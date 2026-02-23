@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use weav_core::config::WeavConfig;
+use weav_core::config::{WalSyncMode, WeavConfig};
 use weav_server::{engine::Engine, grpc_server::WeavGrpcService, http, resp3_server};
 use weav_proto::grpc::weav_service_server::WeavServiceServer;
 
@@ -30,6 +30,21 @@ async fn main() {
             Err(e) => {
                 tracing::error!("Recovery error: {e}");
             }
+        }
+    }
+
+    // Spawn background WAL sync task if configured for EverySecond mode.
+    if config.persistence.enabled {
+        if matches!(config.persistence.wal_sync_mode, WalSyncMode::EverySecond) {
+            let engine_wal = engine.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                loop {
+                    interval.tick().await;
+                    engine_wal.sync_wal();
+                }
+            });
+            tracing::info!("WAL EverySecond sync task started");
         }
     }
 

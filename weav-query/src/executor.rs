@@ -380,6 +380,7 @@ pub fn execute_context_query(
             b.relevance_score
                 .partial_cmp(&a.relevance_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.node_id.cmp(&b.node_id))
         });
         chunks.truncate(limit as usize);
     }
@@ -453,6 +454,7 @@ pub fn execute_context_query(
                         .unwrap_or(std::cmp::Ordering::Equal)
                 }
             };
+            let cmp = cmp.then_with(|| a.node_id.cmp(&b.node_id));
             if sort.direction == SortDirection::Asc {
                 cmp
             } else {

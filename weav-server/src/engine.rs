@@ -82,6 +82,7 @@ pub struct GraphState {
     pub config: GraphConfig,
     pub next_node_id: NodeId,
     pub next_edge_id: EdgeId,
+    pub dedup_config: Option<weav_graph::dedup::DedupConfig>,
 }
 
 // ─── Engine ──────────────────────────────────────────────────────────────────
@@ -135,6 +136,19 @@ impl Engine {
         }
     }
 
+    /// Force-sync the WAL file to disk. Called periodically for EverySecond mode.
+    pub fn sync_wal(&self) {
+        if let Some(ref wal_mutex) = self.wal {
+            let mut wal = wal_mutex.lock();
+            let _ = wal.sync();
+        }
+    }
+
+    /// Return the configured WAL sync mode.
+    pub fn wal_sync_mode(&self) -> &weav_core::config::WalSyncMode {
+        &self.config.persistence.wal_sync_mode
+    }
+
     /// Recover state from a RecoveryResult (snapshot + WAL entries).
     pub fn recover(&self, result: weav_persist::recovery::RecoveryResult) -> WeavResult<()> {
         // Step 1: Restore from snapshot if present.
@@ -175,6 +189,7 @@ impl Engine {
                     config: graph_config,
                     next_node_id: 1,
                     next_edge_id: 1,
+                    dedup_config: None,
                 };
 
                 // Restore nodes.
@@ -405,6 +420,7 @@ impl Engine {
             config: graph_config,
             next_node_id: 1,
             next_edge_id: 1,
+            dedup_config: None,
         };
 
         let mut graphs = self
@@ -476,6 +492,104 @@ impl Engine {
             .get_mut(&cmd.graph)
             .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
 
+        // ── Dedup: entity key (always-on, zero false positives) ─────────
+        if let Some(ref key) = cmd.entity_key {
+            if let Some(existing_id) = weav_graph::dedup::find_duplicate_by_key(
+                &gs.properties, "entity_key", key,
+            ) {
+                // Merge properties into existing node
+                weav_graph::dedup::merge_properties(
+                    &mut gs.properties,
+                    existing_id,
+                    &cmd.properties,
+                    &ConflictPolicy::LastWriteWins,
+                );
+
+                // Update embedding if provided
+                if let Some(ref embedding) = cmd.embedding {
+                    let _ = gs.vector_index.remove(existing_id);
+                    gs.vector_index.insert(existing_id, embedding)?;
+                }
+
+                return Ok(CommandResponse::Integer(existing_id));
+            }
+        }
+
+        // ── Dedup: fuzzy name match (if dedup_config is set) ────────────
+        if let Some(ref dedup_cfg) = gs.dedup_config {
+            if let Some(ref name_field) = dedup_cfg.name_field {
+                // Extract the name value from the incoming properties
+                let name_value = cmd.properties.iter()
+                    .find(|(k, _)| k == name_field)
+                    .and_then(|(_, v)| v.as_str())
+                    .map(|s| s.to_string());
+
+                if let Some(ref name_val) = name_value {
+                    if let Some((existing_id, _score)) = weav_graph::dedup::find_duplicate_by_name(
+                        &gs.properties,
+                        name_field,
+                        name_val,
+                        dedup_cfg.fuzzy_threshold,
+                    ) {
+                        // If require_same_label: check label matches
+                        let label_matches = if dedup_cfg.require_same_label {
+                            gs.properties
+                                .get_node_property(existing_id, "_label")
+                                .and_then(|v| v.as_str())
+                                .map(|l| l == cmd.label)
+                                .unwrap_or(false)
+                        } else {
+                            true
+                        };
+
+                        if label_matches {
+                            weav_graph::dedup::merge_properties(
+                                &mut gs.properties,
+                                existing_id,
+                                &cmd.properties,
+                                &ConflictPolicy::LastWriteWins,
+                            );
+
+                            if let Some(ref embedding) = cmd.embedding {
+                                let _ = gs.vector_index.remove(existing_id);
+                                gs.vector_index.insert(existing_id, embedding)?;
+                            }
+
+                            return Ok(CommandResponse::Integer(existing_id));
+                        }
+                    }
+                }
+            }
+
+            // ── Dedup: vector similarity (if embedding provided) ────────
+            if let Some(ref embedding) = cmd.embedding {
+                if let Ok(search_results) = gs.vector_index.search(embedding, 5, None) {
+                    let similarities: Vec<(NodeId, f32)> = search_results
+                        .iter()
+                        .map(|&(nid, dist)| (nid, 1.0 / (1.0 + dist)))
+                        .collect();
+
+                    if let Some((existing_id, _sim)) = weav_graph::dedup::find_duplicate_by_vector(
+                        &similarities,
+                        dedup_cfg.vector_threshold,
+                    ) {
+                        weav_graph::dedup::merge_properties(
+                            &mut gs.properties,
+                            existing_id,
+                            &cmd.properties,
+                            &ConflictPolicy::LastWriteWins,
+                        );
+
+                        let _ = gs.vector_index.remove(existing_id);
+                        gs.vector_index.insert(existing_id, embedding)?;
+
+                        return Ok(CommandResponse::Integer(existing_id));
+                    }
+                }
+            }
+        }
+
+        // ── No duplicate found: create new node ─────────────────────────
         let node_id = gs.next_node_id;
         gs.next_node_id += 1;
 
@@ -1760,6 +1874,45 @@ mod tests {
     }
 
     #[test]
+    fn test_sync_wal_with_persistence() {
+        let tmp_dir = std::env::temp_dir().join(format!("weav_wal_sync_test_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let mut config = WeavConfig::default();
+        config.persistence.enabled = true;
+        config.persistence.data_dir = tmp_dir.clone();
+        config.persistence.wal_sync_mode = weav_core::config::WalSyncMode::EverySecond;
+
+        let engine = Engine::new(config);
+        create_test_graph(&engine, "wal_g");
+
+        // Add a node to produce WAL entries.
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "wal_g" LABEL "person" PROPERTIES {"name": "Alice"}"#,
+        )
+        .unwrap();
+        engine.execute_command(cmd).unwrap();
+
+        // sync_wal should not panic.
+        engine.sync_wal();
+
+        // Verify wal_sync_mode returns the expected mode.
+        assert!(matches!(
+            engine.wal_sync_mode(),
+            weav_core::config::WalSyncMode::EverySecond
+        ));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_sync_wal_without_persistence() {
+        // sync_wal on an engine without persistence should be a no-op.
+        let engine = make_engine();
+        engine.sync_wal(); // Should not panic
+    }
+
+    #[test]
     fn test_node_delete_also_removes_edges() {
         let engine = make_engine();
         create_test_graph(&engine, "g");
@@ -1801,6 +1954,136 @@ mod tests {
             CommandResponse::GraphInfo(info) => {
                 assert_eq!(info.node_count, 1);
                 assert_eq!(info.edge_count, 0);
+            }
+            _ => panic!("expected GraphInfo"),
+        }
+    }
+
+    #[test]
+    fn test_entity_key_dedup_merges() {
+        let engine = make_engine();
+        create_test_graph(&engine, "g");
+
+        // Add first node with entity_key "alice"
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "Alice", "age": 25} KEY "alice""#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd).unwrap();
+        let first_id = match resp {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Add second node with same entity_key "alice" but different props
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "Alice Updated", "city": "NYC"} KEY "alice""#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd).unwrap();
+        let second_id = match resp {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Should return the SAME node_id (dedup detected)
+        assert_eq!(first_id, second_id, "Dedup should return existing node_id");
+
+        // Verify properties were merged
+        let cmd = parser::parse_command(&format!("NODE GET \"g\" {first_id}")).unwrap();
+        let resp = engine.execute_command(cmd).unwrap();
+        match resp {
+            CommandResponse::NodeInfo(info) => {
+                // "name" should be updated (LastWriteWins)
+                let name = info.properties.iter().find(|(k, _)| k == "name");
+                assert_eq!(name.unwrap().1.as_str(), Some("Alice Updated"));
+                // "city" should be added
+                assert!(info.properties.iter().any(|(k, _)| k == "city"));
+                // "age" should remain from original
+                assert!(info.properties.iter().any(|(k, _)| k == "age"));
+            }
+            _ => panic!("expected NodeInfo"),
+        }
+
+        // Graph should still have only 1 node
+        let cmd = parser::parse_command("GRAPH INFO \"g\"").unwrap();
+        let resp = engine.execute_command(cmd).unwrap();
+        match resp {
+            CommandResponse::GraphInfo(info) => {
+                assert_eq!(info.node_count, 1, "Dedup should not create a second node");
+            }
+            _ => panic!("expected GraphInfo"),
+        }
+    }
+
+    #[test]
+    fn test_no_dedup_without_entity_key() {
+        let engine = make_engine();
+        create_test_graph(&engine, "g");
+
+        // Add two nodes without entity_key
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "Alice"}"#,
+        )
+        .unwrap();
+        let id1 = match engine.execute_command(cmd).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "Alice"}"#,
+        )
+        .unwrap();
+        let id2 = match engine.execute_command(cmd).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        assert_ne!(id1, id2, "Without entity_key, nodes should be distinct");
+    }
+
+    #[test]
+    fn test_dedup_updates_embedding() {
+        let mut config = WeavConfig::default();
+        config.engine.default_vector_dimensions = 4;
+        let engine = Engine::new(config);
+        create_test_graph(&engine, "g");
+
+        // Add node with entity_key and embedding
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "g".to_string(),
+            label: "person".to_string(),
+            properties: vec![("name".to_string(), Value::String(CompactString::from("Alice")))],
+            embedding: Some(vec![1.0, 0.0, 0.0, 0.0]),
+            entity_key: Some("alice".to_string()),
+        });
+        let first_id = match engine.execute_command(cmd).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Add again with same entity_key but new embedding
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "g".to_string(),
+            label: "person".to_string(),
+            properties: vec![("name".to_string(), Value::String(CompactString::from("Alice")))],
+            embedding: Some(vec![0.0, 1.0, 0.0, 0.0]),
+            entity_key: Some("alice".to_string()),
+        });
+        let second_id = match engine.execute_command(cmd).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        assert_eq!(first_id, second_id, "Dedup should return existing node_id");
+
+        // Node count should still be 1
+        let cmd = parser::parse_command("GRAPH INFO \"g\"").unwrap();
+        let resp = engine.execute_command(cmd).unwrap();
+        match resp {
+            CommandResponse::GraphInfo(info) => {
+                assert_eq!(info.node_count, 1);
             }
             _ => panic!("expected GraphInfo"),
         }

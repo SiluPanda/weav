@@ -56,6 +56,13 @@ export interface ContextResult {
   queryTimeUs: number;
 }
 
+export interface DecayParams {
+  type: 'exponential' | 'linear' | 'step' | 'none';
+  halfLifeMs?: number;
+  maxAgeMs?: number;
+  cutoffMs?: number;
+}
+
 export interface ContextParams {
   graph: string;
   query?: string;
@@ -63,10 +70,14 @@ export interface ContextParams {
   seedNodes?: string[];
   budget?: number;
   maxDepth?: number;
-  decay?: string;
+  decay?: DecayParams;
   edgeLabels?: string[];
-  temporalAt?: string;
+  temporalAt?: number;
   includeProvenance?: boolean;
+  limit?: number;
+  sortField?: 'relevance' | 'recency' | 'confidence';
+  sortDirection?: 'asc' | 'desc';
+  direction?: 'outgoing' | 'incoming' | 'both';
 }
 
 export interface AddNodeParams {

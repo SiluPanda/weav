@@ -116,6 +116,8 @@ fn bench_traversal(c: &mut Criterion) {
                 &edge_filter,
                 &node_filter,
                 Direction::Outgoing,
+                None,
+                None,
             );
             black_box(result);
         });

@@ -98,12 +98,12 @@ export class WeavClient {
       embedding: params.embedding,
       entity_key: params.entityKey,
     };
-    const result = await this.request<{ id: number }>(
+    const result = await this.request<{ node_id: number }>(
       'POST',
       `/v1/graphs/${encodeURIComponent(graph)}/nodes`,
       body,
     );
-    return result.id;
+    return result.node_id;
   }
 
   async getNode(graph: string, nodeId: number): Promise<NodeInfo> {
@@ -140,12 +140,12 @@ export class WeavClient {
     if (params.provenance !== undefined) {
       body.provenance = params.provenance;
     }
-    const result = await this.request<{ id: number }>(
+    const result = await this.request<{ edge_id: number }>(
       'POST',
       `/v1/graphs/${encodeURIComponent(graph)}/edges`,
       body,
     );
-    return result.id;
+    return result.edge_id;
   }
 
   async invalidateEdge(graph: string, edgeId: number): Promise<void> {
@@ -164,12 +164,12 @@ export class WeavClient {
         entity_key: n.entityKey,
       })),
     };
-    const result = await this.request<{ ids: number[] }>(
+    const result = await this.request<{ node_ids: number[] }>(
       'POST',
       `/v1/graphs/${encodeURIComponent(graph)}/nodes/bulk`,
       body,
     );
-    return result.ids;
+    return result.node_ids;
   }
 
   async bulkAddEdges(graph: string, edges: AddEdgeParams[]): Promise<number[]> {
@@ -187,12 +187,12 @@ export class WeavClient {
         return edge;
       }),
     };
-    const result = await this.request<{ ids: number[] }>(
+    const result = await this.request<{ edge_ids: number[] }>(
       'POST',
       `/v1/graphs/${encodeURIComponent(graph)}/edges/bulk`,
       body,
     );
-    return result.ids;
+    return result.edge_ids;
   }
 
   // ── Context retrieval ─────────────────────────────────────────────────
@@ -208,13 +208,30 @@ export class WeavClient {
       include_provenance: params.includeProvenance ?? false,
     };
     if (params.decay !== undefined) {
-      body.decay = params.decay;
+      body.decay = {
+        type: params.decay.type,
+        half_life_ms: params.decay.halfLifeMs,
+        max_age_ms: params.decay.maxAgeMs,
+        cutoff_ms: params.decay.cutoffMs,
+      };
     }
     if (params.edgeLabels !== undefined) {
       body.edge_labels = params.edgeLabels;
     }
     if (params.temporalAt !== undefined) {
       body.temporal_at = params.temporalAt;
+    }
+    if (params.limit !== undefined) {
+      body.limit = params.limit;
+    }
+    if (params.sortField !== undefined) {
+      body.sort_field = params.sortField;
+    }
+    if (params.sortDirection !== undefined) {
+      body.sort_direction = params.sortDirection;
+    }
+    if (params.direction !== undefined) {
+      body.direction = params.direction;
     }
     const raw = await this.request<Record<string, unknown>>(
       'POST',

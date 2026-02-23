@@ -330,10 +330,14 @@ describe('ContextParams', () => {
       seedNodes: ['node1', 'node2'],
       budget: 4096,
       maxDepth: 3,
-      decay: 'exponential',
+      decay: { type: 'exponential', halfLifeMs: 3600000 },
       edgeLabels: ['knows', 'works_at'],
-      temporalAt: '2024-01-01T00:00:00Z',
+      temporalAt: 1704067200000,
       includeProvenance: true,
+      limit: 10,
+      sortField: 'relevance',
+      sortDirection: 'desc',
+      direction: 'both',
     };
     assert.equal(params.graph, 'g');
     assert.equal(params.query, 'tell me about Alice');
@@ -341,10 +345,14 @@ describe('ContextParams', () => {
     assert.deepEqual(params.seedNodes, ['node1', 'node2']);
     assert.equal(params.budget, 4096);
     assert.equal(params.maxDepth, 3);
-    assert.equal(params.decay, 'exponential');
+    assert.deepEqual(params.decay, { type: 'exponential', halfLifeMs: 3600000 });
     assert.deepEqual(params.edgeLabels, ['knows', 'works_at']);
-    assert.equal(params.temporalAt, '2024-01-01T00:00:00Z');
+    assert.equal(params.temporalAt, 1704067200000);
     assert.equal(params.includeProvenance, true);
+    assert.equal(params.limit, 10);
+    assert.equal(params.sortField, 'relevance');
+    assert.equal(params.sortDirection, 'desc');
+    assert.equal(params.direction, 'both');
   });
 });
 

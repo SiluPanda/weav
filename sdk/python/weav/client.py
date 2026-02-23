@@ -197,7 +197,7 @@ class WeavClient:
 
         resp = self._client.post(f"/v1/graphs/{graph}/nodes", json=body)
         data = _check_response(resp)
-        return data["id"]
+        return data["node_id"]
 
     def get_node(self, graph: str, node_id: int) -> NodeInfo:
         """Get a node by its ID."""
@@ -248,7 +248,7 @@ class WeavClient:
             body["provenance"] = provenance
         resp = self._client.post(f"/v1/graphs/{graph}/edges", json=body)
         data = _check_response(resp)
-        return data["id"]
+        return data["edge_id"]
 
     def invalidate_edge(self, graph: str, edge_id: int) -> None:
         """Invalidate (soft-delete) an edge by its ID."""
@@ -263,7 +263,7 @@ class WeavClient:
         """Bulk add nodes. Each dict needs at least 'label'. Returns list of IDs."""
         resp = self._client.post(f"/v1/graphs/{graph}/nodes/bulk", json={"nodes": nodes})
         data = _check_response(resp)
-        return data["ids"]
+        return data["node_ids"]
 
     def bulk_add_edges(
         self,
@@ -273,7 +273,7 @@ class WeavClient:
         """Bulk add edges. Each dict needs 'source', 'target', 'label'. Returns list of IDs."""
         resp = self._client.post(f"/v1/graphs/{graph}/edges/bulk", json={"edges": edges})
         data = _check_response(resp)
-        return data["ids"]
+        return data["edge_ids"]
 
     # -- Context retrieval -------------------------------------------------
 
@@ -285,15 +285,21 @@ class WeavClient:
         seed_nodes: list[str] | None = None,
         budget: int = 4096,
         max_depth: int = 3,
-        decay: str | None = None,
+        decay: dict[str, Any] | None = None,
         edge_labels: list[str] | None = None,
-        temporal_at: str | None = None,
+        temporal_at: int | None = None,
         include_provenance: bool = False,
+        limit: int | None = None,
+        sort_field: str | None = None,
+        sort_direction: str | None = None,
+        direction: str | None = None,
     ) -> ContextResult:
         """Run a context query against a graph.
 
         At least one of *query*, *embedding*, or *seed_nodes* should be
         provided so the engine can determine seed nodes for traversal.
+
+        *decay* should be a dict like ``{"type": "exponential", "half_life_ms": 3600000}``.
         """
         body: dict[str, Any] = {
             "graph": graph,
@@ -313,6 +319,14 @@ class WeavClient:
             body["edge_labels"] = edge_labels
         if temporal_at is not None:
             body["temporal_at"] = temporal_at
+        if limit is not None:
+            body["limit"] = limit
+        if sort_field is not None:
+            body["sort_field"] = sort_field
+        if sort_direction is not None:
+            body["sort_direction"] = sort_direction
+        if direction is not None:
+            body["direction"] = direction
 
         resp = self._client.post("/v1/context", json=body)
         data = _check_response(resp)
@@ -405,7 +419,7 @@ class AsyncWeavClient:
 
         resp = await self._client.post(f"/v1/graphs/{graph}/nodes", json=body)
         data = _check_response(resp)
-        return data["id"]
+        return data["node_id"]
 
     async def get_node(self, graph: str, node_id: int) -> NodeInfo:
         """Get a node by its ID."""
@@ -456,7 +470,7 @@ class AsyncWeavClient:
             body["provenance"] = provenance
         resp = await self._client.post(f"/v1/graphs/{graph}/edges", json=body)
         data = _check_response(resp)
-        return data["id"]
+        return data["edge_id"]
 
     async def invalidate_edge(self, graph: str, edge_id: int) -> None:
         """Invalidate (soft-delete) an edge by its ID."""
@@ -473,7 +487,7 @@ class AsyncWeavClient:
         """Bulk add nodes. Each dict needs at least 'label'. Returns list of IDs."""
         resp = await self._client.post(f"/v1/graphs/{graph}/nodes/bulk", json={"nodes": nodes})
         data = _check_response(resp)
-        return data["ids"]
+        return data["node_ids"]
 
     async def bulk_add_edges(
         self,
@@ -483,7 +497,7 @@ class AsyncWeavClient:
         """Bulk add edges. Each dict needs 'source', 'target', 'label'. Returns list of IDs."""
         resp = await self._client.post(f"/v1/graphs/{graph}/edges/bulk", json={"edges": edges})
         data = _check_response(resp)
-        return data["ids"]
+        return data["edge_ids"]
 
     # -- Context retrieval -------------------------------------------------
 
@@ -495,15 +509,21 @@ class AsyncWeavClient:
         seed_nodes: list[str] | None = None,
         budget: int = 4096,
         max_depth: int = 3,
-        decay: str | None = None,
+        decay: dict[str, Any] | None = None,
         edge_labels: list[str] | None = None,
-        temporal_at: str | None = None,
+        temporal_at: int | None = None,
         include_provenance: bool = False,
+        limit: int | None = None,
+        sort_field: str | None = None,
+        sort_direction: str | None = None,
+        direction: str | None = None,
     ) -> ContextResult:
         """Run a context query against a graph.
 
         At least one of *query*, *embedding*, or *seed_nodes* should be
         provided so the engine can determine seed nodes for traversal.
+
+        *decay* should be a dict like ``{"type": "exponential", "half_life_ms": 3600000}``.
         """
         body: dict[str, Any] = {
             "graph": graph,
@@ -523,6 +543,14 @@ class AsyncWeavClient:
             body["edge_labels"] = edge_labels
         if temporal_at is not None:
             body["temporal_at"] = temporal_at
+        if limit is not None:
+            body["limit"] = limit
+        if sort_field is not None:
+            body["sort_field"] = sort_field
+        if sort_direction is not None:
+            body["sort_direction"] = sort_direction
+        if direction is not None:
+            body["direction"] = direction
 
         resp = await self._client.post("/v1/context", json=body)
         data = _check_response(resp)

@@ -11,11 +11,11 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use weav_core::types::{Direction, TokenBudget, Value};
+use weav_core::types::{DecayFunction, Direction, TokenBudget, Value};
 use weav_query::parser::{
-    Command, ContextQuery, EdgeAddCmd, EdgeDeleteCmd, EdgeGetCmd, EdgeInvalidateCmd, GraphCreateCmd,
-    NodeAddCmd, NodeDeleteCmd, NodeGetCmd, NodeUpdateCmd,
-    BulkInsertNodesCmd, BulkInsertEdgesCmd, SeedStrategy,
+    Command, ContextQuery, EdgeAddCmd, EdgeDeleteCmd, EdgeFilterConfig, EdgeGetCmd,
+    EdgeInvalidateCmd, GraphCreateCmd, NodeAddCmd, NodeDeleteCmd, NodeGetCmd, NodeUpdateCmd,
+    BulkInsertNodesCmd, BulkInsertEdgesCmd, SeedStrategy, SortDirection, SortField, SortOrder,
 };
 
 use crate::engine::{CommandResponse, Engine};
@@ -61,6 +61,15 @@ pub struct BulkAddEdgesRequest {
 }
 
 #[derive(Deserialize)]
+pub struct DecayRequest {
+    #[serde(rename = "type")]
+    pub decay_type: String,
+    pub half_life_ms: Option<u64>,
+    pub max_age_ms: Option<u64>,
+    pub cutoff_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
 pub struct ContextRequest {
     pub graph: String,
     pub query: Option<String>,
@@ -69,6 +78,13 @@ pub struct ContextRequest {
     pub budget: Option<u32>,
     pub max_depth: Option<u8>,
     pub include_provenance: Option<bool>,
+    pub decay: Option<DecayRequest>,
+    pub temporal_at: Option<u64>,
+    pub limit: Option<u32>,
+    pub sort_field: Option<String>,
+    pub sort_direction: Option<String>,
+    pub edge_labels: Option<Vec<String>>,
+    pub direction: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -624,19 +640,61 @@ async fn context_query(
         _ => SeedStrategy::Nodes(Vec::new()),
     };
 
+    // Parse direction.
+    let direction = match body.direction.as_deref() {
+        Some("outgoing") => Direction::Outgoing,
+        Some("incoming") => Direction::Incoming,
+        _ => Direction::Both,
+    };
+
+    // Parse decay.
+    let decay = body.decay.and_then(|d| {
+        match d.decay_type.to_lowercase().as_str() {
+            "exponential" => d.half_life_ms.map(|ms| DecayFunction::Exponential { half_life_ms: ms }),
+            "linear" => d.max_age_ms.map(|ms| DecayFunction::Linear { max_age_ms: ms }),
+            "step" => d.cutoff_ms.map(|ms| DecayFunction::Step { cutoff_ms: ms }),
+            "none" => Some(DecayFunction::None),
+            _ => None,
+        }
+    });
+
+    // Parse sort.
+    let sort = body.sort_field.and_then(|field_str| {
+        let field = match field_str.to_lowercase().as_str() {
+            "relevance" => SortField::Relevance,
+            "recency" => SortField::Recency,
+            "confidence" => SortField::Confidence,
+            _ => return None,
+        };
+        let dir = match body.sort_direction.as_deref() {
+            Some("asc") => SortDirection::Asc,
+            _ => SortDirection::Desc,
+        };
+        Some(SortOrder { field, direction: dir })
+    });
+
+    // Parse edge filter from edge_labels.
+    let edge_filter = body.edge_labels.map(|labels| {
+        EdgeFilterConfig {
+            labels: Some(labels),
+            min_weight: None,
+            min_confidence: None,
+        }
+    });
+
     let query = ContextQuery {
         query_text: body.query,
         graph: body.graph,
         budget: body.budget.map(TokenBudget::new),
         seeds,
         max_depth: body.max_depth.unwrap_or(2),
-        direction: Direction::Both,
-        edge_filter: None,
-        decay: None,
+        direction,
+        edge_filter,
+        decay,
         include_provenance: body.include_provenance.unwrap_or(false),
-        temporal_at: None,
-        limit: None,
-        sort: None,
+        temporal_at: body.temporal_at,
+        limit: body.limit,
+        sort,
     };
 
     let cmd = Command::Context(query);

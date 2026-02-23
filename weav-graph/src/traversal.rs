@@ -144,19 +144,16 @@ fn get_neighbors(
 
 /// Check if a node passes the node filter criteria.
 ///
-/// Currently implements `valid_at` filtering: a node passes if it has at least one
-/// edge that is valid at the specified timestamp.
+/// Implements `valid_at`, `labels`, and `has_property` filtering.
 ///
-/// TODO: `labels` filtering requires access to a node-to-label mapping (not stored
-/// in AdjacencyStore). Callers should filter by node label externally or pass a
-/// node_labels map.
-///
-/// TODO: `has_property` filtering requires access to PropertyStore. Callers should
-/// filter by property presence externally.
+/// - `node_label_lookup`: Optional closure that resolves a node to its LabelId.
+/// - `property_check`: Optional closure that checks if a node has a given property.
 fn node_passes_filter(
     adjacency: &AdjacencyStore,
     node: NodeId,
     node_filter: &NodeFilter,
+    node_label_lookup: Option<&dyn Fn(NodeId) -> Option<LabelId>>,
+    property_check: Option<&dyn Fn(NodeId, &str) -> bool>,
 ) -> bool {
     if let Some(ts) = node_filter.valid_at {
         // A node passes the valid_at filter if it has at least one edge
@@ -179,10 +176,41 @@ fn node_passes_filter(
         }
     }
 
+    // Label filtering: check if the node's label is in the allowed set.
+    if let Some(ref allowed_labels) = node_filter.labels {
+        if let Some(ref lookup) = node_label_lookup {
+            match lookup(node) {
+                Some(label_id) => {
+                    if !allowed_labels.contains(&label_id) {
+                        return false;
+                    }
+                }
+                None => return false, // No label found, filter out
+            }
+        }
+        // If no lookup provided, skip label filtering (can't check)
+    }
+
+    // Property filtering: check if the node has all required properties.
+    if let Some(ref required_props) = node_filter.has_property {
+        if let Some(ref checker) = property_check {
+            for prop_name in required_props {
+                if !checker(node, prop_name) {
+                    return false;
+                }
+            }
+        }
+        // If no checker provided, skip property filtering (can't check)
+    }
+
     true
 }
 
 /// Breadth-first search from seed nodes.
+///
+/// Optional closure params for node filtering:
+/// - `node_label_lookup`: Resolves a node to its LabelId (for label filtering).
+/// - `property_check`: Checks if a node has a given property (for has_property filtering).
 pub fn bfs(
     adjacency: &AdjacencyStore,
     seeds: &[NodeId],
@@ -191,6 +219,8 @@ pub fn bfs(
     edge_filter: &EdgeFilter,
     node_filter: &NodeFilter,
     direction: Direction,
+    node_label_lookup: Option<&dyn Fn(NodeId) -> Option<LabelId>>,
+    property_check: Option<&dyn Fn(NodeId, &str) -> bool>,
 ) -> TraversalResult {
     let mut visited_nodes = Vec::new();
     let mut visited_edges = Vec::new();
@@ -199,7 +229,9 @@ pub fn bfs(
     let mut seen = HashSet::new();
     let mut queue: VecDeque<(NodeId, u8)> = VecDeque::new();
 
-    let has_node_filter = node_filter.valid_at.is_some();
+    let has_node_filter = node_filter.valid_at.is_some()
+        || node_filter.labels.is_some()
+        || node_filter.has_property.is_some();
 
     for &seed in seeds {
         if seen.insert(seed) {
@@ -222,7 +254,7 @@ pub fn bfs(
             if seen.insert(neighbor) {
                 // Apply node filter to discovered neighbor
                 if has_node_filter
-                    && !node_passes_filter(adjacency, neighbor, node_filter)
+                    && !node_passes_filter(adjacency, neighbor, node_filter, node_label_lookup, property_check)
                 {
                     // Node doesn't pass the filter; mark as seen but don't visit
                     continue;
@@ -304,7 +336,12 @@ pub fn flow_score(
             depth,
         })
         .collect();
-    result.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    result.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    });
     result
 }
 
@@ -322,6 +359,8 @@ pub fn ego_network(
         &EdgeFilter::none(),
         &NodeFilter::none(),
         Direction::Both,
+        None,
+        None,
     );
     SubGraph {
         nodes: result.visited_nodes,
@@ -508,6 +547,8 @@ mod tests {
             &EdgeFilter::none(),
             &NodeFilter::none(),
             Direction::Outgoing,
+            None,
+            None,
         );
         assert_eq!(result.visited_nodes.len(), 4);
         assert_eq!(*result.depth_map.get(&1).unwrap(), 0);
@@ -527,6 +568,8 @@ mod tests {
             &EdgeFilter::none(),
             &NodeFilter::none(),
             Direction::Outgoing,
+            None,
+            None,
         );
         assert_eq!(result.visited_nodes.len(), 2); // 1, 2
     }
@@ -542,6 +585,8 @@ mod tests {
             &EdgeFilter::none(),
             &NodeFilter::none(),
             Direction::Outgoing,
+            None,
+            None,
         );
         assert_eq!(result.visited_nodes.len(), 2);
     }
@@ -573,6 +618,7 @@ mod tests {
         };
         let result = bfs(
             &adj, &[1], 1, 100, &filter, &NodeFilter::none(), Direction::Outgoing,
+            None, None,
         );
         // Only node 3 should be reachable (weight 0.9 >= 0.8)
         assert_eq!(result.visited_nodes.len(), 2); // seed + node 3
@@ -609,6 +655,7 @@ mod tests {
         };
         let result = bfs(
             &adj, &[1], 1, 100, &filter, &NodeFilter::none(), Direction::Outgoing,
+            None, None,
         );
         assert_eq!(result.visited_nodes.len(), 2);
         assert!(result.visited_nodes.contains(&3));
@@ -648,6 +695,7 @@ mod tests {
         };
         let result = bfs(
             &adj, &[1], 1, 100, &filter150, &NodeFilter::none(), Direction::Outgoing,
+            None, None,
         );
         assert_eq!(result.visited_nodes.len(), 3);
 
@@ -658,6 +706,7 @@ mod tests {
         };
         let result = bfs(
             &adj, &[1], 1, 100, &filter250, &NodeFilter::none(), Direction::Outgoing,
+            None, None,
         );
         assert_eq!(result.visited_nodes.len(), 2);
         assert!(result.visited_nodes.contains(&3));
@@ -766,6 +815,8 @@ mod tests {
             &EdgeFilter::none(),
             &NodeFilter::none(),
             Direction::Incoming,
+            None,
+            None,
         );
         assert_eq!(result.visited_nodes.len(), 4);
         assert_eq!(*result.depth_map.get(&4).unwrap(), 0);
@@ -796,6 +847,7 @@ mod tests {
         };
         let result = bfs(
             &adj, &[1], 1, 100, &filter, &NodeFilter::none(), Direction::Outgoing,
+            None, None,
         );
         assert_eq!(result.visited_nodes.len(), 2);
         assert!(result.visited_nodes.contains(&2));
@@ -848,6 +900,7 @@ mod tests {
         };
         let result = bfs(
             &adj, &[1], 3, 100, &EdgeFilter::none(), &nf, Direction::Outgoing,
+            None, None,
         );
         assert!(result.visited_nodes.contains(&2));
         assert!(result.visited_nodes.contains(&3));
@@ -860,6 +913,7 @@ mod tests {
         };
         let result2 = bfs(
             &adj, &[1], 3, 100, &EdgeFilter::none(), &nf2, Direction::Outgoing,
+            None, None,
         );
         // Node 2 should be filtered out because none of its edges are valid at t=50
         assert!(!result2.visited_nodes.contains(&2));
@@ -902,6 +956,7 @@ mod tests {
         };
         let result = bfs(
             &adj, &[1], 1, 100, &filter, &NodeFilter::none(), Direction::Outgoing,
+            None, None,
         );
         assert_eq!(result.visited_nodes.len(), 2); // seed + node 2
         assert!(result.visited_nodes.contains(&2));
@@ -996,6 +1051,8 @@ mod tests {
             &EdgeFilter::none(),
             &NodeFilter::none(),
             Direction::Both,
+            None,
+            None,
         );
 
         // BFS from 2 with Direction::Both should find 2, 3 (outgoing), and 4 (incoming)
@@ -1028,6 +1085,8 @@ mod tests {
             &EdgeFilter::none(),
             &NodeFilter::none(),
             Direction::Outgoing,
+            None,
+            None,
         );
 
         // All 3 nodes should be found, no infinite loop
@@ -1060,6 +1119,8 @@ mod tests {
             &EdgeFilter::none(),
             &NodeFilter::none(),
             Direction::Outgoing,
+            None,
+            None,
         );
         let mut nodes1 = result1.visited_nodes.clone();
         nodes1.sort();
@@ -1074,6 +1135,8 @@ mod tests {
             &EdgeFilter::none(),
             &NodeFilter::none(),
             Direction::Outgoing,
+            None,
+            None,
         );
         let mut nodes2 = result2.visited_nodes.clone();
         nodes2.sort();
@@ -1093,6 +1156,8 @@ mod tests {
             &EdgeFilter::none(),
             &NodeFilter::none(),
             Direction::Outgoing,
+            None,
+            None,
         );
 
         // The seed is still added to visited_nodes even if it doesn't exist
@@ -1110,6 +1175,79 @@ mod tests {
     }
 
     #[test]
+    fn test_bfs_node_label_filter() {
+        // Graph: 1->2, 1->3. Node 2 has label 0, node 3 has label 1.
+        // Filter allows only label 0 => only node 2 should be visited.
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_node(3);
+
+        let meta1 = make_meta(1, 2, 0);
+        adj.add_edge(1, 2, 0, meta1).unwrap();
+        let meta2 = make_meta(1, 3, 0);
+        adj.add_edge(1, 3, 0, meta2).unwrap();
+
+        // Label lookup: node 2 -> label 0, node 3 -> label 1
+        let label_lookup = |nid: NodeId| -> Option<LabelId> {
+            match nid {
+                1 => Some(0),
+                2 => Some(0),
+                3 => Some(1),
+                _ => None,
+            }
+        };
+
+        let mut allowed = HashSet::new();
+        allowed.insert(0 as LabelId);
+        let nf = NodeFilter {
+            labels: Some(allowed),
+            ..NodeFilter::none()
+        };
+
+        let result = bfs(
+            &adj, &[1], 1, 100, &EdgeFilter::none(), &nf, Direction::Outgoing,
+            Some(&label_lookup), None,
+        );
+        assert!(result.visited_nodes.contains(&1)); // seed always included
+        assert!(result.visited_nodes.contains(&2)); // label 0: passes
+        assert!(!result.visited_nodes.contains(&3)); // label 1: filtered out
+    }
+
+    #[test]
+    fn test_bfs_has_property_filter() {
+        // Graph: 1->2, 1->3. Only node 2 has property "status".
+        // Filter requires "status" => only node 2 should be visited.
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_node(3);
+
+        let meta1 = make_meta(1, 2, 0);
+        adj.add_edge(1, 2, 0, meta1).unwrap();
+        let meta2 = make_meta(1, 3, 0);
+        adj.add_edge(1, 3, 0, meta2).unwrap();
+
+        // Property check: only node 2 has "status"
+        let prop_check = |nid: NodeId, prop: &str| -> bool {
+            nid == 2 && prop == "status"
+        };
+
+        let nf = NodeFilter {
+            has_property: Some(vec!["status".to_string()]),
+            ..NodeFilter::none()
+        };
+
+        let result = bfs(
+            &adj, &[1], 1, 100, &EdgeFilter::none(), &nf, Direction::Outgoing,
+            None, Some(&prop_check),
+        );
+        assert!(result.visited_nodes.contains(&1)); // seed always included
+        assert!(result.visited_nodes.contains(&2)); // has "status": passes
+        assert!(!result.visited_nodes.contains(&3)); // no "status": filtered out
+    }
+
+    #[test]
     fn test_shortest_path_no_edges() {
         // Graph with nodes but no edges between them
         let mut adj = AdjacencyStore::new();
@@ -1119,6 +1257,28 @@ mod tests {
 
         let path = shortest_path(&adj, 1, 3, 10);
         assert!(path.is_none());
+    }
+
+    #[test]
+    fn test_flow_score_deterministic_tie_breaking() {
+        // Star graph: center=1, spokes: 1->2, 1->3, 1->4, 1->5
+        // All spokes get the same propagated score, so tie-break should be by node_id ascending
+        let adj = build_star_graph();
+        let result = flow_score(&adj, &[(1, 1.0)], 0.5, 0.01, 2);
+
+        // Node 1 has score 1.0 (seed), nodes 2-5 each get 0.5
+        assert!(result.len() >= 5);
+        assert_eq!(result[0].node_id, 1); // highest score
+        assert!((result[0].score - 1.0).abs() < 0.001);
+
+        // Tied nodes (score=0.5) should be sorted by node_id ascending
+        let tied: Vec<&ScoredNode> = result.iter().filter(|s| (s.score - 0.5).abs() < 0.001).collect();
+        assert_eq!(tied.len(), 4);
+        for i in 1..tied.len() {
+            assert!(tied[i - 1].node_id < tied[i].node_id,
+                "Tied nodes should be sorted by node_id ascending: {} < {}",
+                tied[i - 1].node_id, tied[i].node_id);
+        }
     }
 
     #[test]

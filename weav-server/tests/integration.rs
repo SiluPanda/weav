@@ -401,12 +401,11 @@ fn test_multiple_graphs() {
     );
 }
 
-// ---- Test 10: Conflict Resolution ----
+// ---- Test 10: Conflict Resolution (Entity-Key Dedup) ----
 
-/// Tests conflict detection and resolution policies.
+/// Tests entity-key deduplication with last-write-wins merge policy.
 /// When two nodes are added with the same entity_key, the engine should
-/// allow both (last-write-wins: both get distinct node IDs, the later
-/// one shadows the earlier for key lookups).
+/// return the same node_id and merge properties (last-write-wins).
 #[test]
 fn test_conflict_resolution() {
     let engine = make_engine();
@@ -416,43 +415,29 @@ fn test_conflict_resolution() {
     let n1 = add_node(&engine, "conflict-graph", "person", "Alice", Some("dup-key"));
 
     // Add a second node with the SAME entity_key but different properties.
-    // Under last-write-wins, the engine assigns a new node_id.
+    // Entity-key dedup returns existing node_id and merges properties.
     let n2 = add_node(&engine, "conflict-graph", "person", "Bob", Some("dup-key"));
 
-    // Both nodes should have been created with distinct IDs.
-    assert_ne!(n1, n2, "Two nodes with same key should still get distinct IDs");
+    // Dedup should return the same node_id.
+    assert_eq!(n1, n2, "Same entity_key should return the same node_id (dedup)");
 
-    // Graph should show 2 nodes.
+    // Graph should show 1 node (deduped).
     let cmd = parse_command("GRAPH INFO \"conflict-graph\"").unwrap();
     match engine.execute_command(cmd).unwrap() {
         CommandResponse::GraphInfo(info) => {
-            assert_eq!(info.node_count, 2, "Both nodes should exist");
+            assert_eq!(info.node_count, 1, "Dedup should keep single node");
         }
         other => panic!("expected GraphInfo, got: {:?}", other),
     }
 
-    // Entity key lookup should find one of the nodes (the property store
-    // returns the first match, which may be n1 or n2 depending on iteration order).
-    let cmd = parse_command(
-        "NODE GET \"conflict-graph\" WHERE entity_key = \"dup-key\"",
-    )
-    .unwrap();
-    match engine.execute_command(cmd).unwrap() {
-        CommandResponse::NodeInfo(info) => {
-            assert!(
-                info.node_id == n1 || info.node_id == n2,
-                "Entity key lookup should return one of the two nodes"
-            );
-        }
-        other => panic!("expected NodeInfo, got: {:?}", other),
-    }
-
-    // Both nodes should be individually retrievable by ID.
+    // The merged node should be retrievable by ID.
     let cmd = parse_command(&format!("NODE GET \"conflict-graph\" {n1}")).unwrap();
     engine.execute_command(cmd).unwrap();
 
-    let cmd = parse_command(&format!("NODE GET \"conflict-graph\" {n2}")).unwrap();
-    engine.execute_command(cmd).unwrap();
+    // Without entity_key, nodes should always get distinct IDs.
+    let n3 = add_node(&engine, "conflict-graph", "person", "Charlie", None);
+    let n4 = add_node(&engine, "conflict-graph", "person", "Diana", None);
+    assert_ne!(n3, n4, "Without entity_key, nodes should be distinct");
 }
 
 // ---- Test 11: Bulk Operations at Scale ----
