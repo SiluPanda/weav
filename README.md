@@ -58,7 +58,7 @@
 <p align="center">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue.svg">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.85%2B-orange.svg">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-497%20passing-brightgreen.svg">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-565%20passing-brightgreen.svg">
   <img alt="Crates" src="https://img.shields.io/badge/crates-9-purple.svg">
 </p>
 
@@ -95,7 +95,7 @@ Weav is a **Redis-like, in-memory context graph database** purpose-built for AI 
 
 ```bash
 # Clone and build
-git clone https://github.com/your-org/weav.git
+git clone https://github.com/SiluPanda/weav.git
 cd weav
 cargo build --release
 
@@ -396,9 +396,22 @@ All responses follow `{ "success": bool, "data"?: T, "error"?: string }`.
 
 | Method | Endpoint | Body |
 |---|---|---|
-| `POST` | `/v1/context` | `{ "graph", "query?", "embedding?", "seed_nodes?", "budget?", "max_depth?", "include_provenance?" }` |
+| `POST` | `/v1/context` | `{ "graph", "query?", "embedding?", "seed_nodes?", "budget?", "max_depth?", "include_provenance?", "decay?", "temporal_at?", "limit?", "sort_field?", "sort_direction?", "edge_labels?", "direction?" }` |
 
 Returns `ContextResult` with chunks, token counts, and query timing.
+
+**Decay parameter** (object, not string):
+```json
+{
+  "decay": {
+    "decay_type": "exponential",
+    "half_life_ms": 3600000,
+    "max_age_ms": null,
+    "cutoff_ms": null
+  }
+}
+```
+Supported types: `exponential`, `linear`, `step`, `none`.
 
 #### Server
 
@@ -444,7 +457,24 @@ result.to_prompt()     # Formatted string for system prompt injection
 result.to_messages()   # OpenAI-compatible message list
 ```
 
-**Full parameter support:** `decay`, `edge_labels`, `temporal_at`, `include_provenance`, `seed_nodes`, `embedding`.
+**Full parameter support:**
+
+```python
+result = client.context("my_graph",
+    query="transformer architectures",
+    budget=4096,
+    decay={"type": "exponential", "half_life_ms": 3600000},
+    edge_labels=["derived_from", "related_to"],
+    temporal_at=1700000000000,
+    direction="outgoing",
+    limit=50,
+    sort_field="relevance",
+    sort_direction="desc",
+    include_provenance=True,
+    seed_nodes=["node_key_1"],
+    embedding=[0.1, 0.2, 0.3],
+)
+```
 
 ### Node.js / TypeScript
 
@@ -457,9 +487,13 @@ const result = await client.context({
   graph: "my_graph",
   query: "...",
   budget: 4096,
-  decay: "exponential",
+  decay: { type: "exponential", halfLifeMs: 3600000 },
   edgeLabels: ["related_to", "derived_from"],
   temporalAt: Date.now(),
+  direction: "outgoing",
+  limit: 50,
+  sortField: "relevance",
+  sortDirection: "desc",
 });
 
 contextToPrompt(result);    // Formatted prompt string
@@ -517,6 +551,8 @@ arena_size_mb = 64
 | Variable | Description |
 |---|---|
 | `WEAV_SERVER_PORT` | RESP3 listen port |
+| `WEAV_SERVER_HTTP_PORT` | HTTP REST listen port |
+| `WEAV_SERVER_GRPC_PORT` | gRPC listen port |
 | `WEAV_SERVER_BIND_ADDRESS` | Bind address |
 | `WEAV_ENGINE_NUM_SHARDS` | Number of shards |
 | `WEAV_PERSISTENCE_ENABLED` | Enable persistence (`true`/`false`) |
@@ -613,22 +649,26 @@ cargo test -p weav-core
 cargo test -p weav-graph
 cargo test -p weav-server
 
+# Python SDK tests
+cd sdk/python && pip install -e ".[dev]" && pytest
+
 # Node SDK tests
 cd sdk/node && npm test
 ```
 
-**497 Rust tests** across all crates, all passing.
+**565 Rust tests** across all crates, **639 total** including SDKs — all passing.
 
 | Crate | Tests |
 |---|---|
 | weav-core | 73 |
-| weav-graph | 87 |
+| weav-graph | 90 |
 | weav-vector | 37 |
 | weav-query | 84 |
 | weav-persist | 28 |
 | weav-proto | 61 |
-| weav-server | 88 (66 unit + 22 integration) |
+| weav-server | 153 (71 unit + 22 integration + 60 E2E) |
 | weav-cli | 39 |
+| Python SDK | 49 |
 | Node SDK | 25 |
 
 ---
