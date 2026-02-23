@@ -341,12 +341,14 @@ mod tests {
                     direction: "outgoing".to_string(),
                     weight: 0.9,
                 }],
+                temporal: None,
             }],
             total_tokens: 7,
             budget_used: 0.5,
             nodes_considered: 10,
             nodes_included: 1,
             query_time_us: 123,
+            conflicts: Vec::new(),
         }
     }
 
@@ -407,6 +409,7 @@ mod tests {
             nodes_considered: 0,
             nodes_included: 0,
             query_time_us: 1,
+            conflicts: Vec::new(),
         };
         let val = context_result_to_resp3(&result);
         match &val {
@@ -441,12 +444,14 @@ mod tests {
                     source_chunk_offset: None,
                 }),
                 relationships: vec![],
+                temporal: None,
             }],
             total_tokens: 1,
             budget_used: 0.01,
             nodes_considered: 1,
             nodes_included: 1,
             query_time_us: 50,
+            conflicts: Vec::new(),
         };
 
         let val = context_result_to_resp3(&result);
@@ -556,6 +561,161 @@ mod tests {
         match cmd {
             weav_query::parser::Command::Stats(Some(name)) => assert_eq!(name, "my_graph"),
             _ => panic!("expected Stats(Some)"),
+        }
+    }
+
+    // -- error_to_resp3 multiple variants --------------------------------------
+
+    #[test]
+    fn test_error_to_resp3_multiple_variants() {
+        let cases: Vec<WeavError> = vec![
+            WeavError::NodeNotFound(42, 1),
+            WeavError::EdgeNotFound(99),
+            WeavError::DuplicateNode("alice".to_string()),
+            WeavError::QueryParseError("unexpected token".to_string()),
+            WeavError::Internal("something broke".to_string()),
+        ];
+
+        for err in &cases {
+            let val = error_to_resp3(err);
+            match &val {
+                Resp3Value::SimpleError(msg) => {
+                    // The message should match the Display impl of WeavError.
+                    assert_eq!(msg, &err.to_string());
+                }
+                other => panic!(
+                    "expected SimpleError for {:?}, got {:?}",
+                    err, other
+                ),
+            }
+        }
+    }
+
+    // -- context_result with empty relationships ---------------------------------
+
+    #[test]
+    fn test_context_result_empty_relationships() {
+        let result = ContextResult {
+            chunks: vec![ContextChunk {
+                node_id: 10,
+                content: "Some content".to_string(),
+                label: "document".to_string(),
+                relevance_score: 0.7,
+                depth: 0,
+                token_count: 3,
+                provenance: None,
+                relationships: vec![],
+                temporal: None,
+            }],
+            total_tokens: 3,
+            budget_used: 0.1,
+            nodes_considered: 5,
+            nodes_included: 1,
+            query_time_us: 42,
+            conflicts: Vec::new(),
+        };
+
+        let val = context_result_to_resp3(&result);
+        // Drill into the first chunk.
+        if let Resp3Value::Map(pairs) = &val {
+            if let Some((_, Resp3Value::Array(chunks))) =
+                pairs.iter().find(|(k, _)| k.as_str() == Some("chunks"))
+            {
+                assert_eq!(chunks.len(), 1);
+                if let Resp3Value::Map(chunk_pairs) = &chunks[0] {
+                    // When relationships is empty, chunk_to_resp3 skips the
+                    // "relationships" key entirely, so it should not be present.
+                    let has_rels = chunk_pairs
+                        .iter()
+                        .any(|(k, _)| k.as_str() == Some("relationships"));
+                    assert!(
+                        !has_rels,
+                        "relationships key should be absent when relationships vec is empty"
+                    );
+                    // Should have exactly 6 fields: node_id, content, label,
+                    // relevance_score, depth, token_count.
+                    assert_eq!(chunk_pairs.len(), 6);
+                } else {
+                    panic!("expected chunk Map");
+                }
+            } else {
+                panic!("expected chunks Array");
+            }
+        } else {
+            panic!("expected top-level Map");
+        }
+    }
+
+    // -- relationship with no target_name ----------------------------------------
+
+    #[test]
+    fn test_relationship_no_target_name() {
+        let result = ContextResult {
+            chunks: vec![ContextChunk {
+                node_id: 1,
+                content: "test node".to_string(),
+                label: "entity".to_string(),
+                relevance_score: 0.9,
+                depth: 0,
+                token_count: 2,
+                provenance: None,
+                relationships: vec![RelationshipSummary {
+                    edge_label: "relates_to".to_string(),
+                    target_node_id: 5,
+                    target_name: None,
+                    direction: "outgoing".to_string(),
+                    weight: 0.8,
+                }],
+                temporal: None,
+            }],
+            total_tokens: 2,
+            budget_used: 0.05,
+            nodes_considered: 3,
+            nodes_included: 1,
+            query_time_us: 10,
+            conflicts: Vec::new(),
+        };
+
+        let val = context_result_to_resp3(&result);
+        // Drill into the first chunk's relationships.
+        if let Resp3Value::Map(pairs) = &val {
+            if let Some((_, Resp3Value::Array(chunks))) =
+                pairs.iter().find(|(k, _)| k.as_str() == Some("chunks"))
+            {
+                if let Resp3Value::Map(chunk_pairs) = &chunks[0] {
+                    let rels_pair = chunk_pairs
+                        .iter()
+                        .find(|(k, _)| k.as_str() == Some("relationships"));
+                    assert!(rels_pair.is_some(), "relationships should be present");
+
+                    if let Some((_, Resp3Value::Array(rels))) = rels_pair {
+                        assert_eq!(rels.len(), 1);
+                        if let Resp3Value::Map(rel_pairs) = &rels[0] {
+                            // When target_name is None, the key should be absent.
+                            let has_target_name = rel_pairs
+                                .iter()
+                                .any(|(k, _)| k.as_str() == Some("target_name"));
+                            assert!(
+                                !has_target_name,
+                                "target_name key should be absent when target_name is None"
+                            );
+                            // Should have exactly 4 fields: edge_label,
+                            // target_node_id, direction, weight.
+                            assert_eq!(rel_pairs.len(), 4);
+                        } else {
+                            panic!("expected relationship Map");
+                        }
+                    } else {
+                        panic!("expected relationships Array");
+                    }
+                } else {
+                    panic!("expected chunk Map");
+                }
+            } else {
+                panic!("expected chunks Array");
+            }
+        } else {
+            panic!("expected top-level Map");
         }
     }
 }

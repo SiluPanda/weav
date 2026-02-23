@@ -31,14 +31,20 @@ export interface RelationshipSummary {
 }
 
 export interface ContextChunk {
-  node_id: number;
+  nodeId: number;
   content: string;
   label: string;
-  relevance_score: number;
+  relevanceScore: number;
   depth: number;
-  token_count: number;
-  provenance?: Provenance;
-  relationships: RelationshipSummary[];
+  tokenCount: number;
+  provenance?: { source: string; confidence: number };
+  relationships: Array<{
+    edge_label: string;
+    target_node_id: number;
+    target_name?: string;
+    direction: string;
+    weight: number;
+  }>;
 }
 
 export interface ContextResult {
@@ -57,6 +63,9 @@ export interface ContextParams {
   seedNodes?: string[];
   budget?: number;
   maxDepth?: number;
+  decay?: string;
+  edgeLabels?: string[];
+  temporalAt?: string;
   includeProvenance?: boolean;
 }
 
@@ -72,6 +81,12 @@ export interface AddEdgeParams {
   target: number;
   label: string;
   weight?: number;
+  provenance?: Provenance;
+}
+
+export interface UpdateNodeParams {
+  properties?: Record<string, unknown>;
+  embedding?: number[];
 }
 
 export interface ApiResponse<T> {

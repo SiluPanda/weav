@@ -4,11 +4,15 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 use compact_str::CompactString;
 
-use weav_core::config::{TokenCounterType, WeavConfig};
+use weav_core::config::{TokenCounterType, WalSyncMode, WeavConfig};
 use weav_core::types::{BiTemporal, TokenBudget, Value};
 use weav_graph::adjacency::{AdjacencyStore, EdgeMeta};
 use weav_graph::properties::PropertyStore;
 use weav_graph::traversal::{bfs, flow_score, EdgeFilter, NodeFilter};
+use weav_persist::snapshot::{
+    make_meta, EdgeSnapshot, FullSnapshot, GraphSnapshot, NodeSnapshot, SnapshotEngine,
+};
+use weav_persist::wal::{WalOperation, WriteAheadLog};
 use weav_query::budget::enforce_budget;
 use weav_query::executor::ContextChunk;
 use weav_query::parser::parse_command;
@@ -36,7 +40,7 @@ fn random_vector(dim: usize, seed: u64) -> Vec<f32> {
 
 fn bench_vector_search(c: &mut Criterion) {
     let dim = 128;
-    let n = 1000;
+    let n = 100_000;
 
     let config = VectorConfig {
         dimensions: dim as u16,
@@ -55,7 +59,7 @@ fn bench_vector_search(c: &mut Criterion) {
 
     let query = random_vector(dim, 999_999);
 
-    c.bench_function("vector_search_1000_128d_k10", |b| {
+    c.bench_function("vector_search_100k_128d_k10", |b| {
         b.iter(|| {
             let results = index.search(black_box(&query), 10, None).unwrap();
             black_box(results);
@@ -97,18 +101,18 @@ fn build_bench_graph(node_count: u64, avg_degree: u64) -> AdjacencyStore {
 }
 
 fn bench_traversal(c: &mut Criterion) {
-    let adj = build_bench_graph(1000, 5);
+    let adj = build_bench_graph(100_000, 5);
 
     let edge_filter = EdgeFilter::none();
     let node_filter = NodeFilter::none();
 
-    c.bench_function("bfs_1000n_depth3", |b| {
+    c.bench_function("bfs_100kn_depth3", |b| {
         b.iter(|| {
             let result = bfs(
                 black_box(&adj),
                 black_box(&[1]),
                 3,
-                10_000,
+                100_000,
                 &edge_filter,
                 &node_filter,
                 Direction::Outgoing,
@@ -117,7 +121,7 @@ fn bench_traversal(c: &mut Criterion) {
         });
     });
 
-    c.bench_function("flow_score_1000n_depth3", |b| {
+    c.bench_function("flow_score_100kn_depth3", |b| {
         b.iter(|| {
             let result = flow_score(
                 black_box(&adj),
@@ -134,11 +138,14 @@ fn bench_traversal(c: &mut Criterion) {
 // ---- 3. Node Insert Benchmark ----
 
 fn bench_insert(c: &mut Criterion) {
-    c.bench_function("insert_node_adjacency", |b| {
+    let mut group = c.benchmark_group("insert");
+    group.throughput(criterion::Throughput::Elements(10_000));
+
+    group.bench_function("node_adjacency_10k", |b| {
         b.iter_with_setup(
             || AdjacencyStore::new(),
             |mut store| {
-                for i in 1..=1000u64 {
+                for i in 1..=10_000u64 {
                     store.add_node(i);
                 }
                 black_box(&store);
@@ -146,11 +153,11 @@ fn bench_insert(c: &mut Criterion) {
         );
     });
 
-    c.bench_function("insert_node_property", |b| {
+    group.bench_function("node_property_10k", |b| {
         b.iter_with_setup(
             || PropertyStore::new(),
             |mut store| {
-                for i in 1..=1000u64 {
+                for i in 1..=10_000u64 {
                     store.set_node_property(
                         i,
                         "name",
@@ -163,17 +170,17 @@ fn bench_insert(c: &mut Criterion) {
         );
     });
 
-    c.bench_function("insert_edge", |b| {
+    group.bench_function("edge_10k", |b| {
         b.iter_with_setup(
             || {
                 let mut adj = AdjacencyStore::new();
-                for i in 1..=1001u64 {
+                for i in 1..=10_001u64 {
                     adj.add_node(i);
                 }
                 adj
             },
             |mut adj| {
-                for i in 1..=1000u64 {
+                for i in 1..=10_000u64 {
                     let meta = EdgeMeta {
                         source: i,
                         target: i + 1,
@@ -189,6 +196,8 @@ fn bench_insert(c: &mut Criterion) {
             },
         );
     });
+
+    group.finish();
 }
 
 // ---- 4. Token Counting Benchmark ----
@@ -267,6 +276,7 @@ fn bench_budget(c: &mut Criterion) {
                 token_count: tokens,
                 provenance: None,
                 relationships: Vec::new(),
+                temporal: None,
             }
         })
         .collect();
@@ -345,6 +355,157 @@ fn bench_engine(c: &mut Criterion) {
     });
 }
 
+// ---- 8. Context Query End-to-End Benchmark ----
+
+fn bench_context_query(c: &mut Criterion) {
+    // Setup: create Engine, create graph, add 1000 nodes with properties,
+    // add edges in chain topology
+    let engine = Engine::new(WeavConfig::default());
+
+    let cmd = parse_command("GRAPH CREATE \"ctx-bench\"").unwrap();
+    engine.execute_command(cmd).unwrap();
+
+    // Add 1000 nodes with properties
+    for i in 0..1000u64 {
+        let cmd_str = format!(
+            r#"NODE ADD TO "ctx-bench" LABEL "document" PROPERTIES {{"title": "doc_{}", "content": "This is document number {} with some searchable content about topic {}"}} KEY "doc_{}""#,
+            i, i, i % 50, i
+        );
+        let cmd = parse_command(&cmd_str).unwrap();
+        engine.execute_command(cmd).unwrap();
+    }
+
+    // Add edges in chain topology
+    for i in 1..1000u64 {
+        let cmd_str = format!(
+            r#"EDGE ADD TO "ctx-bench" FROM {} TO {} LABEL "next" WEIGHT 0.9"#,
+            i,
+            i + 1
+        );
+        let cmd = parse_command(&cmd_str).unwrap();
+        engine.execute_command(cmd).unwrap();
+    }
+
+    // Benchmark: execute a CONTEXT query with SEEDS NODES, DEPTH 3, BUDGET 4096
+    // This measures the full query pipeline: parse -> plan -> execute -> budget
+    c.bench_function("context_query_1000n_depth3_budget4096", |b| {
+        b.iter(|| {
+            let cmd = parse_command(
+                r#"CONTEXT "find documents" FROM "ctx-bench" SEEDS NODES ["doc_0"] DEPTH 3 BUDGET 4096 TOKENS"#,
+            )
+            .unwrap();
+            let resp = engine.execute_command(black_box(cmd)).unwrap();
+            black_box(resp);
+        });
+    });
+}
+
+// ---- 9. Persistence Benchmark ----
+
+fn bench_persistence(c: &mut Criterion) {
+    let mut group = c.benchmark_group("persistence");
+
+    // bench_wal_append: Create a WAL in a temp dir, benchmark appending NodeAdd entries
+    group.bench_function("wal_append", |b| {
+        b.iter_with_setup(
+            || {
+                let dir = std::env::temp_dir().join(format!(
+                    "weav_bench_wal_{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                let wal_path = dir.join("bench.wal");
+                let wal =
+                    WriteAheadLog::new(wal_path, 1024 * 1024 * 64, WalSyncMode::Never).unwrap();
+                (wal, dir)
+            },
+            |(mut wal, dir)| {
+                for i in 0..100u64 {
+                    wal.append(
+                        0,
+                        WalOperation::NodeAdd {
+                            graph_id: 1,
+                            node_id: i,
+                            label: "entity".into(),
+                            properties_json: format!(r#"{{"name":"node_{}"}}"#, i),
+                            embedding: None,
+                            entity_key: Some(format!("key_{}", i)),
+                        },
+                    )
+                    .unwrap();
+                }
+                black_box(&wal);
+                std::fs::remove_dir_all(&dir).ok();
+            },
+        );
+    });
+
+    // bench_snapshot_save: Create a FullSnapshot with 1000 nodes, benchmark save_snapshot()
+    group.bench_function("snapshot_save_1000n", |b| {
+        // Build a snapshot with 1000 nodes once
+        let nodes: Vec<NodeSnapshot> = (0..1000)
+            .map(|i| NodeSnapshot {
+                node_id: i,
+                label: "entity".into(),
+                properties_json: format!(
+                    r#"{{"name":"node_{}","description":"Description for node {}"}}"#,
+                    i, i
+                ),
+                embedding: Some(vec![0.1; 16]),
+                entity_key: Some(format!("key_{}", i)),
+            })
+            .collect();
+
+        let edges: Vec<EdgeSnapshot> = (0..999)
+            .map(|i| EdgeSnapshot {
+                edge_id: i,
+                source: i,
+                target: i + 1,
+                label: "relates_to".into(),
+                weight: 0.8,
+                valid_from: 1000,
+                valid_until: u64::MAX,
+            })
+            .collect();
+
+        let snapshot = FullSnapshot {
+            meta: make_meta(1000, 999, 1, 0),
+            graphs: vec![GraphSnapshot {
+                graph_id: 1,
+                graph_name: "bench-graph".into(),
+                config_json: "{}".into(),
+                nodes,
+                edges,
+            }],
+        };
+
+        b.iter_with_setup(
+            || {
+                let dir = std::env::temp_dir().join(format!(
+                    "weav_bench_snap_{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                let engine = SnapshotEngine::new(dir.clone());
+                (engine, dir)
+            },
+            |(snap_engine, dir)| {
+                let path = snap_engine.save_snapshot(&snapshot).unwrap();
+                black_box(path);
+                std::fs::remove_dir_all(&dir).ok();
+            },
+        );
+    });
+
+    group.finish();
+}
+
 // ---- Criterion Groups and Main ----
 
 criterion_group!(
@@ -356,6 +517,8 @@ criterion_group!(
     bench_parse,
     bench_budget,
     bench_engine,
+    bench_context_query,
+    bench_persistence,
 );
 
 criterion_main!(benches);

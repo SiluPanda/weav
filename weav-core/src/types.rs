@@ -580,4 +580,285 @@ mod tests {
         assert_eq!(budget.max_tokens, 4096);
         assert_eq!(budget.allocation, TokenAllocation::Auto);
     }
+
+    #[test]
+    fn test_bitemporal_is_current_at() {
+        let bt = BiTemporal {
+            valid_from: 100,
+            valid_until: BiTemporal::OPEN,
+            tx_from: 500,
+            tx_until: 1000,
+        };
+        // Before tx_from
+        assert!(!bt.is_current_at(499));
+        // At tx_from (inclusive)
+        assert!(bt.is_current_at(500));
+        // Within range
+        assert!(bt.is_current_at(750));
+        // At tx_until (exclusive)
+        assert!(!bt.is_current_at(1000));
+        // After tx_until
+        assert!(!bt.is_current_at(1500));
+
+        // A currently-open record
+        let bt_open = BiTemporal::new_current(100);
+        assert!(bt_open.is_current_at(100));
+        assert!(bt_open.is_current_at(u64::MAX - 1));
+    }
+
+    #[test]
+    fn test_bitemporal_supersede() {
+        let mut bt = BiTemporal::new_current(100);
+        assert!(bt.is_active());
+        assert_eq!(bt.tx_until, BiTemporal::OPEN);
+
+        bt.supersede(500);
+        assert_eq!(bt.tx_until, 500);
+        assert!(!bt.is_active());
+        // Still current at 499
+        assert!(bt.is_current_at(499));
+        // No longer current at 500
+        assert!(!bt.is_current_at(500));
+    }
+
+    #[test]
+    fn test_value_type_name_all_variants() {
+        assert_eq!(Value::Null.type_name(), "null");
+        assert_eq!(Value::Bool(false).type_name(), "bool");
+        assert_eq!(Value::Int(0).type_name(), "int");
+        assert_eq!(Value::Float(0.0).type_name(), "float");
+        assert_eq!(Value::String("x".into()).type_name(), "string");
+        assert_eq!(Value::Bytes(vec![1, 2]).type_name(), "bytes");
+        assert_eq!(Value::Vector(vec![1.0]).type_name(), "vector");
+        assert_eq!(Value::List(vec![Value::Null]).type_name(), "list");
+        assert_eq!(
+            Value::Map(vec![("k".into(), Value::Int(1))]).type_name(),
+            "map"
+        );
+        assert_eq!(Value::Timestamp(12345).type_name(), "timestamp");
+    }
+
+    #[test]
+    fn test_value_accessors_none_on_mismatch() {
+        let s = Value::String("hello".into());
+        assert_eq!(s.as_int(), None);
+        assert_eq!(s.as_float(), None);
+        assert_eq!(s.as_bool(), None);
+        assert_eq!(s.as_vector(), None);
+
+        let b = Value::Bool(true);
+        assert_eq!(b.as_int(), None);
+        assert_eq!(b.as_float(), None);
+        assert_eq!(b.as_str(), None);
+        assert_eq!(b.as_vector(), None);
+
+        let v = Value::Vector(vec![1.0]);
+        assert_eq!(v.as_int(), None);
+        assert_eq!(v.as_float(), None);
+        assert_eq!(v.as_bool(), None);
+        assert_eq!(v.as_str(), None);
+
+        assert_eq!(Value::Null.as_int(), None);
+        assert_eq!(Value::Null.as_float(), None);
+        assert_eq!(Value::Null.as_bool(), None);
+        assert_eq!(Value::Null.as_str(), None);
+        assert_eq!(Value::Null.as_vector(), None);
+    }
+
+    #[test]
+    fn test_value_value_type_all() {
+        assert_eq!(Value::Null.value_type(), ValueType::Null);
+        assert_eq!(Value::Bool(true).value_type(), ValueType::Bool);
+        assert_eq!(Value::Int(42).value_type(), ValueType::Int);
+        assert_eq!(Value::Float(3.14).value_type(), ValueType::Float);
+        assert_eq!(Value::String("hi".into()).value_type(), ValueType::String);
+        assert_eq!(Value::Bytes(vec![0]).value_type(), ValueType::Bytes);
+        assert_eq!(Value::Vector(vec![1.0]).value_type(), ValueType::Vector);
+        assert_eq!(
+            Value::List(vec![Value::Null]).value_type(),
+            ValueType::List
+        );
+        assert_eq!(
+            Value::Map(vec![("k".into(), Value::Null)]).value_type(),
+            ValueType::Map
+        );
+        assert_eq!(Value::Timestamp(0).value_type(), ValueType::Timestamp);
+    }
+
+    #[test]
+    fn test_extraction_method_variants() {
+        let _a = ExtractionMethod::LlmExtracted;
+        let _b = ExtractionMethod::NlpPipeline;
+        let _c = ExtractionMethod::UserProvided;
+        let _d = ExtractionMethod::Derived;
+        let _e = ExtractionMethod::Imported;
+
+        // Verify they compare correctly
+        assert_eq!(ExtractionMethod::LlmExtracted, ExtractionMethod::LlmExtracted);
+        assert_ne!(ExtractionMethod::LlmExtracted, ExtractionMethod::Imported);
+    }
+
+    #[test]
+    fn test_token_allocation_proportional() {
+        let alloc = TokenAllocation::Proportional {
+            entities_pct: 0.4,
+            relationships_pct: 0.3,
+            text_chunks_pct: 0.2,
+            metadata_pct: 0.1,
+        };
+        match alloc {
+            TokenAllocation::Proportional {
+                entities_pct,
+                relationships_pct,
+                text_chunks_pct,
+                metadata_pct,
+            } => {
+                let sum = entities_pct + relationships_pct + text_chunks_pct + metadata_pct;
+                assert!((sum - 1.0).abs() < 0.001);
+            }
+            _ => panic!("expected Proportional"),
+        }
+    }
+
+    #[test]
+    fn test_token_allocation_priority() {
+        let alloc = TokenAllocation::Priority(vec![
+            ContentPriority::Entities,
+            ContentPriority::Relationships,
+            ContentPriority::TextChunks,
+            ContentPriority::Metadata,
+        ]);
+        match alloc {
+            TokenAllocation::Priority(priorities) => {
+                assert_eq!(priorities.len(), 4);
+                assert_eq!(priorities[0], ContentPriority::Entities);
+                assert_eq!(priorities[3], ContentPriority::Metadata);
+            }
+            _ => panic!("expected Priority"),
+        }
+    }
+
+    #[test]
+    fn test_conflict_policy_all_variants() {
+        let policies = vec![
+            ConflictPolicy::LastWriteWins,
+            ConflictPolicy::HighestConfidence,
+            ConflictPolicy::TemporalInvalidation,
+            ConflictPolicy::Merge,
+            ConflictPolicy::Reject,
+        ];
+        assert_eq!(policies.len(), 5);
+        assert_eq!(ConflictPolicy::default(), ConflictPolicy::LastWriteWins);
+        assert_ne!(ConflictPolicy::Merge, ConflictPolicy::Reject);
+    }
+
+    #[test]
+    fn test_decay_exponential_zero_half_life() {
+        let d = DecayFunction::Exponential { half_life_ms: 0 };
+        // With half_life_ms=0 and age > 0, should return 0.0
+        assert_eq!(d.apply(1.0, 0, 1000), 0.0);
+        assert_eq!(d.apply(0.5, 0, 1), 0.0);
+    }
+
+    #[test]
+    fn test_decay_linear_zero_max_age() {
+        let d = DecayFunction::Linear { max_age_ms: 0 };
+        // With max_age_ms=0 and age > 0, should return 0.0
+        assert_eq!(d.apply(1.0, 0, 1000), 0.0);
+        assert_eq!(d.apply(0.5, 0, 1), 0.0);
+    }
+
+    #[test]
+    fn test_decay_custom_empty_breakpoints() {
+        let d = DecayFunction::Custom {
+            breakpoints: vec![],
+        };
+        // Empty breakpoints => score unchanged
+        assert_eq!(d.apply(1.0, 0, 1000), 1.0);
+        assert_eq!(d.apply(0.75, 0, 500), 0.75);
+    }
+
+    #[test]
+    fn test_decay_future_item() {
+        // When now <= item_ts, score should be returned unchanged
+        let d_exp = DecayFunction::Exponential { half_life_ms: 1000 };
+        assert_eq!(d_exp.apply(0.8, 1000, 500), 0.8); // now < item_ts
+        assert_eq!(d_exp.apply(0.8, 1000, 1000), 0.8); // now == item_ts
+
+        let d_lin = DecayFunction::Linear { max_age_ms: 1000 };
+        assert_eq!(d_lin.apply(0.5, 2000, 1000), 0.5);
+
+        let d_step = DecayFunction::Step { cutoff_ms: 100 };
+        assert_eq!(d_step.apply(0.9, 500, 100), 0.9);
+    }
+
+    #[test]
+    fn test_node_data_construction() {
+        let nd = NodeData {
+            label: "Person".into(),
+            properties: vec![
+                ("name".into(), Value::String("Alice".into())),
+                ("age".into(), Value::Int(30)),
+            ],
+            embedding: Some(vec![0.1, 0.2, 0.3]),
+            entity_key: Some("alice-001".into()),
+            provenance: Some(Provenance::new("test-source", 0.9)),
+        };
+        assert_eq!(nd.label.as_str(), "Person");
+        assert_eq!(nd.properties.len(), 2);
+        assert_eq!(nd.embedding.as_ref().unwrap().len(), 3);
+        assert_eq!(nd.entity_key.as_ref().unwrap().as_str(), "alice-001");
+        assert!(nd.provenance.is_some());
+    }
+
+    #[test]
+    fn test_edge_data_default() {
+        let ed = EdgeData::default();
+        assert_eq!(ed.source, 0);
+        assert_eq!(ed.target, 0);
+        assert_eq!(ed.label.as_str(), "");
+        assert!(ed.properties.is_empty());
+        assert_eq!(ed.weight, 1.0);
+        assert!(ed.provenance.is_none());
+    }
+
+    #[test]
+    fn test_direction_variants() {
+        let out = Direction::Outgoing;
+        let inc = Direction::Incoming;
+        let both = Direction::Both;
+        assert_eq!(out, Direction::Outgoing);
+        assert_eq!(inc, Direction::Incoming);
+        assert_eq!(both, Direction::Both);
+        assert_ne!(out, inc);
+        assert_ne!(out, both);
+        assert_ne!(inc, both);
+    }
+
+    #[test]
+    fn test_scored_path_construction() {
+        let sp = ScoredPath {
+            nodes: vec![1, 2, 3],
+            edges: vec![10, 11],
+            reliability: 0.85,
+        };
+        assert_eq!(sp.nodes, vec![1, 2, 3]);
+        assert_eq!(sp.edges, vec![10, 11]);
+        assert!((sp.reliability - 0.85).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_provenance_boundary_confidence() {
+        // confidence = 0.0 should remain 0.0
+        let p0 = Provenance::new("source-a", 0.0);
+        assert_eq!(p0.confidence, 0.0);
+        assert_eq!(p0.source.as_str(), "source-a");
+        assert_eq!(p0.extraction_method, ExtractionMethod::UserProvided);
+        assert!(p0.source_document_id.is_none());
+        assert!(p0.source_chunk_offset.is_none());
+
+        // confidence = 1.0 should remain 1.0
+        let p1 = Provenance::new("source-b", 1.0);
+        assert_eq!(p1.confidence, 1.0);
+    }
 }

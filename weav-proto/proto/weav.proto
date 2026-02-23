@@ -1,0 +1,182 @@
+syntax = "proto3";
+
+package weav.v1;
+
+service WeavService {
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc CreateGraph(CreateGraphRequest) returns (CreateGraphResponse);
+  rpc DropGraph(DropGraphRequest) returns (DropGraphResponse);
+  rpc ListGraphs(ListGraphsRequest) returns (ListGraphsResponse);
+  rpc GraphInfo(GraphInfoRequest) returns (GraphInfoResponse);
+  rpc AddNode(AddNodeRequest) returns (AddNodeResponse);
+  rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
+  rpc UpdateNode(UpdateNodeRequest) returns (UpdateNodeResponse);
+  rpc DeleteNode(DeleteNodeRequest) returns (DeleteNodeResponse);
+  rpc AddEdge(AddEdgeRequest) returns (AddEdgeResponse);
+  rpc InvalidateEdge(InvalidateEdgeRequest) returns (InvalidateEdgeResponse);
+  rpc ContextQuery(ContextQueryRequest) returns (ContextQueryResponse);
+  rpc BulkAddNodes(BulkAddNodesRequest) returns (BulkAddNodesResponse);
+  rpc BulkAddEdges(BulkAddEdgesRequest) returns (BulkAddEdgesResponse);
+  rpc ContextQueryStream(ContextQueryRequest) returns (stream ContextChunkProto);
+  rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
+  rpc Info(InfoRequest) returns (InfoResponse);
+}
+
+message PingRequest {}
+message PingResponse {
+  string message = 1;
+}
+
+message CreateGraphRequest {
+  string name = 1;
+}
+message CreateGraphResponse {}
+
+message DropGraphRequest {
+  string name = 1;
+}
+message DropGraphResponse {}
+
+message ListGraphsRequest {}
+message ListGraphsResponse {
+  repeated string names = 1;
+}
+
+message GraphInfoRequest {
+  string name = 1;
+}
+message GraphInfoResponse {
+  string name = 1;
+  uint64 node_count = 2;
+  uint64 edge_count = 3;
+}
+
+message Property {
+  string key = 1;
+  string value_json = 2;
+}
+
+message AddNodeRequest {
+  string graph = 1;
+  string label = 2;
+  repeated Property properties = 3;
+  repeated float embedding = 4;
+  string entity_key = 5;
+}
+message AddNodeResponse {
+  uint64 node_id = 1;
+}
+
+message GetNodeRequest {
+  string graph = 1;
+  uint64 node_id = 2;
+}
+message GetNodeResponse {
+  uint64 node_id = 1;
+  string label = 2;
+  repeated Property properties = 3;
+}
+
+message UpdateNodeRequest {
+  string graph = 1;
+  uint64 node_id = 2;
+  repeated Property properties = 3;
+  repeated float embedding = 4;
+}
+message UpdateNodeResponse {}
+
+message DeleteNodeRequest {
+  string graph = 1;
+  uint64 node_id = 2;
+}
+message DeleteNodeResponse {}
+
+message AddEdgeRequest {
+  string graph = 1;
+  uint64 source = 2;
+  uint64 target = 3;
+  string label = 4;
+  float weight = 5;
+}
+message AddEdgeResponse {
+  uint64 edge_id = 1;
+}
+
+message InvalidateEdgeRequest {
+  string graph = 1;
+  uint64 edge_id = 2;
+}
+message InvalidateEdgeResponse {}
+
+message ContextQueryRequest {
+  string graph = 1;
+  string query = 2;
+  repeated float embedding = 3;
+  repeated string seed_nodes = 4;
+  uint32 budget = 5;
+  uint32 max_depth = 6;
+  bool include_provenance = 7;
+}
+
+message ContextChunkProto {
+  uint64 node_id = 1;
+  string content = 2;
+  string label = 3;
+  float relevance_score = 4;
+  uint32 depth = 5;
+  uint32 token_count = 6;
+}
+
+message ContextQueryResponse {
+  repeated ContextChunkProto chunks = 1;
+  uint32 total_tokens = 2;
+  float budget_used = 3;
+  uint32 nodes_considered = 4;
+  uint32 nodes_included = 5;
+  uint64 query_time_us = 6;
+}
+
+message BulkNodeItem {
+  string label = 1;
+  repeated Property properties = 2;
+  repeated float embedding = 3;
+  string entity_key = 4;
+}
+
+message BulkAddNodesRequest {
+  string graph = 1;
+  repeated BulkNodeItem nodes = 2;
+}
+message BulkAddNodesResponse {
+  repeated uint64 ids = 1;
+}
+
+message BulkEdgeItem {
+  uint64 source = 1;
+  uint64 target = 2;
+  string label = 3;
+  float weight = 4;
+}
+
+message BulkAddEdgesRequest {
+  string graph = 1;
+  repeated BulkEdgeItem edges = 2;
+}
+message BulkAddEdgesResponse {
+  repeated uint64 ids = 1;
+}
+
+message SnapshotRequest {}
+message SnapshotResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message InfoRequest {}
+message InfoResponse {
+  string version = 1;
+  uint64 uptime_seconds = 2;
+  uint32 graph_count = 3;
+  uint64 total_nodes = 4;
+  uint64 total_edges = 5;
+}

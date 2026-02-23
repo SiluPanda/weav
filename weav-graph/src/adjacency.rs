@@ -298,6 +298,14 @@ impl AdjacencyStore {
             .collect()
     }
 
+    pub fn all_node_ids(&self) -> Vec<NodeId> {
+        self.node_bitmap.iter().map(|id| id as NodeId).collect()
+    }
+
+    pub fn all_edges(&self) -> impl Iterator<Item = (EdgeId, &EdgeMeta)> {
+        self.edge_meta.iter().map(|(id, meta)| (*id, meta))
+    }
+
     pub fn edge_history(&self, src: NodeId, tgt: NodeId) -> Vec<&EdgeMeta> {
         self.edge_meta
             .values()
@@ -563,5 +571,70 @@ mod tests {
         assert_eq!(edge.weight, 1.0);
 
         assert!(store.get_edge(999).is_none());
+    }
+
+    #[test]
+    fn test_remove_nonexistent_edge() {
+        let mut store = AdjacencyStore::new();
+        store.add_node(1);
+        store.add_node(2);
+
+        // Add one edge so the store is not empty
+        let meta = make_meta(1, 2, 0);
+        store.add_edge(1, 2, 0, meta).unwrap();
+
+        // Try to remove an edge_id that does not exist
+        let result = store.remove_edge(9999);
+        assert!(result.is_err());
+
+        // Existing edge should still be intact
+        assert_eq!(store.edge_count(), 1);
+    }
+
+    #[test]
+    fn test_neighbors_both_with_label() {
+        let mut store = AdjacencyStore::new();
+        store.add_node(1);
+        store.add_node(2);
+        store.add_node(3);
+        store.add_node(4);
+
+        // Label 0: 1 -> 2 (outgoing from 1)
+        let meta1 = make_meta(1, 2, 0);
+        store.add_edge(1, 2, 0, meta1).unwrap();
+
+        // Label 1: 1 -> 3 (outgoing from 1, different label)
+        let meta2 = make_meta(1, 3, 1);
+        store.add_edge(1, 3, 1, meta2).unwrap();
+
+        // Label 0: 4 -> 1 (incoming to 1)
+        let meta3 = make_meta(4, 1, 0);
+        store.add_edge(4, 1, 0, meta3).unwrap();
+
+        // Label 1: neighbors_both for node 1 with label=Some(1) should only return node 3 (outgoing)
+        let both_label1 = store.neighbors_both(1, Some(1));
+        assert_eq!(both_label1.len(), 1);
+        assert_eq!(both_label1[0].0, 3);
+        assert_eq!(both_label1[0].2, Direction::Outgoing);
+
+        // Label 0: neighbors_both for node 1 with label=Some(0) should return node 2 (out) and node 4 (in)
+        let both_label0 = store.neighbors_both(1, Some(0));
+        assert_eq!(both_label0.len(), 2);
+        let out_nodes: Vec<NodeId> = both_label0
+            .iter()
+            .filter(|x| x.2 == Direction::Outgoing)
+            .map(|x| x.0)
+            .collect();
+        let in_nodes: Vec<NodeId> = both_label0
+            .iter()
+            .filter(|x| x.2 == Direction::Incoming)
+            .map(|x| x.0)
+            .collect();
+        assert_eq!(out_nodes, vec![2]);
+        assert_eq!(in_nodes, vec![4]);
+
+        // No label filter: neighbors_both for node 1 should return all 3 neighbors
+        let both_all = store.neighbors_both(1, None);
+        assert_eq!(both_all.len(), 3);
     }
 }

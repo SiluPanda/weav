@@ -43,6 +43,25 @@ pub struct PropertyConflict {
     pub new_value: String,
 }
 
+/// Find a duplicate node by vector similarity.
+///
+/// Accepts a pre-computed slice of `(NodeId, similarity_score)` pairs (as returned
+/// by a vector index search) and a similarity threshold. Returns the NodeId with
+/// the highest similarity score that exceeds the threshold, if any.
+///
+/// This design avoids a circular dependency on `weav-vector`; the caller performs
+/// the vector search and passes the results here.
+pub fn find_duplicate_by_vector(
+    similarity_results: &[(NodeId, f32)],
+    threshold: f32,
+) -> Option<(NodeId, f32)> {
+    similarity_results
+        .iter()
+        .filter(|(_, score)| *score > threshold)
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .copied()
+}
+
 /// Find a duplicate node by exact key match.
 pub fn find_duplicate_by_key(
     properties: &PropertyStore,
@@ -335,5 +354,131 @@ mod tests {
         assert!(config.require_same_label);
         assert!(config.exact_key_field.is_none());
         assert!(config.name_field.is_none());
+    }
+
+    #[test]
+    fn test_find_duplicate_by_vector_above_threshold() {
+        let results = vec![(10, 0.95_f32), (20, 0.85), (30, 0.70)];
+        let found = find_duplicate_by_vector(&results, 0.92);
+        assert!(found.is_some());
+        let (node_id, score) = found.unwrap();
+        assert_eq!(node_id, 10);
+        assert!((score - 0.95).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_find_duplicate_by_vector_none_above_threshold() {
+        let results = vec![(10, 0.80_f32), (20, 0.75), (30, 0.70)];
+        let found = find_duplicate_by_vector(&results, 0.92);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_find_duplicate_by_vector_picks_highest() {
+        let results = vec![(10, 0.93_f32), (20, 0.97), (30, 0.94)];
+        let found = find_duplicate_by_vector(&results, 0.92);
+        assert!(found.is_some());
+        let (node_id, score) = found.unwrap();
+        assert_eq!(node_id, 20);
+        assert!((score - 0.97).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_find_duplicate_by_vector_empty_results() {
+        let results: Vec<(NodeId, f32)> = vec![];
+        let found = find_duplicate_by_vector(&results, 0.92);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_find_duplicate_by_vector_exact_threshold_not_matched() {
+        // Score must be strictly greater than threshold
+        let results = vec![(10, 0.92_f32)];
+        let found = find_duplicate_by_vector(&results, 0.92);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_merge_highest_confidence_policy() {
+        let mut props = PropertyStore::new();
+        props.set_node_property(1, "name", Value::String(CompactString::from("Alice")));
+
+        let new_props = vec![(
+            "name".to_string(),
+            Value::String(CompactString::from("Alicia")),
+        )];
+        let result = merge_properties(&mut props, 1, &new_props, &ConflictPolicy::HighestConfidence);
+
+        // HighestConfidence falls through to last-write-wins in the code
+        match result {
+            MergeResult::Merged { node_id, conflicts } => {
+                assert_eq!(node_id, 1);
+                assert!(conflicts.is_empty()); // no conflicts recorded for fallback
+            }
+            MergeResult::NoChange { .. } => panic!("Expected Merged"),
+        }
+        // New value should win (last-write-wins fallback)
+        assert_eq!(
+            props.get_node_property(1, "name"),
+            Some(&Value::String(CompactString::from("Alicia")))
+        );
+    }
+
+    #[test]
+    fn test_merge_temporal_invalidation_policy() {
+        let mut props = PropertyStore::new();
+        props.set_node_property(1, "status", Value::String(CompactString::from("active")));
+
+        let new_props = vec![(
+            "status".to_string(),
+            Value::String(CompactString::from("inactive")),
+        )];
+        let result = merge_properties(
+            &mut props,
+            1,
+            &new_props,
+            &ConflictPolicy::TemporalInvalidation,
+        );
+
+        // TemporalInvalidation falls through to last-write-wins in the code
+        match result {
+            MergeResult::Merged { node_id, conflicts } => {
+                assert_eq!(node_id, 1);
+                assert!(conflicts.is_empty());
+            }
+            MergeResult::NoChange { .. } => panic!("Expected Merged"),
+        }
+        // New value should win
+        assert_eq!(
+            props.get_node_property(1, "status"),
+            Some(&Value::String(CompactString::from("inactive")))
+        );
+    }
+
+    #[test]
+    fn test_find_duplicate_empty_results() {
+        // No nodes have the "name" property at all
+        let props = PropertyStore::new();
+        let found = find_duplicate_by_name(&props, "name", "Alice", 0.85);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_merge_properties_empty_new_props() {
+        let mut props = PropertyStore::new();
+        props.set_node_property(1, "name", Value::String(CompactString::from("Alice")));
+
+        let new_props: Vec<(String, Value)> = vec![];
+        let result = merge_properties(&mut props, 1, &new_props, &ConflictPolicy::LastWriteWins);
+
+        match result {
+            MergeResult::NoChange { node_id } => assert_eq!(node_id, 1),
+            MergeResult::Merged { .. } => panic!("Expected NoChange"),
+        }
+        // Original properties should remain unchanged
+        assert_eq!(
+            props.get_node_property(1, "name"),
+            Some(&Value::String(CompactString::from("Alice")))
+        );
     }
 }

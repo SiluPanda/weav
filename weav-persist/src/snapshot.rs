@@ -11,6 +11,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use weav_core::types::*;
 
+// ─── SnapshotFormat ─────────────────────────────────────────────────────────
+
+/// Serialization format for snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SnapshotFormat {
+    Bincode,
+    // Rkyv support planned for future versions
+}
+
+impl Default for SnapshotFormat {
+    fn default() -> Self {
+        SnapshotFormat::Bincode
+    }
+}
+
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 /// Metadata about a snapshot file.
@@ -69,12 +84,22 @@ pub struct FullSnapshot {
 /// Engine for creating, loading, listing, and cleaning up snapshots.
 pub struct SnapshotEngine {
     data_dir: PathBuf,
+    format: SnapshotFormat,
 }
 
 impl SnapshotEngine {
-    /// Create a new snapshot engine that stores snapshots in `data_dir`.
+    /// Create a new snapshot engine that stores snapshots in `data_dir`
+    /// using the default format (Bincode).
     pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir }
+        Self {
+            data_dir,
+            format: SnapshotFormat::default(),
+        }
+    }
+
+    /// Create a new snapshot engine with an explicit serialization format.
+    pub fn with_format(data_dir: PathBuf, format: SnapshotFormat) -> Self {
+        Self { data_dir, format }
     }
 
     /// Save a snapshot to disk. Returns the path of the written file.
@@ -84,12 +109,14 @@ impl SnapshotEngine {
         let filename = format!("snapshot-{}.bin", snapshot.meta.created_at);
         let path = self.data_dir.join(&filename);
 
-        let data = bincode::serialize(snapshot).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("bincode serialize snapshot: {e}"),
-            )
-        })?;
+        let data = match &self.format {
+            SnapshotFormat::Bincode => bincode::serialize(snapshot).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bincode serialize snapshot: {e}"),
+                )
+            })?,
+        };
 
         let mut file = File::create(&path)?;
         file.write_all(&data)?;
@@ -104,12 +131,14 @@ impl SnapshotEngine {
         let mut data = Vec::new();
         file.read_to_end(&mut data)?;
 
-        let snapshot: FullSnapshot = bincode::deserialize(&data).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("bincode deserialize snapshot: {e}"),
-            )
-        })?;
+        let snapshot: FullSnapshot = match &self.format {
+            SnapshotFormat::Bincode => bincode::deserialize(&data).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bincode deserialize snapshot: {e}"),
+                )
+            })?,
+        };
 
         Ok(snapshot)
     }
@@ -378,6 +407,81 @@ mod tests {
         assert_eq!(edge.target, 2);
         assert_eq!(edge.weight, 1.0);
         assert_eq!(edge.valid_until, u64::MAX);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_snapshot_with_format() {
+        let dir = test_dir("with_format");
+        let engine = SnapshotEngine::with_format(dir.clone(), SnapshotFormat::Bincode);
+
+        let snap = sample_snapshot(7, now_millis());
+        let path = engine.save_snapshot(&snap).unwrap();
+        assert!(path.exists());
+
+        let loaded = engine.load_snapshot(&path).unwrap();
+        assert_eq!(loaded.meta.wal_sequence, 7);
+        assert_eq!(loaded.graphs.len(), 1);
+        assert_eq!(loaded.graphs[0].nodes.len(), 2);
+        assert_eq!(loaded.graphs[0].edges.len(), 1);
+        assert_eq!(loaded.graphs[0].graph_name, "test-graph");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_cleanup_keep_more_than_exist() {
+        let dir = test_dir("cleanup_keep_more");
+        let engine = SnapshotEngine::new(dir.clone());
+
+        // Save 2 snapshots with distinct timestamps.
+        let ts1 = now_millis();
+        engine.save_snapshot(&sample_snapshot(1, ts1)).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        let ts2 = now_millis();
+        engine.save_snapshot(&sample_snapshot(2, ts2)).unwrap();
+
+        let before = engine.list_snapshots().unwrap();
+        assert_eq!(before.len(), 2);
+
+        // Ask to keep 5, but only 2 exist -- nothing should be deleted.
+        let deleted = engine.cleanup_old_snapshots(5).unwrap();
+        assert_eq!(deleted, 0);
+
+        let after = engine.list_snapshots().unwrap();
+        assert_eq!(after.len(), 2);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_empty_snapshot_roundtrip() {
+        let dir = test_dir("empty_roundtrip");
+        let engine = SnapshotEngine::new(dir.clone());
+
+        let snap = FullSnapshot {
+            meta: SnapshotMeta {
+                path: PathBuf::new(),
+                created_at: now_millis(),
+                size_bytes: 0,
+                node_count: 0,
+                edge_count: 0,
+                graph_count: 0,
+                wal_sequence: 0,
+            },
+            graphs: Vec::new(),
+        };
+
+        let path = engine.save_snapshot(&snap).unwrap();
+        assert!(path.exists());
+
+        let loaded = engine.load_snapshot(&path).unwrap();
+        assert_eq!(loaded.meta.node_count, 0);
+        assert_eq!(loaded.meta.edge_count, 0);
+        assert_eq!(loaded.meta.graph_count, 0);
+        assert_eq!(loaded.meta.wal_sequence, 0);
+        assert!(loaded.graphs.is_empty());
 
         fs::remove_dir_all(&dir).ok();
     }

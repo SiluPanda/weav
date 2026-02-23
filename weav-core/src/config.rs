@@ -339,4 +339,83 @@ max_memory_mb = 8192
         assert!(config.persistence.enabled);
         assert_eq!(config.memory.max_memory_mb, Some(8192));
     }
+
+    #[test]
+    fn test_config_load_none_returns_default() {
+        let config = WeavConfig::load(None).unwrap();
+        assert_eq!(config.server.port, 6380);
+        assert_eq!(config.engine.default_vector_dimensions, 1536);
+        assert!(!config.persistence.enabled);
+    }
+
+    #[test]
+    fn test_config_validate_success() {
+        let config = WeavConfig::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validate_zero_dimensions() {
+        let mut config = WeavConfig::default();
+        config.engine.default_vector_dimensions = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            crate::error::WeavError::InvalidConfig(msg) => {
+                assert!(msg.contains("default_vector_dimensions"));
+            }
+            other => panic!("expected InvalidConfig, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_wal_sync_mode_default() {
+        let mode = WalSyncMode::default();
+        assert!(matches!(mode, WalSyncMode::EverySecond));
+    }
+
+    #[test]
+    fn test_eviction_policy_default() {
+        let policy = EvictionPolicy::default();
+        assert!(matches!(policy, EvictionPolicy::NoEviction));
+    }
+
+    #[test]
+    fn test_server_config_defaults() {
+        let sc = ServerConfig::default();
+        assert_eq!(sc.bind_address, "0.0.0.0");
+        assert_eq!(sc.port, 6380);
+        assert_eq!(sc.grpc_port, Some(6381));
+        assert_eq!(sc.http_port, Some(6382));
+        assert_eq!(sc.max_connections, 10_000);
+        assert_eq!(sc.tcp_keepalive_secs, 300);
+        assert_eq!(sc.read_timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn test_engine_config_defaults() {
+        let ec = EngineConfig::default();
+        assert_eq!(ec.num_shards, None);
+        assert_eq!(ec.message_bus_buffer, 4096);
+        assert_eq!(ec.default_vector_dimensions, 1536);
+        assert_eq!(ec.max_vector_dimensions, 4096);
+        assert_eq!(ec.default_hnsw_m, 16);
+        assert_eq!(ec.default_hnsw_ef_construction, 200);
+        assert_eq!(ec.default_hnsw_ef_search, 50);
+        assert_eq!(ec.default_conflict_policy, ConflictPolicy::LastWriteWins);
+        assert!(ec.enable_temporal);
+        assert!(ec.enable_provenance);
+        assert!(matches!(ec.token_counter, TokenCounterType::CharDiv4));
+    }
+
+    #[test]
+    fn test_persistence_config_defaults() {
+        let pc = PersistenceConfig::default();
+        assert!(!pc.enabled);
+        assert_eq!(pc.data_dir, PathBuf::from("./weav-data"));
+        assert!(pc.wal_enabled);
+        assert!(matches!(pc.wal_sync_mode, WalSyncMode::EverySecond));
+        assert_eq!(pc.snapshot_interval_secs, 3600);
+        assert_eq!(pc.max_wal_size_mb, 256);
+    }
 }

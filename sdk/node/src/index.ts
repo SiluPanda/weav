@@ -1,4 +1,4 @@
-export { WeavClient, WeavError, contextToPrompt } from './client.js';
+export { WeavClient, WeavError, contextToMessages, contextToPrompt } from './client.js';
 export type {
   WeavConfig,
   ContextParams,

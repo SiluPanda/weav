@@ -1,8 +1,8 @@
-//! Graph traversal algorithms: BFS, flow scoring, ego network, shortest path.
+//! Graph traversal algorithms: BFS, flow scoring, ego network, shortest path, scored paths.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use weav_core::types::{Direction, EdgeId, LabelId, NodeId, ScoredNode, Timestamp};
+use weav_core::types::{Direction, EdgeId, LabelId, NodeId, ScoredNode, ScoredPath, Timestamp};
 
 use crate::adjacency::AdjacencyStore;
 
@@ -95,6 +95,17 @@ fn edge_passes_filter(adj: &AdjacencyStore, edge_id: EdgeId, filter: &EdgeFilter
         }
     }
 
+    if let Some(max_age) = filter.max_age_ms {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let edge_age = now_ms.saturating_sub(meta.temporal.tx_from);
+        if edge_age > max_age {
+            return false;
+        }
+    }
+
     if let Some(min_conf) = filter.min_confidence {
         match &meta.provenance {
             Some(prov) => {
@@ -131,6 +142,46 @@ fn get_neighbors(
         .collect()
 }
 
+/// Check if a node passes the node filter criteria.
+///
+/// Currently implements `valid_at` filtering: a node passes if it has at least one
+/// edge that is valid at the specified timestamp.
+///
+/// TODO: `labels` filtering requires access to a node-to-label mapping (not stored
+/// in AdjacencyStore). Callers should filter by node label externally or pass a
+/// node_labels map.
+///
+/// TODO: `has_property` filtering requires access to PropertyStore. Callers should
+/// filter by property presence externally.
+fn node_passes_filter(
+    adjacency: &AdjacencyStore,
+    node: NodeId,
+    node_filter: &NodeFilter,
+) -> bool {
+    if let Some(ts) = node_filter.valid_at {
+        // A node passes the valid_at filter if it has at least one edge
+        // (incoming or outgoing) that is valid at the given timestamp.
+        let outgoing = adjacency.neighbors_out(node, None);
+        let incoming = adjacency.neighbors_in(node, None);
+
+        let has_valid_edge = outgoing
+            .iter()
+            .chain(incoming.iter())
+            .any(|&(_, eid)| {
+                adjacency
+                    .get_edge(eid)
+                    .map(|m| m.temporal.is_valid_at(ts))
+                    .unwrap_or(false)
+            });
+
+        if !has_valid_edge {
+            return false;
+        }
+    }
+
+    true
+}
+
 /// Breadth-first search from seed nodes.
 pub fn bfs(
     adjacency: &AdjacencyStore,
@@ -138,7 +189,7 @@ pub fn bfs(
     max_depth: u8,
     max_nodes: usize,
     edge_filter: &EdgeFilter,
-    _node_filter: &NodeFilter,
+    node_filter: &NodeFilter,
     direction: Direction,
 ) -> TraversalResult {
     let mut visited_nodes = Vec::new();
@@ -147,6 +198,8 @@ pub fn bfs(
     let mut parent_map = HashMap::new();
     let mut seen = HashSet::new();
     let mut queue: VecDeque<(NodeId, u8)> = VecDeque::new();
+
+    let has_node_filter = node_filter.valid_at.is_some();
 
     for &seed in seeds {
         if seen.insert(seed) {
@@ -167,6 +220,14 @@ pub fn bfs(
         let neighbors = get_neighbors(adjacency, node, direction, edge_filter);
         for (neighbor, edge_id) in neighbors {
             if seen.insert(neighbor) {
+                // Apply node filter to discovered neighbor
+                if has_node_filter
+                    && !node_passes_filter(adjacency, neighbor, node_filter)
+                {
+                    // Node doesn't pass the filter; mark as seen but don't visit
+                    continue;
+                }
+
                 let next_depth = depth + 1;
                 depth_map.insert(neighbor, next_depth);
                 parent_map.insert(neighbor, node);
@@ -319,6 +380,77 @@ pub fn shortest_path(
     }
 
     None
+}
+
+/// Find scored paths between anchor nodes (spec 4.3).
+///
+/// For each pair of anchor nodes, find paths up to `max_path_length` using BFS.
+/// Score each path by averaging the anchor scores of nodes on the path.
+/// Returns up to `max_paths` paths sorted by reliability score descending.
+pub fn scored_paths(
+    adjacency: &AdjacencyStore,
+    anchors: &[(NodeId, f32)],
+    max_paths: u32,
+    max_path_length: u8,
+) -> Vec<ScoredPath> {
+    let anchor_scores: HashMap<NodeId, f32> =
+        anchors.iter().copied().collect();
+
+    let mut all_paths: Vec<ScoredPath> = Vec::new();
+
+    // For each pair of anchor nodes, find paths between them
+    for i in 0..anchors.len() {
+        for j in (i + 1)..anchors.len() {
+            let (src, _) = anchors[i];
+            let (tgt, _) = anchors[j];
+
+            if src == tgt {
+                continue;
+            }
+
+            // BFS to find a path from src to tgt up to max_path_length
+            if let Some(path_nodes) = shortest_path(adjacency, src, tgt, max_path_length) {
+                // Compute reliability as the average anchor score of nodes on the path
+                let mut score_sum = 0.0_f32;
+                let mut score_count = 0u32;
+                for &node in &path_nodes {
+                    if let Some(&s) = anchor_scores.get(&node) {
+                        score_sum += s;
+                        score_count += 1;
+                    }
+                }
+                let reliability = if score_count > 0 {
+                    score_sum / score_count as f32
+                } else {
+                    0.0
+                };
+
+                // Collect edge ids along the path
+                let mut edges = Vec::new();
+                for w in path_nodes.windows(2) {
+                    if let Some(eid) = adjacency.edge_between(w[0], w[1], None) {
+                        edges.push(eid);
+                    }
+                }
+
+                all_paths.push(ScoredPath {
+                    nodes: path_nodes,
+                    edges,
+                    reliability,
+                });
+            }
+        }
+    }
+
+    // Sort by reliability descending
+    all_paths.sort_by(|a, b| {
+        b.reliability
+            .partial_cmp(&a.reliability)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    all_paths.truncate(max_paths as usize);
+    all_paths
 }
 
 #[cfg(test)]
@@ -668,5 +800,351 @@ mod tests {
         assert_eq!(result.visited_nodes.len(), 2);
         assert!(result.visited_nodes.contains(&2));
         assert!(!result.visited_nodes.contains(&3));
+    }
+
+    #[test]
+    fn test_bfs_node_filter_valid_at() {
+        // Build a graph: 1 -> 2 -> 3
+        // Edge 1->2 is valid [100, 200)
+        // Edge 2->3 is valid [100, OPEN)
+        // Node 2 has edges valid at t=150 (both), so passes filter at t=150
+        // Node 3 only reachable via node 2; at t=250, edge 1->2 is invalid so
+        // node 2 not reachable via edge filter, but let's test via node filter:
+        // We'll make edge 1->2 valid at all times, but node 2's edges:
+        //   incoming 1->2 valid [100,200), outgoing 2->3 valid [100,OPEN)
+        // At t=250: node 2 still has a valid edge (2->3), so passes node filter
+        // At t=50: node 2 has no valid edges (1->2 starts at 100, 2->3 starts at 100)
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_node(3);
+
+        // Edge 1->2: always valid
+        let meta1 = EdgeMeta {
+            source: 1, target: 2, label: 0,
+            temporal: BiTemporal::new_current(100),
+            provenance: None, weight: 1.0, token_cost: 0,
+        };
+        adj.add_edge(1, 2, 0, meta1).unwrap();
+
+        // Edge 2->3: valid [200, 300)
+        let meta2 = EdgeMeta {
+            source: 2, target: 3, label: 0,
+            temporal: BiTemporal {
+                valid_from: 200,
+                valid_until: 300,
+                tx_from: 200,
+                tx_until: BiTemporal::OPEN,
+            },
+            provenance: None, weight: 1.0, token_cost: 0,
+        };
+        adj.add_edge(2, 3, 0, meta2).unwrap();
+
+        // With node_filter valid_at=250: node 2 has edge 1->2 valid at 250 (new_current(100))
+        // and edge 2->3 valid at 250 (200..300). Both pass. Node 3 has edge 2->3 valid at 250. Passes.
+        let nf = NodeFilter {
+            valid_at: Some(250),
+            ..NodeFilter::none()
+        };
+        let result = bfs(
+            &adj, &[1], 3, 100, &EdgeFilter::none(), &nf, Direction::Outgoing,
+        );
+        assert!(result.visited_nodes.contains(&2));
+        assert!(result.visited_nodes.contains(&3));
+
+        // With node_filter valid_at=50: node 2 has edge 1->2 (valid_from=100, >50 so invalid)
+        // and edge 2->3 (valid_from=200, >50 so invalid). Node 2 fails filter.
+        let nf2 = NodeFilter {
+            valid_at: Some(50),
+            ..NodeFilter::none()
+        };
+        let result2 = bfs(
+            &adj, &[1], 3, 100, &EdgeFilter::none(), &nf2, Direction::Outgoing,
+        );
+        // Node 2 should be filtered out because none of its edges are valid at t=50
+        assert!(!result2.visited_nodes.contains(&2));
+        // Node 3 also not reachable since node 2 was filtered
+        assert!(!result2.visited_nodes.contains(&3));
+    }
+
+    #[test]
+    fn test_edge_filter_max_age_ms() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_node(3);
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Edge 1->2: created very recently (now - 100ms)
+        let meta1 = EdgeMeta {
+            source: 1, target: 2, label: 0,
+            temporal: BiTemporal::new_current(now_ms - 100),
+            provenance: None, weight: 1.0, token_cost: 0,
+        };
+        adj.add_edge(1, 2, 0, meta1).unwrap();
+
+        // Edge 1->3: created long ago (now - 10_000_000ms = ~2.7 hours ago)
+        let meta2 = EdgeMeta {
+            source: 1, target: 3, label: 0,
+            temporal: BiTemporal::new_current(now_ms - 10_000_000),
+            provenance: None, weight: 1.0, token_cost: 0,
+        };
+        adj.add_edge(1, 3, 0, meta2).unwrap();
+
+        // Filter: max_age 5000ms - only edge 1->2 should pass
+        let filter = EdgeFilter {
+            max_age_ms: Some(5000),
+            ..EdgeFilter::none()
+        };
+        let result = bfs(
+            &adj, &[1], 1, 100, &filter, &NodeFilter::none(), Direction::Outgoing,
+        );
+        assert_eq!(result.visited_nodes.len(), 2); // seed + node 2
+        assert!(result.visited_nodes.contains(&2));
+        assert!(!result.visited_nodes.contains(&3));
+    }
+
+    #[test]
+    fn test_scored_paths_linear() {
+        // 1 -> 2 -> 3 -> 4
+        let adj = build_linear_graph();
+        // Anchors: node 1 (score 1.0), node 4 (score 0.8)
+        let anchors = vec![(1, 1.0_f32), (4, 0.8_f32)];
+        let paths = scored_paths(&adj, &anchors, 10, 5);
+
+        assert_eq!(paths.len(), 1); // one path between the pair (1,4)
+        assert_eq!(paths[0].nodes, vec![1, 2, 3, 4]);
+        // Reliability = average of anchor scores on path: (1.0 + 0.8) / 2 = 0.9
+        assert!((paths[0].reliability - 0.9).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_scored_paths_multiple_anchors() {
+        // 1 -> 2 -> 3 -> 4
+        let adj = build_linear_graph();
+        // Three anchors: 1, 2, 4
+        let anchors = vec![(1, 1.0_f32), (2, 0.6_f32), (4, 0.4_f32)];
+        let paths = scored_paths(&adj, &anchors, 10, 5);
+
+        // Should find paths: (1,2), (1,4), (2,4) = 3 paths
+        assert_eq!(paths.len(), 3);
+
+        // Paths should be sorted by reliability descending
+        for i in 1..paths.len() {
+            assert!(paths[i - 1].reliability >= paths[i].reliability);
+        }
+    }
+
+    #[test]
+    fn test_scored_paths_max_paths_limit() {
+        let adj = build_linear_graph();
+        let anchors = vec![(1, 1.0_f32), (2, 0.6_f32), (4, 0.4_f32)];
+        let paths = scored_paths(&adj, &anchors, 1, 5);
+        assert_eq!(paths.len(), 1);
+    }
+
+    #[test]
+    fn test_scored_paths_unreachable() {
+        let adj = build_linear_graph();
+        // Node 4 cannot reach node 1 (directed), so (4, 1) pair yields no path via shortest_path(4,1)
+        // but (1, 4) pair still yields a path via shortest_path(1, 4)
+        let anchors = vec![(1, 1.0_f32), (4, 0.8_f32)];
+        let paths = scored_paths(&adj, &anchors, 10, 5);
+        // shortest_path(1, 4) works, so we get 1 path
+        assert_eq!(paths.len(), 1);
+    }
+
+    #[test]
+    fn test_scored_paths_empty_anchors() {
+        let adj = build_linear_graph();
+        let paths = scored_paths(&adj, &[], 10, 5);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn test_scored_paths_single_anchor() {
+        let adj = build_linear_graph();
+        let anchors = vec![(1, 1.0_f32)];
+        let paths = scored_paths(&adj, &anchors, 10, 5);
+        // No pairs to connect
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn test_bfs_direction_both() {
+        // Node 2 has outgoing edge to 3 and node 4 has edge incoming to 2
+        // i.e., 4 -> 2 -> 3
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(2);
+        adj.add_node(3);
+        adj.add_node(4);
+
+        let meta_2_3 = make_meta(2, 3, 0);
+        adj.add_edge(2, 3, 0, meta_2_3).unwrap();
+        let meta_4_2 = make_meta(4, 2, 0);
+        adj.add_edge(4, 2, 0, meta_4_2).unwrap();
+
+        let result = bfs(
+            &adj,
+            &[2],
+            2,
+            100,
+            &EdgeFilter::none(),
+            &NodeFilter::none(),
+            Direction::Both,
+        );
+
+        // BFS from 2 with Direction::Both should find 2, 3 (outgoing), and 4 (incoming)
+        assert!(result.visited_nodes.contains(&2));
+        assert!(result.visited_nodes.contains(&3));
+        assert!(result.visited_nodes.contains(&4));
+        assert_eq!(result.visited_nodes.len(), 3);
+    }
+
+    #[test]
+    fn test_bfs_cycle_graph() {
+        // Build cycle: 1 -> 2 -> 3 -> 1
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_node(3);
+
+        let meta_1_2 = make_meta(1, 2, 0);
+        adj.add_edge(1, 2, 0, meta_1_2).unwrap();
+        let meta_2_3 = make_meta(2, 3, 0);
+        adj.add_edge(2, 3, 0, meta_2_3).unwrap();
+        let meta_3_1 = make_meta(3, 1, 0);
+        adj.add_edge(3, 1, 0, meta_3_1).unwrap();
+
+        let result = bfs(
+            &adj,
+            &[1],
+            10,
+            100,
+            &EdgeFilter::none(),
+            &NodeFilter::none(),
+            Direction::Outgoing,
+        );
+
+        // All 3 nodes should be found, no infinite loop
+        assert_eq!(result.visited_nodes.len(), 3);
+        assert!(result.visited_nodes.contains(&1));
+        assert!(result.visited_nodes.contains(&2));
+        assert!(result.visited_nodes.contains(&3));
+    }
+
+    #[test]
+    fn test_bfs_disconnected_graph() {
+        // Two disconnected components: 1->2 and 3->4
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_node(3);
+        adj.add_node(4);
+
+        let meta_1_2 = make_meta(1, 2, 0);
+        adj.add_edge(1, 2, 0, meta_1_2).unwrap();
+        let meta_3_4 = make_meta(3, 4, 0);
+        adj.add_edge(3, 4, 0, meta_3_4).unwrap();
+
+        // BFS from node 1 should only find 1 and 2
+        let result1 = bfs(
+            &adj,
+            &[1],
+            10,
+            100,
+            &EdgeFilter::none(),
+            &NodeFilter::none(),
+            Direction::Outgoing,
+        );
+        let mut nodes1 = result1.visited_nodes.clone();
+        nodes1.sort();
+        assert_eq!(nodes1, vec![1, 2]);
+
+        // BFS from node 3 should only find 3 and 4
+        let result2 = bfs(
+            &adj,
+            &[3],
+            10,
+            100,
+            &EdgeFilter::none(),
+            &NodeFilter::none(),
+            Direction::Outgoing,
+        );
+        let mut nodes2 = result2.visited_nodes.clone();
+        nodes2.sort();
+        assert_eq!(nodes2, vec![3, 4]);
+    }
+
+    #[test]
+    fn test_bfs_empty_graph() {
+        let adj = AdjacencyStore::new();
+
+        // BFS from a non-existent node on an empty graph
+        let result = bfs(
+            &adj,
+            &[42],
+            10,
+            100,
+            &EdgeFilter::none(),
+            &NodeFilter::none(),
+            Direction::Outgoing,
+        );
+
+        // The seed is still added to visited_nodes even if it doesn't exist
+        // (BFS doesn't check node existence, it just won't find any neighbors)
+        assert_eq!(result.visited_nodes.len(), 1);
+        assert_eq!(result.visited_nodes[0], 42);
+        assert!(result.visited_edges.is_empty());
+    }
+
+    #[test]
+    fn test_flow_score_empty_seeds() {
+        let adj = build_linear_graph();
+        let result = flow_score(&adj, &[], 0.5, 0.01, 10);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_shortest_path_no_edges() {
+        // Graph with nodes but no edges between them
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_node(3);
+
+        let path = shortest_path(&adj, 1, 3, 10);
+        assert!(path.is_none());
+    }
+
+    #[test]
+    fn test_ego_network_basic() {
+        // Build graph with center node 10 connected to 3 spokes: 10->20, 10->30, 10->40
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(10);
+        adj.add_node(20);
+        adj.add_node(30);
+        adj.add_node(40);
+
+        let meta_10_20 = make_meta(10, 20, 0);
+        adj.add_edge(10, 20, 0, meta_10_20).unwrap();
+        let meta_10_30 = make_meta(10, 30, 0);
+        adj.add_edge(10, 30, 0, meta_10_30).unwrap();
+        let meta_10_40 = make_meta(10, 40, 0);
+        adj.add_edge(10, 40, 0, meta_10_40).unwrap();
+
+        let sub = ego_network(&adj, 10, 1);
+
+        // Should find center + 3 spokes = 4 nodes
+        assert_eq!(sub.nodes.len(), 4);
+        assert!(sub.nodes.contains(&10));
+        assert!(sub.nodes.contains(&20));
+        assert!(sub.nodes.contains(&30));
+        assert!(sub.nodes.contains(&40));
+        assert_eq!(sub.edges.len(), 3);
     }
 }

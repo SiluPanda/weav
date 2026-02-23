@@ -28,3 +28,55 @@ def context_to_openai_messages(result: ContextResult) -> list[dict]:
     ``openai.chat.completions.create()``.
     """
     return [{"role": "system", "content": result.to_prompt()}]
+
+
+class WeavLangChain:
+    """LangChain-compatible retriever that uses Weav for context."""
+
+    def __init__(self, client, graph: str, **default_context_kwargs):
+        self.client = client
+        self.graph = graph
+        self.default_kwargs = default_context_kwargs
+
+    def get_relevant_documents(self, query: str) -> list[dict]:
+        """Retrieve relevant documents from Weav graph."""
+        result = self.client.context(graph=self.graph, query=query, **self.default_kwargs)
+        return [
+            {
+                "page_content": chunk.content,
+                "metadata": {
+                    "node_id": chunk.node_id,
+                    "label": chunk.label,
+                    "score": chunk.relevance_score,
+                },
+            }
+            for chunk in result.chunks
+        ]
+
+    def as_retriever(self):
+        """Return self as a retriever interface."""
+        return self
+
+
+class WeavLlamaIndex:
+    """LlamaIndex-compatible retriever that uses Weav for context."""
+
+    def __init__(self, client, graph: str, **default_context_kwargs):
+        self.client = client
+        self.graph = graph
+        self.default_kwargs = default_context_kwargs
+
+    def retrieve(self, query: str) -> list[dict]:
+        """Retrieve nodes from Weav graph."""
+        result = self.client.context(graph=self.graph, query=query, **self.default_kwargs)
+        return [
+            {
+                "text": chunk.content,
+                "score": chunk.relevance_score,
+                "metadata": {
+                    "node_id": chunk.node_id,
+                    "label": chunk.label,
+                },
+            }
+            for chunk in result.chunks
+        ]

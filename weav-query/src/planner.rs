@@ -1,6 +1,6 @@
 //! Query planner that converts a `ContextQuery` into an ordered execution plan.
 
-use weav_core::types::{DecayFunction, Direction, Timestamp, TokenBudget};
+use weav_core::types::{ConflictPolicy, DecayFunction, Direction, Timestamp, TokenBudget};
 
 use crate::parser::{ContextQuery, EdgeFilterConfig, SeedStrategy};
 
@@ -47,6 +47,15 @@ pub enum PlanStep {
     /// Enforce the token budget constraint.
     TokenBudgetEnforce {
         budget: TokenBudget,
+    },
+    /// Extract paths through the graph.
+    PathExtraction {
+        max_paths: u32,
+        max_length: u8,
+    },
+    /// Detect conflicting information across nodes.
+    ConflictDetection {
+        policy: ConflictPolicy,
     },
     /// Format the final context output.
     FormatContext {
@@ -118,12 +127,34 @@ pub fn plan_context_query(query: &ContextQuery) -> QueryPlan {
         max_depth: query.max_depth,
     });
 
+    // Step 4b: Path extraction (when multiple node seeds)
+    match &query.seeds {
+        SeedStrategy::Nodes(keys) if keys.len() >= 2 => {
+            steps.push(PlanStep::PathExtraction {
+                max_paths: 10,
+                max_length: query.max_depth,
+            });
+        }
+        SeedStrategy::Both { node_keys, .. } if node_keys.len() >= 2 => {
+            steps.push(PlanStep::PathExtraction {
+                max_paths: 10,
+                max_length: query.max_depth,
+            });
+        }
+        _ => {}
+    }
+
     // Step 5: Temporal filter (if set)
     if let Some(ts) = query.temporal_at {
         steps.push(PlanStep::TemporalFilter { timestamp: ts });
     }
 
-    // Step 6: Relevance score (with decay)
+    // Step 6: Conflict detection (always, with default policy)
+    steps.push(PlanStep::ConflictDetection {
+        policy: ConflictPolicy::default(),
+    });
+
+    // Step 7: Relevance score (with decay)
     steps.push(PlanStep::RelevanceScore {
         decay: query.decay.clone(),
     });
@@ -163,6 +194,7 @@ mod tests {
             include_provenance: false,
             temporal_at: None,
             limit: None,
+            sort: None,
         }
     }
 
@@ -171,13 +203,14 @@ mod tests {
         let query = make_basic_query();
         let plan = plan_context_query(&query);
 
-        // Should have: NodeLookup, GraphTraversal, FlowScore, RelevanceScore, FormatContext
-        assert_eq!(plan.steps.len(), 5);
+        // Should have: NodeLookup, GraphTraversal, FlowScore, ConflictDetection, RelevanceScore, FormatContext
+        assert_eq!(plan.steps.len(), 6);
         assert!(matches!(&plan.steps[0], PlanStep::NodeLookup { .. }));
         assert!(matches!(&plan.steps[1], PlanStep::GraphTraversal { .. }));
         assert!(matches!(&plan.steps[2], PlanStep::FlowScore { .. }));
-        assert!(matches!(&plan.steps[3], PlanStep::RelevanceScore { .. }));
-        assert!(matches!(&plan.steps[4], PlanStep::FormatContext { .. }));
+        assert!(matches!(&plan.steps[3], PlanStep::ConflictDetection { .. }));
+        assert!(matches!(&plan.steps[4], PlanStep::RelevanceScore { .. }));
+        assert!(matches!(&plan.steps[5], PlanStep::FormatContext { .. }));
     }
 
     #[test]
@@ -189,8 +222,8 @@ mod tests {
         };
         let plan = plan_context_query(&query);
 
-        // Should have: VectorSearch, GraphTraversal, FlowScore, RelevanceScore, FormatContext
-        assert_eq!(plan.steps.len(), 5);
+        // Should have: VectorSearch, GraphTraversal, FlowScore, ConflictDetection, RelevanceScore, FormatContext
+        assert_eq!(plan.steps.len(), 6);
         assert!(matches!(&plan.steps[0], PlanStep::VectorSearch { k: 5, .. }));
     }
 
@@ -204,8 +237,8 @@ mod tests {
         };
         let plan = plan_context_query(&query);
 
-        // Should have: VectorSearch, NodeLookup, GraphTraversal, FlowScore, RelevanceScore, FormatContext
-        assert_eq!(plan.steps.len(), 6);
+        // Should have: VectorSearch, NodeLookup, GraphTraversal, FlowScore, ConflictDetection, RelevanceScore, FormatContext
+        assert_eq!(plan.steps.len(), 7);
         assert!(matches!(&plan.steps[0], PlanStep::VectorSearch { .. }));
         assert!(matches!(&plan.steps[1], PlanStep::NodeLookup { .. }));
     }
@@ -304,6 +337,22 @@ mod tests {
     }
 
     #[test]
+    fn test_plan_step_path_extraction_exists() {
+        // Verify PlanStep::PathExtraction can be constructed
+        let step = PlanStep::PathExtraction {
+            max_paths: 5,
+            max_length: 3,
+        };
+        assert!(matches!(
+            step,
+            PlanStep::PathExtraction {
+                max_paths: 5,
+                max_length: 3,
+            }
+        ));
+    }
+
+    #[test]
     fn test_plan_full_query() {
         let query = ContextQuery {
             query_text: Some("full test".to_string()),
@@ -325,21 +374,49 @@ mod tests {
             include_provenance: true,
             temporal_at: Some(5000),
             limit: Some(20),
+            sort: None,
         };
 
         let plan = plan_context_query(&query);
 
-        // Should have all 8 steps:
+        // Should have all 9 steps:
         // VectorSearch, NodeLookup, GraphTraversal, FlowScore,
-        // TemporalFilter, RelevanceScore, TokenBudgetEnforce, FormatContext
-        assert_eq!(plan.steps.len(), 8);
+        // TemporalFilter, ConflictDetection, RelevanceScore, TokenBudgetEnforce, FormatContext
+        assert_eq!(plan.steps.len(), 9);
         assert!(matches!(&plan.steps[0], PlanStep::VectorSearch { .. }));
         assert!(matches!(&plan.steps[1], PlanStep::NodeLookup { .. }));
         assert!(matches!(&plan.steps[2], PlanStep::GraphTraversal { .. }));
         assert!(matches!(&plan.steps[3], PlanStep::FlowScore { .. }));
         assert!(matches!(&plan.steps[4], PlanStep::TemporalFilter { .. }));
-        assert!(matches!(&plan.steps[5], PlanStep::RelevanceScore { .. }));
-        assert!(matches!(&plan.steps[6], PlanStep::TokenBudgetEnforce { .. }));
-        assert!(matches!(&plan.steps[7], PlanStep::FormatContext { .. }));
+        assert!(matches!(&plan.steps[5], PlanStep::ConflictDetection { .. }));
+        assert!(matches!(&plan.steps[6], PlanStep::RelevanceScore { .. }));
+        assert!(matches!(&plan.steps[7], PlanStep::TokenBudgetEnforce { .. }));
+        assert!(matches!(&plan.steps[8], PlanStep::FormatContext { .. }));
+    }
+
+    #[test]
+    fn test_plan_path_extraction_for_multi_seeds() {
+        let mut query = make_basic_query();
+        query.seeds = SeedStrategy::Nodes(vec!["key1".to_string(), "key2".to_string()]);
+        let plan = plan_context_query(&query);
+
+        let has_path_extraction = plan
+            .steps
+            .iter()
+            .any(|s| matches!(s, PlanStep::PathExtraction { .. }));
+        assert!(
+            has_path_extraction,
+            "Should have PathExtraction for 2+ node seeds"
+        );
+
+        // Verify PathExtraction has correct params
+        let path_step = plan.steps.iter().find_map(|s| match s {
+            PlanStep::PathExtraction {
+                max_paths,
+                max_length,
+            } => Some((*max_paths, *max_length)),
+            _ => None,
+        });
+        assert_eq!(path_step, Some((10, 2)));
     }
 }

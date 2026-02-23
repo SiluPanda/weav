@@ -125,6 +125,18 @@ impl MessageBus {
     pub fn buffer_size(&self) -> usize {
         self.buffer_size
     }
+
+    /// Broadcast a shutdown message to all shard workers.
+    ///
+    /// Since [`ShardMessage`] variants like `TraverseFrom` and `VectorSearch`
+    /// contain oneshot senders and cannot be cloned, broadcast is limited to
+    /// control messages. This method sends [`ShardMessage::Shutdown`] to every
+    /// shard. Send failures (e.g. disconnected receivers) are silently ignored.
+    pub fn broadcast_shutdown(&self) {
+        for sender in &self.senders {
+            let _ = sender.send(ShardMessage::Shutdown);
+        }
+    }
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────────
@@ -361,5 +373,65 @@ mod tests {
             let msg = rx.try_recv().unwrap();
             assert!(matches!(msg, ShardMessage::Shutdown));
         }
+    }
+
+    #[test]
+    fn test_broadcast_shutdown() {
+        let (bus, receivers) = MessageBus::new(4, 16);
+        bus.broadcast_shutdown();
+
+        // Every shard should have received exactly one Shutdown message.
+        for (i, rx) in receivers.iter().enumerate() {
+            let msg = rx.try_recv().unwrap_or_else(|_| {
+                panic!("shard {i} did not receive a Shutdown message")
+            });
+            assert!(
+                matches!(msg, ShardMessage::Shutdown),
+                "shard {i} received unexpected message variant"
+            );
+            // No extra messages should be pending.
+            assert!(
+                rx.try_recv().is_err(),
+                "shard {i} has unexpected extra messages"
+            );
+        }
+    }
+
+    #[test]
+    fn test_broadcast_shutdown_with_disconnected_receivers() {
+        let (bus, receivers) = MessageBus::new(3, 16);
+        // Drop one receiver to simulate a disconnected shard.
+        drop(receivers);
+        // Should not panic even if all receivers are disconnected.
+        bus.broadcast_shutdown();
+    }
+
+    #[test]
+    fn test_route_by_key_zero_values() {
+        let (bus, _receivers) = MessageBus::new(4, 16);
+        let shard = bus.route_by_key(0, 0);
+        assert!(shard < 4, "shard {shard} out of range for 4 shards");
+    }
+
+    #[test]
+    fn test_route_by_key_max_values() {
+        let (bus, _receivers) = MessageBus::new(4, 16);
+        let shard = bus.route_by_key(u32::MAX, u64::MAX);
+        assert!(shard < 4, "shard {shard} out of range for 4 shards");
+    }
+
+    #[test]
+    fn test_broadcast_shutdown_single_shard() {
+        let (bus, receivers) = MessageBus::new(1, 16);
+        bus.broadcast_shutdown();
+
+        let msg = receivers[0]
+            .try_recv()
+            .expect("single shard should receive Shutdown");
+        assert!(matches!(msg, ShardMessage::Shutdown));
+        assert!(
+            receivers[0].try_recv().is_err(),
+            "should have exactly one message"
+        );
     }
 }

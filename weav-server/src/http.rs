@@ -7,14 +7,15 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use weav_core::types::{Direction, TokenBudget, Value};
 use weav_query::parser::{
-    Command, ContextQuery, EdgeAddCmd, EdgeInvalidateCmd, GraphCreateCmd,
-    NodeAddCmd, NodeDeleteCmd, NodeGetCmd, SeedStrategy,
+    Command, ContextQuery, EdgeAddCmd, EdgeDeleteCmd, EdgeGetCmd, EdgeInvalidateCmd, GraphCreateCmd,
+    NodeAddCmd, NodeDeleteCmd, NodeGetCmd, NodeUpdateCmd,
+    BulkInsertNodesCmd, BulkInsertEdgesCmd, SeedStrategy,
 };
 
 use crate::engine::{CommandResponse, Engine};
@@ -40,6 +41,23 @@ pub struct AddEdgeRequest {
     pub target: u64,
     pub label: String,
     pub weight: Option<f32>,
+    pub properties: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateNodeRequest {
+    pub properties: Option<serde_json::Value>,
+    pub embedding: Option<Vec<f32>>,
+}
+
+#[derive(Deserialize)]
+pub struct BulkAddNodesRequest {
+    pub nodes: Vec<AddNodeRequest>,
+}
+
+#[derive(Deserialize)]
+pub struct BulkAddEdgesRequest {
+    pub edges: Vec<AddEdgeRequest>,
 }
 
 #[derive(Deserialize)]
@@ -110,8 +128,32 @@ struct GraphInfoJson {
 }
 
 #[derive(Serialize)]
-struct IntegerJson {
-    id: u64,
+struct NodeIdResponse {
+    node_id: u64,
+}
+
+#[derive(Serialize)]
+struct EdgeIdResponse {
+    edge_id: u64,
+}
+
+#[derive(Serialize)]
+struct EdgeInfoJson {
+    edge_id: u64,
+    source: u64,
+    target: u64,
+    label: String,
+    weight: f32,
+}
+
+#[derive(Serialize)]
+struct BulkNodeIdsResponse {
+    node_ids: Vec<u64>,
+}
+
+#[derive(Serialize)]
+struct BulkEdgeIdsResponse {
+    edge_ids: Vec<u64>,
 }
 
 // ─── Router construction ────────────────────────────────────────────────────
@@ -127,16 +169,27 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/graphs/{name}", delete(drop_graph))
         // Node routes.
         .route("/v1/graphs/{graph}/nodes", post(add_node))
+        .route("/v1/graphs/{graph}/nodes/bulk", post(bulk_add_nodes))
         .route("/v1/graphs/{graph}/nodes/{id}", get(get_node))
+        .route("/v1/graphs/{graph}/nodes/{id}", put(update_node))
         .route("/v1/graphs/{graph}/nodes/{id}", delete(delete_node))
         // Edge routes.
         .route("/v1/graphs/{graph}/edges", post(add_edge))
+        .route("/v1/graphs/{graph}/edges/bulk", post(bulk_add_edges))
+        .route("/v1/graphs/{graph}/edges/{id}", get(get_edge))
+        .route("/v1/graphs/{graph}/edges/{id}", delete(delete_edge))
         .route(
             "/v1/graphs/{graph}/edges/{id}/invalidate",
             post(invalidate_edge),
         )
+        // Snapshot.
+        .route("/v1/snapshot", post(snapshot))
+        // Server info.
+        .route("/v1/info", get(server_info))
         // Context query.
         .route("/v1/context", post(context_query))
+        // Prometheus metrics.
+        .route("/metrics", get(metrics_handler))
         .with_state(engine)
 }
 
@@ -163,6 +216,14 @@ async fn health() -> impl IntoResponse {
     Json(ApiResponse::ok(HealthResponse {
         status: "ok".to_string(),
     }))
+}
+
+async fn metrics_handler() -> impl IntoResponse {
+    use prometheus::Encoder;
+    let encoder = prometheus::TextEncoder::new();
+    let mut buffer = Vec::new();
+    encoder.encode(&crate::metrics::REGISTRY.gather(), &mut buffer).unwrap();
+    (StatusCode::OK, [("content-type", "text/plain; version=0.0.4")], buffer)
 }
 
 async fn create_graph(
@@ -256,7 +317,7 @@ async fn add_node(
     match engine.execute_command(cmd) {
         Ok(CommandResponse::Integer(id)) => (
             StatusCode::CREATED,
-            Json(ApiResponse::ok(IntegerJson { id })),
+            Json(ApiResponse::ok(NodeIdResponse { node_id: id })),
         )
             .into_response(),
         Ok(_) => (
@@ -320,19 +381,25 @@ async fn add_edge(
     Path(graph): Path<String>,
     Json(body): Json<AddEdgeRequest>,
 ) -> impl IntoResponse {
+    let properties = if let Some(ref val) = body.properties {
+        json_to_props(val)
+    } else {
+        Vec::new()
+    };
+
     let cmd = Command::EdgeAdd(EdgeAddCmd {
         graph,
         source: body.source,
         target: body.target,
         label: body.label,
         weight: body.weight.unwrap_or(1.0),
-        properties: Vec::new(),
+        properties,
     });
 
     match engine.execute_command(cmd) {
         Ok(CommandResponse::Integer(id)) => (
             StatusCode::CREATED,
-            Json(ApiResponse::ok(IntegerJson { id })),
+            Json(ApiResponse::ok(EdgeIdResponse { edge_id: id })),
         )
             .into_response(),
         Ok(_) => (
@@ -355,6 +422,185 @@ async fn invalidate_edge(
 
     match engine.execute_command(cmd) {
         Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
+        Err(e) => weav_error_to_response(e).into_response(),
+    }
+}
+
+async fn get_edge(
+    State(engine): State<Arc<Engine>>,
+    Path((graph, id)): Path<(String, u64)>,
+) -> impl IntoResponse {
+    let cmd = Command::EdgeGet(EdgeGetCmd {
+        graph,
+        edge_id: id,
+    });
+
+    match engine.execute_command(cmd) {
+        Ok(CommandResponse::EdgeInfo(info)) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(EdgeInfoJson {
+                edge_id: info.edge_id,
+                source: info.source,
+                target: info.target,
+                label: info.label,
+                weight: info.weight,
+            })),
+        )
+            .into_response(),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+        )
+            .into_response(),
+        Err(e) => weav_error_to_response(e).into_response(),
+    }
+}
+
+async fn delete_edge(
+    State(engine): State<Arc<Engine>>,
+    Path((graph, id)): Path<(String, u64)>,
+) -> impl IntoResponse {
+    let cmd = Command::EdgeDelete(EdgeDeleteCmd {
+        graph,
+        edge_id: id,
+    });
+
+    match engine.execute_command(cmd) {
+        Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
+        Err(e) => weav_error_to_response(e).into_response(),
+    }
+}
+
+async fn snapshot(
+    State(engine): State<Arc<Engine>>,
+) -> impl IntoResponse {
+    match engine.execute_command(Command::Snapshot) {
+        Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
+        Err(e) => weav_error_to_response(e).into_response(),
+    }
+}
+
+async fn server_info(
+    State(engine): State<Arc<Engine>>,
+) -> impl IntoResponse {
+    match engine.execute_command(Command::Info) {
+        Ok(CommandResponse::Text(text)) => {
+            (StatusCode::OK, Json(ApiResponse::ok(text))).into_response()
+        }
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+        )
+            .into_response(),
+        Err(e) => weav_error_to_response(e).into_response(),
+    }
+}
+
+async fn update_node(
+    State(engine): State<Arc<Engine>>,
+    Path((graph, id)): Path<(String, u64)>,
+    Json(body): Json<UpdateNodeRequest>,
+) -> impl IntoResponse {
+    let properties = if let Some(ref val) = body.properties {
+        json_to_props(val)
+    } else {
+        Vec::new()
+    };
+
+    let cmd = Command::NodeUpdate(NodeUpdateCmd {
+        graph,
+        node_id: id,
+        properties,
+        embedding: body.embedding,
+    });
+
+    match engine.execute_command(cmd) {
+        Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
+        Err(e) => weav_error_to_response(e).into_response(),
+    }
+}
+
+async fn bulk_add_nodes(
+    State(engine): State<Arc<Engine>>,
+    Path(graph): Path<String>,
+    Json(body): Json<BulkAddNodesRequest>,
+) -> impl IntoResponse {
+    let nodes: Vec<NodeAddCmd> = body
+        .nodes
+        .into_iter()
+        .map(|n| {
+            let properties = if let Some(ref val) = n.properties {
+                json_to_props(val)
+            } else {
+                Vec::new()
+            };
+            NodeAddCmd {
+                graph: graph.clone(),
+                label: n.label,
+                properties,
+                embedding: n.embedding,
+                entity_key: n.entity_key,
+            }
+        })
+        .collect();
+
+    let cmd = Command::BulkInsertNodes(BulkInsertNodesCmd {
+        graph,
+        nodes,
+    });
+
+    match engine.execute_command(cmd) {
+        Ok(CommandResponse::IntegerList(ids)) => {
+            (StatusCode::CREATED, Json(ApiResponse::ok(BulkNodeIdsResponse { node_ids: ids }))).into_response()
+        }
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+        )
+            .into_response(),
+        Err(e) => weav_error_to_response(e).into_response(),
+    }
+}
+
+async fn bulk_add_edges(
+    State(engine): State<Arc<Engine>>,
+    Path(graph): Path<String>,
+    Json(body): Json<BulkAddEdgesRequest>,
+) -> impl IntoResponse {
+    let edges: Vec<EdgeAddCmd> = body
+        .edges
+        .into_iter()
+        .map(|e| {
+            let properties = if let Some(ref val) = e.properties {
+                json_to_props(val)
+            } else {
+                Vec::new()
+            };
+            EdgeAddCmd {
+                graph: graph.clone(),
+                source: e.source,
+                target: e.target,
+                label: e.label,
+                weight: e.weight.unwrap_or(1.0),
+                properties,
+            }
+        })
+        .collect();
+
+    let cmd = Command::BulkInsertEdges(BulkInsertEdgesCmd {
+        graph,
+        edges,
+    });
+
+    match engine.execute_command(cmd) {
+        Ok(CommandResponse::IntegerList(ids)) => {
+            (StatusCode::CREATED, Json(ApiResponse::ok(BulkEdgeIdsResponse { edge_ids: ids }))).into_response()
+        }
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+        )
+            .into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
     }
 }
@@ -390,6 +636,7 @@ async fn context_query(
         include_provenance: body.include_provenance.unwrap_or(false),
         temporal_at: None,
         limit: None,
+        sort: None,
     };
 
     let cmd = Command::Context(query);
@@ -419,7 +666,7 @@ fn json_to_props(val: &serde_json::Value) -> Vec<(String, Value)> {
     props
 }
 
-fn json_val_to_value(v: &serde_json::Value) -> Value {
+pub fn json_val_to_value(v: &serde_json::Value) -> Value {
     match v {
         serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(b) => Value::Bool(*b),
@@ -634,7 +881,7 @@ mod tests {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
         let json = body_to_json(resp.into_body()).await;
-        let node_id = json["data"]["id"].as_u64().unwrap();
+        let node_id = json["data"]["node_id"].as_u64().unwrap();
         assert!(node_id >= 1);
 
         // Get node.
@@ -742,7 +989,7 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
         let json = body_to_json(resp.into_body()).await;
-        assert!(json["data"]["id"].as_u64().unwrap() >= 1);
+        assert!(json["data"]["edge_id"].as_u64().unwrap() >= 1);
     }
 
     #[tokio::test]
@@ -807,6 +1054,270 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_update_node() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(Command::GraphCreate(GraphCreateCmd {
+                name: "ug".to_string(),
+                config: None,
+            }))
+            .unwrap();
+
+        let add_resp = engine
+            .execute_command(Command::NodeAdd(NodeAddCmd {
+                graph: "ug".to_string(),
+                label: "person".to_string(),
+                properties: vec![(
+                    "name".to_string(),
+                    Value::String(compact_str::CompactString::from("Alice")),
+                )],
+                embedding: None,
+                entity_key: None,
+            }))
+            .unwrap();
+        let node_id = match add_resp {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/v1/graphs/ug/nodes/{node_id}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"properties": {"name": "Alice Updated", "age": 30}}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_add_nodes() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(Command::GraphCreate(GraphCreateCmd {
+                name: "bg".to_string(),
+                config: None,
+            }))
+            .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/bg/nodes/bulk")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"nodes": [{"label": "person", "properties": {"name": "A"}}, {"label": "person", "properties": {"name": "B"}}]}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        let ids = json["data"]["node_ids"].as_array().unwrap();
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_bulk_add_edges() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(Command::GraphCreate(GraphCreateCmd {
+                name: "beg".to_string(),
+                config: None,
+            }))
+            .unwrap();
+
+        let n1 = match engine
+            .execute_command(Command::NodeAdd(NodeAddCmd {
+                graph: "beg".to_string(),
+                label: "a".to_string(),
+                properties: vec![],
+                embedding: None,
+                entity_key: None,
+            }))
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let n2 = match engine
+            .execute_command(Command::NodeAdd(NodeAddCmd {
+                graph: "beg".to_string(),
+                label: "b".to_string(),
+                properties: vec![],
+                embedding: None,
+                entity_key: None,
+            }))
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let body = serde_json::json!({
+            "edges": [{"source": n1, "target": n2, "label": "knows", "weight": 0.8}]
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/beg/edges/bulk")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = body_to_json(resp.into_body()).await;
+        let ids = json["data"]["edge_ids"].as_array().unwrap();
+        assert_eq!(ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_http_get_graph_not_found() {
+        let app = make_app();
+        let req = Request::builder()
+            .uri("/v1/graphs/nonexistent")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_http_delete_node_not_found() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(Command::GraphCreate(GraphCreateCmd {
+                name: "dng".to_string(),
+                config: None,
+            }))
+            .unwrap();
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/v1/graphs/dng/nodes/99999")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_http_metrics_endpoint() {
+        let app = make_app();
+        let req = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        // The metrics endpoint should return text (even if empty, it's valid prometheus output).
+        assert!(text.is_ascii());
+    }
+
+    #[tokio::test]
+    async fn test_http_json_null_property() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(Command::GraphCreate(GraphCreateCmd {
+                name: "nullg".to_string(),
+                config: None,
+            }))
+            .unwrap();
+
+        // Post a node with a null property value.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/nullg/nodes")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"label": "thing", "properties": {"name": "test", "optional": null}}"#,
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        let node_id = json["data"]["node_id"].as_u64().unwrap();
+
+        // Get the node and check properties.
+        let req = Request::builder()
+            .uri(format!("/v1/graphs/nullg/nodes/{node_id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        // The null property should be present as null in JSON.
+        assert!(json["data"]["properties"].get("optional").is_some());
+        assert!(json["data"]["properties"]["optional"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_http_update_node() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(Command::GraphCreate(GraphCreateCmd {
+                name: "upg".to_string(),
+                config: None,
+            }))
+            .unwrap();
+
+        // Add a node.
+        let add_resp = engine
+            .execute_command(Command::NodeAdd(NodeAddCmd {
+                graph: "upg".to_string(),
+                label: "person".to_string(),
+                properties: vec![(
+                    "name".to_string(),
+                    Value::String(compact_str::CompactString::from("Alice")),
+                )],
+                embedding: None,
+                entity_key: None,
+            }))
+            .unwrap();
+        let node_id = match add_resp {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // PUT to update node properties.
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/v1/graphs/upg/nodes/{node_id}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"properties": {"name": "Bob", "city": "LA"}}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // GET to verify the updated properties.
+        let req = Request::builder()
+            .uri(format!("/v1/graphs/upg/nodes/{node_id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["data"]["properties"]["name"], "Bob");
+        assert_eq!(json["data"]["properties"]["city"], "LA");
     }
 
     #[tokio::test]

@@ -31,6 +31,8 @@ pub enum Resp3Value {
     Array(Vec<Resp3Value>),
     /// Map: `%<count>\r\n<key><value>...` (count = number of entries, not items)
     Map(Vec<(Resp3Value, Resp3Value)>),
+    /// BigNumber: `(<number>\r\n`
+    BigNumber(String),
 }
 
 // ---- Convenience constructors -----------------------------------------------
@@ -359,6 +361,16 @@ fn decode_value(
                 }
             }
         }
+        b'(' => {
+            // BigNumber: read until \r\n, return as BigNumber(String)
+            match read_line(buf, pos)? {
+                Some(line) => Ok(Some(Resp3Value::BigNumber(line))),
+                None => {
+                    *pos -= 1;
+                    Ok(None)
+                }
+            }
+        }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unknown RESP3 type prefix: {:?}", other as char),
@@ -468,6 +480,11 @@ fn encode_value(val: &Resp3Value, dst: &mut BytesMut) {
                 encode_value(k, dst);
                 encode_value(v, dst);
             }
+        }
+        Resp3Value::BigNumber(s) => {
+            dst.put_u8(b'(');
+            dst.put_slice(s.as_bytes());
+            dst.put_slice(b"\r\n");
         }
     }
 }
@@ -815,5 +832,134 @@ mod tests {
     #[test]
     fn test_empty_blob_string() {
         roundtrip(Resp3Value::BlobString(vec![]));
+    }
+
+    #[test]
+    fn test_big_number_roundtrip() {
+        roundtrip(Resp3Value::BigNumber("12345678901234567890".to_string()));
+        roundtrip(Resp3Value::BigNumber("-99999999999999999999".to_string()));
+        roundtrip(Resp3Value::BigNumber("0".to_string()));
+    }
+
+    // -- Decoder error-path tests ------------------------------------------------
+
+    #[test]
+    fn test_decode_invalid_number() {
+        let mut codec = Resp3Codec::new();
+        let mut buf = BytesMut::from(&b":abc\r\n"[..]);
+        let result = codec.decode(&mut buf);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("invalid number"),
+            "expected 'invalid number' in error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_decode_invalid_double() {
+        let mut codec = Resp3Codec::new();
+        let mut buf = BytesMut::from(&b",bad\r\n"[..]);
+        let result = codec.decode(&mut buf);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("invalid double"),
+            "expected 'invalid double' in error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_decode_invalid_boolean() {
+        let mut codec = Resp3Codec::new();
+        let mut buf = BytesMut::from(&b"#x\r\n"[..]);
+        let result = codec.decode(&mut buf);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("invalid boolean flag"),
+            "expected 'invalid boolean flag' in error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_decode_invalid_null() {
+        let mut codec = Resp3Codec::new();
+        let mut buf = BytesMut::from(&b"_garbage\r\n"[..]);
+        let result = codec.decode(&mut buf);
+        // The null decoder expects exactly \r\n after '_'. Since 'g' != '\r',
+        // this should be an error.
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_invalid_blob_length() {
+        let mut codec = Resp3Codec::new();
+        let mut buf = BytesMut::from(&b"$abc\r\nhello\r\n"[..]);
+        let result = codec.decode(&mut buf);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("invalid blob length"),
+            "expected 'invalid blob length' in error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_decode_blob_missing_trailing_crlf() {
+        let mut codec = Resp3Codec::new();
+        // $5\r\nhello but no trailing \r\n -- incomplete frame
+        let mut buf = BytesMut::from(&b"$5\r\nhello"[..]);
+        let result = codec.decode(&mut buf);
+        // Not enough data yet, should return Ok(None)
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_decode_invalid_array_count() {
+        let mut codec = Resp3Codec::new();
+        let mut buf = BytesMut::from(&b"*abc\r\n"[..]);
+        let result = codec.decode(&mut buf);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("invalid array count"),
+            "expected 'invalid array count' in error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_decode_invalid_map_count() {
+        let mut codec = Resp3Codec::new();
+        let mut buf = BytesMut::from(&b"%abc\r\n"[..]);
+        let result = codec.decode(&mut buf);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("invalid map count"),
+            "expected 'invalid map count' in error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_decode_bare_cr() {
+        let mut codec = Resp3Codec::new();
+        // SimpleString with bare \r not followed by \n
+        let mut buf = BytesMut::from(&b"+hello\rworld\r\n"[..]);
+        let result = codec.decode(&mut buf);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("\\r not followed by \\n"),
+            "expected bare CR error, got: {}",
+            err
+        );
     }
 }

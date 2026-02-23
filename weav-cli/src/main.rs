@@ -125,6 +125,7 @@ fn format_resp3(value: &Resp3Value) -> String {
                 .collect::<Vec<_>>()
                 .join("\n")
         }
+        Resp3Value::BigNumber(n) => format!("(big number) {}", n),
     }
 }
 
@@ -142,8 +143,11 @@ Available commands:
   GRAPH DROP \"<name>\"               - Delete a graph
   NODE ADD TO \"<graph>\" LABEL \"<l>\" PROPERTIES {...} - Add a node
   NODE GET \"<graph>\" <id>           - Get a node by ID
+  NODE UPDATE \"<graph>\" <id> PROPERTIES {...} [EMBEDDING [...]] - Update a node
   NODE DELETE \"<graph>\" <id>        - Delete a node
   EDGE ADD TO \"<graph>\" FROM <s> TO <t> LABEL \"<l>\" - Add an edge
+  BULK NODES TO \"<graph>\" DATA [{...}, ...] - Bulk insert nodes
+  BULK EDGES TO \"<graph>\" DATA [{...}, ...] - Bulk insert edges
   CONTEXT \"<query>\" FROM \"<graph>\" BUDGET <n> TOKENS - Context retrieval
   STATS                             - Show statistics
   SNAPSHOT                          - Trigger snapshot
@@ -457,5 +461,135 @@ mod tests {
         ]);
         let formatted = format_resp3(&val);
         assert_eq!(formatted, "1) 1) (integer) 1\n2) (integer) 2\n2) done");
+    }
+
+    // -- tokenize edge cases ------------------------------------------------
+
+    #[test]
+    fn test_tokenize_unterminated_quote() {
+        // Unterminated quote: the quoted token runs to end of input without panic.
+        let tokens = tokenize("GRAPH CREATE \"unclosed");
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[0], "GRAPH");
+        assert_eq!(tokens[1], "CREATE");
+        assert_eq!(tokens[2], "unclosed");
+    }
+
+    #[test]
+    fn test_tokenize_backslash_at_eof() {
+        // Backslash at end of quoted string should not panic.
+        let tokens = tokenize("\"test\\");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0], "test\\");
+    }
+
+    #[test]
+    fn test_tokenize_tab_character() {
+        // Tab is whitespace, so it should split tokens.
+        let tokens = tokenize("hello\tworld");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0], "hello");
+        assert_eq!(tokens[1], "world");
+    }
+
+    #[test]
+    fn test_tokenize_single_quote_in_unquoted() {
+        // Single quote (apostrophe) has no special meaning outside double quotes.
+        let tokens = tokenize("can't stop");
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0], "can't");
+        assert_eq!(tokens[1], "stop");
+    }
+
+    // -- format_resp3 edge cases --------------------------------------------
+
+    #[test]
+    fn test_format_resp3_big_number() {
+        let val = Resp3Value::BigNumber("12345".to_string());
+        let formatted = format_resp3(&val);
+        assert!(formatted.contains("12345"));
+    }
+
+    #[test]
+    fn test_format_resp3_number_zero() {
+        let val = Resp3Value::Number(0);
+        assert_eq!(format_resp3(&val), "(integer) 0");
+    }
+
+    #[test]
+    fn test_format_resp3_number_min() {
+        let val = Resp3Value::Number(i64::MIN);
+        let formatted = format_resp3(&val);
+        assert!(formatted.contains(&i64::MIN.to_string()));
+        assert!(formatted.starts_with("(integer) "));
+    }
+
+    #[test]
+    fn test_format_resp3_number_max() {
+        let val = Resp3Value::Number(i64::MAX);
+        let formatted = format_resp3(&val);
+        assert!(formatted.contains(&i64::MAX.to_string()));
+        assert!(formatted.starts_with("(integer) "));
+    }
+
+    #[test]
+    fn test_format_resp3_double_nan() {
+        let val = Resp3Value::Double(f64::NAN);
+        let formatted = format_resp3(&val);
+        assert!(formatted.contains("NaN"));
+    }
+
+    #[test]
+    fn test_format_resp3_double_infinity() {
+        let val = Resp3Value::Double(f64::INFINITY);
+        let formatted = format_resp3(&val);
+        assert!(formatted.contains("inf"));
+    }
+
+    #[test]
+    fn test_format_resp3_double_zero() {
+        let val = Resp3Value::Double(0.0);
+        assert_eq!(format_resp3(&val), "(double) 0");
+    }
+
+    #[test]
+    fn test_format_resp3_empty_simple_string() {
+        let val = Resp3Value::SimpleString("".into());
+        let formatted = format_resp3(&val);
+        assert_eq!(formatted, "");
+    }
+
+    #[test]
+    fn test_format_resp3_empty_blob_string() {
+        let val = Resp3Value::BlobString(vec![]);
+        let formatted = format_resp3(&val);
+        assert_eq!(formatted, "");
+    }
+
+    #[test]
+    fn test_format_resp3_single_item_array() {
+        let val = Resp3Value::Array(vec![Resp3Value::Number(1)]);
+        let formatted = format_resp3(&val);
+        assert_eq!(formatted, "1) (integer) 1");
+    }
+
+    #[test]
+    fn test_format_resp3_map_with_nested_values() {
+        let val = Resp3Value::Map(vec![
+            (
+                Resp3Value::SimpleString("items".to_string()),
+                Resp3Value::Array(vec![
+                    Resp3Value::Number(10),
+                    Resp3Value::Number(20),
+                ]),
+            ),
+            (
+                Resp3Value::SimpleString("count".to_string()),
+                Resp3Value::Number(2),
+            ),
+        ]);
+        let formatted = format_resp3(&val);
+        assert!(formatted.contains("items => 1) (integer) 10\n2) (integer) 20"));
+        assert!(formatted.contains("count => (integer) 2"));
     }
 }

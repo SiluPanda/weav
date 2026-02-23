@@ -39,8 +39,22 @@ pub enum Command {
     Info,
     /// Statistics (optionally for a specific graph).
     Stats(Option<String>),
+    /// Update a node's properties/embedding.
+    NodeUpdate(NodeUpdateCmd),
+    /// Bulk insert nodes.
+    BulkInsertNodes(BulkInsertNodesCmd),
+    /// Bulk insert edges.
+    BulkInsertEdges(BulkInsertEdgesCmd),
     /// Trigger a snapshot.
     Snapshot,
+    /// Delete an edge.
+    EdgeDelete(EdgeDeleteCmd),
+    /// Get an edge.
+    EdgeGet(EdgeGetCmd),
+    /// Set a config key.
+    ConfigSet(String, String),
+    /// Get a config key.
+    ConfigGet(String),
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +70,7 @@ pub struct ContextQuery {
     pub include_provenance: bool,
     pub temporal_at: Option<Timestamp>,
     pub limit: Option<u32>,
+    pub sort: Option<SortOrder>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,9 +130,60 @@ pub struct EdgeInvalidateCmd {
 }
 
 #[derive(Debug, Clone)]
+pub struct NodeUpdateCmd {
+    pub graph: String,
+    pub node_id: u64,
+    pub properties: Vec<(String, Value)>,
+    pub embedding: Option<Vec<f32>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BulkInsertNodesCmd {
+    pub graph: String,
+    pub nodes: Vec<NodeAddCmd>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BulkInsertEdgesCmd {
+    pub graph: String,
+    pub edges: Vec<EdgeAddCmd>,
+}
+
+#[derive(Debug, Clone)]
 pub struct GraphCreateCmd {
     pub name: String,
     pub config: Option<GraphConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EdgeDeleteCmd {
+    pub graph: String,
+    pub edge_id: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct EdgeGetCmd {
+    pub graph: String,
+    pub edge_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SortField {
+    Relevance,
+    Recency,
+    Confidence,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortOrder {
+    pub field: SortField,
+    pub direction: SortDirection,
 }
 
 // ─── Tokenizer helpers ──────────────────────────────────────────────────────
@@ -312,6 +378,8 @@ pub fn parse_command(input: &str) -> Result<Command, WeavError> {
         "NODE" => parse_node_command(&tokens),
         "EDGE" => parse_edge_command(&tokens),
         "CONTEXT" => parse_context_command(&tokens),
+        "BULK" => parse_bulk_command(&tokens),
+        "CONFIG" => parse_config_command(&tokens),
         _ => Err(parse_err(format!("unknown command: {}", &tokens[0]))),
     }
 }
@@ -357,12 +425,13 @@ fn parse_graph_command(tokens: &[String]) -> Result<Command, WeavError> {
 
 fn parse_node_command(tokens: &[String]) -> Result<Command, WeavError> {
     if tokens.len() < 2 {
-        return Err(parse_err("NODE requires a subcommand (ADD, GET, DELETE)"));
+        return Err(parse_err("NODE requires a subcommand (ADD, GET, UPDATE, DELETE)"));
     }
     let sub = tokens[1].to_uppercase();
     match sub.as_str() {
         "ADD" => parse_node_add(tokens),
         "GET" => parse_node_get(tokens),
+        "UPDATE" => parse_node_update(tokens),
         "DELETE" => parse_node_delete(tokens),
         _ => Err(parse_err(format!("unknown NODE subcommand: {}", &tokens[1]))),
     }
@@ -480,12 +549,14 @@ fn parse_node_delete(tokens: &[String]) -> Result<Command, WeavError> {
 
 fn parse_edge_command(tokens: &[String]) -> Result<Command, WeavError> {
     if tokens.len() < 2 {
-        return Err(parse_err("EDGE requires a subcommand (ADD, INVALIDATE)"));
+        return Err(parse_err("EDGE requires a subcommand (ADD, GET, DELETE, INVALIDATE)"));
     }
     let sub = tokens[1].to_uppercase();
     match sub.as_str() {
         "ADD" => parse_edge_add(tokens),
         "INVALIDATE" => parse_edge_invalidate(tokens),
+        "DELETE" => parse_edge_delete(tokens),
+        "GET" => parse_edge_get(tokens),
         _ => Err(parse_err(format!("unknown EDGE subcommand: {}", &tokens[1]))),
     }
 }
@@ -818,6 +889,31 @@ fn parse_context_command(tokens: &[String]) -> Result<Command, WeavError> {
         None
     };
 
+    // Parse SCORE BY <field> <ASC|DESC>
+    let sort = if let Some(score_pos) = find_keyword(tokens, "SCORE") {
+        if score_pos + 3 < tokens.len() && tokens[score_pos + 1].to_uppercase() == "BY" {
+            let field = match tokens[score_pos + 2].to_uppercase().as_str() {
+                "RELEVANCE" => SortField::Relevance,
+                "RECENCY" => SortField::Recency,
+                "CONFIDENCE" => SortField::Confidence,
+                other => return Err(parse_err(format!("unknown sort field: {other}"))),
+            };
+            let direction = match tokens[score_pos + 3].to_uppercase().as_str() {
+                "ASC" => SortDirection::Asc,
+                "DESC" => SortDirection::Desc,
+                other => return Err(parse_err(format!("unknown sort direction: {other}"))),
+            };
+            Some(SortOrder { field, direction })
+        } else {
+            Some(SortOrder {
+                field: SortField::Relevance,
+                direction: SortDirection::Desc,
+            })
+        }
+    } else {
+        None
+    };
+
     Ok(Command::Context(ContextQuery {
         query_text,
         graph,
@@ -830,7 +926,245 @@ fn parse_context_command(tokens: &[String]) -> Result<Command, WeavError> {
         include_provenance,
         temporal_at,
         limit,
+        sort,
     }))
+}
+
+/// Parse: NODE UPDATE "graph" <id> PROPERTIES {...} [EMBEDDING [...]]
+fn parse_node_update(tokens: &[String]) -> Result<Command, WeavError> {
+    if tokens.len() < 4 {
+        return Err(parse_err("NODE UPDATE requires a graph name and node id"));
+    }
+    let graph = unquote(&tokens[2]).to_string();
+    let node_id: u64 = tokens[3]
+        .parse()
+        .map_err(|_| parse_err(format!("invalid node id: {}", &tokens[3])))?;
+
+    // Find "PROPERTIES" keyword (optional)
+    let properties = if let Some(props_pos) = find_keyword(tokens, "PROPERTIES") {
+        if props_pos + 1 >= tokens.len() {
+            return Err(parse_err("PROPERTIES requires a JSON object"));
+        }
+        parse_properties_json(&tokens[props_pos + 1])?
+    } else {
+        Vec::new()
+    };
+
+    // Find "EMBEDDING" keyword (optional)
+    let embedding = if let Some(emb_pos) = find_keyword(tokens, "EMBEDDING") {
+        if emb_pos + 1 >= tokens.len() {
+            return Err(parse_err("EMBEDDING requires a JSON array"));
+        }
+        Some(parse_f32_array(&tokens[emb_pos + 1])?)
+    } else {
+        None
+    };
+
+    Ok(Command::NodeUpdate(NodeUpdateCmd {
+        graph,
+        node_id,
+        properties,
+        embedding,
+    }))
+}
+
+/// Parse: BULK NODES TO "graph" DATA [<json_array>]
+///        BULK EDGES TO "graph" DATA [<json_array>]
+fn parse_bulk_command(tokens: &[String]) -> Result<Command, WeavError> {
+    if tokens.len() < 2 {
+        return Err(parse_err("BULK requires a subcommand (NODES, EDGES)"));
+    }
+    let sub = tokens[1].to_uppercase();
+    match sub.as_str() {
+        "NODES" => parse_bulk_nodes(tokens),
+        "EDGES" => parse_bulk_edges(tokens),
+        _ => Err(parse_err(format!("unknown BULK subcommand: {}", &tokens[1]))),
+    }
+}
+
+/// Parse: BULK NODES TO "graph" DATA [<json_array>]
+fn parse_bulk_nodes(tokens: &[String]) -> Result<Command, WeavError> {
+    let to_pos = find_keyword(tokens, "TO")
+        .ok_or_else(|| parse_err("BULK NODES requires TO \"graph\""))?;
+    if to_pos + 1 >= tokens.len() {
+        return Err(parse_err("BULK NODES TO requires a graph name"));
+    }
+    let graph = unquote(&tokens[to_pos + 1]).to_string();
+
+    let data_pos = find_keyword(tokens, "DATA")
+        .ok_or_else(|| parse_err("BULK NODES requires DATA [...]"))?;
+    if data_pos + 1 >= tokens.len() {
+        return Err(parse_err("BULK NODES DATA requires a JSON array"));
+    }
+
+    let val: serde_json::Value = serde_json::from_str(&tokens[data_pos + 1])
+        .map_err(|e| parse_err(format!("invalid bulk nodes JSON: {e}")))?;
+    let arr = val
+        .as_array()
+        .ok_or_else(|| parse_err("BULK NODES DATA must be a JSON array"))?;
+
+    let mut nodes = Vec::new();
+    for item in arr {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| parse_err("each bulk node must be a JSON object"))?;
+        let label = obj
+            .get("label")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| parse_err("each bulk node requires a \"label\" field"))?
+            .to_string();
+        let properties = if let Some(props) = obj.get("properties") {
+            if let Some(pobj) = props.as_object() {
+                pobj.iter()
+                    .map(|(k, v)| (k.clone(), json_to_value(v)))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        let embedding = obj.get("embedding").and_then(|v| {
+            v.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_f64().map(|f| f as f32))
+                    .collect()
+            })
+        });
+        let entity_key = obj
+            .get("entity_key")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        nodes.push(NodeAddCmd {
+            graph: graph.clone(),
+            label,
+            properties,
+            embedding,
+            entity_key,
+        });
+    }
+
+    Ok(Command::BulkInsertNodes(BulkInsertNodesCmd { graph, nodes }))
+}
+
+/// Parse: BULK EDGES TO "graph" DATA [<json_array>]
+fn parse_bulk_edges(tokens: &[String]) -> Result<Command, WeavError> {
+    let to_pos = find_keyword(tokens, "TO")
+        .ok_or_else(|| parse_err("BULK EDGES requires TO \"graph\""))?;
+    if to_pos + 1 >= tokens.len() {
+        return Err(parse_err("BULK EDGES TO requires a graph name"));
+    }
+    let graph = unquote(&tokens[to_pos + 1]).to_string();
+
+    let data_pos = find_keyword(tokens, "DATA")
+        .ok_or_else(|| parse_err("BULK EDGES requires DATA [...]"))?;
+    if data_pos + 1 >= tokens.len() {
+        return Err(parse_err("BULK EDGES DATA requires a JSON array"));
+    }
+
+    let val: serde_json::Value = serde_json::from_str(&tokens[data_pos + 1])
+        .map_err(|e| parse_err(format!("invalid bulk edges JSON: {e}")))?;
+    let arr = val
+        .as_array()
+        .ok_or_else(|| parse_err("BULK EDGES DATA must be a JSON array"))?;
+
+    let mut edges = Vec::new();
+    for item in arr {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| parse_err("each bulk edge must be a JSON object"))?;
+        let source = obj
+            .get("source")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| parse_err("each bulk edge requires a \"source\" field"))?;
+        let target = obj
+            .get("target")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| parse_err("each bulk edge requires a \"target\" field"))?;
+        let label = obj
+            .get("label")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| parse_err("each bulk edge requires a \"label\" field"))?
+            .to_string();
+        let weight = obj
+            .get("weight")
+            .and_then(|v| v.as_f64())
+            .map(|f| f as f32)
+            .unwrap_or(1.0);
+        let properties = if let Some(props) = obj.get("properties") {
+            if let Some(pobj) = props.as_object() {
+                pobj.iter()
+                    .map(|(k, v)| (k.clone(), json_to_value(v)))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        edges.push(EdgeAddCmd {
+            graph: graph.clone(),
+            source,
+            target,
+            label,
+            weight,
+            properties,
+        });
+    }
+
+    Ok(Command::BulkInsertEdges(BulkInsertEdgesCmd { graph, edges }))
+}
+
+/// Parse: EDGE DELETE "graph" <edge_id>
+fn parse_edge_delete(tokens: &[String]) -> Result<Command, WeavError> {
+    if tokens.len() < 4 {
+        return Err(parse_err("EDGE DELETE requires a graph name and edge id"));
+    }
+    let graph = unquote(&tokens[2]).to_string();
+    let edge_id: u64 = tokens[3]
+        .parse()
+        .map_err(|_| parse_err(format!("invalid edge id: {}", &tokens[3])))?;
+    Ok(Command::EdgeDelete(EdgeDeleteCmd { graph, edge_id }))
+}
+
+/// Parse: EDGE GET "graph" <edge_id>
+fn parse_edge_get(tokens: &[String]) -> Result<Command, WeavError> {
+    if tokens.len() < 4 {
+        return Err(parse_err("EDGE GET requires a graph name and edge id"));
+    }
+    let graph = unquote(&tokens[2]).to_string();
+    let edge_id: u64 = tokens[3]
+        .parse()
+        .map_err(|_| parse_err(format!("invalid edge id: {}", &tokens[3])))?;
+    Ok(Command::EdgeGet(EdgeGetCmd { graph, edge_id }))
+}
+
+/// Parse: CONFIG SET <key> <value> or CONFIG GET <key>
+fn parse_config_command(tokens: &[String]) -> Result<Command, WeavError> {
+    if tokens.len() < 2 {
+        return Err(parse_err("CONFIG requires a subcommand (SET, GET)"));
+    }
+    let sub = tokens[1].to_uppercase();
+    match sub.as_str() {
+        "SET" => {
+            if tokens.len() < 4 {
+                return Err(parse_err("CONFIG SET requires <key> <value>"));
+            }
+            let key = unquote(&tokens[2]).to_string();
+            let value = unquote(&tokens[3]).to_string();
+            Ok(Command::ConfigSet(key, value))
+        }
+        "GET" => {
+            if tokens.len() < 3 {
+                return Err(parse_err("CONFIG GET requires <key>"));
+            }
+            let key = unquote(&tokens[2]).to_string();
+            Ok(Command::ConfigGet(key))
+        }
+        _ => Err(parse_err(format!("unknown CONFIG subcommand: {}", &tokens[1]))),
+    }
 }
 
 /// Find a keyword (case-insensitive) in the token list, starting from index 0.
@@ -1155,9 +1489,186 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_node_update() {
+        let cmd = parse_command(
+            r#"NODE UPDATE "test_graph" 42 PROPERTIES {"name": "Bob", "age": 25}"#,
+        )
+        .unwrap();
+        match cmd {
+            Command::NodeUpdate(nu) => {
+                assert_eq!(nu.graph, "test_graph");
+                assert_eq!(nu.node_id, 42);
+                assert_eq!(nu.properties.len(), 2);
+                assert!(nu.embedding.is_none());
+            }
+            _ => panic!("expected NodeUpdate"),
+        }
+    }
+
+    #[test]
+    fn test_parse_node_update_with_embedding() {
+        let cmd = parse_command(
+            r#"NODE UPDATE "g" 1 PROPERTIES {"x": 1} EMBEDDING [0.1, 0.2, 0.3]"#,
+        )
+        .unwrap();
+        match cmd {
+            Command::NodeUpdate(nu) => {
+                assert_eq!(nu.node_id, 1);
+                assert!(nu.embedding.is_some());
+                assert_eq!(nu.embedding.unwrap().len(), 3);
+            }
+            _ => panic!("expected NodeUpdate"),
+        }
+    }
+
+    #[test]
+    fn test_parse_node_update_no_properties() {
+        let cmd = parse_command(r#"NODE UPDATE "g" 5 EMBEDDING [1.0, 2.0]"#).unwrap();
+        match cmd {
+            Command::NodeUpdate(nu) => {
+                assert_eq!(nu.node_id, 5);
+                assert!(nu.properties.is_empty());
+                assert!(nu.embedding.is_some());
+            }
+            _ => panic!("expected NodeUpdate"),
+        }
+    }
+
+    #[test]
+    fn test_parse_bulk_nodes() {
+        let cmd = parse_command(
+            r#"BULK NODES TO "g" DATA [{"label": "person", "properties": {"name": "A"}}, {"label": "topic", "entity_key": "t1"}]"#,
+        )
+        .unwrap();
+        match cmd {
+            Command::BulkInsertNodes(bulk) => {
+                assert_eq!(bulk.graph, "g");
+                assert_eq!(bulk.nodes.len(), 2);
+                assert_eq!(bulk.nodes[0].label, "person");
+                assert_eq!(bulk.nodes[1].label, "topic");
+                assert_eq!(bulk.nodes[1].entity_key, Some("t1".to_string()));
+            }
+            _ => panic!("expected BulkInsertNodes"),
+        }
+    }
+
+    #[test]
+    fn test_parse_bulk_edges() {
+        let cmd = parse_command(
+            r#"BULK EDGES TO "g" DATA [{"source": 1, "target": 2, "label": "knows", "weight": 0.9}]"#,
+        )
+        .unwrap();
+        match cmd {
+            Command::BulkInsertEdges(bulk) => {
+                assert_eq!(bulk.graph, "g");
+                assert_eq!(bulk.edges.len(), 1);
+                assert_eq!(bulk.edges[0].source, 1);
+                assert_eq!(bulk.edges[0].target, 2);
+                assert_eq!(bulk.edges[0].label, "knows");
+                assert!((bulk.edges[0].weight - 0.9).abs() < 0.001);
+            }
+            _ => panic!("expected BulkInsertEdges"),
+        }
+    }
+
+    #[test]
+    fn test_parse_bulk_edges_default_weight() {
+        let cmd = parse_command(
+            r#"BULK EDGES TO "g" DATA [{"source": 1, "target": 2, "label": "rel"}]"#,
+        )
+        .unwrap();
+        match cmd {
+            Command::BulkInsertEdges(bulk) => {
+                assert!((bulk.edges[0].weight - 1.0).abs() < 0.001);
+            }
+            _ => panic!("expected BulkInsertEdges"),
+        }
+    }
+
+    #[test]
     fn test_case_insensitive() {
         assert!(matches!(parse_command("ping").unwrap(), Command::Ping));
         assert!(matches!(parse_command("Ping").unwrap(), Command::Ping));
         assert!(matches!(parse_command("info").unwrap(), Command::Info));
+    }
+
+    #[test]
+    fn test_parse_graph_unknown_subcommand() {
+        assert!(parse_command("GRAPH UNKNOWN").is_err());
+    }
+
+    #[test]
+    fn test_parse_config_unknown_subcommand() {
+        assert!(parse_command("CONFIG UNKNOWN").is_err());
+    }
+
+    #[test]
+    fn test_parse_node_delete_non_numeric_id() {
+        assert!(parse_command("NODE DELETE \"g\" abc").is_err());
+    }
+
+    #[test]
+    fn test_parse_edge_invalidate_non_numeric_id() {
+        assert!(parse_command("EDGE INVALIDATE \"g\" abc").is_err());
+    }
+
+    #[test]
+    fn test_parse_edge_add_non_numeric_source() {
+        assert!(parse_command("EDGE ADD TO \"g\" FROM abc TO 2 LABEL \"knows\"").is_err());
+    }
+
+    #[test]
+    fn test_parse_edge_add_non_numeric_target() {
+        assert!(parse_command("EDGE ADD TO \"g\" FROM 1 TO abc LABEL \"knows\"").is_err());
+    }
+
+    #[test]
+    fn test_parse_node_add_invalid_properties_json() {
+        assert!(parse_command("NODE ADD TO \"g\" LABEL \"person\" PROPERTIES {invalid}").is_err());
+    }
+
+    #[test]
+    fn test_parse_node_add_invalid_embedding() {
+        assert!(parse_command("NODE ADD TO \"g\" LABEL \"person\" EMBEDDING [not,numbers]").is_err());
+    }
+
+    #[test]
+    fn test_parse_context_invalid_budget() {
+        assert!(parse_command("CONTEXT \"q\" FROM \"g\" BUDGET abc").is_err());
+    }
+
+    #[test]
+    fn test_parse_context_invalid_depth() {
+        assert!(parse_command("CONTEXT \"q\" FROM \"g\" DEPTH abc").is_err());
+    }
+
+    #[test]
+    fn test_parse_context_unknown_direction() {
+        assert!(parse_command("CONTEXT \"q\" FROM \"g\" DIRECTION SIDEWAYS").is_err());
+    }
+
+    #[test]
+    fn test_parse_bulk_nodes_invalid_json() {
+        assert!(parse_command("BULK NODES TO \"g\" DATA {invalid}").is_err());
+    }
+
+    #[test]
+    fn test_parse_bulk_edges_invalid_json() {
+        assert!(parse_command("BULK EDGES TO \"g\" DATA {invalid}").is_err());
+    }
+
+    #[test]
+    fn test_parse_edge_delete_non_numeric() {
+        assert!(parse_command("EDGE DELETE \"g\" abc").is_err());
+    }
+
+    #[test]
+    fn test_parse_edge_get_non_numeric() {
+        assert!(parse_command("EDGE GET \"g\" abc").is_err());
+    }
+
+    #[test]
+    fn test_parse_node_update_non_numeric() {
+        assert!(parse_command("NODE UPDATE \"g\" abc PROPERTIES {\"name\":\"test\"}").is_err());
     }
 }

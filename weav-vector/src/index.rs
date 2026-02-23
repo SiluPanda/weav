@@ -278,6 +278,17 @@ impl VectorIndex {
     pub fn contains(&self, node_id: NodeId) -> bool {
         self.node_to_key.contains_key(&node_id)
     }
+
+    /// Estimate the memory usage of this vector index in bytes.
+    ///
+    /// Approximation: each vector costs `dimensions * 4` bytes (f32) plus ~64
+    /// bytes of HNSW graph overhead. Each HashMap entry in the id-maps costs
+    /// roughly 48 bytes.
+    pub fn memory_usage_bytes(&self) -> usize {
+        let vector_bytes = self.len() * (self.dimensions as usize * 4 + 64);
+        let map_bytes = self.node_to_key.len() * 48;
+        vector_bytes + map_bytes
+    }
 }
 
 #[cfg(test)]
@@ -506,5 +517,154 @@ mod tests {
             WeavError::DimensionMismatch { .. } => {}
             _ => panic!("expected DimensionMismatch"),
         }
+    }
+
+    #[test]
+    fn test_memory_usage_empty() {
+        let config = make_config(4);
+        let index = VectorIndex::new(config).unwrap();
+        assert_eq!(index.memory_usage_bytes(), 0);
+    }
+
+    #[test]
+    fn test_memory_usage_with_vectors() {
+        let config = make_config(4);
+        let mut index = VectorIndex::new(config).unwrap();
+        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        index.insert(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+
+        let usage = index.memory_usage_bytes();
+        // 2 vectors * (4 dims * 4 bytes + 64 overhead) = 2 * 80 = 160
+        // + 2 entries * 48 = 96
+        // Total = 256
+        assert_eq!(usage, 256);
+        assert!(usage > 0);
+    }
+
+    #[test]
+    fn test_memory_usage_after_remove() {
+        let config = make_config(4);
+        let mut index = VectorIndex::new(config).unwrap();
+        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        index.insert(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+
+        let usage_before = index.memory_usage_bytes();
+        index.remove(1).unwrap();
+        let usage_after = index.memory_usage_bytes();
+        assert!(usage_after < usage_before);
+        // 1 vector * (4*4 + 64) + 1 * 48 = 80 + 48 = 128
+        assert_eq!(usage_after, 128);
+    }
+
+    #[test]
+    fn test_quantization_f16() {
+        let config = VectorConfig {
+            dimensions: 4,
+            metric: DistanceMetric::Cosine,
+            hnsw_m: 16,
+            hnsw_ef_construction: 200,
+            hnsw_ef_search: 50,
+            quantization: Quantization::F16,
+        };
+        let mut index = VectorIndex::new(config).unwrap();
+
+        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        index.insert(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(index.len(), 2);
+
+        let results = index.search(&[1.0, 0.0, 0.0, 0.0], 2, None).unwrap();
+        assert!(!results.is_empty());
+        // Nearest neighbor should be node 1 (exact match)
+        assert_eq!(results[0].0, 1);
+    }
+
+    #[test]
+    fn test_quantization_i8() {
+        let config = VectorConfig {
+            dimensions: 4,
+            metric: DistanceMetric::Cosine,
+            hnsw_m: 16,
+            hnsw_ef_construction: 200,
+            hnsw_ef_search: 50,
+            quantization: Quantization::I8,
+        };
+        let mut index = VectorIndex::new(config).unwrap();
+
+        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        index.insert(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(index.len(), 2);
+
+        let results = index.search(&[1.0, 0.0, 0.0, 0.0], 2, None).unwrap();
+        assert!(!results.is_empty());
+        // Nearest neighbor should be node 1 (exact match)
+        assert_eq!(results[0].0, 1);
+    }
+
+    #[test]
+    fn test_search_filtered_empty_index() {
+        let config = make_config(4);
+        let index = VectorIndex::new(config).unwrap();
+
+        let mut candidates = RoaringBitmap::new();
+        candidates.insert(1);
+        candidates.insert(2);
+        candidates.insert(3);
+
+        // search_filtered on an empty index should return empty, not panic
+        let results = index
+            .search_filtered(&[1.0, 0.0, 0.0, 0.0], 5, &candidates)
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_filtered_dimension_mismatch() {
+        let config = make_config(4);
+        let mut index = VectorIndex::new(config).unwrap();
+
+        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+
+        let mut candidates = RoaringBitmap::new();
+        candidates.insert(1);
+
+        // Query with wrong dimensions (2 instead of 4) should return DimensionMismatch
+        let err = index
+            .search_filtered(&[1.0, 0.0], 5, &candidates)
+            .unwrap_err();
+        match err {
+            WeavError::DimensionMismatch { expected, got } => {
+                assert_eq!(expected, 4);
+                assert_eq!(got, 2);
+            }
+            _ => panic!("expected DimensionMismatch error"),
+        }
+    }
+
+    #[test]
+    fn test_search_ef_override_restoration() {
+        let config = make_config(4);
+        let mut index = VectorIndex::new(config).unwrap();
+
+        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        index.insert(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        index.insert(3, &[0.7, 0.7, 0.0, 0.0]).unwrap();
+
+        // First search with an ef_search override of 200
+        let results_with_override = index
+            .search(&[1.0, 0.0, 0.0, 0.0], 3, Some(200))
+            .unwrap();
+        assert!(!results_with_override.is_empty());
+        assert_eq!(results_with_override[0].0, 1);
+
+        // Second search without override - should use the original ef_search (50)
+        // and still return correct results, proving the override was restored
+        let results_without_override = index
+            .search(&[1.0, 0.0, 0.0, 0.0], 3, None)
+            .unwrap();
+        assert!(!results_without_override.is_empty());
+        assert_eq!(results_without_override[0].0, 1);
+
+        // Verify the internal ef_search is back to the original value (50)
+        assert_eq!(index.inner.expansion_search(), 50);
     }
 }

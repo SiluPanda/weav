@@ -75,19 +75,30 @@ pub enum WalOperation {
     },
 }
 
+impl WalOperation {
+    /// Return the graph_id hint for operations that carry one, or 0.
+    pub fn graph_id_hint(&self) -> GraphId {
+        match self {
+            WalOperation::NodeAdd { graph_id, .. }
+            | WalOperation::NodeUpdate { graph_id, .. }
+            | WalOperation::NodeDelete { graph_id, .. }
+            | WalOperation::EdgeAdd { graph_id, .. }
+            | WalOperation::EdgeInvalidate { graph_id, .. }
+            | WalOperation::EdgeDelete { graph_id, .. }
+            | WalOperation::VectorUpdate { graph_id, .. } => *graph_id,
+            WalOperation::GraphCreate { .. } | WalOperation::GraphDrop { .. } => 0,
+        }
+    }
+}
+
 // ─── Checksum ───────────────────────────────────────────────────────────────
 
-/// Compute a simple checksum over a byte slice.
+/// Compute a CRC32 checksum over a byte slice.
 ///
-/// This uses a basic wrapping-add approach. For production you would use
-/// `crc32fast`, but this keeps the dependency list minimal.
+/// Uses the `crc32fast` crate which provides hardware-accelerated CRC32C
+/// on supported platforms, with a fast software fallback otherwise.
 pub fn compute_checksum(data: &[u8]) -> u32 {
-    let mut hash: u32 = 0;
-    for (i, &byte) in data.iter().enumerate() {
-        // Rotate left by 5 bits and wrapping-add the byte, mixed with position.
-        hash = hash.rotate_left(5).wrapping_add(byte as u32).wrapping_add(i as u32);
-    }
-    hash
+    crc32fast::hash(data)
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -240,6 +251,57 @@ impl WriteAheadLog {
         self.current_size = 0;
 
         Ok(rotated)
+    }
+
+    /// Truncate WAL entries with sequence numbers before `seq`.
+    ///
+    /// Reads all entries from the current WAL file, keeps only those with
+    /// `entry.seq >= seq`, and rewrites the file. This is typically called
+    /// after a successful snapshot to reclaim WAL space.
+    pub fn truncate_before(&mut self, seq: u64) -> io::Result<()> {
+        // Flush pending writes before reading the file.
+        self.writer.flush()?;
+        self.writer.get_ref().sync_all()?;
+
+        // Read all entries that should be kept.
+        let reader = WalReader::open(&self.path)?;
+        let kept: Vec<WalEntry> = reader
+            .filter_map(|r| r.ok())
+            .filter(|entry| entry.seq >= seq)
+            .collect();
+
+        // Rewrite the WAL file with only the kept entries.
+        let file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.path)?;
+        let mut writer = BufWriter::new(file);
+
+        let mut new_size = 0u64;
+        for entry in &kept {
+            let entry_bytes = bincode::serialize(entry).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bincode serialize entry: {e}"),
+                )
+            })?;
+            let len = entry_bytes.len() as u32;
+            writer.write_all(&len.to_le_bytes())?;
+            writer.write_all(&entry_bytes)?;
+            new_size += 4 + entry_bytes.len() as u64;
+        }
+
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+
+        // Re-open the file in append mode for future writes.
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&self.path)?;
+        self.writer = BufWriter::new(file);
+        self.current_size = new_size;
+
+        Ok(())
     }
 
     /// The current sequence number (i.e. the seq of the last appended entry).
@@ -565,5 +627,172 @@ mod tests {
         // Different data should give a different checksum (with very high probability).
         let c3 = compute_checksum(b"hello worlD");
         assert_ne!(c1, c3);
+    }
+
+    #[test]
+    fn test_wal_sync_explicit() {
+        let dir = test_dir("sync_explicit");
+        let wal_path = dir.join("wal");
+
+        {
+            let mut wal =
+                WriteAheadLog::new(wal_path.clone(), 1024 * 1024, WalSyncMode::Never).unwrap();
+            wal.append(
+                0,
+                WalOperation::GraphCreate {
+                    name: "g1".into(),
+                    config_json: "{}".into(),
+                },
+            )
+            .unwrap();
+            wal.append(
+                0,
+                WalOperation::NodeAdd {
+                    graph_id: 1,
+                    node_id: 1,
+                    label: "A".into(),
+                    properties_json: "{}".into(),
+                    embedding: None,
+                    entity_key: None,
+                },
+            )
+            .unwrap();
+
+            // Explicitly sync -- should not panic.
+            wal.sync().unwrap();
+        }
+
+        // Entries should be readable after explicit sync.
+        let reader = WalReader::open(&wal_path).unwrap();
+        let entries: Vec<WalEntry> = reader.map(|r| r.unwrap()).collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].seq, 1);
+        assert_eq!(entries[1].seq, 2);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_wal_truncate_before() {
+        let dir = test_dir("truncate_before");
+        let wal_path = dir.join("wal");
+
+        // Write 5 entries (seq 1..=5).
+        let mut wal =
+            WriteAheadLog::new(wal_path.clone(), 1024 * 1024, WalSyncMode::Always).unwrap();
+        for _ in 0..5 {
+            wal.append(
+                0,
+                WalOperation::GraphDrop {
+                    name: "g".into(),
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(wal.sequence_number(), 5);
+
+        // Truncate entries before seq 3 (keep seq 3, 4, 5).
+        wal.truncate_before(3).unwrap();
+
+        // Read back and verify only entries with seq >= 3 remain.
+        let reader = WalReader::open(&wal_path).unwrap();
+        let entries: Vec<WalEntry> = reader.map(|r| r.unwrap()).collect();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].seq, 3);
+        assert_eq!(entries[1].seq, 4);
+        assert_eq!(entries[2].seq, 5);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_wal_sync_mode_every_second() {
+        let dir = test_dir("sync_every_second");
+        let wal_path = dir.join("wal");
+
+        {
+            let mut wal =
+                WriteAheadLog::new(wal_path.clone(), 1024 * 1024, WalSyncMode::EverySecond)
+                    .unwrap();
+            wal.append(
+                0,
+                WalOperation::GraphCreate {
+                    name: "g1".into(),
+                    config_json: "{}".into(),
+                },
+            )
+            .unwrap();
+            wal.append(
+                1,
+                WalOperation::NodeAdd {
+                    graph_id: 1,
+                    node_id: 10,
+                    label: "Thing".into(),
+                    properties_json: r#"{"k":"v"}"#.into(),
+                    embedding: Some(vec![0.5]),
+                    entity_key: None,
+                },
+            )
+            .unwrap();
+        }
+
+        // Verify entries are readable.
+        let reader = WalReader::open(&wal_path).unwrap();
+        let entries: Vec<WalEntry> = reader.map(|r| r.unwrap()).collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].seq, 1);
+        assert_eq!(entries[1].seq, 2);
+        assert_eq!(entries[1].shard_id, 1);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_wal_reader_corrupted_entry() {
+        let dir = test_dir("corrupted_entry");
+        let wal_path = dir.join("wal");
+
+        // Write two valid entries.
+        {
+            let mut wal =
+                WriteAheadLog::new(wal_path.clone(), 1024 * 1024, WalSyncMode::Always).unwrap();
+            wal.append(
+                0,
+                WalOperation::GraphCreate {
+                    name: "g1".into(),
+                    config_json: "{}".into(),
+                },
+            )
+            .unwrap();
+            wal.append(
+                0,
+                WalOperation::GraphDrop {
+                    name: "g1".into(),
+                },
+            )
+            .unwrap();
+        }
+
+        // Append garbage bytes after the valid entries to simulate corruption.
+        {
+            use std::io::Write;
+            let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+            // Write a plausible length prefix (say 50 bytes) followed by garbage data.
+            let fake_len: u32 = 50;
+            file.write_all(&fake_len.to_le_bytes()).unwrap();
+            file.write_all(&vec![0xDE; 50]).unwrap();
+            file.flush().unwrap();
+        }
+
+        // Read with WalReader: the first two entries should be OK, then corruption.
+        let reader = WalReader::open(&wal_path).unwrap();
+        let results: Vec<io::Result<WalEntry>> = reader.collect();
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_ok());
+        assert!(results[1].is_ok());
+        // Third entry should be an error (deserialization or checksum failure).
+        assert!(results[2].is_err());
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

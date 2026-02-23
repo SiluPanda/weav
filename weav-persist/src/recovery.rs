@@ -31,6 +31,10 @@ pub struct RecoveryResult {
     pub graphs_recovered: u32,
     /// Non-fatal errors encountered during recovery.
     pub errors: Vec<String>,
+    /// The loaded snapshot (if any).
+    pub snapshot: Option<crate::snapshot::FullSnapshot>,
+    /// WAL entries to replay (after snapshot cutoff).
+    pub wal_entries: Vec<WalEntry>,
 }
 
 // ─── RecoveryManager ────────────────────────────────────────────────────────
@@ -59,6 +63,8 @@ impl RecoveryManager {
             wal_entries_replayed: 0,
             graphs_recovered: 0,
             errors: Vec::new(),
+            snapshot: None,
+            wal_entries: Vec::new(),
         };
 
         // Step 1: Try to load the latest snapshot.
@@ -71,6 +77,7 @@ impl RecoveryManager {
                     result.snapshots_loaded = 1;
                     result.graphs_recovered = snapshot.meta.graph_count;
                     wal_sequence_cutoff = snapshot.meta.wal_sequence;
+                    result.snapshot = Some(snapshot);
                 }
                 Err(e) => {
                     result
@@ -104,6 +111,7 @@ impl RecoveryManager {
                         if entry.seq > wal_sequence_cutoff {
                             if self.validate_wal_entry(&entry) {
                                 result.wal_entries_replayed += 1;
+                                result.wal_entries.push(entry);
                             } else {
                                 result.errors.push(format!(
                                     "checksum mismatch for WAL entry seq {}",
@@ -411,6 +419,84 @@ mod tests {
     #[test]
     fn test_find_wal_files_nonexistent_dir() {
         let dir = PathBuf::from("/tmp/weav_nonexistent_dir_test_12345");
+        let mgr = RecoveryManager::new(dir);
+        let files = mgr.find_wal_files().unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_recovery_corrupted_wal_entry() {
+        let dir = test_dir("corrupted_wal");
+        let wal_path = dir.join("wal");
+
+        // Write 3 valid entries.
+        {
+            let mut wal =
+                WriteAheadLog::new(wal_path.clone(), 1024 * 1024, WalSyncMode::Always).unwrap();
+            wal.append(
+                0,
+                WalOperation::GraphCreate {
+                    name: "g1".into(),
+                    config_json: "{}".into(),
+                },
+            )
+            .unwrap();
+            wal.append(
+                0,
+                WalOperation::NodeAdd {
+                    graph_id: 1,
+                    node_id: 1,
+                    label: "Person".into(),
+                    properties_json: "{}".into(),
+                    embedding: None,
+                    entity_key: None,
+                },
+            )
+            .unwrap();
+            wal.append(
+                0,
+                WalOperation::NodeDelete {
+                    graph_id: 1,
+                    node_id: 1,
+                },
+            )
+            .unwrap();
+        }
+
+        // Append garbage bytes to simulate corruption after the valid entries.
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&wal_path)
+                .unwrap();
+            // Write a plausible length prefix followed by garbage.
+            let fake_len: u32 = 40;
+            file.write_all(&fake_len.to_le_bytes()).unwrap();
+            file.write_all(&vec![0xAB; 40]).unwrap();
+            file.flush().unwrap();
+        }
+
+        let mgr = RecoveryManager::new(dir.clone());
+        let result = mgr.recover().unwrap();
+
+        // The 3 valid entries should be recovered.
+        assert_eq!(result.wal_entries_replayed, 3);
+        // Errors list should be non-empty (the corrupted entry causes an error).
+        assert!(!result.errors.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_recovery_nonexistent_wal_dir() {
+        let dir = PathBuf::from(format!(
+            "/tmp/weav_recovery_nonexistent_test_{}",
+            now_millis()
+        ));
+        // Ensure the directory truly does not exist.
+        assert!(!dir.exists());
+
         let mgr = RecoveryManager::new(dir);
         let files = mgr.find_wal_files().unwrap();
         assert!(files.is_empty());

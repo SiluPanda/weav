@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use weav_core::error::WeavError;
 use weav_core::shard::StringInterner;
-use weav_core::types::{Direction, NodeId, Provenance, Timestamp};
+use weav_core::types::{BiTemporal, Direction, NodeId, Provenance, Timestamp};
 
 use weav_graph::adjacency::AdjacencyStore;
 use weav_graph::properties::PropertyStore;
@@ -13,9 +13,20 @@ use weav_vector::index::VectorIndex;
 use weav_vector::tokens::TokenCounter;
 
 use crate::budget::enforce_budget;
-use crate::parser::{ContextQuery, SeedStrategy};
+use crate::parser::{ContextQuery, SeedStrategy, SortDirection, SortField};
 
 // ─── Result types ───────────────────────────────────────────────────────────
+
+/// Information about a detected conflict between two nodes.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConflictInfo {
+    pub node_a: NodeId,
+    pub node_b: NodeId,
+    pub property: String,
+    pub value_a: String,
+    pub value_b: String,
+    pub resolution: String,
+}
 
 /// The complete result of a context query.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -32,6 +43,8 @@ pub struct ContextResult {
     pub nodes_included: u32,
     /// Wall-clock query time in microseconds.
     pub query_time_us: u64,
+    /// Detected conflicts between nodes.
+    pub conflicts: Vec<ConflictInfo>,
 }
 
 /// A single chunk of context extracted from the graph.
@@ -53,6 +66,8 @@ pub struct ContextChunk {
     pub provenance: Option<Provenance>,
     /// Summary of this node's relationships.
     pub relationships: Vec<RelationshipSummary>,
+    /// Optional bi-temporal metadata for the node.
+    pub temporal: Option<BiTemporal>,
 }
 
 /// Summary of a relationship (edge) for context output.
@@ -143,11 +158,20 @@ pub fn execute_context_query(
     }
 
     // ── Step 2: Run flow_score from seeds ───────────────────────────────
+    let plan = crate::planner::plan_context_query(query);
+    let (alpha, theta) = plan.steps.iter().find_map(|step| {
+        if let crate::planner::PlanStep::FlowScore { alpha, theta, .. } = step {
+            Some((*alpha, *theta))
+        } else {
+            None
+        }
+    }).unwrap_or((0.5, 0.01));
+
     let scored_nodes = flow_score(
         adjacency,
         &seeds_with_scores,
-        0.5,  // alpha
-        0.01, // theta
+        alpha,
+        theta,
         query.max_depth,
     );
 
@@ -185,8 +209,45 @@ pub fn execute_context_query(
         // Count tokens
         let token_count = token_counter.count(&content);
 
-        // Get provenance if stored
-        let provenance = None; // Provenance is stored at the edge level, not node level
+        // Get provenance from node properties if available
+        let provenance = {
+            let source_prop = properties
+                .get_node_property(node_id, "provenance")
+                .or_else(|| properties.get_node_property(node_id, "source"));
+            source_prop.and_then(|v| {
+                v.as_str().map(|s| Provenance::new(s, 1.0))
+            })
+        };
+
+        // Build temporal metadata from node properties if available
+        let temporal = {
+            let valid_from = properties
+                .get_node_property(node_id, "_valid_from")
+                .and_then(|v| v.as_int())
+                .map(|i| i as u64);
+            let valid_until = properties
+                .get_node_property(node_id, "_valid_until")
+                .and_then(|v| v.as_int())
+                .map(|i| i as u64);
+            let tx_from = properties
+                .get_node_property(node_id, "_tx_from")
+                .and_then(|v| v.as_int())
+                .map(|i| i as u64);
+            let tx_until = properties
+                .get_node_property(node_id, "_tx_until")
+                .and_then(|v| v.as_int())
+                .map(|i| i as u64);
+            if let Some(vf) = valid_from {
+                Some(BiTemporal {
+                    valid_from: vf,
+                    valid_until: valid_until.unwrap_or(BiTemporal::OPEN),
+                    tx_from: tx_from.unwrap_or(vf),
+                    tx_until: tx_until.unwrap_or(BiTemporal::OPEN),
+                })
+            } else {
+                None
+            }
+        };
 
         chunks.push(ContextChunk {
             node_id,
@@ -197,7 +258,74 @@ pub fn execute_context_query(
             token_count,
             provenance,
             relationships: Vec::new(), // Filled in step 7
+            temporal,
         });
+    }
+
+    // ── Step 3b: Detect conflicts ───────────────────────────────────────
+    let mut conflicts: Vec<ConflictInfo> = Vec::new();
+    {
+        // Group chunks by label
+        let mut label_groups: std::collections::HashMap<&str, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (idx, chunk) in chunks.iter().enumerate() {
+            label_groups
+                .entry(chunk.label.as_str())
+                .or_default()
+                .push(idx);
+        }
+
+        // Within each group, compare property values
+        for (_label, indices) in &label_groups {
+            if indices.len() < 2 {
+                continue;
+            }
+            for i in 0..indices.len() {
+                for j in (i + 1)..indices.len() {
+                    let node_a = chunks[indices[i]].node_id;
+                    let node_b = chunks[indices[j]].node_id;
+
+                    let props_a = properties.get_all_node_properties(node_a);
+                    let props_b = properties.get_all_node_properties(node_b);
+
+                    for (key_a, val_a) in &props_a {
+                        if key_a.starts_with('_') {
+                            continue;
+                        }
+                        for (key_b, val_b) in &props_b {
+                            if key_a == key_b {
+                                let str_a = format!("{val_a:?}");
+                                let str_b = format!("{val_b:?}");
+                                if str_a != str_b {
+                                    // Resolve: node with higher score wins
+                                    let resolution = if chunks[indices[i]].relevance_score
+                                        >= chunks[indices[j]].relevance_score
+                                    {
+                                        format!(
+                                            "kept node {} (higher relevance)",
+                                            node_a
+                                        )
+                                    } else {
+                                        format!(
+                                            "kept node {} (higher relevance)",
+                                            node_b
+                                        )
+                                    };
+                                    conflicts.push(ConflictInfo {
+                                        node_a,
+                                        node_b,
+                                        property: key_a.to_string(),
+                                        value_a: str_a,
+                                        value_b: str_b,
+                                        resolution,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ── Step 4: Temporal filter ─────────────────────────────────────────
@@ -301,6 +429,38 @@ pub fn execute_context_query(
         }
     }
 
+    // ── Step 7b: Apply user-requested sort ─────────────────────────────
+    if let Some(ref sort) = query.sort {
+        result_chunks.sort_by(|a, b| {
+            let cmp = match sort.field {
+                SortField::Relevance => a
+                    .relevance_score
+                    .partial_cmp(&b.relevance_score)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                SortField::Recency => {
+                    // Compare by temporal valid_from (more recent = higher)
+                    let ts_a = a.temporal.map(|t| t.valid_from).unwrap_or(0);
+                    let ts_b = b.temporal.map(|t| t.valid_from).unwrap_or(0);
+                    ts_a.cmp(&ts_b)
+                }
+                SortField::Confidence => {
+                    let conf_a =
+                        a.provenance.as_ref().map(|p| p.confidence).unwrap_or(0.0);
+                    let conf_b =
+                        b.provenance.as_ref().map(|p| p.confidence).unwrap_or(0.0);
+                    conf_a
+                        .partial_cmp(&conf_b)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }
+            };
+            if sort.direction == SortDirection::Asc {
+                cmp
+            } else {
+                cmp.reverse()
+            }
+        });
+    }
+
     // ── Step 8: Build final result ──────────────────────────────────────
     let elapsed = start.elapsed();
     let nodes_included = result_chunks.len() as u32;
@@ -312,6 +472,7 @@ pub fn execute_context_query(
         nodes_considered,
         nodes_included,
         query_time_us: elapsed.as_micros() as u64,
+        conflicts,
     })
 }
 
@@ -345,7 +506,7 @@ mod tests {
     use weav_vector::index::{VectorConfig, VectorIndex};
     use weav_vector::tokens::TokenCounter;
 
-    use crate::parser::{ContextQuery, SeedStrategy};
+    use crate::parser::{ContextQuery, SeedStrategy, SortDirection, SortField, SortOrder};
 
     fn setup_test_stores() -> (
         AdjacencyStore,
@@ -502,6 +663,7 @@ mod tests {
             include_provenance: false,
             temporal_at: None,
             limit: None,
+            sort: None,
         };
 
         let result =
@@ -535,6 +697,7 @@ mod tests {
             include_provenance: false,
             temporal_at: None,
             limit: None,
+            sort: None,
         };
 
         let result =
@@ -562,6 +725,7 @@ mod tests {
             include_provenance: false,
             temporal_at: None,
             limit: Some(1),
+            sort: None,
         };
 
         let result =
@@ -587,6 +751,7 @@ mod tests {
             include_provenance: false,
             temporal_at: None,
             limit: None,
+            sort: None,
         };
 
         let result =
@@ -623,6 +788,7 @@ mod tests {
             include_provenance: false,
             temporal_at: None,
             limit: None,
+            sort: None,
         };
 
         let result =
@@ -632,6 +798,139 @@ mod tests {
         // No seeds found, so no results
         assert_eq!(result.nodes_considered, 0);
         assert_eq!(result.nodes_included, 0);
+    }
+
+    #[test]
+    fn test_execute_uses_plan_flow_score_params() {
+        // Verify that execute_context_query derives alpha/theta from the planner,
+        // not from hardcoded values. The planner defaults to alpha=0.5, theta=0.01
+        // so we confirm the plan produces those defaults, then run the executor
+        // and verify results are consistent (i.e. the plan path is exercised).
+        let (adj, props, vec_index, token_counter, interner) = setup_test_stores();
+
+        let query = ContextQuery {
+            query_text: Some("plan test".to_string()),
+            graph: "test".to_string(),
+            budget: None,
+            seeds: SeedStrategy::Nodes(vec!["alice".to_string()]),
+            max_depth: 2,
+            direction: Direction::Both,
+            edge_filter: None,
+            decay: None,
+            include_provenance: false,
+            temporal_at: None,
+            limit: None,
+            sort: None,
+        };
+
+        // Step 1: Confirm the planner produces the expected default alpha/theta
+        let plan = crate::planner::plan_context_query(&query);
+        let flow_params = plan.steps.iter().find_map(|step| {
+            if let crate::planner::PlanStep::FlowScore { alpha, theta, max_depth } = step {
+                Some((*alpha, *theta, *max_depth))
+            } else {
+                None
+            }
+        });
+        assert_eq!(flow_params, Some((0.5, 0.01, 2)),
+            "Planner should produce default alpha=0.5, theta=0.01, max_depth=2");
+
+        // Step 2: Execute the query (which now reads from the plan internally)
+        let result =
+            execute_context_query(&query, &adj, &props, &vec_index, &token_counter, &interner)
+                .unwrap();
+
+        // The executor should produce results using the plan's parameters
+        assert!(result.nodes_considered > 0, "Should find nodes via flow scoring");
+        assert!(result.nodes_included > 0, "Should include scored nodes");
+
+        // Alice (seed) should be present with a high relevance score
+        let alice_chunk = result.chunks.iter().find(|c| c.node_id == 1);
+        assert!(alice_chunk.is_some(), "Alice should be in results");
+        let alice = alice_chunk.unwrap();
+        assert!(alice.relevance_score > 0.0, "Seed node should have positive score");
+
+        // Neighbors should also be scored (via flow propagation with plan's alpha/theta)
+        let neighbor_chunks: Vec<_> = result.chunks.iter().filter(|c| c.node_id != 1).collect();
+        assert!(!neighbor_chunks.is_empty(), "Flow scoring should reach neighbors");
+        for chunk in &neighbor_chunks {
+            assert!(chunk.relevance_score > 0.0,
+                "Neighbor nodes should have positive scores from flow propagation");
+            assert!(chunk.relevance_score < alice.relevance_score,
+                "Neighbor scores should be lower than the seed score (alpha=0.5 decay)");
+        }
+    }
+
+    #[test]
+    fn test_execute_seed_strategy_both() {
+        let (adj, props, mut vec_index, token_counter, interner) = setup_test_stores();
+
+        // Add embeddings for node 1 (Alice) so vector search can find it
+        vec_index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        vec_index.insert(3, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+
+        // Also set an entity_key for node 2 (Bob) so node key lookup can find it
+        // (already set in setup_test_stores)
+
+        let query = ContextQuery {
+            query_text: Some("test both".to_string()),
+            graph: "test".to_string(),
+            budget: None,
+            seeds: SeedStrategy::Both {
+                embedding: vec![1.0, 0.0, 0.0, 0.0],
+                top_k: 5,
+                node_keys: vec!["bob".to_string()],
+            },
+            max_depth: 1,
+            direction: Direction::Both,
+            edge_filter: None,
+            decay: None,
+            include_provenance: false,
+            temporal_at: None,
+            limit: None,
+            sort: None,
+        };
+
+        let result =
+            execute_context_query(&query, &adj, &props, &vec_index, &token_counter, &interner)
+                .unwrap();
+
+        assert!(result.nodes_considered > 0);
+        assert!(result.nodes_included > 0);
+
+        // Both Alice (from vector search) and Bob (from node key lookup) should be in results
+        let node_ids: Vec<u64> = result.chunks.iter().map(|c| c.node_id).collect();
+        assert!(node_ids.contains(&1), "Alice should be found via vector search");
+        assert!(node_ids.contains(&2), "Bob should be found via node key lookup");
+    }
+
+    #[test]
+    fn test_execute_empty_seeds() {
+        let (adj, props, vec_index, token_counter, interner) = setup_test_stores();
+
+        let query = ContextQuery {
+            query_text: Some("test".to_string()),
+            graph: "test".to_string(),
+            budget: None,
+            seeds: SeedStrategy::Nodes(vec![]),
+            max_depth: 2,
+            direction: Direction::Both,
+            edge_filter: None,
+            decay: None,
+            include_provenance: false,
+            temporal_at: None,
+            limit: None,
+            sort: None,
+        };
+
+        let result =
+            execute_context_query(&query, &adj, &props, &vec_index, &token_counter, &interner)
+                .unwrap();
+
+        // Empty seed list means no seeds found, so no results
+        assert_eq!(result.nodes_considered, 0);
+        assert_eq!(result.nodes_included, 0);
+        assert!(result.chunks.is_empty());
     }
 
     #[test]
@@ -653,5 +952,218 @@ mod tests {
         assert!(content.contains("description: A developer"));
         assert!(!content.contains("_internal"));
         assert!(!content.contains("age")); // Int, not string
+    }
+
+    #[test]
+    fn test_conflict_detection() {
+        // Two "person" nodes with the same property key ("name") but different values
+        // should produce a ConflictInfo.
+        let (adj, mut props, vec_index, token_counter, interner) = setup_test_stores();
+
+        // Node 1 (Alice) and Node 2 (Bob) are both label "person" and both have
+        // "name" and "description" properties with different values.
+        // Additionally give them a shared property with the SAME value to confirm
+        // no false positives.
+        props.set_node_property(
+            1,
+            "role",
+            Value::String(CompactString::from("engineer")),
+        );
+        props.set_node_property(
+            2,
+            "role",
+            Value::String(CompactString::from("engineer")),
+        );
+
+        let query = ContextQuery {
+            query_text: Some("test".to_string()),
+            graph: "test".to_string(),
+            budget: None,
+            seeds: SeedStrategy::Nodes(vec!["alice".to_string()]),
+            max_depth: 2,
+            direction: Direction::Both,
+            edge_filter: None,
+            decay: None,
+            include_provenance: false,
+            temporal_at: None,
+            limit: None,
+            sort: None,
+        };
+
+        let result =
+            execute_context_query(&query, &adj, &props, &vec_index, &token_counter, &interner)
+                .unwrap();
+
+        // We should have conflicts for "name" and "description" between Alice and Bob
+        assert!(
+            !result.conflicts.is_empty(),
+            "Should detect conflicts between two person nodes"
+        );
+
+        // Find the "name" conflict between person nodes (1 and 2)
+        let name_conflict = result
+            .conflicts
+            .iter()
+            .find(|c| {
+                c.property == "name"
+                    && ((c.node_a == 1 && c.node_b == 2) || (c.node_a == 2 && c.node_b == 1))
+            });
+        assert!(name_conflict.is_some(), "Should detect name conflict between person nodes 1 and 2");
+        let nc = name_conflict.unwrap();
+        // Resolution should mention a node
+        assert!(
+            nc.resolution.contains("kept node"),
+            "Resolution should use LastWriteWins strategy"
+        );
+
+        // "role" has the same value on both, so NO conflict for "role"
+        let role_conflict = result
+            .conflicts
+            .iter()
+            .find(|c| c.property == "role");
+        assert!(
+            role_conflict.is_none(),
+            "Should not report conflict when values are identical"
+        );
+    }
+
+    #[test]
+    fn test_sort_order_applied() {
+        // Create nodes with temporal metadata to test sorting by recency.
+        let (adj, mut props, vec_index, token_counter, interner) = setup_test_stores();
+
+        // Give nodes valid_from timestamps: Alice=1000, Bob=3000, Rust=2000
+        props.set_node_property(1, "_valid_from", Value::Int(1000));
+        props.set_node_property(2, "_valid_from", Value::Int(3000));
+        props.set_node_property(3, "_valid_from", Value::Int(2000));
+
+        // Query with SORT BY RECENCY ASC (oldest first)
+        let query_asc = ContextQuery {
+            query_text: Some("test".to_string()),
+            graph: "test".to_string(),
+            budget: None,
+            seeds: SeedStrategy::Nodes(vec!["alice".to_string()]),
+            max_depth: 2,
+            direction: Direction::Both,
+            edge_filter: None,
+            decay: None,
+            include_provenance: false,
+            temporal_at: None,
+            limit: None,
+            sort: Some(SortOrder {
+                field: SortField::Recency,
+                direction: SortDirection::Asc,
+            }),
+        };
+
+        let result_asc =
+            execute_context_query(&query_asc, &adj, &props, &vec_index, &token_counter, &interner)
+                .unwrap();
+
+        // Should be ordered by valid_from ascending
+        assert!(
+            result_asc.chunks.len() >= 2,
+            "Need at least 2 chunks to verify sorting"
+        );
+        for i in 1..result_asc.chunks.len() {
+            let ts_prev = result_asc.chunks[i - 1]
+                .temporal
+                .map(|t| t.valid_from)
+                .unwrap_or(0);
+            let ts_curr = result_asc.chunks[i]
+                .temporal
+                .map(|t| t.valid_from)
+                .unwrap_or(0);
+            assert!(
+                ts_prev <= ts_curr,
+                "ASC sort: chunk {} (valid_from={}) should be <= chunk {} (valid_from={})",
+                i - 1,
+                ts_prev,
+                i,
+                ts_curr
+            );
+        }
+
+        // Query with SORT BY RECENCY DESC (most recent first)
+        let query_desc = ContextQuery {
+            query_text: Some("test".to_string()),
+            graph: "test".to_string(),
+            budget: None,
+            seeds: SeedStrategy::Nodes(vec!["alice".to_string()]),
+            max_depth: 2,
+            direction: Direction::Both,
+            edge_filter: None,
+            decay: None,
+            include_provenance: false,
+            temporal_at: None,
+            limit: None,
+            sort: Some(SortOrder {
+                field: SortField::Recency,
+                direction: SortDirection::Desc,
+            }),
+        };
+
+        let result_desc =
+            execute_context_query(&query_desc, &adj, &props, &vec_index, &token_counter, &interner)
+                .unwrap();
+
+        // Should be ordered by valid_from descending
+        assert!(
+            result_desc.chunks.len() >= 2,
+            "Need at least 2 chunks to verify sorting"
+        );
+        for i in 1..result_desc.chunks.len() {
+            let ts_prev = result_desc.chunks[i - 1]
+                .temporal
+                .map(|t| t.valid_from)
+                .unwrap_or(0);
+            let ts_curr = result_desc.chunks[i]
+                .temporal
+                .map(|t| t.valid_from)
+                .unwrap_or(0);
+            assert!(
+                ts_prev >= ts_curr,
+                "DESC sort: chunk {} (valid_from={}) should be >= chunk {} (valid_from={})",
+                i - 1,
+                ts_prev,
+                i,
+                ts_curr
+            );
+        }
+
+        // Query with SORT BY RELEVANCE DESC (default-like behavior)
+        let query_rel = ContextQuery {
+            query_text: Some("test".to_string()),
+            graph: "test".to_string(),
+            budget: None,
+            seeds: SeedStrategy::Nodes(vec!["alice".to_string()]),
+            max_depth: 2,
+            direction: Direction::Both,
+            edge_filter: None,
+            decay: None,
+            include_provenance: false,
+            temporal_at: None,
+            limit: None,
+            sort: Some(SortOrder {
+                field: SortField::Relevance,
+                direction: SortDirection::Desc,
+            }),
+        };
+
+        let result_rel =
+            execute_context_query(&query_rel, &adj, &props, &vec_index, &token_counter, &interner)
+                .unwrap();
+
+        // Should be ordered by relevance_score descending
+        for i in 1..result_rel.chunks.len() {
+            assert!(
+                result_rel.chunks[i - 1].relevance_score >= result_rel.chunks[i].relevance_score,
+                "DESC relevance sort: chunk {} (score={}) should be >= chunk {} (score={})",
+                i - 1,
+                result_rel.chunks[i - 1].relevance_score,
+                i,
+                result_rel.chunks[i].relevance_score
+            );
+        }
     }
 }

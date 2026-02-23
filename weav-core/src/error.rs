@@ -81,4 +81,81 @@ mod tests {
             "token budget 4096 exceeded: context requires 5000 tokens"
         );
     }
+
+    #[test]
+    fn test_error_display_all_variants() {
+        let variants: Vec<WeavError> = vec![
+            WeavError::GraphNotFound("g1".into()),
+            WeavError::NodeNotFound(1, 2),
+            WeavError::EdgeNotFound(99),
+            WeavError::DuplicateNode("alice".into()),
+            WeavError::Conflict("merge conflict".into()),
+            WeavError::TokenBudgetExceeded {
+                budget: 1000,
+                required: 2000,
+            },
+            WeavError::DimensionMismatch {
+                expected: 1536,
+                got: 768,
+            },
+            WeavError::ShardUnavailable(5),
+            WeavError::PersistenceError("disk full".into()),
+            WeavError::ProtocolError("bad frame".into()),
+            WeavError::QueryParseError("unexpected token".into()),
+            WeavError::CapacityExceeded("max nodes reached".into()),
+            WeavError::InvalidConfig("bad port".into()),
+            WeavError::Internal("something broke".into()),
+        ];
+
+        for err in &variants {
+            let display = format!("{}", err);
+            assert!(
+                !display.is_empty(),
+                "Display for {:?} should not be empty",
+                err
+            );
+        }
+
+        // Verify specific messages for the previously untested variants
+        assert_eq!(
+            WeavError::EdgeNotFound(99).to_string(),
+            "edge 99 not found"
+        );
+        assert_eq!(
+            WeavError::DuplicateNode("alice".into()).to_string(),
+            "duplicate node: entity with key 'alice' already exists"
+        );
+        assert_eq!(
+            WeavError::Conflict("merge conflict".into()).to_string(),
+            "conflict detected: merge conflict"
+        );
+        assert_eq!(
+            WeavError::ShardUnavailable(5).to_string(),
+            "shard 5 unavailable"
+        );
+        assert_eq!(
+            WeavError::PersistenceError("disk full".into()).to_string(),
+            "persistence error: disk full"
+        );
+        assert_eq!(
+            WeavError::ProtocolError("bad frame".into()).to_string(),
+            "protocol error: bad frame"
+        );
+        assert_eq!(
+            WeavError::QueryParseError("unexpected token".into()).to_string(),
+            "query parse error: unexpected token"
+        );
+        assert_eq!(
+            WeavError::CapacityExceeded("max nodes reached".into()).to_string(),
+            "capacity exceeded: max nodes reached"
+        );
+        assert_eq!(
+            WeavError::InvalidConfig("bad port".into()).to_string(),
+            "invalid configuration: bad port"
+        );
+        assert_eq!(
+            WeavError::Internal("something broke".into()).to_string(),
+            "internal error: something broke"
+        );
+    }
 }

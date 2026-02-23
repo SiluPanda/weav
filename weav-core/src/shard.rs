@@ -1,29 +1,48 @@
-//! Shard infrastructure — stub for Phase 1 agent to complete.
+//! Shard infrastructure for the Weav engine.
+//!
+//! Provides the core shard types that form the foundation of Weav's
+//! thread-per-core architecture with keyspace sharding.
 
-// This module will be fully implemented by the Phase 1 agent.
-// For now, provide minimal types so other crates can reference them.
+use bumpalo::Bump;
 
 use crate::config::GraphConfig;
-use crate::types::{GraphId, LabelId, PropertyKeyId, ShardId};
+use crate::types::{GraphId, LabelId, PropertyKeyId, ShardId, Timestamp};
 use compact_str::CompactString;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 
 /// A single shard owning a portion of the keyspace.
+///
+/// Each shard has its own bump allocator for arena-based allocation,
+/// a string interner for compact label/property-key encoding, and a
+/// set of per-graph metadata entries.
 pub struct Shard {
     pub id: ShardId,
     graphs: HashMap<GraphId, GraphShard>,
     string_interner: StringInterner,
     stats: ShardStats,
+    allocator: Bump,
 }
 
-/// Per-graph data within a shard.
+/// Lightweight per-graph metadata within a shard.
+///
+/// `GraphShard` in `weav-core` is intentionally a metadata-only struct.
+/// The actual graph storage (adjacency lists, property stores, vector
+/// indices, temporal and provenance indices) is managed by the
+/// [`Engine`](../../weav_server/engine/struct.Engine.html) in `weav-server`,
+/// which composes types from `weav-graph` and `weav-vector`. This
+/// separation keeps `weav-core` free of upward dependencies while still
+/// providing a place for per-graph bookkeeping at the shard level.
 pub struct GraphShard {
     pub graph_id: GraphId,
     pub graph_name: CompactString,
     pub config: GraphConfig,
-    // topology, properties, vector_index, temporal_index, provenance_index
-    // will be added as Phase 2 and Phase 3 types are implemented.
+    /// Cached node count for this graph within this shard.
+    pub node_count: u64,
+    /// Cached edge count for this graph within this shard.
+    pub edge_count: u64,
+    /// Timestamp (ms since epoch) when this graph shard was created.
+    pub created_at: Timestamp,
 }
 
 /// Bidirectional string interner for labels and property keys.
@@ -136,7 +155,16 @@ impl Shard {
             graphs: HashMap::new(),
             string_interner: StringInterner::new(),
             stats: ShardStats::new(),
+            allocator: Bump::new(),
         }
+    }
+
+    /// Returns a reference to this shard's bump allocator.
+    ///
+    /// The bump allocator provides fast arena-based allocation for
+    /// temporary per-request data within the shard.
+    pub fn allocator(&self) -> &Bump {
+        &self.allocator
     }
 
     /// Get a reference to the string interner.
@@ -182,10 +210,17 @@ impl Shard {
 
 impl GraphShard {
     pub fn new(graph_id: GraphId, name: CompactString, config: GraphConfig) -> Self {
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as Timestamp;
         Self {
             graph_id,
             graph_name: name,
             config,
+            node_count: 0,
+            edge_count: 0,
+            created_at,
         }
     }
 }
@@ -232,5 +267,114 @@ mod tests {
         let removed = shard.remove_graph(1);
         assert!(removed.is_some());
         assert!(shard.get_graph(1).is_none());
+    }
+
+    #[test]
+    fn test_interner_get_label_id() {
+        let mut interner = StringInterner::new();
+        // Non-existent label returns None
+        assert_eq!(interner.get_label_id("missing"), None);
+
+        let id = interner.intern_label("Person");
+        assert_eq!(interner.get_label_id("Person"), Some(id));
+        assert_eq!(interner.get_label_id("NotInterned"), None);
+    }
+
+    #[test]
+    fn test_interner_get_property_key_id() {
+        let mut interner = StringInterner::new();
+        // Non-existent property key returns None
+        assert_eq!(interner.get_property_key_id("missing"), None);
+
+        let id = interner.intern_property_key("name");
+        assert_eq!(interner.get_property_key_id("name"), Some(id));
+        assert_eq!(interner.get_property_key_id("age"), None);
+    }
+
+    #[test]
+    fn test_interner_resolve_nonexistent() {
+        let interner = StringInterner::new();
+        assert_eq!(interner.resolve_label(999), None);
+        assert_eq!(interner.resolve_property_key(999), None);
+    }
+
+    #[test]
+    fn test_shard_accessors() {
+        let mut shard = Shard::new(7);
+        assert_eq!(shard.id, 7);
+
+        // allocator() returns a reference
+        let _alloc = shard.allocator();
+
+        // interner() returns immutable reference
+        let _interner = shard.interner();
+
+        // interner_mut() returns mutable reference - intern something
+        let id = shard.interner_mut().intern_label("TestLabel");
+        assert_eq!(shard.interner().resolve_label(id), Some("TestLabel"));
+
+        // stats() returns reference
+        let stats = shard.stats();
+        assert_eq!(
+            stats.node_count.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn test_shard_get_graph_mut() {
+        let mut shard = Shard::new(0);
+        let graph = GraphShard::new(1, "test".into(), GraphConfig::default());
+        shard.insert_graph(graph);
+
+        // Verify we can get a mutable reference and modify
+        let g = shard.get_graph_mut(1).expect("graph 1 should exist");
+        assert_eq!(g.node_count, 0);
+        g.node_count = 42;
+        g.edge_count = 10;
+
+        // Verify mutation persisted
+        let g2 = shard.get_graph(1).unwrap();
+        assert_eq!(g2.node_count, 42);
+        assert_eq!(g2.edge_count, 10);
+
+        // Non-existent graph returns None
+        assert!(shard.get_graph_mut(999).is_none());
+    }
+
+    #[test]
+    fn test_shard_remove_nonexistent_graph() {
+        let mut shard = Shard::new(0);
+        let result = shard.remove_graph(999);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_shard_graph_ids_multiple() {
+        let mut shard = Shard::new(0);
+        shard.insert_graph(GraphShard::new(10, "g10".into(), GraphConfig::default()));
+        shard.insert_graph(GraphShard::new(20, "g20".into(), GraphConfig::default()));
+        shard.insert_graph(GraphShard::new(30, "g30".into(), GraphConfig::default()));
+
+        let mut ids = shard.graph_ids();
+        ids.sort();
+        assert_eq!(ids, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn test_shard_graph_ids_empty() {
+        let shard = Shard::new(0);
+        assert!(shard.graph_ids().is_empty());
+    }
+
+    #[test]
+    fn test_shard_stats_new() {
+        let stats = ShardStats::new();
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(stats.node_count.load(Relaxed), 0);
+        assert_eq!(stats.edge_count.load(Relaxed), 0);
+        assert_eq!(stats.memory_bytes.load(Relaxed), 0);
+        assert_eq!(stats.query_count.load(Relaxed), 0);
+        assert_eq!(stats.avg_query_us.load(Relaxed), 0);
     }
 }

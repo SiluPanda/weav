@@ -210,6 +210,22 @@ class WeavClient:
         resp = self._client.delete(f"/v1/graphs/{graph}/nodes/{node_id}")
         _check_response(resp)
 
+    def update_node(
+        self,
+        graph: str,
+        node_id: int,
+        properties: dict[str, Any] | None = None,
+        embedding: list[float] | None = None,
+    ) -> None:
+        """Update a node's properties and/or embedding."""
+        body: dict[str, Any] = {}
+        if properties is not None:
+            body["properties"] = properties
+        if embedding is not None:
+            body["embedding"] = embedding
+        resp = self._client.put(f"/v1/graphs/{graph}/nodes/{node_id}", json=body)
+        _check_response(resp)
+
     # -- Edge operations ---------------------------------------------------
 
     def add_edge(
@@ -219,6 +235,7 @@ class WeavClient:
         target: int,
         label: str,
         weight: float = 1.0,
+        provenance: dict | None = None,
     ) -> int:
         """Add an edge between two nodes. Returns the new edge ID."""
         body: dict[str, Any] = {
@@ -227,6 +244,8 @@ class WeavClient:
             "label": label,
             "weight": weight,
         }
+        if provenance is not None:
+            body["provenance"] = provenance
         resp = self._client.post(f"/v1/graphs/{graph}/edges", json=body)
         data = _check_response(resp)
         return data["id"]
@@ -235,6 +254,26 @@ class WeavClient:
         """Invalidate (soft-delete) an edge by its ID."""
         resp = self._client.post(f"/v1/graphs/{graph}/edges/{edge_id}/invalidate")
         _check_response(resp)
+
+    def bulk_add_nodes(
+        self,
+        graph: str,
+        nodes: list[dict[str, Any]],
+    ) -> list[int]:
+        """Bulk add nodes. Each dict needs at least 'label'. Returns list of IDs."""
+        resp = self._client.post(f"/v1/graphs/{graph}/nodes/bulk", json={"nodes": nodes})
+        data = _check_response(resp)
+        return data["ids"]
+
+    def bulk_add_edges(
+        self,
+        graph: str,
+        edges: list[dict[str, Any]],
+    ) -> list[int]:
+        """Bulk add edges. Each dict needs 'source', 'target', 'label'. Returns list of IDs."""
+        resp = self._client.post(f"/v1/graphs/{graph}/edges/bulk", json={"edges": edges})
+        data = _check_response(resp)
+        return data["ids"]
 
     # -- Context retrieval -------------------------------------------------
 
@@ -246,6 +285,9 @@ class WeavClient:
         seed_nodes: list[str] | None = None,
         budget: int = 4096,
         max_depth: int = 3,
+        decay: str | None = None,
+        edge_labels: list[str] | None = None,
+        temporal_at: str | None = None,
         include_provenance: bool = False,
     ) -> ContextResult:
         """Run a context query against a graph.
@@ -265,6 +307,12 @@ class WeavClient:
             body["embedding"] = embedding
         if seed_nodes is not None:
             body["seed_nodes"] = seed_nodes
+        if decay is not None:
+            body["decay"] = decay
+        if edge_labels is not None:
+            body["edge_labels"] = edge_labels
+        if temporal_at is not None:
+            body["temporal_at"] = temporal_at
 
         resp = self._client.post("/v1/context", json=body)
         data = _check_response(resp)
@@ -370,6 +418,22 @@ class AsyncWeavClient:
         resp = await self._client.delete(f"/v1/graphs/{graph}/nodes/{node_id}")
         _check_response(resp)
 
+    async def update_node(
+        self,
+        graph: str,
+        node_id: int,
+        properties: dict[str, Any] | None = None,
+        embedding: list[float] | None = None,
+    ) -> None:
+        """Update a node's properties and/or embedding."""
+        body: dict[str, Any] = {}
+        if properties is not None:
+            body["properties"] = properties
+        if embedding is not None:
+            body["embedding"] = embedding
+        resp = await self._client.put(f"/v1/graphs/{graph}/nodes/{node_id}", json=body)
+        _check_response(resp)
+
     # -- Edge operations ---------------------------------------------------
 
     async def add_edge(
@@ -379,6 +443,7 @@ class AsyncWeavClient:
         target: int,
         label: str,
         weight: float = 1.0,
+        provenance: dict | None = None,
     ) -> int:
         """Add an edge between two nodes. Returns the new edge ID."""
         body: dict[str, Any] = {
@@ -387,6 +452,8 @@ class AsyncWeavClient:
             "label": label,
             "weight": weight,
         }
+        if provenance is not None:
+            body["provenance"] = provenance
         resp = await self._client.post(f"/v1/graphs/{graph}/edges", json=body)
         data = _check_response(resp)
         return data["id"]
@@ -398,6 +465,26 @@ class AsyncWeavClient:
         )
         _check_response(resp)
 
+    async def bulk_add_nodes(
+        self,
+        graph: str,
+        nodes: list[dict[str, Any]],
+    ) -> list[int]:
+        """Bulk add nodes. Each dict needs at least 'label'. Returns list of IDs."""
+        resp = await self._client.post(f"/v1/graphs/{graph}/nodes/bulk", json={"nodes": nodes})
+        data = _check_response(resp)
+        return data["ids"]
+
+    async def bulk_add_edges(
+        self,
+        graph: str,
+        edges: list[dict[str, Any]],
+    ) -> list[int]:
+        """Bulk add edges. Each dict needs 'source', 'target', 'label'. Returns list of IDs."""
+        resp = await self._client.post(f"/v1/graphs/{graph}/edges/bulk", json={"edges": edges})
+        data = _check_response(resp)
+        return data["ids"]
+
     # -- Context retrieval -------------------------------------------------
 
     async def context(
@@ -408,6 +495,9 @@ class AsyncWeavClient:
         seed_nodes: list[str] | None = None,
         budget: int = 4096,
         max_depth: int = 3,
+        decay: str | None = None,
+        edge_labels: list[str] | None = None,
+        temporal_at: str | None = None,
         include_provenance: bool = False,
     ) -> ContextResult:
         """Run a context query against a graph.
@@ -427,6 +517,12 @@ class AsyncWeavClient:
             body["embedding"] = embedding
         if seed_nodes is not None:
             body["seed_nodes"] = seed_nodes
+        if decay is not None:
+            body["decay"] = decay
+        if edge_labels is not None:
+            body["edge_labels"] = edge_labels
+        if temporal_at is not None:
+            body["temporal_at"] = temporal_at
 
         resp = await self._client.post("/v1/context", json=body)
         data = _check_response(resp)
