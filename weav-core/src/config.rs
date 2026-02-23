@@ -56,6 +56,16 @@ impl WeavConfig {
                 self.server.port = port;
             }
         }
+        if let Ok(v) = std::env::var("WEAV_SERVER_HTTP_PORT") {
+            if let Ok(port) = v.parse() {
+                self.server.http_port = Some(port);
+            }
+        }
+        if let Ok(v) = std::env::var("WEAV_SERVER_GRPC_PORT") {
+            if let Ok(port) = v.parse() {
+                self.server.grpc_port = Some(port);
+            }
+        }
         if let Ok(v) = std::env::var("WEAV_SERVER_BIND_ADDRESS") {
             self.server.bind_address = v;
         }

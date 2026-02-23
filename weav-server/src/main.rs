@@ -7,7 +7,7 @@ use weav_proto::grpc::weav_service_server::WeavServiceServer;
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let config = WeavConfig::default();
+    let config = WeavConfig::load(None).unwrap_or_default();
     let engine = Arc::new(Engine::new(config.clone()));
 
     // Recovery on startup.
