@@ -1,0 +1,15 @@
+[package]
+name = "weav-vector"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+weav-core = { path = "../weav-core" }
+usearch = { workspace = true }
+roaring = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tiktoken-rs = { workspace = true }
+
+[dev-dependencies]

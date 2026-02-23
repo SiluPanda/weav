@@ -1,0 +1,12 @@
+[package]
+name = "weav-persist"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+weav-core = { path = "../weav-core" }
+serde = { workspace = true }
+bincode = { workspace = true }
+rkyv = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

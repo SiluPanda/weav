@@ -1,0 +1,13 @@
+[project]
+name = "weav"
+version = "0.1.0"
+description = "Python SDK for Weav context graph database"
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.27"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "respx>=0.22"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.backends"

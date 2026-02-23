@@ -1,0 +1,18 @@
+[package]
+name = "weav-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "weav-cli"
+path = "src/main.rs"
+
+[dependencies]
+weav-proto = { path = "../weav-proto" }
+weav-core = { path = "../weav-core" }
+clap = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+rustyline = { workspace = true }
+futures = "0.3"

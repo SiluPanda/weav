@@ -1,0 +1,83 @@
+[workspace]
+resolver = "2"
+members = [
+    "weav-core",
+    "weav-graph",
+    "weav-vector",
+    "weav-query",
+    "weav-persist",
+    "weav-server",
+    "weav-proto",
+    "weav-cli",
+    "benchmarks",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# Concurrency
+crossbeam = "0.8"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+
+# Data structures
+roaring = "0.10"
+smallvec = { version = "1", features = ["union"] }
+compact_str = { version = "0.8", features = ["serde"] }
+
+# Hashing
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Vector search
+usearch = "2"
+
+# Serialization
+rkyv = { version = "0.8", features = ["bytecheck"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+
+# Networking
+bytes = "1"
+axum = "0.8"
+tower = "0.5"
+
+# Token counting
+tiktoken-rs = "0.6"
+
+# String matching (for dedup)
+strsim = "0.11"
+
+# Configuration
+toml = "0.8"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+rustyline = "15"
+
+# Memory
+bumpalo = "3"
+
+# Testing
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3

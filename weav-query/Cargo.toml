@@ -1,0 +1,15 @@
+[package]
+name = "weav-query"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+weav-core = { path = "../weav-core" }
+weav-graph = { path = "../weav-graph" }
+weav-vector = { path = "../weav-vector" }
+roaring = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+compact_str = { workspace = true }

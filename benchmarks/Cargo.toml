@@ -1,0 +1,17 @@
+[package]
+name = "weav-benchmarks"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+weav-core = { path = "../weav-core" }
+weav-graph = { path = "../weav-graph" }
+weav-vector = { path = "../weav-vector" }
+weav-query = { path = "../weav-query" }
+weav-server = { path = "../weav-server" }
+criterion = { workspace = true }
+compact_str = { workspace = true }
+
+[[bench]]
+name = "benchmarks"
+harness = false

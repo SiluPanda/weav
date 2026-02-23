@@ -1,0 +1,16 @@
+[package]
+name = "weav-graph"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+weav-core = { path = "../weav-core" }
+compact_str = { workspace = true }
+roaring = { workspace = true }
+smallvec = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+strsim = { workspace = true }
+
+[dev-dependencies]

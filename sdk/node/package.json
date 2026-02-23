@@ -1,0 +1,14 @@
+{
+  "name": "@weav/client",
+  "version": "0.1.0",
+  "description": "Node.js SDK for Weav context graph database",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test tests/*.test.ts"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}
