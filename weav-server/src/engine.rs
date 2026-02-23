@@ -3,8 +3,9 @@
 //! Provides a thread-safe interface for executing commands against graphs.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
 use std::time::SystemTime;
+
+use parking_lot::{Mutex, RwLock};
 
 use compact_str::CompactString;
 
@@ -91,7 +92,7 @@ pub struct Engine {
     next_graph_id: RwLock<GraphId>,
     token_counter: TokenCounter,
     config: WeavConfig,
-    wal: Option<std::sync::Mutex<WriteAheadLog>>,
+    wal: Option<Mutex<WriteAheadLog>>,
     snapshot_engine: Option<SnapshotEngine>,
     runtime_config: RwLock<HashMap<String, String>>,
 }
@@ -110,7 +111,7 @@ impl Engine {
                 config.persistence.wal_sync_mode.clone(),
             )
             .ok()
-            .map(std::sync::Mutex::new);
+            .map(Mutex::new);
             let snap = SnapshotEngine::new(data_dir);
             (wal, Some(snap))
         } else {
@@ -129,9 +130,8 @@ impl Engine {
 
     fn append_wal(&self, op: WalOperation) {
         if let Some(ref wal_mutex) = self.wal {
-            if let Ok(mut wal) = wal_mutex.lock() {
-                let _ = wal.append(0, op);
-            }
+            let mut wal = wal_mutex.lock();
+            let _ = wal.append(0, op);
         }
     }
 
@@ -159,8 +159,7 @@ impl Engine {
                 let vector_index = VectorIndex::new(vec_config)?;
 
                 let graph_id = {
-                    let mut id = self.next_graph_id.write()
-                        .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+                    let mut id = self.next_graph_id.write();
                     let gid = *id;
                     *id = gid.max(gs.graph_id) + 1;
                     gs.graph_id
@@ -242,8 +241,7 @@ impl Engine {
                     }
                 }
 
-                let mut graphs = self.graphs.write()
-                    .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+                let mut graphs = self.graphs.write();
                 graphs.insert(gs.graph_name.clone(), state);
             }
         }
@@ -271,8 +269,7 @@ impl Engine {
                 } => {
                     // Find graph by ID - we need to find the name
                     // For WAL replay, we use the graph_id to find the graph name
-                    let graphs = self.graphs.read()
-                        .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+                    let graphs = self.graphs.read();
                     let graph_name = graphs.values()
                         .find(|gs| gs.graph_id == entry.operation.graph_id_hint())
                         .map(|gs| gs.name.clone());
@@ -316,7 +313,6 @@ impl Engine {
                 env!("CARGO_PKG_VERSION"),
                 self.graphs
                     .read()
-                    .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?
                     .len()
             ))),
             Command::Stats(graph_name) => self.handle_stats(graph_name),
@@ -346,8 +342,7 @@ impl Engine {
     fn handle_stats(&self, graph_name: Option<String>) -> WeavResult<CommandResponse> {
         let graphs = self
             .graphs
-            .read()
-            .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+            .read();
 
         if let Some(name) = graph_name {
             let gs = graphs
@@ -394,8 +389,7 @@ impl Engine {
         let graph_id = {
             let mut id = self
                 .next_graph_id
-                .write()
-                .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+                .write();
             let gid = *id;
             *id += 1;
             gid
@@ -415,8 +409,7 @@ impl Engine {
 
         let mut graphs = self
             .graphs
-            .write()
-            .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+            .write();
 
         if graphs.contains_key(&cmd.name) {
             return Err(WeavError::Conflict(format!(
@@ -438,8 +431,7 @@ impl Engine {
     fn handle_graph_drop(&self, name: &str) -> WeavResult<CommandResponse> {
         let mut graphs = self
             .graphs
-            .write()
-            .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+            .write();
         graphs
             .remove(name)
             .ok_or_else(|| WeavError::GraphNotFound(name.to_string()))?;
@@ -452,8 +444,7 @@ impl Engine {
     fn handle_graph_info(&self, name: &str) -> WeavResult<CommandResponse> {
         let graphs = self
             .graphs
-            .read()
-            .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+            .read();
         let gs = graphs
             .get(name)
             .ok_or_else(|| WeavError::GraphNotFound(name.to_string()))?;
@@ -467,8 +458,7 @@ impl Engine {
     fn handle_graph_list(&self) -> WeavResult<CommandResponse> {
         let graphs = self
             .graphs
-            .read()
-            .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+            .read();
         let names: Vec<String> = graphs.keys().cloned().collect();
         Ok(CommandResponse::StringList(names))
     }
@@ -481,8 +471,7 @@ impl Engine {
     ) -> WeavResult<CommandResponse> {
         let mut graphs = self
             .graphs
-            .write()
-            .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+            .write();
         let gs = graphs
             .get_mut(&cmd.graph)
             .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
@@ -547,8 +536,7 @@ impl Engine {
     ) -> WeavResult<CommandResponse> {
         let graphs = self
             .graphs
-            .read()
-            .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+            .read();
         let gs = graphs
             .get(&cmd.graph)
             .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
@@ -603,8 +591,7 @@ impl Engine {
     ) -> WeavResult<CommandResponse> {
         let mut graphs = self
             .graphs
-            .write()
-            .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+            .write();
         let gs = graphs
             .get_mut(&cmd.graph)
             .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
@@ -634,8 +621,7 @@ impl Engine {
     ) -> WeavResult<CommandResponse> {
         let mut graphs = self
             .graphs
-            .write()
-            .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+            .write();
         let gs = graphs
             .get_mut(&cmd.graph)
             .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
@@ -673,8 +659,7 @@ impl Engine {
     ) -> WeavResult<CommandResponse> {
         let mut graphs = self
             .graphs
-            .write()
-            .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+            .write();
         let gs = graphs
             .get_mut(&cmd.graph)
             .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
@@ -724,8 +709,7 @@ impl Engine {
     ) -> WeavResult<CommandResponse> {
         let mut graphs = self
             .graphs
-            .write()
-            .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+            .write();
         let gs = graphs
             .get_mut(&cmd.graph)
             .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
@@ -764,8 +748,7 @@ impl Engine {
     ) -> WeavResult<CommandResponse> {
         let mut graphs = self
             .graphs
-            .write()
-            .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+            .write();
         let gs = graphs
             .get_mut(&cmd.graph)
             .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
@@ -812,8 +795,7 @@ impl Engine {
     ) -> WeavResult<CommandResponse> {
         let mut graphs = self
             .graphs
-            .write()
-            .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+            .write();
         let gs = graphs
             .get_mut(&cmd.graph)
             .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
@@ -842,8 +824,7 @@ impl Engine {
     ) -> WeavResult<CommandResponse> {
         let mut graphs = self
             .graphs
-            .write()
-            .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+            .write();
         let gs = graphs
             .get_mut(&cmd.graph)
             .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
@@ -870,8 +851,7 @@ impl Engine {
     ) -> WeavResult<CommandResponse> {
         let graphs = self
             .graphs
-            .read()
-            .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+            .read();
         let gs = graphs
             .get(&cmd.graph)
             .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
@@ -899,8 +879,7 @@ impl Engine {
     fn handle_config_set(&self, key: String, value: String) -> WeavResult<CommandResponse> {
         let mut config = self
             .runtime_config
-            .write()
-            .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+            .write();
         config.insert(key, value);
         Ok(CommandResponse::Ok)
     }
@@ -908,8 +887,7 @@ impl Engine {
     fn handle_config_get(&self, key: String) -> WeavResult<CommandResponse> {
         let config = self
             .runtime_config
-            .read()
-            .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+            .read();
         match config.get(&key) {
             Some(val) => Ok(CommandResponse::Text(val.clone())),
             None => Ok(CommandResponse::Null),
@@ -926,12 +904,10 @@ impl Engine {
 
         let graphs = self
             .graphs
-            .read()
-            .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+            .read();
 
         let wal_sequence = self.wal.as_ref()
-            .and_then(|w| w.lock().ok())
-            .map(|w| w.sequence_number())
+            .map(|w| w.lock().sequence_number())
             .unwrap_or(0);
 
         let mut graph_snapshots = Vec::new();
@@ -1033,8 +1009,7 @@ impl Engine {
     ) -> WeavResult<CommandResponse> {
         let graphs = self
             .graphs
-            .read()
-            .map_err(|e| WeavError::Internal(format!("lock poisoned: {e}")))?;
+            .read();
         let gs = graphs
             .get(&query.graph)
             .ok_or_else(|| WeavError::GraphNotFound(query.graph.clone()))?;

@@ -1054,6 +1054,62 @@ async fn test_concurrent_read_write() {
     assert_eq!(info["data"]["node_count"], 70); // 20 seed + 50 writer
 }
 
+/// High-concurrency stress test: 8 writer tasks x 50 ops + 4 reader tasks x 50 ops.
+/// This exact scenario caused cascading server crashes before the parking_lot fix
+/// due to std::sync::RwLock poisoning.
+#[tokio::test]
+async fn test_high_concurrency_stress() {
+    let engine = Arc::new(Engine::new(WeavConfig::default()));
+    engine.execute_command(weav_query::parser::Command::GraphCreate(weav_query::parser::GraphCreateCmd { name: "stress".to_string(), config: None })).unwrap();
+
+    // Pre-seed 10 nodes
+    for i in 0..10u32 {
+        engine.execute_command(weav_query::parser::Command::NodeAdd(weav_query::parser::NodeAddCmd {
+            graph: "stress".to_string(), label: "item".to_string(),
+            properties: vec![("seed".to_string(), weav_core::types::Value::Int(i as i64))],
+            embedding: None, entity_key: None,
+        })).unwrap();
+    }
+
+    let server = TestServer::start_with_engine(engine).await;
+    let mut handles = Vec::new();
+
+    // 8 writer tasks (50 nodes each = 400 total)
+    for task_id in 0..8u32 {
+        let url = format!("{}/v1/graphs/stress/nodes", server.base_url);
+        let c = server.client.clone();
+        handles.push(tokio::spawn(async move {
+            for i in 0..50u32 {
+                let resp = c.post(&url)
+                    .json(&json!({"label": "item", "properties": {"task": task_id, "i": i}}))
+                    .send().await.unwrap();
+                assert_eq!(resp.status(), StatusCode::CREATED);
+            }
+        }));
+    }
+
+    // 4 reader tasks (50 reads each = 200 total)
+    for _ in 0..4u32 {
+        let graph_url = format!("{}/v1/graphs/stress", server.base_url);
+        let c = server.client.clone();
+        handles.push(tokio::spawn(async move {
+            for _ in 0..50u32 {
+                let resp = c.get(&graph_url).send().await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let resp = c.get(format!("{}/nodes/1", graph_url)).send().await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+            }
+        }));
+    }
+
+    for h in handles { h.await.unwrap(); }
+
+    // Verify: 10 seed + 400 writer = 410
+    let client = WeavClient::new(&server);
+    let (_, info) = client.get_graph("stress").await;
+    assert_eq!(info["data"]["node_count"], 410);
+}
+
 #[tokio::test]
 async fn test_multiple_graphs_isolation() {
     let server = TestServer::start().await;

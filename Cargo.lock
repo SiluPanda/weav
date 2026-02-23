@@ -3078,6 +3078,7 @@ dependencies = [
  "bytes",
  "compact_str",
  "futures",
+ "parking_lot",
  "prometheus",
  "prost",
  "reqwest",
