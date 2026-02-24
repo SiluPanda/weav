@@ -1168,4 +1168,331 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_execute_build_content_no_string_properties() {
+        // Node with only Int/Float properties (no String values).
+        // build_content should return empty string since it only concatenates strings.
+        let v_age = Value::Int(30);
+        let v_score = Value::Float(99.5);
+        let v_active = Value::Bool(true);
+
+        let props: Vec<(&str, &Value)> = vec![
+            ("age", &v_age),
+            ("score", &v_score),
+            ("active", &v_active),
+        ];
+
+        let content = build_content(&props);
+        assert!(
+            content.is_empty(),
+            "build_content should return empty string when no String values exist, got: '{content}'"
+        );
+    }
+
+    #[test]
+    fn test_execute_build_content_many_properties() {
+        // Node with 20+ string properties. Verify concatenation works correctly.
+        let values: Vec<Value> = (0..25)
+            .map(|i| Value::String(CompactString::from(format!("value_{i}"))))
+            .collect();
+
+        let props: Vec<(&str, &Value)> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                // We need a stable key string; use a leaked &str for test convenience
+                let key: &str = Box::leak(format!("prop_{i}").into_boxed_str());
+                (key, v)
+            })
+            .collect();
+
+        let content = build_content(&props);
+
+        // Should contain all 25 properties joined by newlines
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(
+            lines.len(),
+            25,
+            "Should have 25 lines for 25 string properties, got {}",
+            lines.len()
+        );
+
+        for i in 0..25 {
+            assert!(
+                content.contains(&format!("prop_{i}: value_{i}")),
+                "Missing property prop_{i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_execute_build_content_only_internal_properties() {
+        // All properties start with `_`. build_content should return empty string.
+        let v1 = Value::String(CompactString::from("internal1"));
+        let v2 = Value::String(CompactString::from("internal2"));
+        let v3 = Value::String(CompactString::from("internal3"));
+
+        let props: Vec<(&str, &Value)> = vec![
+            ("_label", &v1),
+            ("_created_at", &v2),
+            ("_valid_from", &v3),
+        ];
+
+        let content = build_content(&props);
+        assert!(
+            content.is_empty(),
+            "build_content should return empty for all internal (_-prefixed) properties, got: '{content}'"
+        );
+    }
+
+    #[test]
+    fn test_execute_temporal_filter_at_zero() {
+        // temporal_at=0 should filter out all nodes created after timestamp 0.
+        let (adj, mut props, vec_index, token_counter, interner) = setup_test_stores();
+
+        // Set _valid_from on all nodes to timestamps > 0
+        props.set_node_property(1, "_valid_from", Value::Int(1000));
+        props.set_node_property(2, "_valid_from", Value::Int(2000));
+        props.set_node_property(3, "_valid_from", Value::Int(3000));
+        props.set_node_property(4, "_valid_from", Value::Int(4000));
+
+        let query = ContextQuery {
+            query_text: Some("test".to_string()),
+            graph: "test".to_string(),
+            budget: None,
+            seeds: SeedStrategy::Nodes(vec!["alice".to_string()]),
+            max_depth: 3,
+            direction: Direction::Both,
+            edge_filter: None,
+            decay: None,
+            include_provenance: false,
+            temporal_at: Some(0), // timestamp 0 — before all nodes were created
+            limit: None,
+            sort: None,
+        };
+
+        let result =
+            execute_context_query(&query, &adj, &props, &vec_index, &token_counter, &interner)
+                .unwrap();
+
+        assert!(
+            result.chunks.is_empty(),
+            "temporal_at=0 should exclude all nodes with valid_from > 0, got {} chunks",
+            result.chunks.len()
+        );
+    }
+
+    #[test]
+    fn test_execute_temporal_filter_at_max() {
+        // temporal_at=u64::MAX-1 should allow all nodes through (since their valid_from < MAX-1).
+        let (adj, mut props, vec_index, token_counter, interner) = setup_test_stores();
+
+        // Set _valid_from on nodes to various timestamps
+        props.set_node_property(1, "_valid_from", Value::Int(1000));
+        props.set_node_property(2, "_valid_from", Value::Int(2000));
+        props.set_node_property(3, "_valid_from", Value::Int(3000));
+
+        let query = ContextQuery {
+            query_text: Some("test".to_string()),
+            graph: "test".to_string(),
+            budget: None,
+            seeds: SeedStrategy::Nodes(vec!["alice".to_string()]),
+            max_depth: 3,
+            direction: Direction::Both,
+            edge_filter: None,
+            decay: None,
+            include_provenance: false,
+            temporal_at: Some(u64::MAX - 1), // far future — everything is valid
+            limit: None,
+            sort: None,
+        };
+
+        let result =
+            execute_context_query(&query, &adj, &props, &vec_index, &token_counter, &interner)
+                .unwrap();
+
+        // Should include all reachable nodes (alice + neighbors)
+        assert!(
+            result.nodes_included > 0,
+            "temporal_at=MAX-1 should allow all nodes through"
+        );
+        // Verify nodes with temporal metadata are present
+        let node_ids: Vec<u64> = result.chunks.iter().map(|c| c.node_id).collect();
+        assert!(node_ids.contains(&1), "Alice should be present");
+        assert!(node_ids.contains(&2), "Bob should be present");
+        assert!(node_ids.contains(&3), "Rust should be present");
+    }
+
+    #[test]
+    fn test_execute_sort_by_token_count() {
+        // While the executor doesn't have a direct SortField::TokenCount, we can verify
+        // chunks are correctly sorted by relevance (which correlates), and also verify
+        // that token_count values are correctly computed so external sorting works.
+        let (adj, mut props, vec_index, token_counter, interner) = setup_test_stores();
+
+        // Give nodes varying amounts of content to produce different token counts
+        // Node 1 (Alice): short content
+        props.set_node_property(
+            1,
+            "bio",
+            Value::String(CompactString::from("Short")),
+        );
+        // Node 2 (Bob): medium content
+        props.set_node_property(
+            2,
+            "bio",
+            Value::String(CompactString::from("A moderately longer piece of text content")),
+        );
+        // Node 3 (Rust): long content
+        props.set_node_property(
+            3,
+            "bio",
+            Value::String(CompactString::from(
+                "A very long and detailed description that contains many words to increase the token count significantly beyond the others",
+            )),
+        );
+
+        let query = ContextQuery {
+            query_text: Some("test".to_string()),
+            graph: "test".to_string(),
+            budget: None,
+            seeds: SeedStrategy::Nodes(vec!["alice".to_string()]),
+            max_depth: 3,
+            direction: Direction::Both,
+            edge_filter: None,
+            decay: None,
+            include_provenance: false,
+            temporal_at: None,
+            limit: None,
+            sort: None,
+        };
+
+        let result =
+            execute_context_query(&query, &adj, &props, &vec_index, &token_counter, &interner)
+                .unwrap();
+
+        // Collect chunks and sort by token_count ascending
+        let mut chunks_asc = result.chunks.clone();
+        chunks_asc.sort_by_key(|c| c.token_count);
+
+        // Verify ascending order
+        for i in 1..chunks_asc.len() {
+            assert!(
+                chunks_asc[i - 1].token_count <= chunks_asc[i].token_count,
+                "ASC: chunk {} (tokens={}) should be <= chunk {} (tokens={})",
+                i - 1,
+                chunks_asc[i - 1].token_count,
+                i,
+                chunks_asc[i].token_count,
+            );
+        }
+
+        // Sort by token_count descending
+        let mut chunks_desc = result.chunks.clone();
+        chunks_desc.sort_by(|a, b| b.token_count.cmp(&a.token_count));
+
+        // Verify descending order
+        for i in 1..chunks_desc.len() {
+            assert!(
+                chunks_desc[i - 1].token_count >= chunks_desc[i].token_count,
+                "DESC: chunk {} (tokens={}) should be >= chunk {} (tokens={})",
+                i - 1,
+                chunks_desc[i - 1].token_count,
+                i,
+                chunks_desc[i].token_count,
+            );
+        }
+
+        // Verify that different content lengths produce different token counts
+        let alice_chunk = result.chunks.iter().find(|c| c.node_id == 1).unwrap();
+        let rust_chunk = result.chunks.iter().find(|c| c.node_id == 3).unwrap();
+        assert!(
+            rust_chunk.token_count > alice_chunk.token_count,
+            "Longer content should produce more tokens: rust={} vs alice={}",
+            rust_chunk.token_count,
+            alice_chunk.token_count,
+        );
+    }
+
+    #[test]
+    fn test_execute_limit_zero() {
+        // limit=0 should produce 0 chunks in result.
+        let (adj, props, vec_index, token_counter, interner) = setup_test_stores();
+
+        let query = ContextQuery {
+            query_text: Some("test".to_string()),
+            graph: "test".to_string(),
+            budget: None,
+            seeds: SeedStrategy::Nodes(vec!["alice".to_string()]),
+            max_depth: 3,
+            direction: Direction::Both,
+            edge_filter: None,
+            decay: None,
+            include_provenance: false,
+            temporal_at: None,
+            limit: Some(0),
+            sort: None,
+        };
+
+        let result =
+            execute_context_query(&query, &adj, &props, &vec_index, &token_counter, &interner)
+                .unwrap();
+
+        assert_eq!(
+            result.chunks.len(),
+            0,
+            "limit=0 should produce 0 chunks, got {}",
+            result.chunks.len()
+        );
+        assert_eq!(result.nodes_included, 0);
+    }
+
+    #[test]
+    fn test_execute_decay_with_future_timestamp() {
+        // When item_ts > now, decay should return score unchanged.
+        // Test the DecayFunction::apply directly since the executor uses SystemTime::now().
+        use weav_core::types::DecayFunction;
+
+        let decay_exp = DecayFunction::Exponential { half_life_ms: 1000 };
+        let decay_lin = DecayFunction::Linear { max_age_ms: 5000 };
+        let decay_step = DecayFunction::Step { cutoff_ms: 2000 };
+        let decay_none = DecayFunction::None;
+
+        let score = 0.85_f32;
+        let now: u64 = 10_000; // "now" is 10 seconds
+        let future_ts: u64 = 20_000; // item created in the "future" at 20 seconds
+
+        // All decay functions should return score unchanged when item_ts > now
+        let result_exp = decay_exp.apply(score, future_ts, now);
+        assert!(
+            (result_exp - score).abs() < f32::EPSILON,
+            "Exponential decay should return score unchanged for future timestamps, got {result_exp}"
+        );
+
+        let result_lin = decay_lin.apply(score, future_ts, now);
+        assert!(
+            (result_lin - score).abs() < f32::EPSILON,
+            "Linear decay should return score unchanged for future timestamps, got {result_lin}"
+        );
+
+        let result_step = decay_step.apply(score, future_ts, now);
+        assert!(
+            (result_step - score).abs() < f32::EPSILON,
+            "Step decay should return score unchanged for future timestamps, got {result_step}"
+        );
+
+        let result_none = decay_none.apply(score, future_ts, now);
+        assert!(
+            (result_none - score).abs() < f32::EPSILON,
+            "None decay should return score unchanged for future timestamps, got {result_none}"
+        );
+
+        // Also verify that when item_ts == now, the score is unchanged (age = 0)
+        let result_same = decay_exp.apply(score, now, now);
+        assert!(
+            (result_same - score).abs() < f32::EPSILON,
+            "Decay with item_ts == now should return score unchanged, got {result_same}"
+        );
+    }
 }

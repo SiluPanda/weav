@@ -445,4 +445,248 @@ mod tests {
         assert_eq!(result.included.len(), 3);
         assert_eq!(result.total_tokens, 30);
     }
+
+    #[test]
+    fn test_enforce_budget_all_chunks_zero_tokens() {
+        // All chunks have token_count=0. All should be included (infinite density).
+        let chunks = vec![
+            make_chunk(1, 0.9, 0),
+            make_chunk(2, 0.8, 0),
+            make_chunk(3, 0.7, 0),
+            make_chunk(4, 0.6, 0),
+        ];
+        let result = enforce_budget(chunks, &TokenBudget::new(100));
+
+        assert_eq!(
+            result.included.len(),
+            4,
+            "All zero-token chunks should be included"
+        );
+        assert_eq!(result.excluded.len(), 0);
+        assert_eq!(result.total_tokens, 0);
+        assert_eq!(result.budget_utilization, 0.0);
+
+        // Output should be sorted by relevance descending
+        for i in 1..result.included.len() {
+            assert!(
+                result.included[i - 1].relevance_score >= result.included[i].relevance_score,
+                "Output should be sorted by relevance descending"
+            );
+        }
+    }
+
+    #[test]
+    fn test_enforce_budget_single_huge_chunk() {
+        // One chunk with 10000 tokens, budget=100. Should be excluded.
+        let chunks = vec![make_chunk(1, 0.99, 10000)];
+        let result = enforce_budget(chunks, &TokenBudget::new(100));
+
+        assert!(
+            result.included.is_empty(),
+            "A chunk with 10000 tokens should not fit in a 100-token budget"
+        );
+        assert_eq!(result.excluded.len(), 1);
+        assert_eq!(result.excluded[0], 1);
+        assert_eq!(result.total_tokens, 0);
+        assert_eq!(result.budget_utilization, 0.0);
+    }
+
+    #[test]
+    fn test_enforce_budget_equal_density_tiebreak() {
+        // Multiple chunks with identical relevance/token ratio.
+        // All have density = 0.5/10 = 0.05. Budget only fits 2.
+        // Verify deterministic behavior (no panic, correct count).
+        let chunks = vec![
+            make_chunk(1, 0.5, 10),
+            make_chunk(2, 0.5, 10),
+            make_chunk(3, 0.5, 10),
+        ];
+        let result = enforce_budget(chunks, &TokenBudget::new(20));
+
+        assert_eq!(
+            result.included.len(),
+            2,
+            "Budget=20 should fit exactly 2 chunks of 10 tokens each"
+        );
+        assert_eq!(result.excluded.len(), 1);
+        assert_eq!(result.total_tokens, 20);
+        assert!((result.budget_utilization - 1.0).abs() < 0.001);
+
+        // All included chunks should have equal relevance
+        for chunk in &result.included {
+            assert!(
+                (chunk.relevance_score - 0.5).abs() < f32::EPSILON,
+                "All included chunks should have relevance 0.5"
+            );
+        }
+    }
+
+    #[test]
+    fn test_enforce_budget_one_token() {
+        // Budget=1 token. Only chunks with 0 or 1 tokens fit.
+        let chunks = vec![
+            make_chunk(1, 0.9, 0),  // zero tokens — fits
+            make_chunk(2, 0.8, 1),  // exactly 1 token — fits
+            make_chunk(3, 0.7, 2),  // 2 tokens — too large
+            make_chunk(4, 0.6, 10), // 10 tokens — too large
+        ];
+        let result = enforce_budget(chunks, &TokenBudget::new(1));
+
+        let included_ids: Vec<u64> = result.included.iter().map(|c| c.node_id).collect();
+        assert!(
+            included_ids.contains(&1),
+            "Zero-token chunk should be included"
+        );
+        assert!(
+            included_ids.contains(&2),
+            "One-token chunk should fit in budget=1"
+        );
+        assert_eq!(
+            result.included.len(),
+            2,
+            "Only chunks with 0 or 1 tokens should be included"
+        );
+        assert_eq!(result.total_tokens, 1);
+        assert!((result.budget_utilization - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_enforce_budget_proportional_zero_category() {
+        // Proportional with metadata_pct=0.0. Metadata chunks should be excluded.
+        let chunks = vec![
+            make_chunk_with_label(1, 0.9, 10, "person"),      // entity
+            make_chunk_with_label(2, 0.8, 10, "relationship"), // relationship
+            make_chunk_with_label(3, 0.7, 10, "text_chunk"),   // text
+            make_chunk_with_label(4, 0.95, 10, "metadata"),    // metadata — budget=0
+        ];
+        let budget = TokenBudget {
+            max_tokens: 100,
+            allocation: TokenAllocation::Proportional {
+                entities_pct: 0.4,
+                relationships_pct: 0.3,
+                text_chunks_pct: 0.3,
+                metadata_pct: 0.0, // zero allocation for metadata
+            },
+        };
+        let result = enforce_budget(chunks, &budget);
+
+        let included_ids: Vec<u64> = result.included.iter().map(|c| c.node_id).collect();
+        assert!(
+            !included_ids.contains(&4),
+            "Metadata chunk (node 4) should be excluded when metadata_pct=0.0"
+        );
+        assert!(
+            included_ids.contains(&1),
+            "Entity chunk should be included"
+        );
+        assert!(
+            included_ids.contains(&2),
+            "Relationship chunk should be included"
+        );
+        assert!(
+            included_ids.contains(&3),
+            "Text chunk should be included"
+        );
+        assert_eq!(result.included.len(), 3);
+    }
+
+    #[test]
+    fn test_enforce_budget_proportional_all_same_label() {
+        // All chunks have same label. They compete for one category's budget.
+        // "person" maps to entities (catch-all). Budget = 100 * 0.3 = 30 for entities.
+        // Each chunk is 15 tokens, so only 2 fit in 30 tokens.
+        let chunks = vec![
+            make_chunk_with_label(1, 0.9, 15, "person"),
+            make_chunk_with_label(2, 0.8, 15, "person"),
+            make_chunk_with_label(3, 0.7, 15, "person"),
+        ];
+        let budget = TokenBudget {
+            max_tokens: 100,
+            allocation: TokenAllocation::Proportional {
+                entities_pct: 0.3,
+                relationships_pct: 0.3,
+                text_chunks_pct: 0.2,
+                metadata_pct: 0.2,
+            },
+        };
+        let result = enforce_budget(chunks, &budget);
+
+        // entities_budget = 100 * 0.3 = 30. Each chunk=15 tokens, so 2 fit.
+        assert_eq!(
+            result.included.len(),
+            2,
+            "Only 2 of 3 chunks should fit in entities budget of 30 tokens (each 15)"
+        );
+        assert_eq!(result.total_tokens, 30);
+        assert_eq!(result.excluded.len(), 1);
+    }
+
+    #[test]
+    fn test_enforce_budget_proportional_rounding() {
+        // Proportional with percentages summing to 1.05 (> 1.0).
+        // Verify no panic and budget enforcement still works correctly.
+        let chunks = vec![
+            make_chunk_with_label(1, 0.9, 10, "person"),
+            make_chunk_with_label(2, 0.8, 10, "relationship"),
+            make_chunk_with_label(3, 0.7, 10, "text_chunk"),
+            make_chunk_with_label(4, 0.6, 10, "metadata"),
+        ];
+        let budget = TokenBudget {
+            max_tokens: 100,
+            allocation: TokenAllocation::Proportional {
+                entities_pct: 0.30,
+                relationships_pct: 0.30,
+                text_chunks_pct: 0.25,
+                metadata_pct: 0.20, // sum = 1.05
+            },
+        };
+        // Should NOT panic
+        let result = enforce_budget(chunks, &budget);
+
+        // Each category has enough budget for its single 10-token chunk
+        // entities: 30, relationships: 30, text: 25, metadata: 20
+        assert_eq!(
+            result.included.len(),
+            4,
+            "All chunks should fit since each category budget >= 10 tokens"
+        );
+        assert_eq!(result.total_tokens, 40);
+    }
+
+    #[test]
+    fn test_enforce_budget_negative_relevance() {
+        // Chunk with negative relevance_score. Should still be handled correctly.
+        let chunks = vec![
+            make_chunk(1, -0.5, 10),
+            make_chunk(2, 0.8, 10),
+            make_chunk(3, -1.0, 5),
+        ];
+        let result = enforce_budget(chunks, &TokenBudget::new(100));
+
+        // All chunks should fit within the budget
+        assert_eq!(
+            result.included.len(),
+            3,
+            "All chunks should be included regardless of negative relevance"
+        );
+        assert_eq!(result.total_tokens, 25);
+        assert_eq!(result.excluded.len(), 0);
+
+        // Output should be sorted by relevance descending
+        // Positive (0.8) first, then negatives (-0.5, -1.0)
+        assert!(
+            (result.included[0].relevance_score - 0.8).abs() < f32::EPSILON,
+            "Highest relevance (0.8) should be first"
+        );
+        assert!(
+            (result.included[1].relevance_score - (-0.5)).abs() < f32::EPSILON,
+            "Second should be -0.5, got {}",
+            result.included[1].relevance_score
+        );
+        assert!(
+            (result.included[2].relevance_score - (-1.0)).abs() < f32::EPSILON,
+            "Last should be -1.0, got {}",
+            result.included[2].relevance_score
+        );
+    }
 }
