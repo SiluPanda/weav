@@ -58,7 +58,7 @@
 <p align="center">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue.svg">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.85%2B-orange.svg">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-565%20passing-brightgreen.svg">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-731%20passing-brightgreen.svg">
   <img alt="Crates" src="https://img.shields.io/badge/crates-9-purple.svg">
 </p>
 
@@ -656,17 +656,17 @@ cd sdk/python && pip install -e ".[dev]" && pytest
 cd sdk/node && npm test
 ```
 
-**565 Rust tests** across all crates, **639 total** including SDKs — all passing.
+**731 Rust tests** across all crates, **805 total** including SDKs — all passing.
 
 | Crate | Tests |
 |---|---|
-| weav-core | 73 |
-| weav-graph | 90 |
-| weav-vector | 37 |
-| weav-query | 84 |
-| weav-persist | 28 |
+| weav-core | 105 |
+| weav-graph | 138 |
+| weav-vector | 53 |
+| weav-query | 118 |
+| weav-persist | 44 |
 | weav-proto | 61 |
-| weav-server | 153 (71 unit + 22 integration + 60 E2E) |
+| weav-server | 173 (77 unit + 28 integration + 68 E2E) |
 | weav-cli | 39 |
 | Python SDK | 49 |
 | Node SDK | 25 |
