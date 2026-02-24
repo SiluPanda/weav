@@ -795,4 +795,238 @@ mod tests {
 
         fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn test_wal_checksum_mismatch_detection() {
+        let dir = test_dir("checksum_mismatch");
+        let wal_path = dir.join("wal");
+
+        // Build a WalEntry with a deliberately wrong checksum and write it manually.
+        // This guarantees a checksum mismatch that the reader must detect.
+        {
+            use std::io::Write;
+            let op = WalOperation::NodeAdd {
+                graph_id: 1,
+                node_id: 42,
+                label: "Person".into(),
+                properties_json: r#"{"name":"Alice"}"#.into(),
+                embedding: Some(vec![1.0, 2.0]),
+                entity_key: None,
+            };
+            let op_bytes = bincode::serialize(&op).unwrap();
+            let correct_checksum = compute_checksum(&op_bytes);
+
+            // Create an entry with a corrupted checksum (off by one).
+            let entry = WalEntry {
+                seq: 1,
+                timestamp: now_millis(),
+                shard_id: 0,
+                operation: op,
+                checksum: correct_checksum.wrapping_add(1),
+            };
+
+            let entry_bytes = bincode::serialize(&entry).unwrap();
+            let len = entry_bytes.len() as u32;
+
+            let mut file = File::create(&wal_path).unwrap();
+            file.write_all(&len.to_le_bytes()).unwrap();
+            file.write_all(&entry_bytes).unwrap();
+            file.flush().unwrap();
+        }
+
+        // Reading should yield exactly one entry which is a checksum mismatch error.
+        let reader = WalReader::open(&wal_path).unwrap();
+        let results: Vec<io::Result<WalEntry>> = reader.collect();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_err(), "Corrupted entry should be detected");
+        let err_msg = results[0].as_ref().unwrap_err().to_string();
+        assert!(
+            err_msg.contains("checksum mismatch"),
+            "Error should mention checksum mismatch, got: {err_msg}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_wal_truncated_length_prefix() {
+        let dir = test_dir("truncated_len");
+        let wal_path = dir.join("wal");
+
+        // Write 2 valid entries.
+        {
+            let mut wal =
+                WriteAheadLog::new(wal_path.clone(), 1024 * 1024, WalSyncMode::Always).unwrap();
+            wal.append(0, WalOperation::GraphDrop { name: "a".into() })
+                .unwrap();
+            wal.append(0, WalOperation::GraphDrop { name: "b".into() })
+                .unwrap();
+        }
+
+        // Append only 2 incomplete bytes (less than a full u32 length prefix).
+        {
+            use std::io::Write;
+            let mut file = OpenOptions::new().append(true).open(&wal_path).unwrap();
+            file.write_all(&[0x01, 0x02]).unwrap();
+            file.flush().unwrap();
+        }
+
+        // Reader should return the 2 valid entries and then handle the truncated
+        // prefix gracefully (UnexpectedEof causes the iterator to return None).
+        let reader = WalReader::open(&wal_path).unwrap();
+        let results: Vec<io::Result<WalEntry>> = reader.collect();
+        // The 2-byte incomplete length prefix triggers UnexpectedEof on read_exact,
+        // which the reader treats as end-of-file (returns None), so we get exactly 2 results.
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_ok());
+        assert!(results[1].is_ok());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_wal_empty_file() {
+        let dir = test_dir("empty_file");
+        let wal_path = dir.join("wal");
+
+        // Create an empty file (0 bytes).
+        fs::write(&wal_path, b"").unwrap();
+
+        // WalReader::open should succeed.
+        let reader = WalReader::open(&wal_path).unwrap();
+
+        // Iterating should produce no entries.
+        let entries: Vec<io::Result<WalEntry>> = reader.collect();
+        assert!(entries.is_empty());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_wal_graph_id_hint_coverage() {
+        // GraphCreate returns 0.
+        let op = WalOperation::GraphCreate {
+            name: "g".into(),
+            config_json: "{}".into(),
+        };
+        assert_eq!(op.graph_id_hint(), 0);
+
+        // GraphDrop returns 0.
+        let op = WalOperation::GraphDrop {
+            name: "g".into(),
+        };
+        assert_eq!(op.graph_id_hint(), 0);
+
+        // NodeAdd returns its graph_id.
+        let op = WalOperation::NodeAdd {
+            graph_id: 5,
+            node_id: 1,
+            label: "L".into(),
+            properties_json: "{}".into(),
+            embedding: None,
+            entity_key: None,
+        };
+        assert_eq!(op.graph_id_hint(), 5);
+
+        // NodeUpdate returns its graph_id.
+        let op = WalOperation::NodeUpdate {
+            graph_id: 10,
+            node_id: 1,
+            properties_json: "{}".into(),
+        };
+        assert_eq!(op.graph_id_hint(), 10);
+
+        // NodeDelete returns its graph_id.
+        let op = WalOperation::NodeDelete {
+            graph_id: 7,
+            node_id: 1,
+        };
+        assert_eq!(op.graph_id_hint(), 7);
+
+        // EdgeAdd returns its graph_id.
+        let op = WalOperation::EdgeAdd {
+            graph_id: 3,
+            edge_id: 1,
+            source: 1,
+            target: 2,
+            label: "KNOWS".into(),
+            weight: 1.0,
+        };
+        assert_eq!(op.graph_id_hint(), 3);
+
+        // EdgeInvalidate returns its graph_id.
+        let op = WalOperation::EdgeInvalidate {
+            graph_id: 8,
+            edge_id: 1,
+            timestamp: 1000,
+        };
+        assert_eq!(op.graph_id_hint(), 8);
+
+        // EdgeDelete returns its graph_id.
+        let op = WalOperation::EdgeDelete {
+            graph_id: 12,
+            edge_id: 1,
+        };
+        assert_eq!(op.graph_id_hint(), 12);
+
+        // VectorUpdate returns its graph_id.
+        let op = WalOperation::VectorUpdate {
+            graph_id: 99,
+            node_id: 1,
+            vector: vec![0.1],
+        };
+        assert_eq!(op.graph_id_hint(), 99);
+    }
+
+    #[test]
+    fn test_wal_truncate_before_all() {
+        let dir = test_dir("truncate_all");
+        let wal_path = dir.join("wal");
+
+        // Write 5 entries (seq 1..=5).
+        let mut wal =
+            WriteAheadLog::new(wal_path.clone(), 1024 * 1024, WalSyncMode::Always).unwrap();
+        for _ in 0..5 {
+            wal.append(0, WalOperation::GraphDrop { name: "g".into() })
+                .unwrap();
+        }
+        assert_eq!(wal.sequence_number(), 5);
+
+        // Truncate with seq > last entry: all entries should be removed.
+        wal.truncate_before(100).unwrap();
+
+        // Read back: no entries should remain.
+        let reader = WalReader::open(&wal_path).unwrap();
+        let entries: Vec<WalEntry> = reader.map(|r| r.unwrap()).collect();
+        assert!(entries.is_empty());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_wal_truncate_before_none() {
+        let dir = test_dir("truncate_none");
+        let wal_path = dir.join("wal");
+
+        // Write 5 entries (seq 1..=5).
+        let mut wal =
+            WriteAheadLog::new(wal_path.clone(), 1024 * 1024, WalSyncMode::Always).unwrap();
+        for _ in 0..5 {
+            wal.append(0, WalOperation::GraphDrop { name: "g".into() })
+                .unwrap();
+        }
+        assert_eq!(wal.sequence_number(), 5);
+
+        // Truncate with seq=1: keeps all entries with seq >= 1 (i.e., all of them).
+        wal.truncate_before(1).unwrap();
+
+        // Read back: all 5 entries should remain.
+        let reader = WalReader::open(&wal_path).unwrap();
+        let entries: Vec<WalEntry> = reader.map(|r| r.unwrap()).collect();
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[0].seq, 1);
+        assert_eq!(entries[4].seq, 5);
+
+        fs::remove_dir_all(&dir).ok();
+    }
 }

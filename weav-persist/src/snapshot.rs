@@ -485,4 +485,215 @@ mod tests {
 
         fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn test_snapshot_multiple_graphs_roundtrip() {
+        let dir = test_dir("multi_graph_rt");
+        let engine = SnapshotEngine::new(dir.clone());
+
+        // Build a snapshot with 3 graphs, each with different node/edge counts.
+        let snap = FullSnapshot {
+            meta: SnapshotMeta {
+                path: PathBuf::new(),
+                created_at: now_millis(),
+                size_bytes: 0,
+                node_count: 6,  // 1 + 2 + 3
+                edge_count: 3,  // 0 + 1 + 2
+                graph_count: 3,
+                wal_sequence: 50,
+            },
+            graphs: vec![
+                GraphSnapshot {
+                    graph_id: 1,
+                    graph_name: "graph-alpha".into(),
+                    config_json: r#"{"dim":128}"#.into(),
+                    nodes: vec![NodeSnapshot {
+                        node_id: 1,
+                        label: "A".into(),
+                        properties_json: "{}".into(),
+                        embedding: None,
+                        entity_key: None,
+                    }],
+                    edges: vec![],
+                },
+                GraphSnapshot {
+                    graph_id: 2,
+                    graph_name: "graph-beta".into(),
+                    config_json: "{}".into(),
+                    nodes: vec![
+                        NodeSnapshot {
+                            node_id: 10,
+                            label: "B".into(),
+                            properties_json: r#"{"x":1}"#.into(),
+                            embedding: Some(vec![0.1, 0.2]),
+                            entity_key: Some("b1".into()),
+                        },
+                        NodeSnapshot {
+                            node_id: 11,
+                            label: "B".into(),
+                            properties_json: r#"{"x":2}"#.into(),
+                            embedding: None,
+                            entity_key: Some("b2".into()),
+                        },
+                    ],
+                    edges: vec![EdgeSnapshot {
+                        edge_id: 100,
+                        source: 10,
+                        target: 11,
+                        label: "LINK".into(),
+                        weight: 0.5,
+                        valid_from: 500,
+                        valid_until: u64::MAX,
+                    }],
+                },
+                GraphSnapshot {
+                    graph_id: 3,
+                    graph_name: "graph-gamma".into(),
+                    config_json: "{}".into(),
+                    nodes: vec![
+                        NodeSnapshot {
+                            node_id: 20,
+                            label: "C".into(),
+                            properties_json: "{}".into(),
+                            embedding: None,
+                            entity_key: None,
+                        },
+                        NodeSnapshot {
+                            node_id: 21,
+                            label: "C".into(),
+                            properties_json: "{}".into(),
+                            embedding: None,
+                            entity_key: None,
+                        },
+                        NodeSnapshot {
+                            node_id: 22,
+                            label: "C".into(),
+                            properties_json: "{}".into(),
+                            embedding: None,
+                            entity_key: None,
+                        },
+                    ],
+                    edges: vec![
+                        EdgeSnapshot {
+                            edge_id: 200,
+                            source: 20,
+                            target: 21,
+                            label: "REL".into(),
+                            weight: 1.0,
+                            valid_from: 0,
+                            valid_until: u64::MAX,
+                        },
+                        EdgeSnapshot {
+                            edge_id: 201,
+                            source: 21,
+                            target: 22,
+                            label: "REL".into(),
+                            weight: 0.8,
+                            valid_from: 0,
+                            valid_until: u64::MAX,
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let path = engine.save_snapshot(&snap).unwrap();
+        let loaded = engine.load_snapshot(&path).unwrap();
+
+        assert_eq!(loaded.meta.graph_count, 3);
+        assert_eq!(loaded.meta.node_count, 6);
+        assert_eq!(loaded.meta.edge_count, 3);
+        assert_eq!(loaded.meta.wal_sequence, 50);
+        assert_eq!(loaded.graphs.len(), 3);
+
+        // Verify each graph.
+        assert_eq!(loaded.graphs[0].graph_name, "graph-alpha");
+        assert_eq!(loaded.graphs[0].nodes.len(), 1);
+        assert_eq!(loaded.graphs[0].edges.len(), 0);
+
+        assert_eq!(loaded.graphs[1].graph_name, "graph-beta");
+        assert_eq!(loaded.graphs[1].nodes.len(), 2);
+        assert_eq!(loaded.graphs[1].edges.len(), 1);
+        assert_eq!(loaded.graphs[1].nodes[0].entity_key, Some("b1".into()));
+
+        assert_eq!(loaded.graphs[2].graph_name, "graph-gamma");
+        assert_eq!(loaded.graphs[2].nodes.len(), 3);
+        assert_eq!(loaded.graphs[2].edges.len(), 2);
+        assert_eq!(loaded.graphs[2].edges[1].weight, 0.8);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_snapshot_large_embedding() {
+        let dir = test_dir("large_embed");
+        let engine = SnapshotEngine::new(dir.clone());
+
+        // Create a 4096-dimension embedding vector.
+        let large_embedding: Vec<f32> = (0..4096).map(|i| (i as f32) * 0.001).collect();
+
+        let snap = FullSnapshot {
+            meta: SnapshotMeta {
+                path: PathBuf::new(),
+                created_at: now_millis(),
+                size_bytes: 0,
+                node_count: 1,
+                edge_count: 0,
+                graph_count: 1,
+                wal_sequence: 1,
+            },
+            graphs: vec![GraphSnapshot {
+                graph_id: 1,
+                graph_name: "embed-graph".into(),
+                config_json: "{}".into(),
+                nodes: vec![NodeSnapshot {
+                    node_id: 1,
+                    label: "Document".into(),
+                    properties_json: r#"{"title":"Large"}"#.into(),
+                    embedding: Some(large_embedding.clone()),
+                    entity_key: None,
+                }],
+                edges: vec![],
+            }],
+        };
+
+        let path = engine.save_snapshot(&snap).unwrap();
+        let loaded = engine.load_snapshot(&path).unwrap();
+
+        let loaded_embedding = loaded.graphs[0].nodes[0].embedding.as_ref().unwrap();
+        assert_eq!(loaded_embedding.len(), 4096);
+        // Verify all values round-trip exactly.
+        assert_eq!(loaded_embedding, &large_embedding);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_snapshot_meta_helper() {
+        let meta = make_meta(100, 50, 3, 999);
+
+        assert_eq!(meta.node_count, 100);
+        assert_eq!(meta.edge_count, 50);
+        assert_eq!(meta.graph_count, 3);
+        assert_eq!(meta.wal_sequence, 999);
+        assert_eq!(meta.size_bytes, 0);
+        // path should be empty (default).
+        assert_eq!(meta.path, PathBuf::new());
+        // created_at should be a recent timestamp (within the last few seconds).
+        assert!(meta.created_at > 0);
+    }
+
+    #[test]
+    fn test_snapshot_load_nonexistent_file() {
+        let dir = test_dir("load_nonexistent");
+        let engine = SnapshotEngine::new(dir.clone());
+
+        let result = engine.load_snapshot(Path::new("/tmp/weav_nonexistent_snapshot_12345.bin"));
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -548,4 +548,335 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn test_recovery_wal_entries_for_deleted_graphs() {
+        let dir = test_dir("deleted_graphs");
+        let wal_path = dir.join("wal");
+
+        // Write: GraphCreate, NodeAdd, GraphDrop -- all for the same graph.
+        {
+            let mut wal =
+                WriteAheadLog::new(wal_path, 1024 * 1024, WalSyncMode::Always).unwrap();
+            wal.append(
+                0,
+                WalOperation::GraphCreate {
+                    name: "ephemeral".into(),
+                    config_json: "{}".into(),
+                },
+            )
+            .unwrap();
+            wal.append(
+                0,
+                WalOperation::NodeAdd {
+                    graph_id: 1,
+                    node_id: 1,
+                    label: "Thing".into(),
+                    properties_json: "{}".into(),
+                    embedding: None,
+                    entity_key: None,
+                },
+            )
+            .unwrap();
+            wal.append(
+                0,
+                WalOperation::GraphDrop {
+                    name: "ephemeral".into(),
+                },
+            )
+            .unwrap();
+        }
+
+        let mgr = RecoveryManager::new(dir.clone());
+        let result = mgr.recover().unwrap();
+
+        // All 3 entries should be replayed (recovery doesn't skip ops for dropped graphs).
+        assert_eq!(result.wal_entries_replayed, 3);
+        assert!(result.errors.is_empty());
+        assert_eq!(result.wal_entries.len(), 3);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_recovery_out_of_order_wal_sequences() {
+        let dir = test_dir("out_of_order");
+        let wal_path = dir.join("wal");
+
+        // Manually write entries with out-of-order sequence numbers (3, 1, 2).
+        // We do this by directly writing WAL entries with custom seq values.
+        {
+            use std::io::Write;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&wal_path)
+                .unwrap();
+            let mut writer = std::io::BufWriter::new(file);
+
+            for seq in [3u64, 1, 2] {
+                let op = WalOperation::GraphDrop {
+                    name: format!("g{seq}"),
+                };
+                let op_bytes = bincode::serialize(&op).unwrap();
+                let checksum = compute_checksum(&op_bytes);
+                let entry = WalEntry {
+                    seq,
+                    timestamp: now_millis(),
+                    shard_id: 0,
+                    operation: op,
+                    checksum,
+                };
+                let entry_bytes = bincode::serialize(&entry).unwrap();
+                let len = entry_bytes.len() as u32;
+                writer.write_all(&len.to_le_bytes()).unwrap();
+                writer.write_all(&entry_bytes).unwrap();
+            }
+            writer.flush().unwrap();
+        }
+
+        let mgr = RecoveryManager::new(dir.clone());
+        let result = mgr.recover().unwrap();
+
+        // All entries with seq > 0 (cutoff) should be replayed: 3, 1, 2 => all 3.
+        assert_eq!(result.wal_entries_replayed, 3);
+        assert!(result.errors.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_recovery_duplicate_wal_entries() {
+        let dir = test_dir("dup_entries");
+        let wal_path = dir.join("wal");
+
+        // Write entries with duplicate sequence numbers.
+        {
+            use std::io::Write;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&wal_path)
+                .unwrap();
+            let mut writer = std::io::BufWriter::new(file);
+
+            // Two entries both with seq=5.
+            for _ in 0..2 {
+                let op = WalOperation::NodeAdd {
+                    graph_id: 1,
+                    node_id: 1,
+                    label: "Dup".into(),
+                    properties_json: "{}".into(),
+                    embedding: None,
+                    entity_key: None,
+                };
+                let op_bytes = bincode::serialize(&op).unwrap();
+                let checksum = compute_checksum(&op_bytes);
+                let entry = WalEntry {
+                    seq: 5,
+                    timestamp: now_millis(),
+                    shard_id: 0,
+                    operation: op,
+                    checksum,
+                };
+                let entry_bytes = bincode::serialize(&entry).unwrap();
+                let len = entry_bytes.len() as u32;
+                writer.write_all(&len.to_le_bytes()).unwrap();
+                writer.write_all(&entry_bytes).unwrap();
+            }
+            writer.flush().unwrap();
+        }
+
+        let mgr = RecoveryManager::new(dir.clone());
+        let result = mgr.recover().unwrap();
+
+        // Both entries should be replayed (no dedup).
+        assert_eq!(result.wal_entries_replayed, 2);
+        assert!(result.errors.is_empty());
+        assert_eq!(result.wal_entries.len(), 2);
+        assert_eq!(result.wal_entries[0].seq, 5);
+        assert_eq!(result.wal_entries[1].seq, 5);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_recovery_empty_wal_file() {
+        let dir = test_dir("empty_wal");
+        let wal_path = dir.join("wal");
+
+        // Create an empty WAL file.
+        std::fs::write(&wal_path, b"").unwrap();
+
+        let mgr = RecoveryManager::new(dir.clone());
+        let result = mgr.recover().unwrap();
+
+        assert_eq!(result.wal_entries_replayed, 0);
+        assert!(result.errors.is_empty());
+        assert!(result.wal_entries.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_recovery_snapshot_plus_no_new_wal() {
+        let dir = test_dir("snap_no_new_wal");
+
+        // Create a snapshot at wal_sequence=100.
+        let engine = SnapshotEngine::new(dir.clone());
+        let snap = FullSnapshot {
+            meta: SnapshotMeta {
+                path: PathBuf::new(),
+                created_at: now_millis(),
+                size_bytes: 0,
+                node_count: 5,
+                edge_count: 2,
+                graph_count: 1,
+                wal_sequence: 100,
+            },
+            graphs: vec![GraphSnapshot {
+                graph_id: 1,
+                graph_name: "g1".into(),
+                config_json: "{}".into(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            }],
+        };
+        engine.save_snapshot(&snap).unwrap();
+
+        // Create a WAL with entries only up to seq 100.
+        let wal_path = dir.join("wal");
+        {
+            use std::io::Write;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&wal_path)
+                .unwrap();
+            let mut writer = std::io::BufWriter::new(file);
+
+            for seq in [98u64, 99, 100] {
+                let op = WalOperation::GraphDrop {
+                    name: format!("g{seq}"),
+                };
+                let op_bytes = bincode::serialize(&op).unwrap();
+                let checksum = compute_checksum(&op_bytes);
+                let entry = WalEntry {
+                    seq,
+                    timestamp: now_millis(),
+                    shard_id: 0,
+                    operation: op,
+                    checksum,
+                };
+                let entry_bytes = bincode::serialize(&entry).unwrap();
+                let len = entry_bytes.len() as u32;
+                writer.write_all(&len.to_le_bytes()).unwrap();
+                writer.write_all(&entry_bytes).unwrap();
+            }
+            writer.flush().unwrap();
+        }
+
+        let mgr = RecoveryManager::new(dir.clone());
+        let result = mgr.recover().unwrap();
+
+        // Snapshot loaded, but no WAL entries with seq > 100 => 0 replayed.
+        assert_eq!(result.snapshots_loaded, 1);
+        assert_eq!(result.graphs_recovered, 1);
+        assert_eq!(result.wal_entries_replayed, 0);
+        assert!(result.errors.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_recovery_multiple_graphs_in_wal() {
+        let dir = test_dir("multi_graph_wal");
+        let wal_path = dir.join("wal");
+
+        // Write operations spanning 3 different graphs.
+        {
+            let mut wal =
+                WriteAheadLog::new(wal_path, 1024 * 1024, WalSyncMode::Always).unwrap();
+
+            // Graph 1 operations.
+            wal.append(
+                0,
+                WalOperation::NodeAdd {
+                    graph_id: 1,
+                    node_id: 1,
+                    label: "A".into(),
+                    properties_json: "{}".into(),
+                    embedding: None,
+                    entity_key: None,
+                },
+            )
+            .unwrap();
+
+            // Graph 2 operations.
+            wal.append(
+                0,
+                WalOperation::NodeAdd {
+                    graph_id: 2,
+                    node_id: 10,
+                    label: "B".into(),
+                    properties_json: "{}".into(),
+                    embedding: None,
+                    entity_key: None,
+                },
+            )
+            .unwrap();
+            wal.append(
+                0,
+                WalOperation::EdgeAdd {
+                    graph_id: 2,
+                    edge_id: 100,
+                    source: 10,
+                    target: 11,
+                    label: "REL".into(),
+                    weight: 1.0,
+                },
+            )
+            .unwrap();
+
+            // Graph 3 operations.
+            wal.append(
+                0,
+                WalOperation::VectorUpdate {
+                    graph_id: 3,
+                    node_id: 20,
+                    vector: vec![0.1, 0.2, 0.3],
+                },
+            )
+            .unwrap();
+            wal.append(
+                0,
+                WalOperation::NodeDelete {
+                    graph_id: 3,
+                    node_id: 20,
+                },
+            )
+            .unwrap();
+        }
+
+        let mgr = RecoveryManager::new(dir.clone());
+        let result = mgr.recover().unwrap();
+
+        // All 5 operations across 3 graphs should be replayed.
+        assert_eq!(result.wal_entries_replayed, 5);
+        assert!(result.errors.is_empty());
+        assert_eq!(result.wal_entries.len(), 5);
+
+        // Verify the graph_id hints span 3 different graphs.
+        let graph_ids: std::collections::HashSet<u32> = result
+            .wal_entries
+            .iter()
+            .map(|e| e.operation.graph_id_hint())
+            .collect();
+        assert_eq!(graph_ids.len(), 3);
+        assert!(graph_ids.contains(&1));
+        assert!(graph_ids.contains(&2));
+        assert!(graph_ids.contains(&3));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
