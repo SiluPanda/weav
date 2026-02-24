@@ -667,4 +667,154 @@ mod tests {
         // Verify the internal ef_search is back to the original value (50)
         assert_eq!(index.inner.expansion_search(), 50);
     }
+
+    // ── Round 6 edge-case tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_insert_all_zero_vector() {
+        let config = make_config(4);
+        let mut index = VectorIndex::new(config).unwrap();
+        index.insert(1, &[0.0, 0.0, 0.0, 0.0]).unwrap();
+        assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn test_search_k_zero() {
+        let config = make_config(4);
+        let mut index = VectorIndex::new(config).unwrap();
+        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+
+        let results = index.search(&[1.0, 0.0, 0.0, 0.0], 0, None).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_k_greater_than_index_size() {
+        let config = make_config(4);
+        let mut index = VectorIndex::new(config).unwrap();
+        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        index.insert(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+
+        let results = index.search(&[1.0, 0.0, 0.0, 0.0], 10, None).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_remove_non_existent_node() {
+        let config = make_config(4);
+        let mut index = VectorIndex::new(config).unwrap();
+        // Node 999 was never inserted; remove should return Ok(())
+        assert!(index.remove(999).is_ok());
+    }
+
+    #[test]
+    fn test_update_non_existent_node() {
+        let config = make_config(4);
+        let mut index = VectorIndex::new(config).unwrap();
+        // Node 999 doesn't exist; update uses remove+insert pattern so it should insert
+        index.update(999, &[0.5, 0.5, 0.0, 0.0]).unwrap();
+        assert_eq!(index.len(), 1);
+        assert!(index.contains(999));
+    }
+
+    #[test]
+    fn test_insert_after_remove() {
+        let config = make_config(4);
+        let mut index = VectorIndex::new(config).unwrap();
+
+        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        assert_eq!(index.len(), 1);
+
+        index.remove(1).unwrap();
+        assert_eq!(index.len(), 0);
+
+        index.insert(1, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(index.len(), 1);
+        assert!(index.contains(1));
+    }
+
+    #[test]
+    fn test_search_filtered_empty_candidates() {
+        let config = make_config(4);
+        let mut index = VectorIndex::new(config).unwrap();
+        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+
+        let candidates = RoaringBitmap::new(); // empty
+        let results = index
+            .search_filtered(&[1.0, 0.0, 0.0, 0.0], 5, &candidates)
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_filtered_no_matching_candidates() {
+        let config = make_config(4);
+        let mut index = VectorIndex::new(config).unwrap();
+        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        index.insert(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        index.insert(3, &[0.0, 0.0, 1.0, 0.0]).unwrap();
+
+        // Filter to nodes 100, 200 which don't exist in the index
+        let mut candidates = RoaringBitmap::new();
+        candidates.insert(100);
+        candidates.insert(200);
+
+        let results = index
+            .search_filtered(&[1.0, 0.0, 0.0, 0.0], 5, &candidates)
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_euclidean_metric_distance() {
+        let config = VectorConfig {
+            dimensions: 4,
+            metric: DistanceMetric::Euclidean,
+            hnsw_m: 16,
+            hnsw_ef_construction: 200,
+            hnsw_ef_search: 50,
+            quantization: Quantization::None,
+        };
+        let mut index = VectorIndex::new(config).unwrap();
+
+        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        index.insert(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+
+        // Search for vector [1,0,0,0]; nearest is node 1 (distance 0)
+        let results = index.search(&[1.0, 0.0, 0.0, 0.0], 2, None).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, 1);
+        assert!(results[0].1 < 0.01); // exact match
+
+        // Node 2 is at L2sq distance = (1-0)^2 + (0-1)^2 + 0 + 0 = 2.0
+        assert_eq!(results[1].0, 2);
+        assert!((results[1].1 - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_dot_product_metric() {
+        let config = VectorConfig {
+            dimensions: 4,
+            metric: DistanceMetric::DotProduct,
+            hnsw_m: 16,
+            hnsw_ef_construction: 200,
+            hnsw_ef_search: 50,
+            quantization: Quantization::None,
+        };
+        let mut index = VectorIndex::new(config).unwrap();
+
+        // Insert two unit-ish vectors
+        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        index.insert(2, &[0.5, 0.5, 0.0, 0.0]).unwrap();
+
+        // Search with [1,0,0,0]. Inner product with node 1 = 1.0, with node 2 = 0.5.
+        // usearch uses IP metric where distance = 1 - dot_product for normalized,
+        // so node 1 should be the best match.
+        let results = index.search(&[1.0, 0.0, 0.0, 0.0], 2, None).unwrap();
+        assert_eq!(results.len(), 2);
+        // Node 1 should be the closest (highest dot product = lowest distance)
+        assert_eq!(results[0].0, 1);
+        // The distances should be ordered
+        assert!(results[0].1 <= results[1].1);
+    }
 }

@@ -270,4 +270,82 @@ mod tests {
         let map = Value::Map(vec![("k".into(), Value::Bool(true))]);
         assert_eq!(value_to_string(&map), "{k: true}");
     }
+
+    // ── Round 6 edge-case tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_token_count_multibyte_utf8() {
+        let counter = TokenCounter::new(TokenCounterType::CharDiv4);
+        // "cafe\u{0301}" = "caf\xc3\xa9" in UTF-8, 5 bytes (c, a, f, 0xc3, 0xa9)
+        // Actually "café" as a single char e-acute is 5 bytes total
+        let text = "caf\u{00e9}";
+        let byte_len = text.len(); // 5 bytes (c=1, a=1, f=1, e-acute=2)
+        assert_eq!(byte_len, 5);
+        // CharDiv4 counts bytes: ceil(5/4) = 2
+        assert_eq!(counter.count(text), 2);
+    }
+
+    #[test]
+    fn test_token_count_emoji() {
+        let counter = TokenCounter::new(TokenCounterType::CharDiv4);
+        let text = "Hello \u{1F30D}"; // "Hello 🌍"
+        let byte_len = text.len(); // "Hello " = 6 bytes, 🌍 = 4 bytes = 10 total
+        assert_eq!(byte_len, 10);
+        // CharDiv4: ceil(10/4) = 3
+        assert_eq!(counter.count(text), 3);
+    }
+
+    #[test]
+    fn test_token_count_cjk() {
+        let counter = TokenCounter::new(TokenCounterType::CharDiv4);
+        let text = "\u{4F60}\u{597D}\u{4E16}\u{754C}"; // "你好世界"
+        let byte_len = text.len(); // Each CJK char is 3 bytes in UTF-8: 4*3 = 12
+        assert_eq!(byte_len, 12);
+        // CharDiv4: ceil(12/4) = 3
+        assert_eq!(counter.count(text), 3);
+    }
+
+    #[test]
+    fn test_token_count_very_long_string() {
+        let counter = TokenCounter::new(TokenCounterType::CharDiv4);
+        let text = "a".repeat(10000);
+        // 10000 bytes, CharDiv4: ceil(10000/4) = 2500
+        assert_eq!(counter.count(&text), 2500);
+    }
+
+    #[test]
+    fn test_count_node_with_all_value_types() {
+        let counter = TokenCounter::new(TokenCounterType::CharDiv4);
+        let props = vec![
+            ("null_prop".to_string(), Value::Null),
+            ("bool_prop".to_string(), Value::Bool(true)),
+            ("int_prop".to_string(), Value::Int(42)),
+            ("float_prop".to_string(), Value::Float(3.14)),
+            ("str_prop".to_string(), Value::String("hello".into())),
+            ("bytes_prop".to_string(), Value::Bytes(vec![0xDE, 0xAD])),
+            ("vec_prop".to_string(), Value::Vector(vec![1.0, 2.0])),
+            (
+                "list_prop".to_string(),
+                Value::List(vec![Value::Int(1), Value::Bool(false)]),
+            ),
+            (
+                "map_prop".to_string(),
+                Value::Map(vec![("k".into(), Value::Int(9))]),
+            ),
+            ("ts_prop".to_string(), Value::Timestamp(1700000000)),
+        ];
+        let count = counter.count_node(1, &props);
+        // Should not panic and should return a positive count
+        assert!(count > 0);
+    }
+
+    #[test]
+    fn test_count_chunk_no_relationships() {
+        let counter = TokenCounter::new(TokenCounterType::CharDiv4);
+        let count = counter.count_chunk("content", "label", &[]);
+        // "label\ncontent" = 13 bytes, ceil(13/4) = 4
+        let expected = counter.count("label\ncontent");
+        assert_eq!(count, expected);
+        assert_eq!(count, 4);
+    }
 }

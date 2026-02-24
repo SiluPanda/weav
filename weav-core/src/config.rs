@@ -428,4 +428,80 @@ max_memory_mb = 8192
         assert_eq!(pc.snapshot_interval_secs, 3600);
         assert_eq!(pc.max_wal_size_mb, 256);
     }
+
+    // ── Round 1 edge-case tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_config_validate_dimensions_equal() {
+        let mut config = WeavConfig::default();
+        config.engine.default_vector_dimensions = 2048;
+        config.engine.max_vector_dimensions = 2048;
+        // max >= default, should pass
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validate_both_dimensions_zero() {
+        let mut config = WeavConfig::default();
+        config.engine.default_vector_dimensions = 0;
+        config.engine.max_vector_dimensions = 0;
+        // default = 0 should fail first
+        let err = config.validate().unwrap_err();
+        match err {
+            crate::error::WeavError::InvalidConfig(msg) => {
+                assert!(msg.contains("default_vector_dimensions"));
+            }
+            other => panic!("expected InvalidConfig, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_toml_unknown_fields_ignored() {
+        let toml_str = r#"
+[server]
+port = 6380
+unknown_field = "should be ignored"
+
+[engine]
+nonexistent_setting = 42
+"#;
+        let config: WeavConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.server.port, 6380);
+    }
+
+    #[test]
+    fn test_toml_empty_string_produces_defaults() {
+        let config: WeavConfig = toml::from_str("").unwrap();
+        assert_eq!(config.server.port, 6380);
+        assert_eq!(config.engine.default_vector_dimensions, 1536);
+        assert!(!config.persistence.enabled);
+    }
+
+    #[test]
+    fn test_toml_partial_config() {
+        let toml_str = r#"
+[server]
+port = 9999
+"#;
+        let config: WeavConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.server.port, 9999);
+        // Everything else should be defaults
+        assert_eq!(config.engine.default_vector_dimensions, 1536);
+        assert_eq!(config.engine.num_shards, None);
+        assert!(!config.persistence.enabled);
+        assert_eq!(config.memory.max_memory_mb, None);
+    }
+
+    #[test]
+    fn test_graph_config_defaults() {
+        let gc = GraphConfig::default();
+        assert_eq!(gc.default_conflict_policy, crate::types::ConflictPolicy::LastWriteWins);
+        assert_eq!(gc.default_decay, crate::types::DecayFunction::None);
+        assert_eq!(gc.max_nodes, None);
+        assert_eq!(gc.max_edges, None);
+        assert!(gc.enable_temporal);
+        assert!(gc.enable_provenance);
+        assert_eq!(gc.vector_dimensions, 1536);
+        assert_eq!(gc.auto_dedup_threshold, None);
+    }
 }

@@ -377,4 +377,101 @@ mod tests {
         assert_eq!(stats.query_count.load(Relaxed), 0);
         assert_eq!(stats.avg_query_us.load(Relaxed), 0);
     }
+
+    // ── Round 2 edge-case tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_string_interner_empty_string_label() {
+        let mut interner = StringInterner::new();
+        let id = interner.intern_label("");
+        assert_eq!(interner.resolve_label(id), Some(""));
+        // Re-interning returns same ID
+        assert_eq!(interner.intern_label(""), id);
+    }
+
+    #[test]
+    fn test_string_interner_empty_string_property() {
+        let mut interner = StringInterner::new();
+        let id = interner.intern_property_key("");
+        assert_eq!(interner.resolve_property_key(id), Some(""));
+        assert_eq!(interner.intern_property_key(""), id);
+    }
+
+    #[test]
+    fn test_string_interner_case_sensitivity() {
+        let mut interner = StringInterner::new();
+        let id_upper = interner.intern_label("Person");
+        let id_lower = interner.intern_label("person");
+        assert_ne!(id_upper, id_lower, "interning is case-sensitive");
+        assert_eq!(interner.resolve_label(id_upper), Some("Person"));
+        assert_eq!(interner.resolve_label(id_lower), Some("person"));
+    }
+
+    #[test]
+    fn test_string_interner_special_characters() {
+        let mut interner = StringInterner::new();
+        let id1 = interner.intern_label("hello world");
+        let id2 = interner.intern_label("key/with/slashes");
+        let id3 = interner.intern_label("emoji_test");
+        let id4 = interner.intern_property_key("prop with spaces");
+
+        assert_eq!(interner.resolve_label(id1), Some("hello world"));
+        assert_eq!(interner.resolve_label(id2), Some("key/with/slashes"));
+        assert_eq!(interner.resolve_label(id3), Some("emoji_test"));
+        assert_eq!(interner.resolve_property_key(id4), Some("prop with spaces"));
+    }
+
+    #[test]
+    fn test_string_interner_many_labels_monotonic() {
+        let mut interner = StringInterner::new();
+        let mut ids = Vec::new();
+        for i in 0..1000 {
+            let id = interner.intern_label(&format!("label_{i}"));
+            ids.push(id);
+        }
+        // IDs should be monotonically increasing
+        for w in ids.windows(2) {
+            assert!(w[1] > w[0], "IDs should be monotonically increasing");
+        }
+        // Verify round-trip for a sample
+        assert_eq!(interner.resolve_label(ids[0]), Some("label_0"));
+        assert_eq!(interner.resolve_label(ids[999]), Some("label_999"));
+    }
+
+    #[test]
+    fn test_graph_shard_count_increment() {
+        let mut gs = GraphShard::new(1, "test".into(), GraphConfig::default());
+        assert_eq!(gs.node_count, 0);
+        assert_eq!(gs.edge_count, 0);
+
+        gs.node_count += 100;
+        gs.edge_count += 50;
+        assert_eq!(gs.node_count, 100);
+        assert_eq!(gs.edge_count, 50);
+    }
+
+    #[test]
+    fn test_shard_insert_replace_graph() {
+        let mut shard = Shard::new(0);
+        shard.insert_graph(GraphShard::new(1, "original".into(), GraphConfig::default()));
+        assert_eq!(shard.get_graph(1).unwrap().graph_name.as_str(), "original");
+
+        // Insert with same ID replaces
+        shard.insert_graph(GraphShard::new(1, "replaced".into(), GraphConfig::default()));
+        assert_eq!(shard.get_graph(1).unwrap().graph_name.as_str(), "replaced");
+        assert_eq!(shard.graph_ids().len(), 1);
+    }
+
+    #[test]
+    fn test_shard_multiple_interners_independent() {
+        let mut shard_a = Shard::new(0);
+        let mut shard_b = Shard::new(1);
+
+        let id_a = shard_a.interner_mut().intern_label("Person");
+        let id_b = shard_b.interner_mut().intern_label("Person");
+
+        // Both start from 0, so IDs should be the same value
+        assert_eq!(id_a, id_b);
+        assert_eq!(id_a, 0);
+    }
 }

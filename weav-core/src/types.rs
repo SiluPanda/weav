@@ -861,4 +861,191 @@ mod tests {
         let p1 = Provenance::new("source-b", 1.0);
         assert_eq!(p1.confidence, 1.0);
     }
+
+    // ── Round 1 edge-case tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_bitemporal_zero_width_window() {
+        // valid_from == valid_until => half-open [from, until) is empty
+        let bt = BiTemporal {
+            valid_from: 500,
+            valid_until: 500,
+            tx_from: 500,
+            tx_until: 500,
+        };
+        assert!(!bt.is_valid_at(500), "zero-width window should not be valid at boundary");
+        assert!(!bt.is_valid_at(499));
+        assert!(!bt.is_valid_at(501));
+        assert!(!bt.is_current_at(500), "zero-width tx window should not be current");
+        assert!(!bt.is_active());
+    }
+
+    #[test]
+    fn test_bitemporal_max_timestamp_boundary() {
+        let bt = BiTemporal {
+            valid_from: u64::MAX,
+            valid_until: BiTemporal::OPEN,
+            tx_from: 0,
+            tx_until: BiTemporal::OPEN,
+        };
+        // valid_from = MAX, valid_until = MAX => [MAX, MAX) is empty
+        assert!(!bt.is_valid_at(u64::MAX), "half-open at MAX should be invalid");
+        assert!(!bt.is_valid_at(u64::MAX - 1), "below MAX not >= valid_from if MAX-1 < MAX");
+        // Actually MAX-1 < MAX so valid_from(MAX) <= MAX-1 is false
+    }
+
+    #[test]
+    fn test_bitemporal_is_current_at_max() {
+        let bt = BiTemporal {
+            valid_from: 0,
+            valid_until: BiTemporal::OPEN,
+            tx_from: u64::MAX,
+            tx_until: BiTemporal::OPEN,
+        };
+        // tx_from = MAX, tx_until = MAX => [MAX, MAX) is empty
+        assert!(!bt.is_current_at(u64::MAX));
+        assert!(!bt.is_current_at(u64::MAX - 1));
+    }
+
+    #[test]
+    fn test_decay_custom_unsorted_breakpoints() {
+        // Breakpoints out of order: code iterates linearly, so (1000, 0.5) is
+        // checked first. For age=750, 750 <= 1000 => interpolates (0,1.0)->(1000,0.5)
+        let d = DecayFunction::Custom {
+            breakpoints: vec![(1000, 0.5), (500, 0.8)],
+        };
+        let score = d.apply(1.0, 0, 750);
+        // Interpolation: t = 750/1000 = 0.75, result = 1.0 + 0.75*(0.5-1.0) = 0.625
+        assert!((score - 0.625).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_decay_custom_duplicate_ages() {
+        // Two breakpoints at the same age: bp_age == prev.0,
+        // so the code path `bp_age == prev.0` triggers, returns score * bp_mult
+        let d = DecayFunction::Custom {
+            breakpoints: vec![(500, 0.5), (500, 0.3)],
+        };
+        // At age 500: first bp (500, 0.5) matches since age <= 500.
+        // prev = (0, 1.0), bp = (500, 0.5), bp_age != prev.0 (500 != 0)
+        // t = 500/500 = 1.0, result = 1.0 + 1.0*(0.5-1.0) = 0.5
+        let score = d.apply(1.0, 0, 500);
+        assert!((score - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_decay_custom_single_breakpoint() {
+        let d = DecayFunction::Custom {
+            breakpoints: vec![(500, 0.0)],
+        };
+        // At age 250: interpolate (0,1.0) -> (500,0.0), t = 0.5, result = 0.5
+        assert!((d.apply(1.0, 0, 250) - 0.5).abs() < 0.001);
+        // At age 500: t = 1.0, result = 0.0
+        assert!((d.apply(1.0, 0, 500) - 0.0).abs() < 0.001);
+        // Past last: use last multiplier (0.0)
+        assert_eq!(d.apply(1.0, 0, 1000), 0.0);
+    }
+
+    #[test]
+    fn test_value_empty_list_and_map() {
+        let empty_list = Value::List(vec![]);
+        assert_eq!(empty_list.type_name(), "list");
+        assert_eq!(empty_list.value_type(), ValueType::List);
+        assert_eq!(empty_list.as_int(), None);
+
+        let empty_map = Value::Map(vec![]);
+        assert_eq!(empty_map.type_name(), "map");
+        assert_eq!(empty_map.value_type(), ValueType::Map);
+        assert_eq!(empty_map.as_str(), None);
+    }
+
+    #[test]
+    fn test_value_nested_structures() {
+        let nested = Value::List(vec![
+            Value::Map(vec![
+                ("inner_list".into(), Value::List(vec![
+                    Value::Int(42),
+                    Value::String("deep".into()),
+                ])),
+            ]),
+            Value::List(vec![Value::Null]),
+        ]);
+        assert_eq!(nested.type_name(), "list");
+        assert_eq!(nested.value_type(), ValueType::List);
+        // Verify inner structure is accessible
+        if let Value::List(items) = &nested {
+            assert_eq!(items.len(), 2);
+            if let Value::Map(entries) = &items[0] {
+                assert_eq!(entries[0].0.as_str(), "inner_list");
+            } else {
+                panic!("expected Map");
+            }
+        } else {
+            panic!("expected List");
+        }
+    }
+
+    #[test]
+    fn test_value_float_nan_and_infinity() {
+        let nan_val = Value::Float(f64::NAN);
+        assert_eq!(nan_val.type_name(), "float");
+        let extracted = nan_val.as_float().unwrap();
+        assert!(extracted.is_nan());
+
+        let inf_val = Value::Float(f64::INFINITY);
+        assert_eq!(inf_val.as_float(), Some(f64::INFINITY));
+
+        let neg_inf = Value::Float(f64::NEG_INFINITY);
+        assert_eq!(neg_inf.as_float(), Some(f64::NEG_INFINITY));
+
+        // NaN != NaN (IEEE 754)
+        assert_ne!(Value::Float(f64::NAN), Value::Float(f64::NAN));
+    }
+
+    #[test]
+    fn test_provenance_nan_confidence() {
+        let p = Provenance::new("src", f32::NAN);
+        // f32::NAN.clamp(0.0, 1.0) returns NaN in Rust (comparisons with NaN are false)
+        assert!(p.confidence.is_nan());
+    }
+
+    #[test]
+    fn test_token_allocation_proportional_not_summing_to_one() {
+        // Percentages intentionally sum to 0.5 - no validation at type level
+        let alloc = TokenAllocation::Proportional {
+            entities_pct: 0.2,
+            relationships_pct: 0.1,
+            text_chunks_pct: 0.1,
+            metadata_pct: 0.1,
+        };
+        if let TokenAllocation::Proportional { entities_pct, relationships_pct, text_chunks_pct, metadata_pct } = alloc {
+            let sum = entities_pct + relationships_pct + text_chunks_pct + metadata_pct;
+            assert!((sum - 0.5).abs() < 0.001, "sum should be 0.5, got {sum}");
+        }
+
+        // Over 1.0
+        let over = TokenAllocation::Proportional {
+            entities_pct: 0.5,
+            relationships_pct: 0.5,
+            text_chunks_pct: 0.5,
+            metadata_pct: 0.5,
+        };
+        if let TokenAllocation::Proportional { entities_pct, relationships_pct, text_chunks_pct, metadata_pct } = over {
+            let sum = entities_pct + relationships_pct + text_chunks_pct + metadata_pct;
+            assert!((sum - 2.0).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn test_token_allocation_priority_with_duplicates() {
+        let alloc = TokenAllocation::Priority(vec![
+            ContentPriority::Entities,
+            ContentPriority::Entities,
+            ContentPriority::Metadata,
+        ]);
+        if let TokenAllocation::Priority(p) = alloc {
+            assert_eq!(p.len(), 3);
+            assert_eq!(p[0], p[1]); // duplicates are allowed
+        }
+    }
 }

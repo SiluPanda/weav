@@ -434,4 +434,76 @@ mod tests {
             "should have exactly one message"
         );
     }
+
+    // ── Round 2 edge-case tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_message_bus_single_shard() {
+        let (bus, _receivers) = MessageBus::new(1, 16);
+        // All keys route to shard 0
+        for node_id in 0..100 {
+            assert_eq!(bus.route_by_key(0, node_id), 0);
+        }
+    }
+
+    #[test]
+    fn test_message_bus_route_different_graph_same_node() {
+        let (bus, _receivers) = MessageBus::new(8, 16);
+        let shard_g1 = bus.route_by_key(1, 100);
+        let shard_g2 = bus.route_by_key(2, 100);
+        // Different graph_ids with same node_id may route to different shards
+        // (or the same - we just verify both are valid)
+        assert!(shard_g1 < 8);
+        assert!(shard_g2 < 8);
+        // They should be deterministic
+        assert_eq!(bus.route_by_key(1, 100), shard_g1);
+        assert_eq!(bus.route_by_key(2, 100), shard_g2);
+    }
+
+    #[test]
+    fn test_message_bus_multiple_messages_fifo() {
+        let (bus, receivers) = MessageBus::new(1, 128);
+        // Send 100 snapshot messages
+        for _ in 0..100 {
+            let (resp_tx, _resp_rx) = crossbeam_channel::bounded(1);
+            bus.send_to_shard(0, ShardMessage::Snapshot { respond_to: resp_tx }).unwrap();
+        }
+        // Receive all 100
+        let mut count = 0;
+        while receivers[0].try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 100);
+    }
+
+    #[test]
+    fn test_message_bus_broadcast_shutdown_no_receivers() {
+        let (bus, receivers) = MessageBus::new(4, 16);
+        drop(receivers);
+        // Should not panic
+        bus.broadcast_shutdown();
+    }
+
+    #[test]
+    fn test_message_bus_num_shards_and_buffer() {
+        let (bus, _receivers) = MessageBus::new(16, 256);
+        assert_eq!(bus.num_shards(), 16);
+        assert_eq!(bus.buffer_size(), 256);
+    }
+
+    #[test]
+    fn test_message_bus_send_after_partial_receiver_drop() {
+        let (bus, mut receivers) = MessageBus::new(3, 16);
+        // Drop receiver for shard 1 only
+        let _r0 = receivers.remove(0); // keep shard 0
+        // receivers now has shard 1 and shard 2 (originally indices 1, 2)
+        drop(receivers.remove(0)); // drop shard 1's receiver
+
+        // Send to shard 0 should work
+        bus.send_to_shard(0, ShardMessage::Shutdown).unwrap();
+        // Send to shard 1 should fail (disconnected)
+        assert!(bus.send_to_shard(1, ShardMessage::Shutdown).is_err());
+        // Send to shard 2 should work
+        bus.send_to_shard(2, ShardMessage::Shutdown).unwrap();
+    }
 }

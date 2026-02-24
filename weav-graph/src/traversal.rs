@@ -1307,4 +1307,164 @@ mod tests {
         assert!(sub.nodes.contains(&40));
         assert_eq!(sub.edges.len(), 3);
     }
+
+    // ── Round 5 edge-case tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_bfs_empty_graph_no_seeds() {
+        let adj = AdjacencyStore::new();
+        let result = bfs(&adj, &[], 3, 100, &EdgeFilter::none(), &NodeFilter::none(), Direction::Outgoing, None, None);
+        assert!(result.visited_nodes.is_empty());
+        assert!(result.visited_edges.is_empty());
+    }
+
+    #[test]
+    fn test_bfs_seed_not_in_graph() {
+        let adj = AdjacencyStore::new();
+        let result = bfs(&adj, &[999], 3, 100, &EdgeFilter::none(), &NodeFilter::none(), Direction::Outgoing, None, None);
+        // Seed is pushed into visited even if not in graph, but no expansion
+        assert_eq!(result.visited_nodes.len(), 1);
+        assert_eq!(result.visited_nodes[0], 999);
+        assert!(result.visited_edges.is_empty());
+    }
+
+    #[test]
+    fn test_bfs_disconnected_components() {
+        let mut adj = AdjacencyStore::new();
+        // Component 1: 1->2
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        // Component 2: 3->4
+        adj.add_node(3);
+        adj.add_node(4);
+        adj.add_edge(3, 4, 0, make_meta(3, 4, 0)).unwrap();
+
+        let result = bfs(&adj, &[1], 5, 100, &EdgeFilter::none(), &NodeFilter::none(), Direction::Outgoing, None, None);
+        assert_eq!(result.visited_nodes.len(), 2);
+        assert!(result.visited_nodes.contains(&1));
+        assert!(result.visited_nodes.contains(&2));
+        assert!(!result.visited_nodes.contains(&3));
+        assert!(!result.visited_nodes.contains(&4));
+    }
+
+    #[test]
+    fn test_bfs_cycle_handling() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_node(3);
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let result = bfs(&adj, &[1], 10, 100, &EdgeFilter::none(), &NodeFilter::none(), Direction::Outgoing, None, None);
+        // Should visit each node exactly once (seen set prevents revisits)
+        assert_eq!(result.visited_nodes.len(), 3);
+    }
+
+    #[test]
+    fn test_bfs_max_depth_zero() {
+        let adj = build_linear_graph();
+        let result = bfs(&adj, &[1], 0, 100, &EdgeFilter::none(), &NodeFilter::none(), Direction::Outgoing, None, None);
+        // max_depth=0: seeds only, no expansion
+        assert_eq!(result.visited_nodes.len(), 1);
+        assert_eq!(result.visited_nodes[0], 1);
+    }
+
+    #[test]
+    fn test_bfs_max_depth_255() {
+        let adj = build_linear_graph(); // 4 nodes
+        let result = bfs(&adj, &[1], 255, 100, &EdgeFilter::none(), &NodeFilter::none(), Direction::Outgoing, None, None);
+        // Should traverse entire graph without overflow
+        assert_eq!(result.visited_nodes.len(), 4);
+    }
+
+    #[test]
+    fn test_bfs_max_nodes_limit() {
+        let adj = build_star_graph(); // 5 nodes: 1->2, 1->3, 1->4, 1->5
+        let result = bfs(&adj, &[1], 5, 2, &EdgeFilter::none(), &NodeFilter::none(), Direction::Outgoing, None, None);
+        // max_nodes=2: should stop after 2 nodes
+        assert_eq!(result.visited_nodes.len(), 2);
+    }
+
+    #[test]
+    fn test_flow_score_no_seeds() {
+        let adj = build_linear_graph();
+        let result = flow_score(&adj, &[], 0.5, 0.01, 2);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_flow_score_unreachable_nodes() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2); // no edges from 1 to 2
+
+        let result = flow_score(&adj, &[(1, 1.0)], 0.5, 0.01, 5);
+        // Only seed node should be in results
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].node_id, 1);
+    }
+
+    #[test]
+    fn test_flow_score_zero_alpha() {
+        let adj = build_linear_graph();
+        let result = flow_score(&adj, &[(1, 1.0)], 0.0, 0.01, 3);
+        // alpha=0: propagated = 0.0 < theta, no propagation
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].node_id, 1);
+    }
+
+    #[test]
+    fn test_flow_score_theta_larger_than_seed() {
+        let adj = build_linear_graph();
+        let result = flow_score(&adj, &[(1, 0.5)], 0.5, 1.0, 3);
+        // Propagated = 0.5 * 0.5 = 0.25 < theta(1.0), no propagation
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_shortest_path_same_source_target() {
+        let adj = build_linear_graph();
+        let path = shortest_path(&adj, 1, 1, 10);
+        assert_eq!(path, Some(vec![1]));
+    }
+
+    #[test]
+    fn test_shortest_path_no_path() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2); // disconnected
+
+        let path = shortest_path(&adj, 1, 2, 10);
+        assert!(path.is_none());
+    }
+
+    #[test]
+    fn test_shortest_path_depth_limited() {
+        let adj = build_linear_graph(); // 1->2->3->4
+        // Path 1->3 requires depth 2, but max_depth=1
+        let path = shortest_path(&adj, 1, 3, 1);
+        assert!(path.is_none());
+    }
+
+    #[test]
+    fn test_ego_network_isolated_node() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(42);
+
+        let sub = ego_network(&adj, 42, 2);
+        assert_eq!(sub.nodes.len(), 1);
+        assert_eq!(sub.nodes[0], 42);
+        assert!(sub.edges.is_empty());
+    }
+
+    #[test]
+    fn test_scored_paths_one_anchor() {
+        let adj = build_linear_graph();
+        // Single anchor: no pairs to form, so no paths
+        let paths = scored_paths(&adj, &[(1, 1.0)], 10, 5);
+        assert!(paths.is_empty());
+    }
 }

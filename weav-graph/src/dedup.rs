@@ -481,4 +481,114 @@ mod tests {
             Some(&Value::String(CompactString::from("Alice")))
         );
     }
+
+    // ── Round 4 edge-case tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_find_duplicate_by_vector_nan_scores() {
+        let results = vec![(10, f32::NAN)];
+        // NaN > threshold is always false, so no match
+        let found = find_duplicate_by_vector(&results, 0.5);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_find_duplicate_by_vector_threshold_zero() {
+        let results = vec![(10, 0.01_f32), (20, 0.0001)];
+        // threshold=0.0, any score > 0.0 matches
+        let found = find_duplicate_by_vector(&results, 0.0);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().0, 10);
+    }
+
+    #[test]
+    fn test_find_duplicate_by_vector_threshold_one() {
+        let results = vec![(10, 0.99_f32), (20, 1.0)];
+        // threshold=1.0, only scores > 1.0 match (impossible for normalized similarity)
+        // score=1.0 is NOT > 1.0, so no match
+        let found = find_duplicate_by_vector(&results, 1.0);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_find_duplicate_by_name_empty_string() {
+        let mut props = PropertyStore::new();
+        props.set_node_property(1, "name", Value::String(CompactString::from("")));
+
+        // Empty string vs empty string: Jaro-Winkler similarity is 1.0
+        let found = find_duplicate_by_name(&props, "name", "", 0.85);
+        assert!(found.is_some());
+        let (_, score) = found.unwrap();
+        assert!((score - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_find_duplicate_by_name_case_sensitive() {
+        let mut props = PropertyStore::new();
+        props.set_node_property(1, "name", Value::String(CompactString::from("Alice")));
+
+        // "alice" vs "Alice" - Jaro-Winkler is case-sensitive
+        let found = find_duplicate_by_name(&props, "name", "alice", 0.99);
+        // Similarity should be < 1.0 due to case difference
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_merge_properties_many_conflicts() {
+        let mut props = PropertyStore::new();
+        // Set 10 properties on node 1
+        for i in 0..10 {
+            props.set_node_property(1, &format!("key_{i}"), Value::Int(i));
+        }
+
+        // New values all differ
+        let new_props: Vec<(String, Value)> = (0..10)
+            .map(|i| (format!("key_{i}"), Value::Int(i + 100)))
+            .collect();
+
+        let result = merge_properties(&mut props, 1, &new_props, &ConflictPolicy::Reject);
+        match result {
+            MergeResult::Merged { conflicts, .. } => {
+                assert_eq!(conflicts.len(), 10);
+            }
+            MergeResult::NoChange { .. } => panic!("Expected Merged with conflicts"),
+        }
+        // Under Reject, original values should be preserved
+        assert_eq!(props.get_node_property(1, "key_0"), Some(&Value::Int(0)));
+    }
+
+    #[test]
+    fn test_merge_properties_mixed_types() {
+        let mut props = PropertyStore::new();
+        props.set_node_property(1, "count", Value::Int(5));
+
+        let new_props = vec![(
+            "count".to_string(),
+            Value::String(CompactString::from("five")),
+        )];
+        let result = merge_properties(&mut props, 1, &new_props, &ConflictPolicy::LastWriteWins);
+
+        match result {
+            MergeResult::Merged { conflicts, .. } => {
+                assert!(conflicts.is_empty());
+            }
+            MergeResult::NoChange { .. } => panic!("Expected Merged"),
+        }
+        // Type changed from Int to String
+        assert_eq!(
+            props.get_node_property(1, "count"),
+            Some(&Value::String(CompactString::from("five")))
+        );
+    }
+
+    #[test]
+    fn test_find_duplicate_by_key_non_string_value() {
+        let mut props = PropertyStore::new();
+        // email is an Int, not a String
+        props.set_node_property(1, "email", Value::Int(42));
+
+        // as_str() returns None for Int, so no match
+        let found = find_duplicate_by_key(&props, "email", "42");
+        assert!(found.is_none());
+    }
 }

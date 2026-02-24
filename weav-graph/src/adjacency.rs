@@ -637,4 +637,238 @@ mod tests {
         let both_all = store.neighbors_both(1, None);
         assert_eq!(both_all.len(), 3);
     }
+
+    // ── Round 3 edge-case tests ──────────────────────────────────────────
+
+    fn make_meta_at(src: NodeId, tgt: NodeId, label: LabelId, valid_from: u64) -> EdgeMeta {
+        EdgeMeta {
+            source: src,
+            target: tgt,
+            label,
+            temporal: BiTemporal::new_current(valid_from),
+            provenance: None,
+            weight: 1.0,
+            token_cost: 0,
+        }
+    }
+
+    #[test]
+    fn test_self_loop_edge() {
+        let mut store = AdjacencyStore::new();
+        store.add_node(1);
+        let meta = make_meta(1, 1, 0);
+        let eid = store.add_edge(1, 1, 0, meta).unwrap();
+
+        assert_eq!(store.edge_count(), 1);
+        let out = store.neighbors_out(1, None);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], (1, eid));
+
+        let inc = store.neighbors_in(1, None);
+        assert_eq!(inc.len(), 1);
+        assert_eq!(inc[0], (1, eid));
+
+        assert_eq!(store.degree_out(1), 1);
+        assert_eq!(store.degree_in(1), 1);
+        assert_eq!(store.edge_between(1, 1, None), Some(eid));
+    }
+
+    #[test]
+    fn test_multi_edges_same_pair() {
+        let mut store = AdjacencyStore::new();
+        store.add_node(1);
+        store.add_node(2);
+
+        let m1 = make_meta(1, 2, 0);
+        let eid1 = store.add_edge(1, 2, 0, m1).unwrap();
+        let m2 = make_meta(1, 2, 1);
+        let eid2 = store.add_edge(1, 2, 1, m2).unwrap();
+        let m3 = make_meta(1, 2, 0);
+        let eid3 = store.add_edge(1, 2, 0, m3).unwrap();
+
+        assert_ne!(eid1, eid2);
+        assert_ne!(eid2, eid3);
+        assert_eq!(store.edge_count(), 3);
+
+        let out = store.neighbors_out(1, None);
+        assert_eq!(out.len(), 3);
+
+        // edge_between returns first found for label 0
+        let found = store.edge_between(1, 2, Some(0));
+        assert!(found == Some(eid1) || found == Some(eid3));
+    }
+
+    #[test]
+    fn test_cycle_three_nodes() {
+        let mut store = AdjacencyStore::new();
+        store.add_node(1);
+        store.add_node(2);
+        store.add_node(3);
+
+        store.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        store.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        store.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        assert_eq!(store.edge_count(), 3);
+        assert_eq!(store.neighbors_out(1, None).len(), 1);
+        assert_eq!(store.neighbors_out(2, None).len(), 1);
+        assert_eq!(store.neighbors_out(3, None).len(), 1);
+        assert_eq!(store.neighbors_out(1, None)[0].0, 2);
+        assert_eq!(store.neighbors_out(2, None)[0].0, 3);
+        assert_eq!(store.neighbors_out(3, None)[0].0, 1);
+    }
+
+    #[test]
+    fn test_node_deletion_in_cycle() {
+        let mut store = AdjacencyStore::new();
+        store.add_node(1);
+        store.add_node(2);
+        store.add_node(3);
+
+        store.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        store.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        store.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        // Remove node 2 - edges 1->2 and 2->3 should be removed, 3->1 remains
+        store.remove_node(2).unwrap();
+        assert_eq!(store.edge_count(), 1);
+        assert!(store.neighbors_out(1, None).is_empty());
+        assert_eq!(store.neighbors_out(3, None).len(), 1);
+        assert_eq!(store.neighbors_out(3, None)[0].0, 1);
+    }
+
+    #[test]
+    fn test_smallvec_boundary_nine_edges() {
+        let mut store = AdjacencyStore::new();
+        store.add_node(1);
+        for i in 2..=10 {
+            store.add_node(i);
+        }
+        // Add 9 outgoing edges from node 1 (exceeds SmallVec inline capacity of 8)
+        for i in 2..=10 {
+            store.add_edge(1, i, 0, make_meta(1, i, 0)).unwrap();
+        }
+        let out = store.neighbors_out(1, None);
+        assert_eq!(out.len(), 9);
+        assert_eq!(store.degree_out(1), 9);
+    }
+
+    #[test]
+    fn test_label_filter_nonexistent_label() {
+        let mut store = AdjacencyStore::new();
+        store.add_node(1);
+        store.add_node(2);
+        store.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+
+        assert!(store.neighbors_out(1, Some(99)).is_empty());
+        assert!(store.neighbors_in(2, Some(99)).is_empty());
+    }
+
+    #[test]
+    fn test_neighbors_at_before_valid_from() {
+        let mut store = AdjacencyStore::new();
+        store.add_node(1);
+        store.add_node(2);
+        store.add_edge(1, 2, 0, make_meta_at(1, 2, 0, 1000)).unwrap();
+
+        // Timestamp 500 is before valid_from(1000)
+        let result = store.neighbors_at(1, 500, None);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_neighbors_at_exact_valid_from() {
+        let mut store = AdjacencyStore::new();
+        store.add_node(1);
+        store.add_node(2);
+        store.add_edge(1, 2, 0, make_meta_at(1, 2, 0, 1000)).unwrap();
+
+        // At valid_from: is_valid_at uses inclusive lower bound [from, until)
+        let result = store.neighbors_at(1, 1000, None);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_neighbors_at_exact_valid_until() {
+        let mut store = AdjacencyStore::new();
+        store.add_node(1);
+        store.add_node(2);
+        let eid = store.add_edge(1, 2, 0, make_meta_at(1, 2, 0, 1000)).unwrap();
+        store.invalidate_edge(eid, 2000).unwrap();
+
+        // At valid_until(2000): exclusive upper bound, so NOT included
+        let result = store.neighbors_at(1, 2000, None);
+        assert!(result.is_empty());
+
+        // Just before: should be included
+        let result = store.neighbors_at(1, 1999, None);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_edge_history_empty() {
+        let store = AdjacencyStore::new();
+        assert!(store.edge_history(1, 2).is_empty());
+    }
+
+    #[test]
+    fn test_all_node_ids_contains_all() {
+        let mut store = AdjacencyStore::new();
+        for id in [5, 3, 1, 4, 2] {
+            store.add_node(id);
+        }
+        let mut ids = store.all_node_ids();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_add_node_idempotent() {
+        let mut store = AdjacencyStore::new();
+        store.add_node(1);
+        store.add_node(1);
+        assert_eq!(store.node_count(), 1);
+    }
+
+    #[test]
+    fn test_remove_node_cleans_backward_adjacency() {
+        let mut store = AdjacencyStore::new();
+        store.add_node(1);
+        store.add_node(2);
+        store.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+
+        store.remove_node(1).unwrap();
+        assert!(store.neighbors_in(2, None).is_empty());
+    }
+
+    #[test]
+    fn test_degree_nonexistent_node() {
+        let store = AdjacencyStore::new();
+        assert_eq!(store.degree_out(999), 0);
+        assert_eq!(store.degree_in(999), 0);
+    }
+
+    #[test]
+    fn test_invalidate_nonexistent_edge() {
+        let mut store = AdjacencyStore::new();
+        let result = store.invalidate_edge(999, 2000);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WeavError::EdgeNotFound(id) => assert_eq!(id, 999),
+            other => panic!("expected EdgeNotFound, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_add_edge_source_missing() {
+        let mut store = AdjacencyStore::new();
+        store.add_node(2);
+        // Node 1 doesn't exist
+        let result = store.add_edge(1, 2, 0, make_meta(1, 2, 0));
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WeavError::NodeNotFound(id, _) => assert_eq!(id, 1),
+            other => panic!("expected NodeNotFound, got: {other}"),
+        }
+    }
 }

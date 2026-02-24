@@ -2088,4 +2088,112 @@ mod tests {
             _ => panic!("expected GraphInfo"),
         }
     }
+
+    // ── Round 10: Edge-case tests ────────────────────────────────────────
+
+    #[test]
+    fn test_engine_empty_graph_name() {
+        let engine = make_engine();
+        // Attempt to create a graph with an empty name.
+        let cmd = parser::parse_command("GRAPH CREATE \"\"").unwrap();
+        let result = engine.execute_command(cmd);
+        // The engine may accept or reject an empty name; either outcome is valid.
+        // We just verify it does not panic.
+        match result {
+            Ok(CommandResponse::Ok) => {
+                // If accepted, we should be able to query it.
+                let cmd = parser::parse_command("GRAPH INFO \"\"").unwrap();
+                let resp = engine.execute_command(cmd).unwrap();
+                assert!(matches!(resp, CommandResponse::GraphInfo(_)));
+            }
+            Err(_) => {
+                // Rejecting an empty name is also valid behaviour.
+            }
+            other => panic!("unexpected response: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_engine_duplicate_graph_create() {
+        let engine = make_engine();
+        create_test_graph(&engine, "dup_test");
+
+        // Creating the same graph again should return Conflict.
+        let cmd = parser::parse_command("GRAPH CREATE \"dup_test\"").unwrap();
+        let result = engine.execute_command(cmd);
+        assert!(result.is_err(), "duplicate GRAPH CREATE should return an error");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, WeavError::Conflict(_)),
+            "expected Conflict error, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_engine_node_add_to_nonexistent_graph() {
+        let engine = make_engine();
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "nonexistent" LABEL "person" PROPERTIES {"name": "X"}"#,
+        )
+        .unwrap();
+        let result = engine.execute_command(cmd);
+        assert!(result.is_err(), "NODE ADD to nonexistent graph should fail");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, WeavError::GraphNotFound(_)),
+            "expected GraphNotFound, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_engine_edge_between_nonexistent_nodes() {
+        let engine = make_engine();
+        create_test_graph(&engine, "edge_test");
+
+        // Try to add an edge referencing node IDs that do not exist.
+        let cmd = parser::parse_command(
+            r#"EDGE ADD TO "edge_test" FROM 9990 TO 9991 LABEL "link""#,
+        )
+        .unwrap();
+        let result = engine.execute_command(cmd);
+        assert!(
+            result.is_err(),
+            "EDGE ADD between nonexistent nodes should fail"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, WeavError::NodeNotFound(..)),
+            "expected NodeNotFound, got: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_engine_delete_nonexistent_node() {
+        let engine = make_engine();
+        create_test_graph(&engine, "del_node_test");
+
+        let cmd = parser::parse_command("NODE DELETE \"del_node_test\" 999").unwrap();
+        let result = engine.execute_command(cmd);
+        assert!(
+            result.is_err(),
+            "NODE DELETE on nonexistent node should fail"
+        );
+    }
+
+    #[test]
+    fn test_engine_graph_info_nonexistent() {
+        let engine = make_engine();
+        let cmd = parser::parse_command("GRAPH INFO \"nonexistent\"").unwrap();
+        let result = engine.execute_command(cmd);
+        assert!(result.is_err(), "GRAPH INFO for nonexistent graph should fail");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, WeavError::GraphNotFound(_)),
+            "expected GraphNotFound, got: {:?}",
+            err
+        );
+    }
 }

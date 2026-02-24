@@ -465,4 +465,99 @@ mod tests {
         );
         assert!(store.get_all_node_properties(99).is_empty());
     }
+
+    // ── Round 4 edge-case tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_property_type_change_same_key() {
+        let mut store = PropertyStore::new();
+        store.set_node_property(1, "age", Value::Int(30));
+        assert_eq!(store.get_node_property(1, "age"), Some(&Value::Int(30)));
+
+        // Change type from Int to String
+        store.set_node_property(1, "age", Value::String(CompactString::from("thirty")));
+        assert_eq!(
+            store.get_node_property(1, "age"),
+            Some(&Value::String(CompactString::from("thirty")))
+        );
+    }
+
+    #[test]
+    fn test_remove_property_twice() {
+        let mut store = PropertyStore::new();
+        store.set_node_property(1, "name", Value::String(CompactString::from("Alice")));
+
+        store.remove_node_property(1, "name");
+        assert_eq!(store.get_node_property(1, "name"), None);
+
+        // Second remove should be a no-op without panic
+        store.remove_node_property(1, "name");
+        assert_eq!(store.get_node_property(1, "name"), None);
+    }
+
+    #[test]
+    fn test_batch_with_duplicate_keys() {
+        let mut store = PropertyStore::new();
+        store.set_node_properties_batch(
+            1,
+            vec![
+                ("count".to_string(), Value::Int(1)),
+                ("count".to_string(), Value::Int(2)),
+            ],
+        );
+        // Last value should win
+        assert_eq!(store.get_node_property(1, "count"), Some(&Value::Int(2)));
+    }
+
+    #[test]
+    fn test_estimate_tokens_nan_float() {
+        let mut store = PropertyStore::new();
+        store.set_node_property(1, "val", Value::Float(f64::NAN));
+        // NaN formats as "NaN" (3 chars), 3/4 = 0
+        let tokens = store.estimate_tokens(1);
+        assert_eq!(tokens, 0);
+    }
+
+    #[test]
+    fn test_estimate_tokens_empty_string() {
+        let mut store = PropertyStore::new();
+        store.set_node_property(1, "empty", Value::String(CompactString::from("")));
+        // Empty string = 0 chars, 0/4 = 0
+        assert_eq!(store.estimate_tokens(1), 0);
+    }
+
+    #[test]
+    fn test_nodes_where_no_match() {
+        let mut store = PropertyStore::new();
+        store.set_node_property(1, "age", Value::Int(20));
+        store.set_node_property(2, "age", Value::Int(30));
+
+        let result = store.nodes_where("age", &|v| v.as_int() == Some(999));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_nodes_with_property_after_remove() {
+        let mut store = PropertyStore::new();
+        store.set_node_property(1, "name", Value::String(CompactString::from("Alice")));
+        store.set_node_property(2, "name", Value::String(CompactString::from("Bob")));
+
+        store.remove_node_property(1, "name");
+
+        let nodes = store.nodes_with_property("name");
+        assert_eq!(nodes, vec![2]);
+    }
+
+    #[test]
+    fn test_edge_properties_independent_edges() {
+        let mut store = PropertyStore::new();
+        store.set_edge_property(100, "weight", Value::Float(0.5));
+        store.set_edge_property(200, "weight", Value::Float(0.9));
+        store.set_edge_property(200, "type", Value::String(CompactString::from("knows")));
+
+        assert_eq!(store.get_edge_property(100, "weight"), Some(&Value::Float(0.5)));
+        assert_eq!(store.get_edge_property(200, "weight"), Some(&Value::Float(0.9)));
+        assert_eq!(store.get_all_edge_properties(100).len(), 1);
+        assert_eq!(store.get_all_edge_properties(200).len(), 2);
+    }
 }

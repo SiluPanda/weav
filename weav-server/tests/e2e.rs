@@ -1127,3 +1127,194 @@ async fn test_multiple_graphs_isolation() {
     assert_eq!(i2["data"]["node_count"], 5);
     assert_eq!(i3["data"]["node_count"], 7);
 }
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Round 10: E2E Edge-case tests
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+#[tokio::test]
+async fn test_e2e_malformed_json_body() {
+    let server = TestServer::start().await;
+    let client = WeavClient::new(&server);
+    // POST a completely invalid string as the body to the node creation endpoint.
+    client.create_graph("malformed_g").await;
+    let (status, _) = client
+        .raw_post("/v1/graphs/malformed_g/nodes", "not json at all")
+        .await;
+    assert!(
+        status.is_client_error(),
+        "malformed JSON body should return 4xx, got {status}"
+    );
+}
+
+#[tokio::test]
+async fn test_e2e_empty_json_body() {
+    let server = TestServer::start().await;
+    let client = WeavClient::new(&server);
+    client.create_graph("empty_json_g").await;
+    // POST empty JSON object (missing required `label` field).
+    let (status, _) = client
+        .raw_post("/v1/graphs/empty_json_g/nodes", "{}")
+        .await;
+    assert!(
+        status.is_client_error(),
+        "empty JSON body missing 'label' should return 4xx, got {status}"
+    );
+}
+
+#[tokio::test]
+async fn test_e2e_special_characters_in_graph_name() {
+    let server = TestServer::start().await;
+    let client = WeavClient::new(&server);
+    let special_name = "test-graph_with.special";
+    let (status, _) = client.create_graph(special_name).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "graph with special characters should be created successfully"
+    );
+    // Verify it shows up in graph info.
+    let (status, body) = client.get_graph(special_name).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["name"], special_name);
+}
+
+#[tokio::test]
+async fn test_e2e_self_loop_via_http() {
+    let (_server, client, graph) = setup("selfloop_e2e").await;
+    let (_, body) = client
+        .add_node(&graph, &make_node_with_props("item", json!({"name": "solo"})))
+        .await;
+    let nid = extract_node_id(&body);
+
+    // Add a self-loop edge: source == target.
+    let edge_req = AddEdgeRequest {
+        source: nid,
+        target: nid,
+        label: "self_ref".to_string(),
+        weight: Some(1.0),
+        properties: None,
+    };
+    let (status, body) = client.add_edge(&graph, &edge_req).await;
+    assert_eq!(status, StatusCode::CREATED, "self-loop edge should succeed");
+    let eid = extract_edge_id(&body);
+    assert!(eid > 0, "edge ID should be positive");
+
+    // Verify graph info.
+    let (_, info) = client.get_graph(&graph).await;
+    assert_eq!(info["data"]["node_count"], 1);
+    assert_eq!(info["data"]["edge_count"], 1);
+}
+
+#[tokio::test]
+async fn test_e2e_bulk_nodes_with_duplicates() {
+    let (_server, client, graph) = setup("bulk_dup").await;
+    // Add two nodes that share the same entity_key.
+    let nodes = vec![
+        make_node_with_key("person", "same_key", json!({"name": "First"})),
+        make_node_with_key("person", "same_key", json!({"name": "Second"})),
+    ];
+    let (status, body) = client.bulk_add_nodes(&graph, &nodes).await;
+    // Bulk insert should succeed even with duplicate entity_keys.
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "bulk add with duplicate keys should succeed, got body: {body}"
+    );
+    // Bulk insert assigns IDs sequentially (no dedup at bulk level).
+    let ids = body["data"]["node_ids"].as_array().unwrap();
+    assert_eq!(ids.len(), 2, "bulk should return one ID per input node");
+    // Both nodes are inserted (bulk does not apply entity_key dedup).
+    let (_, info) = client.get_graph(&graph).await;
+    assert_eq!(
+        info["data"]["node_count"], 2,
+        "bulk insert should create both nodes"
+    );
+}
+
+#[tokio::test]
+async fn test_e2e_context_with_large_max_depth() {
+    let (_server, client, graph) = setup("deep_ctx").await;
+    // Build a small chain: A -> B -> C.
+    let (_, a) = client
+        .add_node(&graph, &make_node_with_key("item", "a", json!({"name": "A"})))
+        .await;
+    let (_, b) = client
+        .add_node(&graph, &make_node_with_key("item", "b", json!({"name": "B"})))
+        .await;
+    let (_, c) = client
+        .add_node(&graph, &make_node_with_key("item", "c", json!({"name": "C"})))
+        .await;
+    let aid = extract_node_id(&a);
+    let bid = extract_node_id(&b);
+    let cid = extract_node_id(&c);
+    client
+        .add_edge(
+            &graph,
+            &AddEdgeRequest {
+                source: aid,
+                target: bid,
+                label: "next".to_string(),
+                weight: Some(0.9),
+                properties: None,
+            },
+        )
+        .await;
+    client
+        .add_edge(
+            &graph,
+            &AddEdgeRequest {
+                source: bid,
+                target: cid,
+                label: "next".to_string(),
+                weight: Some(0.9),
+                properties: None,
+            },
+        )
+        .await;
+
+    // Context with max_depth=255 should work without error.
+    let (status, body) = client
+        .context(&json!({
+            "graph": graph,
+            "seed_nodes": ["a"],
+            "max_depth": 255,
+            "budget": 100000
+        }))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "context with large max_depth should succeed, body: {body}"
+    );
+    let nodes_included = body["data"]["nodes_included"].as_u64().unwrap_or(0);
+    assert!(
+        nodes_included > 0,
+        "context should include at least the seed node"
+    );
+}
+
+#[tokio::test]
+async fn test_e2e_get_nonexistent_node() {
+    let (_server, client, graph) = setup("get_missing_node").await;
+    let (status, body) = client.get_node(&graph, 999999).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "GET nonexistent node should return 404"
+    );
+    assert_eq!(body["success"], false);
+}
+
+#[tokio::test]
+async fn test_e2e_delete_nonexistent_graph() {
+    let server = TestServer::start().await;
+    let client = WeavClient::new(&server);
+    let (status, body) = client.delete_graph("nonexistent").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "DELETE nonexistent graph should return 404"
+    );
+    assert_eq!(body["success"], false);
+}
