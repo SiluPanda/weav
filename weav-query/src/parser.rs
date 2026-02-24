@@ -1671,4 +1671,138 @@ mod tests {
     fn test_parse_node_update_non_numeric() {
         assert!(parse_command("NODE UPDATE \"g\" abc PROPERTIES {\"name\":\"test\"}").is_err());
     }
+
+    // ── Round 7 edge-case tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_empty_string() {
+        let result = parse_command("");
+        assert!(result.is_err(), "empty string should return error");
+    }
+
+    #[test]
+    fn test_parse_whitespace_only() {
+        let result = parse_command("   \t  ");
+        assert!(result.is_err(), "whitespace-only input should return error");
+    }
+
+    #[test]
+    fn test_parse_unknown_command_with_args() {
+        let result = parse_command("FOOBAR something");
+        assert!(result.is_err(), "unknown command with args should return error");
+    }
+
+    #[test]
+    fn test_parse_sql_injection_attempt() {
+        // Should fail parsing gracefully, not panic or execute anything dangerous
+        let result = parse_command("NODE ADD; DROP TABLE users; --");
+        assert!(result.is_err(), "SQL injection-like input should fail gracefully");
+    }
+
+    #[test]
+    fn test_parse_unclosed_quote() {
+        // The tokenizer consumes unclosed quotes until EOF and wraps them.
+        // Depending on how the resulting tokens are interpreted, the command
+        // may parse or error. Either way it must not panic.
+        let result = parse_command("GRAPH CREATE \"unclosed");
+        // The tokenizer treats the rest of input as the quoted string content,
+        // so this actually parses as GraphCreate with name "unclosed".
+        // We just assert it does not panic; either Ok or Err is acceptable.
+        match result {
+            Ok(Command::GraphCreate(gc)) => {
+                assert_eq!(gc.name, "unclosed");
+            }
+            Err(_) => { /* also acceptable */ }
+            other => panic!("unexpected parse result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_escaped_quotes_in_name() {
+        // Escaped quotes inside a quoted string — tokenizer supports backslash escapes
+        let result = parse_command(r#"GRAPH CREATE "my \"graph\" name""#);
+        match result {
+            Ok(Command::GraphCreate(gc)) => {
+                assert_eq!(gc.name, "my \"graph\" name");
+            }
+            Err(_) => { /* also acceptable if parser rejects embedded quotes */ }
+            other => panic!("unexpected parse result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_negative_node_id() {
+        // NodeId is u64, cannot be negative — parser should error
+        let result = parse_command("NODE GET \"g\" -1");
+        assert!(result.is_err(), "negative node id should return error (u64 cannot be negative)");
+    }
+
+    #[test]
+    fn test_parse_node_id_overflow() {
+        // Number larger than u64::MAX should fail to parse
+        let result = parse_command("NODE GET \"g\" 99999999999999999999");
+        assert!(result.is_err(), "node id overflow (> u64::MAX) should return error");
+    }
+
+    #[test]
+    fn test_parse_context_zero_budget() {
+        // BUDGET 0 TOKENS should parse successfully (0 is a valid u32)
+        let cmd = parse_command(r#"CONTEXT "q" FROM "g" BUDGET 0 TOKENS"#).unwrap();
+        match cmd {
+            Command::Context(cq) => {
+                assert_eq!(cq.budget.as_ref().unwrap().max_tokens, 0);
+            }
+            _ => panic!("expected Context"),
+        }
+    }
+
+    #[test]
+    fn test_parse_context_huge_budget() {
+        // u32::MAX = 4294967295, should parse successfully
+        let cmd = parse_command(r#"CONTEXT "q" FROM "g" BUDGET 4294967295 TOKENS"#).unwrap();
+        match cmd {
+            Command::Context(cq) => {
+                assert_eq!(cq.budget.as_ref().unwrap().max_tokens, 4294967295);
+            }
+            _ => panic!("expected Context"),
+        }
+    }
+
+    #[test]
+    fn test_parse_node_add_empty_properties() {
+        // Empty JSON object {} should parse with empty property list
+        let cmd = parse_command(
+            r#"NODE ADD TO "g" LABEL "L" PROPERTIES {}"#,
+        )
+        .unwrap();
+        match cmd {
+            Command::NodeAdd(na) => {
+                assert_eq!(na.graph, "g");
+                assert_eq!(na.label, "L");
+                assert!(na.properties.is_empty(), "empty JSON object should yield empty props");
+            }
+            _ => panic!("expected NodeAdd"),
+        }
+    }
+
+    #[test]
+    fn test_parse_context_empty_embedding() {
+        // SEEDS VECTOR [] — empty vector should parse
+        let cmd = parse_command(
+            r#"CONTEXT "q" FROM "g" SEEDS VECTOR [] TOP 5"#,
+        )
+        .unwrap();
+        match cmd {
+            Command::Context(cq) => {
+                match &cq.seeds {
+                    SeedStrategy::Vector { embedding, top_k } => {
+                        assert!(embedding.is_empty(), "empty embedding array should parse to empty vec");
+                        assert_eq!(*top_k, 5);
+                    }
+                    _ => panic!("expected Vector seed strategy"),
+                }
+            }
+            _ => panic!("expected Context"),
+        }
+    }
 }

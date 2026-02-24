@@ -179,6 +179,7 @@ pub fn plan_context_query(query: &ContextQuery) -> QueryPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::{SortDirection, SortField, SortOrder};
     use weav_core::types::TokenBudget;
 
     fn make_basic_query() -> ContextQuery {
@@ -418,5 +419,203 @@ mod tests {
             _ => None,
         });
         assert_eq!(path_step, Some((10, 2)));
+    }
+
+    // ── Round 7 edge-case tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_plan_empty_vector_seeds() {
+        // Seeds with empty embedding and top_k=0
+        let mut query = make_basic_query();
+        query.seeds = SeedStrategy::Vector {
+            embedding: vec![],
+            top_k: 0,
+        };
+        let plan = plan_context_query(&query);
+
+        // Should still include a VectorSearch step even with empty embedding
+        let has_vector_search = plan
+            .steps
+            .iter()
+            .any(|s| matches!(s, PlanStep::VectorSearch { .. }));
+        assert!(
+            has_vector_search,
+            "VectorSearch step should be present even with empty embedding"
+        );
+
+        // Verify the VectorSearch has k=0 and empty query_vector
+        let vs = plan.steps.iter().find_map(|s| match s {
+            PlanStep::VectorSearch { query_vector, k } => Some((query_vector.clone(), *k)),
+            _ => None,
+        });
+        assert_eq!(vs, Some((vec![], 0)));
+    }
+
+    #[test]
+    fn test_plan_both_seeds_empty() {
+        // Both seeds with empty embedding and empty keys
+        let mut query = make_basic_query();
+        query.seeds = SeedStrategy::Both {
+            embedding: vec![],
+            top_k: 0,
+            node_keys: vec![],
+        };
+        let plan = plan_context_query(&query);
+
+        // VectorSearch should be present (Both always adds VectorSearch)
+        let has_vector_search = plan
+            .steps
+            .iter()
+            .any(|s| matches!(s, PlanStep::VectorSearch { .. }));
+        assert!(has_vector_search, "VectorSearch should be present for Both seeds");
+
+        // NodeLookup should NOT be present (empty node_keys are skipped)
+        let has_node_lookup = plan
+            .steps
+            .iter()
+            .any(|s| matches!(s, PlanStep::NodeLookup { .. }));
+        assert!(
+            !has_node_lookup,
+            "NodeLookup should NOT be present when node_keys is empty"
+        );
+
+        // GraphTraversal should always be present
+        let has_traversal = plan
+            .steps
+            .iter()
+            .any(|s| matches!(s, PlanStep::GraphTraversal { .. }));
+        assert!(has_traversal, "GraphTraversal should always be present");
+    }
+
+    #[test]
+    fn test_plan_max_depth_zero() {
+        // Query with max_depth=0 should still include GraphTraversal
+        let mut query = make_basic_query();
+        query.max_depth = 0;
+        let plan = plan_context_query(&query);
+
+        let traversal = plan.steps.iter().find_map(|s| match s {
+            PlanStep::GraphTraversal { max_depth, .. } => Some(*max_depth),
+            _ => None,
+        });
+        assert_eq!(
+            traversal,
+            Some(0),
+            "GraphTraversal should be present with max_depth=0"
+        );
+
+        // FlowScore should also reflect max_depth=0
+        let flow = plan.steps.iter().find_map(|s| match s {
+            PlanStep::FlowScore { max_depth, .. } => Some(*max_depth),
+            _ => None,
+        });
+        assert_eq!(flow, Some(0), "FlowScore should reflect max_depth=0");
+    }
+
+    #[test]
+    fn test_plan_all_options_combined() {
+        // Query with every option set
+        let query = ContextQuery {
+            query_text: Some("all options".to_string()),
+            graph: "g".to_string(),
+            budget: Some(TokenBudget::new(8192)),
+            seeds: SeedStrategy::Both {
+                embedding: vec![0.1, 0.2, 0.3],
+                top_k: 20,
+                node_keys: vec!["k1".to_string(), "k2".to_string(), "k3".to_string()],
+            },
+            max_depth: 5,
+            direction: Direction::Outgoing,
+            edge_filter: Some(EdgeFilterConfig {
+                labels: Some(vec!["related".to_string(), "depends_on".to_string()]),
+                min_weight: Some(0.3),
+                min_confidence: Some(0.7),
+            }),
+            decay: Some(DecayFunction::Step { cutoff_ms: 86400000 }),
+            include_provenance: true,
+            temporal_at: Some(999999),
+            limit: Some(100),
+            sort: Some(SortOrder {
+                field: SortField::Recency,
+                direction: SortDirection::Asc,
+            }),
+        };
+
+        let plan = plan_context_query(&query);
+
+        // Should have all 10 steps:
+        // VectorSearch, NodeLookup, GraphTraversal, FlowScore, PathExtraction,
+        // TemporalFilter, ConflictDetection, RelevanceScore, TokenBudgetEnforce, FormatContext
+        assert_eq!(plan.steps.len(), 10, "all options combined should produce 10 steps");
+        assert!(matches!(&plan.steps[0], PlanStep::VectorSearch { k: 20, .. }));
+        assert!(matches!(&plan.steps[1], PlanStep::NodeLookup { .. }));
+        assert!(matches!(&plan.steps[2], PlanStep::GraphTraversal { max_depth: 5, .. }));
+        assert!(matches!(&plan.steps[3], PlanStep::FlowScore { max_depth: 5, .. }));
+        assert!(matches!(&plan.steps[4], PlanStep::PathExtraction { max_paths: 10, max_length: 5 }));
+        assert!(matches!(&plan.steps[5], PlanStep::TemporalFilter { timestamp: 999999 }));
+        assert!(matches!(&plan.steps[6], PlanStep::ConflictDetection { .. }));
+        assert!(matches!(&plan.steps[7], PlanStep::RelevanceScore { decay: Some(DecayFunction::Step { .. }) }));
+        assert!(matches!(&plan.steps[8], PlanStep::TokenBudgetEnforce { .. }));
+        assert!(matches!(&plan.steps[9], PlanStep::FormatContext { include_provenance: true }));
+    }
+
+    #[test]
+    fn test_plan_single_node_seed_no_path_extraction() {
+        // Single node key seed — PathExtraction requires 2+ seeds
+        let mut query = make_basic_query();
+        query.seeds = SeedStrategy::Nodes(vec!["only_one".to_string()]);
+        let plan = plan_context_query(&query);
+
+        let has_path_extraction = plan
+            .steps
+            .iter()
+            .any(|s| matches!(s, PlanStep::PathExtraction { .. }));
+        assert!(
+            !has_path_extraction,
+            "PathExtraction should NOT be generated for a single node seed"
+        );
+    }
+
+    #[test]
+    fn test_plan_conflict_detection_always_present() {
+        // Verify ConflictDetection is present for various query shapes
+
+        // 1. Basic node seeds
+        let plan1 = plan_context_query(&make_basic_query());
+        assert!(
+            plan1.steps.iter().any(|s| matches!(s, PlanStep::ConflictDetection { .. })),
+            "ConflictDetection should be present for basic node seeds"
+        );
+
+        // 2. Vector seeds
+        let mut q2 = make_basic_query();
+        q2.seeds = SeedStrategy::Vector {
+            embedding: vec![1.0],
+            top_k: 5,
+        };
+        let plan2 = plan_context_query(&q2);
+        assert!(
+            plan2.steps.iter().any(|s| matches!(s, PlanStep::ConflictDetection { .. })),
+            "ConflictDetection should be present for vector seeds"
+        );
+
+        // 3. Empty seeds
+        let mut q3 = make_basic_query();
+        q3.seeds = SeedStrategy::Nodes(vec![]);
+        let plan3 = plan_context_query(&q3);
+        assert!(
+            plan3.steps.iter().any(|s| matches!(s, PlanStep::ConflictDetection { .. })),
+            "ConflictDetection should be present even with empty seeds"
+        );
+
+        // 4. With budget and temporal
+        let mut q4 = make_basic_query();
+        q4.budget = Some(TokenBudget::new(1000));
+        q4.temporal_at = Some(5000);
+        let plan4 = plan_context_query(&q4);
+        assert!(
+            plan4.steps.iter().any(|s| matches!(s, PlanStep::ConflictDetection { .. })),
+            "ConflictDetection should be present with budget and temporal"
+        );
     }
 }
