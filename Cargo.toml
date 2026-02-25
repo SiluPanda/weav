@@ -6,6 +6,7 @@ members = [
     "weav-vector",
     "weav-query",
     "weav-persist",
+    "weav-auth",
     "weav-server",
     "weav-proto",
     "weav-cli",
@@ -36,6 +37,13 @@ compact_str = { version = "0.8", features = ["serde"] }
 # Hashing
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crc32fast = "1"
+sha2 = "0.10"
+
+# Auth
+argon2 = "0.5"
+rand = "0.8"
+glob-match = "0.2"
+base64 = "0.22"
 
 # Vector search
 usearch = "2"

@@ -15,7 +15,7 @@ fn make_engine() -> Engine {
 
 fn create_graph(engine: &Engine, name: &str) {
     let cmd = parse_command(&format!("GRAPH CREATE \"{name}\"")).unwrap();
-    engine.execute_command(cmd).unwrap();
+    engine.execute_command(cmd, None).unwrap();
 }
 
 fn add_node(engine: &Engine, graph: &str, label: &str, name: &str, key: Option<&str>) -> u64 {
@@ -29,7 +29,7 @@ fn add_node(engine: &Engine, graph: &str, label: &str, name: &str, key: Option<&
         )
     };
     let cmd = parse_command(&cmd_str).unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Integer(id) => id,
         other => panic!("expected Integer from NODE ADD, got: {:?}", other),
     }
@@ -40,7 +40,7 @@ fn add_edge(engine: &Engine, graph: &str, src: u64, tgt: u64, label: &str, weigh
         r#"EDGE ADD TO "{graph}" FROM {src} TO {tgt} LABEL "{label}" WEIGHT {weight}"#
     );
     let cmd = parse_command(&cmd_str).unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Integer(id) => id,
         other => panic!("expected Integer from EDGE ADD, got: {:?}", other),
     }
@@ -58,7 +58,7 @@ fn test_full_graph_lifecycle() {
 
     // Verify the graph exists in the list
     let cmd = parse_command("GRAPH LIST").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::StringList(names) => {
             assert!(names.contains(&"lifecycle-graph".to_string()));
         }
@@ -76,7 +76,7 @@ fn test_full_graph_lifecycle() {
 
     // Get a node and verify its properties
     let cmd = parse_command(&format!("NODE GET \"lifecycle-graph\" {n1}")).unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::NodeInfo(info) => {
             assert_eq!(info.node_id, n1);
             assert_eq!(info.label, "company");
@@ -94,7 +94,7 @@ fn test_full_graph_lifecycle() {
 
     // Verify graph info shows correct counts
     let cmd = parse_command("GRAPH INFO \"lifecycle-graph\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(info.name, "lifecycle-graph");
             assert_eq!(info.node_count, 3);
@@ -108,7 +108,7 @@ fn test_full_graph_lifecycle() {
         r#"CONTEXT "who works at apple" FROM "lifecycle-graph" SEEDS NODES ["apple"] DEPTH 2"#,
     )
     .unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Context(result) => {
             assert!(result.nodes_considered > 0, "Should consider at least the seed node");
             assert!(result.nodes_included > 0, "Should include at least the seed node");
@@ -121,10 +121,10 @@ fn test_full_graph_lifecycle() {
 
     // Delete a node and verify edge count drops
     let cmd = parse_command(&format!("NODE DELETE \"lifecycle-graph\" {n2}")).unwrap();
-    engine.execute_command(cmd).unwrap();
+    engine.execute_command(cmd, None).unwrap();
 
     let cmd = parse_command("GRAPH INFO \"lifecycle-graph\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(info.node_count, 2, "Should have 2 nodes after deletion");
             assert_eq!(info.edge_count, 1, "Deleting n2 should remove the employs edge");
@@ -134,11 +134,11 @@ fn test_full_graph_lifecycle() {
 
     // Drop the graph
     let cmd = parse_command("GRAPH DROP \"lifecycle-graph\"").unwrap();
-    engine.execute_command(cmd).unwrap();
+    engine.execute_command(cmd, None).unwrap();
 
     // Verify graph no longer exists
     let cmd = parse_command("GRAPH LIST").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::StringList(names) => {
             assert!(!names.contains(&"lifecycle-graph".to_string()));
         }
@@ -163,7 +163,7 @@ fn test_temporal_workflow() {
 
     // Verify both edges exist
     let cmd = parse_command("GRAPH INFO \"temporal-graph\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(info.edge_count, 2);
         }
@@ -172,7 +172,7 @@ fn test_temporal_workflow() {
 
     // Invalidate the first edge
     let cmd = parse_command(&format!("EDGE INVALIDATE \"temporal-graph\" {e1}")).unwrap();
-    let resp = engine.execute_command(cmd).unwrap();
+    let resp = engine.execute_command(cmd, None).unwrap();
     assert!(
         matches!(resp, CommandResponse::Ok),
         "Edge invalidation should succeed"
@@ -180,7 +180,7 @@ fn test_temporal_workflow() {
 
     // Edge is still in the graph (it is invalidated, not removed)
     let cmd = parse_command("GRAPH INFO \"temporal-graph\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             // Edge count stays the same because invalidation does not remove, it sets valid_until
             assert_eq!(info.edge_count, 2);
@@ -207,7 +207,7 @@ fn test_dedup_through_engine() {
         "NODE GET \"dedup-graph\" WHERE entity_key = \"alice-key\"",
     )
     .unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::NodeInfo(info) => {
             assert_eq!(info.node_id, n1);
             assert_eq!(info.label, "person");
@@ -219,7 +219,7 @@ fn test_dedup_through_engine() {
         "NODE GET \"dedup-graph\" WHERE entity_key = \"bob-key\"",
     )
     .unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::NodeInfo(info) => {
             assert_eq!(info.node_id, n2);
         }
@@ -232,7 +232,7 @@ fn test_dedup_through_engine() {
     )
     .unwrap();
     assert!(
-        engine.execute_command(cmd).is_err(),
+        engine.execute_command(cmd, None).is_err(),
         "Looking up non-existent entity_key should return an error"
     );
 }
@@ -255,7 +255,7 @@ fn test_budget_enforcement_e2e() {
             i, description, i
         );
         let cmd = parse_command(&cmd_str).unwrap();
-        let nid = match engine.execute_command(cmd).unwrap() {
+        let nid = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             other => panic!("expected Integer, got: {:?}", other),
         };
@@ -279,7 +279,7 @@ fn test_budget_enforcement_e2e() {
         r#"CONTEXT "find documents" FROM "budget-graph" SEEDS NODES ["doc-0"] DEPTH 3 BUDGET 50 TOKENS"#,
     )
     .unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Context(result) => {
             assert!(
                 result.total_tokens <= 50,
@@ -299,7 +299,7 @@ fn test_budget_enforcement_e2e() {
         r#"CONTEXT "find documents" FROM "budget-graph" SEEDS NODES ["doc-0"] DEPTH 3 BUDGET 100000 TOKENS"#,
     )
     .unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Context(result) => {
             assert!(
                 result.nodes_included > 0,
@@ -323,7 +323,7 @@ fn test_multiple_graphs() {
 
     // Verify all three exist
     let cmd = parse_command("GRAPH LIST").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::StringList(names) => {
             assert_eq!(names.len(), 3);
             assert!(names.contains(&"graph-a".to_string()));
@@ -339,7 +339,7 @@ fn test_multiple_graphs() {
 
     // Verify they are independent
     let cmd = parse_command("GRAPH INFO \"graph-a\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(info.node_count, 1);
         }
@@ -347,7 +347,7 @@ fn test_multiple_graphs() {
     }
 
     let cmd = parse_command("GRAPH INFO \"graph-b\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(info.node_count, 1);
         }
@@ -355,7 +355,7 @@ fn test_multiple_graphs() {
     }
 
     let cmd = parse_command("GRAPH INFO \"graph-c\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(info.node_count, 0, "graph-c should have no nodes");
         }
@@ -364,11 +364,11 @@ fn test_multiple_graphs() {
 
     // Operations on one graph should not affect another
     let cmd = parse_command(&format!("NODE GET \"graph-a\" {na}")).unwrap();
-    engine.execute_command(cmd).unwrap();
+    engine.execute_command(cmd, None).unwrap();
 
     // Verify the correct node is returned for nb from graph-b
     let cmd = parse_command(&format!("NODE GET \"graph-b\" {nb}")).unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::NodeInfo(info) => {
             assert_eq!(info.node_id, nb);
             assert_eq!(info.label, "type_b");
@@ -378,10 +378,10 @@ fn test_multiple_graphs() {
 
     // Drop one graph, others should remain
     let cmd = parse_command("GRAPH DROP \"graph-b\"").unwrap();
-    engine.execute_command(cmd).unwrap();
+    engine.execute_command(cmd, None).unwrap();
 
     let cmd = parse_command("GRAPH LIST").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::StringList(names) => {
             assert_eq!(names.len(), 2);
             assert!(!names.contains(&"graph-b".to_string()));
@@ -391,12 +391,12 @@ fn test_multiple_graphs() {
 
     // graph-a should still work
     let cmd = parse_command(&format!("NODE GET \"graph-a\" {na}")).unwrap();
-    engine.execute_command(cmd).unwrap();
+    engine.execute_command(cmd, None).unwrap();
 
     // Creating a duplicate graph should fail
     let cmd = parse_command("GRAPH CREATE \"graph-a\"").unwrap();
     assert!(
-        engine.execute_command(cmd).is_err(),
+        engine.execute_command(cmd, None).is_err(),
         "Creating a duplicate graph should fail"
     );
 }
@@ -423,7 +423,7 @@ fn test_conflict_resolution() {
 
     // Graph should show 1 node (deduped).
     let cmd = parse_command("GRAPH INFO \"conflict-graph\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(info.node_count, 1, "Dedup should keep single node");
         }
@@ -432,7 +432,7 @@ fn test_conflict_resolution() {
 
     // The merged node should be retrievable by ID.
     let cmd = parse_command(&format!("NODE GET \"conflict-graph\" {n1}")).unwrap();
-    engine.execute_command(cmd).unwrap();
+    engine.execute_command(cmd, None).unwrap();
 
     // Without entity_key, nodes should always get distinct IDs.
     let n3 = add_node(&engine, "conflict-graph", "person", "Charlie", None);
@@ -458,7 +458,7 @@ fn test_bulk_operations() {
     let nodes_json = format!("[{}]", node_entries.join(", "));
     let cmd_str = format!(r#"BULK NODES TO "bulk-graph" DATA {nodes_json}"#);
     let cmd = parse_command(&cmd_str).unwrap();
-    let node_ids = match engine.execute_command(cmd).unwrap() {
+    let node_ids = match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::IntegerList(ids) => ids,
         other => panic!("expected IntegerList from BULK NODES, got: {:?}", other),
     };
@@ -466,7 +466,7 @@ fn test_bulk_operations() {
 
     // Verify node count via GRAPH INFO.
     let cmd = parse_command("GRAPH INFO \"bulk-graph\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(info.node_count, 100);
         }
@@ -484,7 +484,7 @@ fn test_bulk_operations() {
     let edges_json = format!("[{}]", edge_entries.join(", "));
     let cmd_str = format!(r#"BULK EDGES TO "bulk-graph" DATA {edges_json}"#);
     let cmd = parse_command(&cmd_str).unwrap();
-    let edge_ids = match engine.execute_command(cmd).unwrap() {
+    let edge_ids = match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::IntegerList(ids) => ids,
         other => panic!("expected IntegerList from BULK EDGES, got: {:?}", other),
     };
@@ -492,7 +492,7 @@ fn test_bulk_operations() {
 
     // Verify edge count.
     let cmd = parse_command("GRAPH INFO \"bulk-graph\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(info.edge_count, 99);
         }
@@ -505,7 +505,7 @@ fn test_bulk_operations() {
             "NODE GET \"bulk-graph\" WHERE entity_key = \"bulk-{i}\""
         ))
         .unwrap();
-        match engine.execute_command(cmd).unwrap() {
+        match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::NodeInfo(info) => {
                 assert_eq!(info.node_id, node_ids[i]);
                 assert_eq!(info.label, "item");
@@ -526,17 +526,17 @@ fn test_protocol_parity() {
 
     // PING should always return Pong.
     let cmd = parse_command("PING").unwrap();
-    let resp = engine.execute_command(cmd).unwrap();
+    let resp = engine.execute_command(cmd, None).unwrap();
     assert!(matches!(resp, CommandResponse::Pong), "PING -> Pong");
 
     // GRAPH CREATE should return Ok.
     let cmd = parse_command("GRAPH CREATE \"parity-graph\"").unwrap();
-    let resp = engine.execute_command(cmd).unwrap();
+    let resp = engine.execute_command(cmd, None).unwrap();
     assert!(matches!(resp, CommandResponse::Ok), "GRAPH CREATE -> Ok");
 
     // GRAPH LIST should include the new graph.
     let cmd = parse_command("GRAPH LIST").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::StringList(names) => {
             assert!(names.contains(&"parity-graph".to_string()));
         }
@@ -548,7 +548,7 @@ fn test_protocol_parity() {
         r#"NODE ADD TO "parity-graph" LABEL "entity" PROPERTIES {"name": "test"} KEY "test-key""#,
     )
     .unwrap();
-    let node_id = match engine.execute_command(cmd).unwrap() {
+    let node_id = match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Integer(id) => id,
         other => panic!("expected Integer from NODE ADD, got: {:?}", other),
     };
@@ -556,7 +556,7 @@ fn test_protocol_parity() {
 
     // NODE GET by ID should return the same node.
     let cmd = parse_command(&format!("NODE GET \"parity-graph\" {node_id}")).unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::NodeInfo(info) => {
             assert_eq!(info.node_id, node_id);
             assert_eq!(info.label, "entity");
@@ -569,7 +569,7 @@ fn test_protocol_parity() {
         "NODE GET \"parity-graph\" WHERE entity_key = \"test-key\"",
     )
     .unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::NodeInfo(info) => {
             assert_eq!(info.node_id, node_id, "Key lookup should match ID lookup");
             assert_eq!(info.label, "entity");
@@ -579,7 +579,7 @@ fn test_protocol_parity() {
 
     // GRAPH INFO should reflect the node.
     let cmd = parse_command("GRAPH INFO \"parity-graph\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(info.node_count, 1);
             assert_eq!(info.edge_count, 0);
@@ -589,7 +589,7 @@ fn test_protocol_parity() {
 
     // INFO should return server info.
     let cmd = parse_command("INFO").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Text(text) => {
             assert!(text.contains("weav-server"));
         }
@@ -598,7 +598,7 @@ fn test_protocol_parity() {
 
     // STATS should show graph count.
     let cmd = parse_command("STATS").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Text(text) => {
             assert!(text.contains("graphs=1"));
         }
@@ -636,7 +636,7 @@ fn test_persistence_wal_recovery() {
 
     // Take a snapshot.
     let cmd = parse_command("SNAPSHOT").unwrap();
-    engine.execute_command(cmd).unwrap();
+    engine.execute_command(cmd, None).unwrap();
 
     // Create a brand-new engine from the same data dir.
     let engine2 = Engine::new(config);
@@ -650,7 +650,7 @@ fn test_persistence_wal_recovery() {
 
     // Verify the recovered engine has the graph.
     let cmd = parse_command("GRAPH LIST").unwrap();
-    match engine2.execute_command(cmd).unwrap() {
+    match engine2.execute_command(cmd, None).unwrap() {
         CommandResponse::StringList(names) => {
             assert!(
                 names.contains(&"persist-graph".to_string()),
@@ -662,7 +662,7 @@ fn test_persistence_wal_recovery() {
 
     // Verify graph info shows correct counts.
     let cmd = parse_command("GRAPH INFO \"persist-graph\"").unwrap();
-    match engine2.execute_command(cmd).unwrap() {
+    match engine2.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(info.node_count, 2, "Should recover 2 nodes");
             assert_eq!(info.edge_count, 1, "Should recover 1 edge");
@@ -674,7 +674,7 @@ fn test_persistence_wal_recovery() {
     // (Note: entity_key lookups may not survive the properties_json roundtrip
     //  due to Debug formatting in the snapshot; verify by node ID instead.)
     let cmd = parse_command(&format!("NODE GET \"persist-graph\" {n1}")).unwrap();
-    match engine2.execute_command(cmd).unwrap() {
+    match engine2.execute_command(cmd, None).unwrap() {
         CommandResponse::NodeInfo(info) => {
             assert_eq!(info.node_id, n1);
             assert_eq!(info.label, "person");
@@ -683,7 +683,7 @@ fn test_persistence_wal_recovery() {
     }
 
     let cmd = parse_command(&format!("NODE GET \"persist-graph\" {n2}")).unwrap();
-    match engine2.execute_command(cmd).unwrap() {
+    match engine2.execute_command(cmd, None).unwrap() {
         CommandResponse::NodeInfo(info) => {
             assert_eq!(info.node_id, n2);
             assert_eq!(info.label, "person");
@@ -717,7 +717,7 @@ fn test_concurrent_writes() {
                     r#"NODE ADD TO "concurrent-write-graph" LABEL "item" PROPERTIES {{"name": "{name}"}} KEY "{key}""#,
                 );
                 let cmd = parse_command(&cmd_str).unwrap();
-                let resp = engine_clone.execute_command(cmd).unwrap();
+                let resp = engine_clone.execute_command(cmd, None).unwrap();
                 match resp {
                     CommandResponse::Integer(id) => assert!(id >= 1),
                     other => panic!("thread {t}: expected Integer, got: {:?}", other),
@@ -734,7 +734,7 @@ fn test_concurrent_writes() {
 
     // Verify total node count = 8 * 50 = 400.
     let cmd = parse_command("GRAPH INFO \"concurrent-write-graph\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(
                 info.node_count, 400,
@@ -751,7 +751,7 @@ fn test_concurrent_writes() {
             "NODE GET \"concurrent-write-graph\" WHERE entity_key = \"{key}\""
         ))
         .unwrap();
-        match engine.execute_command(cmd).unwrap() {
+        match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::NodeInfo(info) => {
                 assert_eq!(info.label, "item");
             }
@@ -774,7 +774,7 @@ fn test_edge_delete_and_get() {
 
     // EDGE GET should return the edge info.
     let cmd = parse_command(&format!("EDGE GET \"edge-ops-graph\" {e1}")).unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::EdgeInfo(info) => {
             assert_eq!(info.edge_id, e1);
             assert_eq!(info.source, n1);
@@ -787,7 +787,7 @@ fn test_edge_delete_and_get() {
 
     // Verify edge count is 1 before deletion.
     let cmd = parse_command("GRAPH INFO \"edge-ops-graph\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(info.edge_count, 1);
         }
@@ -796,19 +796,19 @@ fn test_edge_delete_and_get() {
 
     // EDGE DELETE the edge.
     let cmd = parse_command(&format!("EDGE DELETE \"edge-ops-graph\" {e1}")).unwrap();
-    let resp = engine.execute_command(cmd).unwrap();
+    let resp = engine.execute_command(cmd, None).unwrap();
     assert!(matches!(resp, CommandResponse::Ok), "EDGE DELETE should return Ok");
 
     // EDGE GET after deletion should fail.
     let cmd = parse_command(&format!("EDGE GET \"edge-ops-graph\" {e1}")).unwrap();
     assert!(
-        engine.execute_command(cmd).is_err(),
+        engine.execute_command(cmd, None).is_err(),
         "EDGE GET after EDGE DELETE should return an error"
     );
 
     // Verify edge count is 0 after deletion.
     let cmd = parse_command("GRAPH INFO \"edge-ops-graph\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(info.edge_count, 0, "Edge count should be 0 after deletion");
         }
@@ -825,12 +825,12 @@ fn test_config_set_and_get() {
 
     // CONFIG SET a key-value pair.
     let cmd = parse_command("CONFIG SET \"my.key\" \"my.value\"").unwrap();
-    let resp = engine.execute_command(cmd).unwrap();
+    let resp = engine.execute_command(cmd, None).unwrap();
     assert!(matches!(resp, CommandResponse::Ok), "CONFIG SET should return Ok");
 
     // CONFIG GET should return the value.
     let cmd = parse_command("CONFIG GET \"my.key\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Text(val) => {
             assert_eq!(val, "my.value", "CONFIG GET should return the set value");
         }
@@ -839,17 +839,17 @@ fn test_config_set_and_get() {
 
     // CONFIG GET for a non-existent key should return Null.
     let cmd = parse_command("CONFIG GET \"nonexistent\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Null => {} // Expected
         other => panic!("expected Null for nonexistent config key, got: {:?}", other),
     }
 
     // CONFIG SET can overwrite an existing key.
     let cmd = parse_command("CONFIG SET \"my.key\" \"updated.value\"").unwrap();
-    engine.execute_command(cmd).unwrap();
+    engine.execute_command(cmd, None).unwrap();
 
     let cmd = parse_command("CONFIG GET \"my.key\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Text(val) => {
             assert_eq!(val, "updated.value", "CONFIG GET should return the updated value");
         }
@@ -858,10 +858,10 @@ fn test_config_set_and_get() {
 
     // Multiple keys can coexist.
     let cmd = parse_command("CONFIG SET \"another.key\" \"another.value\"").unwrap();
-    engine.execute_command(cmd).unwrap();
+    engine.execute_command(cmd, None).unwrap();
 
     let cmd = parse_command("CONFIG GET \"another.key\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Text(val) => {
             assert_eq!(val, "another.value");
         }
@@ -870,7 +870,7 @@ fn test_config_set_and_get() {
 
     // Original key should still be accessible.
     let cmd = parse_command("CONFIG GET \"my.key\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Text(val) => {
             assert_eq!(val, "updated.value");
         }
@@ -908,11 +908,11 @@ fn test_concurrent_reads() {
             for _ in 0..100 {
                 // Read operations: PING, GRAPH LIST, GRAPH INFO, NODE GET
                 let cmd = parse_command("PING").unwrap();
-                let resp = engine_clone.execute_command(cmd).unwrap();
+                let resp = engine_clone.execute_command(cmd, None).unwrap();
                 assert!(matches!(resp, CommandResponse::Pong));
 
                 let cmd = parse_command("GRAPH LIST").unwrap();
-                let resp = engine_clone.execute_command(cmd).unwrap();
+                let resp = engine_clone.execute_command(cmd, None).unwrap();
                 match resp {
                     CommandResponse::StringList(names) => {
                         assert!(names.contains(&"concurrent-graph".to_string()));
@@ -921,7 +921,7 @@ fn test_concurrent_reads() {
                 }
 
                 let cmd = parse_command("GRAPH INFO \"concurrent-graph\"").unwrap();
-                let resp = engine_clone.execute_command(cmd).unwrap();
+                let resp = engine_clone.execute_command(cmd, None).unwrap();
                 match resp {
                     CommandResponse::GraphInfo(info) => {
                         assert_eq!(info.node_count, 50);
@@ -936,7 +936,7 @@ fn test_concurrent_reads() {
                     node_id
                 ))
                 .unwrap();
-                let resp = engine_clone.execute_command(cmd).unwrap();
+                let resp = engine_clone.execute_command(cmd, None).unwrap();
                 match resp {
                     CommandResponse::NodeInfo(info) => {
                         assert_eq!(info.node_id, node_id as u64);
@@ -972,21 +972,21 @@ fn test_error_propagation() {
     // 3. Graph not found
     let cmd = parse_command("GRAPH INFO \"nonexistent\"").unwrap();
     assert!(
-        engine.execute_command(cmd).is_err(),
+        engine.execute_command(cmd, None).is_err(),
         "GRAPH INFO on non-existent graph should error"
     );
 
     // 4. Graph drop on non-existent graph
     let cmd = parse_command("GRAPH DROP \"nonexistent\"").unwrap();
     assert!(
-        engine.execute_command(cmd).is_err(),
+        engine.execute_command(cmd, None).is_err(),
         "GRAPH DROP on non-existent graph should error"
     );
 
     // 5. Node get on non-existent graph
     let cmd = parse_command("NODE GET \"nonexistent\" 1").unwrap();
     assert!(
-        engine.execute_command(cmd).is_err(),
+        engine.execute_command(cmd, None).is_err(),
         "NODE GET on non-existent graph should error"
     );
 
@@ -994,7 +994,7 @@ fn test_error_propagation() {
     create_graph(&engine, "error-graph");
     let cmd = parse_command("NODE GET \"error-graph\" 999").unwrap();
     assert!(
-        engine.execute_command(cmd).is_err(),
+        engine.execute_command(cmd, None).is_err(),
         "NODE GET for non-existent node should error"
     );
 
@@ -1004,21 +1004,21 @@ fn test_error_propagation() {
     )
     .unwrap();
     assert!(
-        engine.execute_command(cmd).is_err(),
+        engine.execute_command(cmd, None).is_err(),
         "EDGE ADD with non-existent nodes should error"
     );
 
     // 8. Edge invalidate for non-existent edge
     let cmd = parse_command("EDGE INVALIDATE \"error-graph\" 999").unwrap();
     assert!(
-        engine.execute_command(cmd).is_err(),
+        engine.execute_command(cmd, None).is_err(),
         "EDGE INVALIDATE for non-existent edge should error"
     );
 
     // 9. Node delete for non-existent node
     let cmd = parse_command("NODE DELETE \"error-graph\" 999").unwrap();
     assert!(
-        engine.execute_command(cmd).is_err(),
+        engine.execute_command(cmd, None).is_err(),
         "NODE DELETE for non-existent node should error"
     );
 
@@ -1028,14 +1028,14 @@ fn test_error_propagation() {
     )
     .unwrap();
     assert!(
-        engine.execute_command(cmd).is_err(),
+        engine.execute_command(cmd, None).is_err(),
         "CONTEXT on non-existent graph should error"
     );
 
     // 11. Stats on non-existent graph
     let cmd = parse_command("STATS \"nonexistent\"").unwrap();
     assert!(
-        engine.execute_command(cmd).is_err(),
+        engine.execute_command(cmd, None).is_err(),
         "STATS on non-existent graph should error"
     );
 }
@@ -1063,7 +1063,7 @@ fn test_context_query_multi_seed() {
         r#"CONTEXT "programming languages" FROM "multi-seed-graph" SEEDS NODES ["alice", "bob"] DEPTH 2"#,
     )
     .unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Context(result) => {
             assert!(
                 result.nodes_considered >= 2,
@@ -1089,7 +1089,7 @@ fn test_stats_and_info() {
 
     // INFO before any graphs
     let cmd = parse_command("INFO").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Text(text) => {
             assert!(text.contains("weav-server"), "INFO should contain server name");
         }
@@ -1098,7 +1098,7 @@ fn test_stats_and_info() {
 
     // Global stats
     let cmd = parse_command("STATS").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Text(text) => {
             assert!(text.contains("graphs="), "STATS should show graph count");
         }
@@ -1118,7 +1118,7 @@ fn test_stats_and_info() {
     }
 
     let cmd = parse_command("STATS \"stats-graph\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Text(text) => {
             assert!(text.contains("graph=stats-graph"));
             assert!(text.contains("nodes=5"));
@@ -1129,7 +1129,7 @@ fn test_stats_and_info() {
 
     // SNAPSHOT should return Ok
     let cmd = parse_command("SNAPSHOT").unwrap();
-    let resp = engine.execute_command(cmd).unwrap();
+    let resp = engine.execute_command(cmd, None).unwrap();
     assert!(matches!(resp, CommandResponse::Ok));
 }
 
@@ -1148,14 +1148,14 @@ fn test_node_update_e2e() {
         r#"NODE ADD TO "update-graph" LABEL "person" PROPERTIES {"name": "Alice", "age": 30} KEY "alice""#,
     )
     .unwrap();
-    let node_id = match engine.execute_command(cmd).unwrap() {
+    let node_id = match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Integer(id) => id,
         other => panic!("expected Integer from NODE ADD, got: {:?}", other),
     };
 
     // Verify initial properties
     let cmd = parse_command(&format!("NODE GET \"update-graph\" {node_id}")).unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::NodeInfo(info) => {
             assert_eq!(info.node_id, node_id);
             assert_eq!(info.label, "person");
@@ -1170,7 +1170,7 @@ fn test_node_update_e2e() {
         r#"NODE UPDATE "update-graph" {node_id} PROPERTIES {{"name": "Bob"}}"#
     ))
     .unwrap();
-    let resp = engine.execute_command(cmd).unwrap();
+    let resp = engine.execute_command(cmd, None).unwrap();
     assert!(
         matches!(resp, CommandResponse::Ok),
         "NODE UPDATE should return Ok"
@@ -1178,7 +1178,7 @@ fn test_node_update_e2e() {
 
     // Verify updated properties
     let cmd = parse_command(&format!("NODE GET \"update-graph\" {node_id}")).unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::NodeInfo(info) => {
             assert_eq!(info.node_id, node_id);
             assert_eq!(info.label, "person");
@@ -1203,7 +1203,7 @@ fn test_node_update_e2e() {
     )
     .unwrap();
     assert!(
-        engine.execute_command(cmd).is_err(),
+        engine.execute_command(cmd, None).is_err(),
         "Updating a non-existent node should return an error"
     );
 }
@@ -1230,7 +1230,7 @@ fn test_vector_embedding_e2e() {
         r#"NODE ADD TO "vector-graph" LABEL "doc" PROPERTIES {"name": "doc_x"} EMBEDDING [1.0,0.0,0.0,0.0] KEY "doc-x""#,
     )
     .unwrap();
-    let n1 = match engine.execute_command(cmd).unwrap() {
+    let n1 = match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Integer(id) => id,
         other => panic!("expected Integer from NODE ADD, got: {:?}", other),
     };
@@ -1240,7 +1240,7 @@ fn test_vector_embedding_e2e() {
         r#"NODE ADD TO "vector-graph" LABEL "doc" PROPERTIES {"name": "doc_y"} EMBEDDING [0.0,1.0,0.0,0.0] KEY "doc-y""#,
     )
     .unwrap();
-    let n2 = match engine.execute_command(cmd).unwrap() {
+    let n2 = match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Integer(id) => id,
         other => panic!("expected Integer from NODE ADD, got: {:?}", other),
     };
@@ -1250,7 +1250,7 @@ fn test_vector_embedding_e2e() {
         r#"NODE ADD TO "vector-graph" LABEL "doc" PROPERTIES {"name": "doc_xy"} EMBEDDING [0.7,0.7,0.0,0.0] KEY "doc-xy""#,
     )
     .unwrap();
-    let n3 = match engine.execute_command(cmd).unwrap() {
+    let n3 = match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Integer(id) => id,
         other => panic!("expected Integer from NODE ADD, got: {:?}", other),
     };
@@ -1264,7 +1264,7 @@ fn test_vector_embedding_e2e() {
         r#"CONTEXT "find similar docs" FROM "vector-graph" SEEDS VECTOR [0.9,0.1,0.0,0.0] TOP 3 DEPTH 1 BUDGET 100000 TOKENS"#,
     )
     .unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Context(result) => {
             assert!(
                 result.nodes_included > 0,
@@ -1321,7 +1321,7 @@ fn test_concurrent_read_write_interleaving() {
                     r#"NODE ADD TO "rw-interleave-graph" LABEL "item" PROPERTIES {{"name": "{name}"}} KEY "{key}""#,
                 );
                 let cmd = parse_command(&cmd_str).unwrap();
-                let resp = engine_clone.execute_command(cmd).unwrap();
+                let resp = engine_clone.execute_command(cmd, None).unwrap();
                 match resp {
                     CommandResponse::Integer(id) => assert!(id >= 1),
                     other => panic!("writer {t}: expected Integer, got: {:?}", other),
@@ -1338,7 +1338,7 @@ fn test_concurrent_read_write_interleaving() {
             for _ in 0..50 {
                 // Read: GRAPH INFO
                 let cmd = parse_command("GRAPH INFO \"rw-interleave-graph\"").unwrap();
-                let resp = engine_clone.execute_command(cmd).unwrap();
+                let resp = engine_clone.execute_command(cmd, None).unwrap();
                 match resp {
                     CommandResponse::GraphInfo(info) => {
                         // Node count should be at least the initial 10
@@ -1358,7 +1358,7 @@ fn test_concurrent_read_write_interleaving() {
                     node_id
                 ))
                 .unwrap();
-                let resp = engine_clone.execute_command(cmd).unwrap();
+                let resp = engine_clone.execute_command(cmd, None).unwrap();
                 match resp {
                     CommandResponse::NodeInfo(info) => {
                         assert_eq!(info.node_id, node_id as u64);
@@ -1380,7 +1380,7 @@ fn test_concurrent_read_write_interleaving() {
     // Verify final node count: initial 10 + (writer_count * writes_per_thread)
     let expected_total = 10 + (writer_count * writes_per_thread) as u64;
     let cmd = parse_command("GRAPH INFO \"rw-interleave-graph\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(
                 info.node_count, expected_total,
@@ -1407,7 +1407,7 @@ fn test_large_dataset_operations() {
             r#"NODE ADD TO "large-graph" LABEL "item" PROPERTIES {{"name": "item_{i}", "index": {i}}} KEY "large-{i}""#,
         );
         let cmd = parse_command(&cmd_str).unwrap();
-        let nid = match engine.execute_command(cmd).unwrap() {
+        let nid = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             other => panic!("expected Integer, got: {:?}", other),
         };
@@ -1428,7 +1428,7 @@ fn test_large_dataset_operations() {
 
     // Verify counts
     let cmd = parse_command("GRAPH INFO \"large-graph\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(info.node_count, 200, "Should have 200 nodes");
             assert_eq!(info.edge_count, 199, "Should have 199 edges");
@@ -1441,7 +1441,7 @@ fn test_large_dataset_operations() {
         r#"CONTEXT "traverse chain" FROM "large-graph" SEEDS NODES ["large-0"] DEPTH 5 BUDGET 100000 TOKENS"#,
     )
     .unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Context(result) => {
             assert!(
                 result.nodes_included > 0,
@@ -1463,7 +1463,7 @@ fn test_large_dataset_operations() {
         r#"CONTEXT "middle of chain" FROM "large-graph" SEEDS NODES ["large-100"] DEPTH 3 BUDGET 100000 TOKENS"#,
     )
     .unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Context(result) => {
             assert!(
                 result.nodes_included > 0,
@@ -1493,7 +1493,7 @@ fn test_edge_operations_e2e() {
 
     // Verify all edges exist via EDGE GET
     let cmd = parse_command(&format!("EDGE GET \"edge-e2e-graph\" {e1}")).unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::EdgeInfo(info) => {
             assert_eq!(info.edge_id, e1);
             assert_eq!(info.source, n1);
@@ -1505,7 +1505,7 @@ fn test_edge_operations_e2e() {
     }
 
     let cmd = parse_command(&format!("EDGE GET \"edge-e2e-graph\" {e2}")).unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::EdgeInfo(info) => {
             assert_eq!(info.edge_id, e2);
             assert_eq!(info.source, n1);
@@ -1516,7 +1516,7 @@ fn test_edge_operations_e2e() {
     }
 
     let cmd = parse_command(&format!("EDGE GET \"edge-e2e-graph\" {e3}")).unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::EdgeInfo(info) => {
             assert_eq!(info.edge_id, e3);
             assert_eq!(info.source, n2);
@@ -1528,7 +1528,7 @@ fn test_edge_operations_e2e() {
 
     // Verify edge count is 3
     let cmd = parse_command("GRAPH INFO \"edge-e2e-graph\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(info.edge_count, 3);
         }
@@ -1537,7 +1537,7 @@ fn test_edge_operations_e2e() {
 
     // Delete the middle edge (e2: manages)
     let cmd = parse_command(&format!("EDGE DELETE \"edge-e2e-graph\" {e2}")).unwrap();
-    let resp = engine.execute_command(cmd).unwrap();
+    let resp = engine.execute_command(cmd, None).unwrap();
     assert!(
         matches!(resp, CommandResponse::Ok),
         "EDGE DELETE should return Ok"
@@ -1546,24 +1546,24 @@ fn test_edge_operations_e2e() {
     // EDGE GET after deletion should fail
     let cmd = parse_command(&format!("EDGE GET \"edge-e2e-graph\" {e2}")).unwrap();
     assert!(
-        engine.execute_command(cmd).is_err(),
+        engine.execute_command(cmd, None).is_err(),
         "EDGE GET after EDGE DELETE should return an error"
     );
 
     // Other edges should still exist
     let cmd = parse_command(&format!("EDGE GET \"edge-e2e-graph\" {e1}")).unwrap();
     engine
-        .execute_command(cmd)
+        .execute_command(cmd, None)
         .expect("Edge e1 should still exist after deleting e2");
 
     let cmd = parse_command(&format!("EDGE GET \"edge-e2e-graph\" {e3}")).unwrap();
     engine
-        .execute_command(cmd)
+        .execute_command(cmd, None)
         .expect("Edge e3 should still exist after deleting e2");
 
     // Verify edge count dropped to 2
     let cmd = parse_command("GRAPH INFO \"edge-e2e-graph\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(info.edge_count, 2, "Edge count should be 2 after one deletion");
         }
@@ -1572,12 +1572,12 @@ fn test_edge_operations_e2e() {
 
     // Delete remaining edges and verify count goes to 0
     let cmd = parse_command(&format!("EDGE DELETE \"edge-e2e-graph\" {e1}")).unwrap();
-    engine.execute_command(cmd).unwrap();
+    engine.execute_command(cmd, None).unwrap();
     let cmd = parse_command(&format!("EDGE DELETE \"edge-e2e-graph\" {e3}")).unwrap();
-    engine.execute_command(cmd).unwrap();
+    engine.execute_command(cmd, None).unwrap();
 
     let cmd = parse_command("GRAPH INFO \"edge-e2e-graph\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(info.edge_count, 0, "All edges should be deleted");
             assert_eq!(info.node_count, 3, "Nodes should still exist");
@@ -1604,7 +1604,7 @@ fn test_temporal_filtering_context() {
 
     // Invalidate the first edge to give it a temporal boundary
     let cmd = parse_command(&format!("EDGE INVALIDATE \"temporal-ctx-graph\" 1")).unwrap();
-    engine.execute_command(cmd).unwrap();
+    engine.execute_command(cmd, None).unwrap();
 
     // Execute a context query with AT timestamp parameter
     // Use a large timestamp (far in the future) so all non-invalidated edges are included
@@ -1612,7 +1612,7 @@ fn test_temporal_filtering_context() {
         r#"CONTEXT "temporal events" FROM "temporal-ctx-graph" SEEDS NODES ["ev1"] DEPTH 2 AT 9999999999999"#,
     )
     .unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Context(result) => {
             assert!(
                 result.nodes_considered > 0,
@@ -1630,7 +1630,7 @@ fn test_temporal_filtering_context() {
         r#"CONTEXT "past events" FROM "temporal-ctx-graph" SEEDS NODES ["ev2"] DEPTH 2 AT 1"#,
     )
     .unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Context(result) => {
             // Should still complete without error, even if filtering reduces results
             assert!(
@@ -1661,7 +1661,7 @@ fn test_integration_self_loop_edge() {
 
     // Verify counts.
     let cmd = parse_command("GRAPH INFO \"selfloop-graph\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(info.node_count, 1, "Should have exactly 1 node");
             assert_eq!(info.edge_count, 1, "Should have exactly 1 (self-loop) edge");
@@ -1685,7 +1685,7 @@ fn test_integration_node_update_then_get() {
         r#"NODE UPDATE "update-get-graph" {node_id} PROPERTIES {{"name": "Alice Updated", "city": "Berlin"}}"#,
     ))
     .unwrap();
-    let resp = engine.execute_command(cmd).unwrap();
+    let resp = engine.execute_command(cmd, None).unwrap();
     assert!(
         matches!(resp, CommandResponse::Ok),
         "NODE UPDATE should return Ok"
@@ -1693,7 +1693,7 @@ fn test_integration_node_update_then_get() {
 
     // Verify via NODE GET.
     let cmd = parse_command(&format!("NODE GET \"update-get-graph\" {node_id}")).unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::NodeInfo(info) => {
             assert_eq!(info.node_id, node_id);
             let name = info.properties.iter().find(|(k, _)| k == "name");
@@ -1719,7 +1719,7 @@ fn test_integration_bulk_insert_empty_arrays() {
         r#"BULK NODES TO "bulk-empty-graph" DATA []"#,
     )
     .unwrap();
-    let resp = engine.execute_command(cmd).unwrap();
+    let resp = engine.execute_command(cmd, None).unwrap();
     match resp {
         CommandResponse::IntegerList(ids) => {
             assert!(ids.is_empty(), "Empty BULK INSERT should return empty list");
@@ -1729,7 +1729,7 @@ fn test_integration_bulk_insert_empty_arrays() {
 
     // Graph should have 0 nodes.
     let cmd = parse_command("GRAPH INFO \"bulk-empty-graph\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(info.node_count, 0, "No nodes should have been inserted");
         }
@@ -1753,7 +1753,7 @@ fn test_integration_context_no_seeds_found() {
         r#"CONTEXT "test" FROM "ctx-noseed-graph" SEEDS NODES ["nonexistent_key_xyz"]"#,
     )
     .unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Context(result) => {
             assert_eq!(
                 result.nodes_included, 0,
@@ -1780,7 +1780,7 @@ fn test_integration_edge_invalidate_then_query() {
 
     // Invalidate the edge.
     let cmd = parse_command(&format!("EDGE INVALIDATE \"inv-edge-graph\" {eid}")).unwrap();
-    engine.execute_command(cmd).unwrap();
+    engine.execute_command(cmd, None).unwrap();
 
     // Query with a very early timestamp (before the edge was created).
     // The edge was created after epoch, so AT 1 should exclude it from traversal.
@@ -1788,7 +1788,7 @@ fn test_integration_edge_invalidate_then_query() {
         r#"CONTEXT "after invalidation" FROM "inv-edge-graph" SEEDS NODES ["e1"] DEPTH 2 AT 1"#,
     )
     .unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Context(result) => {
             // The seed node should be present (it was added before/during our timestamp window).
             assert!(
@@ -1806,7 +1806,7 @@ fn test_integration_edge_invalidate_then_query() {
         r#"CONTEXT "future query" FROM "inv-edge-graph" SEEDS NODES ["e1"] DEPTH 2 AT 9999999999999"#,
     )
     .unwrap();
-    let resp = engine.execute_command(cmd);
+    let resp = engine.execute_command(cmd, None);
     assert!(resp.is_ok(), "Context query after edge invalidation should not error")
 }
 
@@ -1828,7 +1828,7 @@ fn test_integration_graph_drop_cleans_everything() {
 
     // Verify graph exists and has data.
     let cmd = parse_command("GRAPH INFO \"drop-clean-graph\"").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(info.node_count, 3);
             assert_eq!(info.edge_count, 2);
@@ -1838,11 +1838,11 @@ fn test_integration_graph_drop_cleans_everything() {
 
     // Drop the graph.
     let cmd = parse_command("GRAPH DROP \"drop-clean-graph\"").unwrap();
-    engine.execute_command(cmd).unwrap();
+    engine.execute_command(cmd, None).unwrap();
 
     // GRAPH LIST should no longer contain it.
     let cmd = parse_command("GRAPH LIST").unwrap();
-    match engine.execute_command(cmd).unwrap() {
+    match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::StringList(names) => {
             assert!(
                 !names.contains(&"drop-clean-graph".to_string()),
@@ -1855,7 +1855,7 @@ fn test_integration_graph_drop_cleans_everything() {
     // GRAPH INFO should fail with GraphNotFound.
     let cmd = parse_command("GRAPH INFO \"drop-clean-graph\"").unwrap();
     assert!(
-        engine.execute_command(cmd).is_err(),
+        engine.execute_command(cmd, None).is_err(),
         "GRAPH INFO after drop should return error"
     );
 }

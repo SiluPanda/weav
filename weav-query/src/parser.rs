@@ -55,6 +55,38 @@ pub enum Command {
     ConfigSet(String, String),
     /// Get a config key.
     ConfigGet(String),
+    /// Authenticate: AUTH [username] password
+    Auth {
+        username: Option<String>,
+        password: String,
+    },
+    /// ACL SETUSER username [>password] [on|off] [+@cat|-@cat] [~pattern]
+    AclSetUser(AclSetUserCmd),
+    /// ACL DELUSER username
+    AclDelUser(String),
+    /// ACL LIST
+    AclList,
+    /// ACL GETUSER username
+    AclGetUser(String),
+    /// ACL WHOAMI
+    AclWhoAmI,
+    /// ACL SAVE
+    AclSave,
+    /// ACL LOAD
+    AclLoad,
+}
+
+#[derive(Debug, Clone)]
+pub struct AclSetUserCmd {
+    pub username: String,
+    /// Plaintext password to set (from ">password" token).
+    pub password: Option<String>,
+    /// Whether to enable the user.
+    pub enabled: Option<bool>,
+    /// Category grants/revocations like "+@read", "-@admin".
+    pub categories: Vec<String>,
+    /// Graph patterns like "~pattern:permission".
+    pub graph_patterns: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -380,6 +412,8 @@ pub fn parse_command(input: &str) -> Result<Command, WeavError> {
         "CONTEXT" => parse_context_command(&tokens),
         "BULK" => parse_bulk_command(&tokens),
         "CONFIG" => parse_config_command(&tokens),
+        "AUTH" => parse_auth_command(&tokens),
+        "ACL" => parse_acl_command(&tokens),
         _ => Err(parse_err(format!("unknown command: {}", &tokens[0]))),
     }
 }
@@ -1167,6 +1201,91 @@ fn parse_config_command(tokens: &[String]) -> Result<Command, WeavError> {
     }
 }
 
+// ─── AUTH / ACL commands ─────────────────────────────────────────────────────
+
+fn parse_auth_command(tokens: &[String]) -> Result<Command, WeavError> {
+    // AUTH [username] password
+    match tokens.len() {
+        2 => {
+            // AUTH <password> — Redis-compat single-password form.
+            Ok(Command::Auth {
+                username: None,
+                password: unquote(&tokens[1]).to_string(),
+            })
+        }
+        3 => {
+            // AUTH <username> <password>
+            Ok(Command::Auth {
+                username: Some(unquote(&tokens[1]).to_string()),
+                password: unquote(&tokens[2]).to_string(),
+            })
+        }
+        _ => Err(parse_err("AUTH requires 1 or 2 arguments: AUTH [username] password")),
+    }
+}
+
+fn parse_acl_command(tokens: &[String]) -> Result<Command, WeavError> {
+    if tokens.len() < 2 {
+        return Err(parse_err("ACL requires a subcommand (SETUSER, DELUSER, LIST, GETUSER, WHOAMI, SAVE, LOAD)"));
+    }
+    let sub = tokens[1].to_uppercase();
+    match sub.as_str() {
+        "SETUSER" => {
+            if tokens.len() < 3 {
+                return Err(parse_err("ACL SETUSER requires a username"));
+            }
+            let username = unquote(&tokens[2]).to_string();
+            let mut password = None;
+            let mut enabled = None;
+            let mut categories = Vec::new();
+            let mut graph_patterns = Vec::new();
+
+            for token in &tokens[3..] {
+                let t = token.as_str();
+                if let Some(pw) = t.strip_prefix('>') {
+                    password = Some(pw.to_string());
+                } else if t.eq_ignore_ascii_case("on") {
+                    enabled = Some(true);
+                } else if t.eq_ignore_ascii_case("off") {
+                    enabled = Some(false);
+                } else if t.starts_with('+') || t.starts_with('-') {
+                    categories.push(t.to_string());
+                } else if let Some(pat) = t.strip_prefix('~') {
+                    // ~pattern:permission
+                    if let Some((p, perm)) = pat.rsplit_once(':') {
+                        graph_patterns.push((p.to_string(), perm.to_string()));
+                    }
+                }
+            }
+
+            Ok(Command::AclSetUser(AclSetUserCmd {
+                username,
+                password,
+                enabled,
+                categories,
+                graph_patterns,
+            }))
+        }
+        "DELUSER" => {
+            if tokens.len() < 3 {
+                return Err(parse_err("ACL DELUSER requires a username"));
+            }
+            Ok(Command::AclDelUser(unquote(&tokens[2]).to_string()))
+        }
+        "LIST" => Ok(Command::AclList),
+        "GETUSER" => {
+            if tokens.len() < 3 {
+                return Err(parse_err("ACL GETUSER requires a username"));
+            }
+            Ok(Command::AclGetUser(unquote(&tokens[2]).to_string()))
+        }
+        "WHOAMI" => Ok(Command::AclWhoAmI),
+        "SAVE" => Ok(Command::AclSave),
+        "LOAD" => Ok(Command::AclLoad),
+        _ => Err(parse_err(format!("unknown ACL subcommand: {}", &tokens[1]))),
+    }
+}
+
 /// Find a keyword (case-insensitive) in the token list, starting from index 0.
 fn find_keyword(tokens: &[String], keyword: &str) -> Option<usize> {
     find_keyword_after(tokens, keyword, 0)
@@ -1804,5 +1923,131 @@ mod tests {
             }
             _ => panic!("expected Context"),
         }
+    }
+
+    // ── AUTH / ACL command tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_auth_password_only() {
+        let cmd = parse_command("AUTH mysecret").unwrap();
+        match cmd {
+            Command::Auth { username, password } => {
+                assert!(username.is_none());
+                assert_eq!(password, "mysecret");
+            }
+            _ => panic!("expected Auth"),
+        }
+    }
+
+    #[test]
+    fn test_parse_auth_username_password() {
+        let cmd = parse_command("AUTH alice secret123").unwrap();
+        match cmd {
+            Command::Auth { username, password } => {
+                assert_eq!(username, Some("alice".into()));
+                assert_eq!(password, "secret123");
+            }
+            _ => panic!("expected Auth"),
+        }
+    }
+
+    #[test]
+    fn test_parse_auth_no_args() {
+        let result = parse_command("AUTH");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_acl_whoami() {
+        let cmd = parse_command("ACL WHOAMI").unwrap();
+        assert!(matches!(cmd, Command::AclWhoAmI));
+    }
+
+    #[test]
+    fn test_parse_acl_list() {
+        let cmd = parse_command("ACL LIST").unwrap();
+        assert!(matches!(cmd, Command::AclList));
+    }
+
+    #[test]
+    fn test_parse_acl_save() {
+        let cmd = parse_command("ACL SAVE").unwrap();
+        assert!(matches!(cmd, Command::AclSave));
+    }
+
+    #[test]
+    fn test_parse_acl_load() {
+        let cmd = parse_command("ACL LOAD").unwrap();
+        assert!(matches!(cmd, Command::AclLoad));
+    }
+
+    #[test]
+    fn test_parse_acl_getuser() {
+        let cmd = parse_command("ACL GETUSER alice").unwrap();
+        match cmd {
+            Command::AclGetUser(name) => assert_eq!(name, "alice"),
+            _ => panic!("expected AclGetUser"),
+        }
+    }
+
+    #[test]
+    fn test_parse_acl_deluser() {
+        let cmd = parse_command("ACL DELUSER bob").unwrap();
+        match cmd {
+            Command::AclDelUser(name) => assert_eq!(name, "bob"),
+            _ => panic!("expected AclDelUser"),
+        }
+    }
+
+    #[test]
+    fn test_parse_acl_setuser_basic() {
+        let cmd = parse_command("ACL SETUSER alice >pass123 on +@read +@write").unwrap();
+        match cmd {
+            Command::AclSetUser(cmd) => {
+                assert_eq!(cmd.username, "alice");
+                assert_eq!(cmd.password, Some("pass123".into()));
+                assert_eq!(cmd.enabled, Some(true));
+                assert_eq!(cmd.categories, vec!["+@read", "+@write"]);
+            }
+            _ => panic!("expected AclSetUser"),
+        }
+    }
+
+    #[test]
+    fn test_parse_acl_setuser_with_graph_pattern() {
+        let cmd = parse_command("ACL SETUSER bob on +@read ~app:*:readwrite").unwrap();
+        match cmd {
+            Command::AclSetUser(cmd) => {
+                assert_eq!(cmd.username, "bob");
+                assert_eq!(cmd.graph_patterns.len(), 1);
+                assert_eq!(cmd.graph_patterns[0].0, "app:*");
+                assert_eq!(cmd.graph_patterns[0].1, "readwrite");
+            }
+            _ => panic!("expected AclSetUser"),
+        }
+    }
+
+    #[test]
+    fn test_parse_acl_setuser_disabled() {
+        let cmd = parse_command("ACL SETUSER charlie off").unwrap();
+        match cmd {
+            Command::AclSetUser(cmd) => {
+                assert_eq!(cmd.username, "charlie");
+                assert_eq!(cmd.enabled, Some(false));
+            }
+            _ => panic!("expected AclSetUser"),
+        }
+    }
+
+    #[test]
+    fn test_parse_acl_unknown_subcommand() {
+        let result = parse_command("ACL UNKNOWN");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_acl_no_subcommand() {
+        let result = parse_command("ACL");
+        assert!(result.is_err());
     }
 }

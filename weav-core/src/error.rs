@@ -46,6 +46,15 @@ pub enum WeavError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("authentication required")]
+    AuthenticationRequired,
+
+    #[error("authentication failed: {0}")]
+    AuthenticationFailed(String),
+
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
 }
 
 /// Convenience type alias for `Result<T, WeavError>`.
@@ -105,6 +114,9 @@ mod tests {
             WeavError::CapacityExceeded("max nodes reached".into()),
             WeavError::InvalidConfig("bad port".into()),
             WeavError::Internal("something broke".into()),
+            WeavError::AuthenticationRequired,
+            WeavError::AuthenticationFailed("bad password".into()),
+            WeavError::PermissionDenied("no write access".into()),
         ];
 
         for err in &variants {
@@ -156,6 +168,18 @@ mod tests {
         assert_eq!(
             WeavError::Internal("something broke".into()).to_string(),
             "internal error: something broke"
+        );
+        assert_eq!(
+            WeavError::AuthenticationRequired.to_string(),
+            "authentication required"
+        );
+        assert_eq!(
+            WeavError::AuthenticationFailed("bad password".into()).to_string(),
+            "authentication failed: bad password"
+        );
+        assert_eq!(
+            WeavError::PermissionDenied("no write access".into()).to_string(),
+            "permission denied: no write access"
         );
     }
 }

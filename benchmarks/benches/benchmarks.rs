@@ -301,7 +301,7 @@ fn bench_engine(c: &mut Criterion) {
 
     // Create a graph
     let cmd = parse_command("GRAPH CREATE \"bench-graph\"").unwrap();
-    engine.execute_command(cmd).unwrap();
+    engine.execute_command(cmd, None).unwrap();
 
     // Add 100 nodes with properties
     for i in 0..100u64 {
@@ -310,7 +310,7 @@ fn bench_engine(c: &mut Criterion) {
             i, i, i
         );
         let cmd = parse_command(&cmd_str).unwrap();
-        engine.execute_command(cmd).unwrap();
+        engine.execute_command(cmd, None).unwrap();
     }
 
     // Add some edges between nodes
@@ -321,13 +321,13 @@ fn bench_engine(c: &mut Criterion) {
             i + 1
         );
         let cmd = parse_command(&cmd_str).unwrap();
-        engine.execute_command(cmd).unwrap();
+        engine.execute_command(cmd, None).unwrap();
     }
 
     c.bench_function("engine_ping", |b| {
         b.iter(|| {
             let cmd = parse_command("PING").unwrap();
-            let resp = engine.execute_command(black_box(cmd)).unwrap();
+            let resp = engine.execute_command(black_box(cmd), None).unwrap();
             black_box(resp);
         });
     });
@@ -335,7 +335,7 @@ fn bench_engine(c: &mut Criterion) {
     c.bench_function("engine_node_get", |b| {
         b.iter(|| {
             let cmd = parse_command("NODE GET \"bench-graph\" 1").unwrap();
-            let resp = engine.execute_command(black_box(cmd)).unwrap();
+            let resp = engine.execute_command(black_box(cmd), None).unwrap();
             black_box(resp);
         });
     });
@@ -343,7 +343,7 @@ fn bench_engine(c: &mut Criterion) {
     c.bench_function("engine_graph_list", |b| {
         b.iter(|| {
             let cmd = parse_command("GRAPH LIST").unwrap();
-            let resp = engine.execute_command(black_box(cmd)).unwrap();
+            let resp = engine.execute_command(black_box(cmd), None).unwrap();
             black_box(resp);
         });
     });
@@ -351,7 +351,7 @@ fn bench_engine(c: &mut Criterion) {
     c.bench_function("engine_graph_info", |b| {
         b.iter(|| {
             let cmd = parse_command("GRAPH INFO \"bench-graph\"").unwrap();
-            let resp = engine.execute_command(black_box(cmd)).unwrap();
+            let resp = engine.execute_command(black_box(cmd), None).unwrap();
             black_box(resp);
         });
     });
@@ -365,7 +365,7 @@ fn bench_context_query(c: &mut Criterion) {
     let engine = Engine::new(WeavConfig::default());
 
     let cmd = parse_command("GRAPH CREATE \"ctx-bench\"").unwrap();
-    engine.execute_command(cmd).unwrap();
+    engine.execute_command(cmd, None).unwrap();
 
     // Add 1000 nodes with properties
     for i in 0..1000u64 {
@@ -374,7 +374,7 @@ fn bench_context_query(c: &mut Criterion) {
             i, i, i % 50, i
         );
         let cmd = parse_command(&cmd_str).unwrap();
-        engine.execute_command(cmd).unwrap();
+        engine.execute_command(cmd, None).unwrap();
     }
 
     // Add edges in chain topology
@@ -385,7 +385,7 @@ fn bench_context_query(c: &mut Criterion) {
             i + 1
         );
         let cmd = parse_command(&cmd_str).unwrap();
-        engine.execute_command(cmd).unwrap();
+        engine.execute_command(cmd, None).unwrap();
     }
 
     // Benchmark: execute a CONTEXT query with SEEDS NODES, DEPTH 3, BUDGET 4096
@@ -396,7 +396,7 @@ fn bench_context_query(c: &mut Criterion) {
                 r#"CONTEXT "find documents" FROM "ctx-bench" SEEDS NODES ["doc_0"] DEPTH 3 BUDGET 4096 TOKENS"#,
             )
             .unwrap();
-            let resp = engine.execute_command(black_box(cmd)).unwrap();
+            let resp = engine.execute_command(black_box(cmd), None).unwrap();
             black_box(resp);
         });
     });

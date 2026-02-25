@@ -1,6 +1,12 @@
 export interface WeavConfig {
   host: string;
   port: number;
+  /** API key for Bearer token auth. */
+  apiKey?: string;
+  /** Username for Basic auth. */
+  username?: string;
+  /** Password for Basic auth. */
+  password?: string;
 }
 
 export interface GraphInfo {

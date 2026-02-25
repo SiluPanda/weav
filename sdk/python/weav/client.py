@@ -138,9 +138,25 @@ class WeavClient:
             print(result.to_prompt())
     """
 
-    def __init__(self, host: str = "localhost", port: int = 6382, *, timeout: float = 30.0):
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 6382,
+        *,
+        timeout: float = 30.0,
+        api_key: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+    ):
         self.base_url = f"http://{host}:{port}"
-        self._client = httpx.Client(base_url=self.base_url, timeout=timeout)
+        headers: dict[str, str] = {}
+        if api_key is not None:
+            headers["Authorization"] = f"Bearer {api_key}"
+        elif username is not None and password is not None:
+            import base64
+            credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+            headers["Authorization"] = f"Basic {credentials}"
+        self._client = httpx.Client(base_url=self.base_url, timeout=timeout, headers=headers)
 
     def close(self) -> None:
         """Close the underlying HTTP connection pool."""
@@ -360,9 +376,25 @@ class AsyncWeavClient:
             print(result.to_prompt())
     """
 
-    def __init__(self, host: str = "localhost", port: int = 6382, *, timeout: float = 30.0):
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 6382,
+        *,
+        timeout: float = 30.0,
+        api_key: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+    ):
         self.base_url = f"http://{host}:{port}"
-        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout)
+        headers: dict[str, str] = {}
+        if api_key is not None:
+            headers["Authorization"] = f"Bearer {api_key}"
+        elif username is not None and password is not None:
+            import base64
+            credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
+            headers["Authorization"] = f"Basic {credentials}"
+        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=timeout, headers=headers)
 
     async def close(self) -> None:
         """Close the underlying HTTP connection pool."""

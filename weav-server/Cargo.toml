@@ -14,6 +14,7 @@ weav-vector = { path = "../weav-vector" }
 weav-query = { path = "../weav-query" }
 weav-persist = { path = "../weav-persist" }
 weav-proto = { path = "../weav-proto" }
+weav-auth = { path = "../weav-auth" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 axum = { workspace = true }
@@ -30,6 +31,7 @@ futures = "0.3"
 tonic = { workspace = true }
 prost = { workspace = true }
 prometheus = "0.13"
+base64 = { workspace = true }
 tokio-stream = "0.1"
 
 [dev-dependencies]

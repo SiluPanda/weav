@@ -119,6 +119,9 @@ pub async fn run_resp3_server(engine: Arc<Engine>, addr: &str) {
             tracing::debug!("RESP3 connection from {}", peer);
             let mut framed = Framed::new(stream, Resp3Codec::new());
 
+            // Per-connection identity (None until AUTH succeeds).
+            let mut identity: Option<weav_auth::identity::SessionIdentity> = None;
+
             while let Some(frame_result) = framed.next().await {
                 let frame = match frame_result {
                     Ok(f) => f,
@@ -140,12 +143,42 @@ pub async fn run_resp3_server(engine: Arc<Engine>, addr: &str) {
                     }
                 };
 
-                // Parse and execute command.
-                let response = match parse_command(&cmd_str) {
-                    Ok(cmd) => match engine.execute_command(cmd) {
-                        Ok(resp) => command_response_to_resp3(resp),
-                        Err(e) => error_to_resp3(&e),
-                    },
+                // Parse the command.
+                let cmd = match parse_command(&cmd_str) {
+                    Ok(cmd) => cmd,
+                    Err(e) => {
+                        if framed.send(error_to_resp3(&e)).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+
+                // Handle AUTH specially: authenticate and store the identity.
+                if let weav_query::parser::Command::Auth { ref username, ref password } = cmd {
+                    if engine.is_auth_enabled() {
+                        let auth_result = match username {
+                            Some(u) => engine.authenticate(u, password),
+                            None => engine.authenticate_default(password),
+                        };
+                        let response = match auth_result {
+                            Ok(id) => {
+                                let resp_text = format!("OK (user: {})", id.username);
+                                identity = Some(id);
+                                command_response_to_resp3(CommandResponse::Text(resp_text))
+                            }
+                            Err(e) => error_to_resp3(&e),
+                        };
+                        if framed.send(response).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+
+                // Execute command with current identity.
+                let response = match engine.execute_command(cmd, identity.as_ref()) {
+                    Ok(resp) => command_response_to_resp3(resp),
                     Err(e) => error_to_resp3(&e),
                 };
 
@@ -243,7 +276,7 @@ mod tests {
             if let Some(Ok(frame)) = framed.next().await {
                 let cmd_str = resp3_to_command_string(&frame).unwrap();
                 let cmd = parse_command(&cmd_str).unwrap();
-                let resp = engine_clone.execute_command(cmd).unwrap();
+                let resp = engine_clone.execute_command(cmd, None).unwrap();
                 let resp3 = command_response_to_resp3(resp);
                 framed.send(resp3).await.unwrap();
             }

@@ -23,11 +23,19 @@ export class WeavError extends Error {
 
 export class WeavClient {
   private baseUrl: string;
+  private authHeader?: string;
 
   constructor(config?: Partial<WeavConfig>) {
     const host = config?.host ?? 'localhost';
     const port = config?.port ?? 6382;
     this.baseUrl = `http://${host}:${port}`;
+
+    if (config?.apiKey) {
+      this.authHeader = `Bearer ${config.apiKey}`;
+    } else if (config?.username && config?.password) {
+      const credentials = btoa(`${config.username}:${config.password}`);
+      this.authHeader = `Basic ${credentials}`;
+    }
   }
 
   /** Visible for testing. */
@@ -41,9 +49,13 @@ export class WeavClient {
     body?: unknown,
   ): Promise<T> {
     const url = `${this.baseUrl}${path}`;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (this.authHeader) {
+      headers['Authorization'] = this.authHeader;
+    }
     const options: RequestInit = {
       method,
-      headers: { 'Content-Type': 'application/json' },
+      headers,
     };
     if (body !== undefined) {
       options.body = JSON.stringify(body);

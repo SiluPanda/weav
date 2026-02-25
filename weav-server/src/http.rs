@@ -221,6 +221,9 @@ fn weav_error_to_response(err: weav_core::error::WeavError) -> impl IntoResponse
         weav_core::error::WeavError::QueryParseError(_) => StatusCode::BAD_REQUEST,
         weav_core::error::WeavError::DimensionMismatch { .. } => StatusCode::BAD_REQUEST,
         weav_core::error::WeavError::InvalidConfig(_) => StatusCode::BAD_REQUEST,
+        weav_core::error::WeavError::AuthenticationRequired => StatusCode::UNAUTHORIZED,
+        weav_core::error::WeavError::AuthenticationFailed(_) => StatusCode::UNAUTHORIZED,
+        weav_core::error::WeavError::PermissionDenied(_) => StatusCode::FORBIDDEN,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, Json(ApiResponse::<()>::err(err.to_string())))
@@ -250,7 +253,7 @@ async fn create_graph(
         name: body.name,
         config: None,
     });
-    match engine.execute_command(cmd) {
+    match engine.execute_command(cmd, None) {
         Ok(_) => (
             StatusCode::CREATED,
             Json(ApiResponse::<()>::ok_empty()).into_response(),
@@ -263,7 +266,7 @@ async fn create_graph(
 }
 
 async fn list_graphs(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
-    match engine.execute_command(Command::GraphList) {
+    match engine.execute_command(Command::GraphList, None) {
         Ok(CommandResponse::StringList(names)) => {
             (StatusCode::OK, Json(ApiResponse::ok(names))).into_response()
         }
@@ -281,7 +284,7 @@ async fn get_graph_info(
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     let cmd = Command::GraphInfo(name);
-    match engine.execute_command(cmd) {
+    match engine.execute_command(cmd, None) {
         Ok(CommandResponse::GraphInfo(info)) => (
             StatusCode::OK,
             Json(ApiResponse::ok(GraphInfoJson {
@@ -305,7 +308,7 @@ async fn drop_graph(
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     let cmd = Command::GraphDrop(name);
-    match engine.execute_command(cmd) {
+    match engine.execute_command(cmd, None) {
         Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
     }
@@ -330,7 +333,7 @@ async fn add_node(
         entity_key: body.entity_key,
     });
 
-    match engine.execute_command(cmd) {
+    match engine.execute_command(cmd, None) {
         Ok(CommandResponse::Integer(id)) => (
             StatusCode::CREATED,
             Json(ApiResponse::ok(NodeIdResponse { node_id: id })),
@@ -355,7 +358,7 @@ async fn get_node(
         entity_key: None,
     });
 
-    match engine.execute_command(cmd) {
+    match engine.execute_command(cmd, None) {
         Ok(CommandResponse::NodeInfo(info)) => {
             let props_json = props_to_json(&info.properties);
             (
@@ -386,7 +389,7 @@ async fn delete_node(
         node_id: id,
     });
 
-    match engine.execute_command(cmd) {
+    match engine.execute_command(cmd, None) {
         Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
     }
@@ -412,7 +415,7 @@ async fn add_edge(
         properties,
     });
 
-    match engine.execute_command(cmd) {
+    match engine.execute_command(cmd, None) {
         Ok(CommandResponse::Integer(id)) => (
             StatusCode::CREATED,
             Json(ApiResponse::ok(EdgeIdResponse { edge_id: id })),
@@ -436,7 +439,7 @@ async fn invalidate_edge(
         edge_id: id,
     });
 
-    match engine.execute_command(cmd) {
+    match engine.execute_command(cmd, None) {
         Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
     }
@@ -451,7 +454,7 @@ async fn get_edge(
         edge_id: id,
     });
 
-    match engine.execute_command(cmd) {
+    match engine.execute_command(cmd, None) {
         Ok(CommandResponse::EdgeInfo(info)) => (
             StatusCode::OK,
             Json(ApiResponse::ok(EdgeInfoJson {
@@ -481,7 +484,7 @@ async fn delete_edge(
         edge_id: id,
     });
 
-    match engine.execute_command(cmd) {
+    match engine.execute_command(cmd, None) {
         Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
     }
@@ -490,7 +493,7 @@ async fn delete_edge(
 async fn snapshot(
     State(engine): State<Arc<Engine>>,
 ) -> impl IntoResponse {
-    match engine.execute_command(Command::Snapshot) {
+    match engine.execute_command(Command::Snapshot, None) {
         Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
     }
@@ -499,7 +502,7 @@ async fn snapshot(
 async fn server_info(
     State(engine): State<Arc<Engine>>,
 ) -> impl IntoResponse {
-    match engine.execute_command(Command::Info) {
+    match engine.execute_command(Command::Info, None) {
         Ok(CommandResponse::Text(text)) => {
             (StatusCode::OK, Json(ApiResponse::ok(text))).into_response()
         }
@@ -530,7 +533,7 @@ async fn update_node(
         embedding: body.embedding,
     });
 
-    match engine.execute_command(cmd) {
+    match engine.execute_command(cmd, None) {
         Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
     }
@@ -565,7 +568,7 @@ async fn bulk_add_nodes(
         nodes,
     });
 
-    match engine.execute_command(cmd) {
+    match engine.execute_command(cmd, None) {
         Ok(CommandResponse::IntegerList(ids)) => {
             (StatusCode::CREATED, Json(ApiResponse::ok(BulkNodeIdsResponse { node_ids: ids }))).into_response()
         }
@@ -608,7 +611,7 @@ async fn bulk_add_edges(
         edges,
     });
 
-    match engine.execute_command(cmd) {
+    match engine.execute_command(cmd, None) {
         Ok(CommandResponse::IntegerList(ids)) => {
             (StatusCode::CREATED, Json(ApiResponse::ok(BulkEdgeIdsResponse { edge_ids: ids }))).into_response()
         }
@@ -698,7 +701,7 @@ async fn context_query(
     };
 
     let cmd = Command::Context(query);
-    match engine.execute_command(cmd) {
+    match engine.execute_command(cmd, None) {
         Ok(CommandResponse::Context(result)) => {
             (StatusCode::OK, Json(ApiResponse::ok(result))).into_response()
         }
@@ -869,7 +872,7 @@ mod tests {
             .execute_command(Command::GraphCreate(GraphCreateCmd {
                 name: "info_g".to_string(),
                 config: None,
-            }))
+            }), None)
             .unwrap();
 
         let req = Request::builder()
@@ -903,7 +906,7 @@ mod tests {
             .execute_command(Command::GraphCreate(GraphCreateCmd {
                 name: "drop_me".to_string(),
                 config: None,
-            }))
+            }), None)
             .unwrap();
 
         let req = Request::builder()
@@ -924,7 +927,7 @@ mod tests {
             .execute_command(Command::GraphCreate(GraphCreateCmd {
                 name: "ng".to_string(),
                 config: None,
-            }))
+            }), None)
             .unwrap();
 
         // Add node.
@@ -963,7 +966,7 @@ mod tests {
             .execute_command(Command::GraphCreate(GraphCreateCmd {
                 name: "dg".to_string(),
                 config: None,
-            }))
+            }), None)
             .unwrap();
 
         // Add and then delete a node.
@@ -974,7 +977,7 @@ mod tests {
                 properties: vec![],
                 embedding: None,
                 entity_key: None,
-            }))
+            }), None)
             .unwrap();
         let node_id = match add_resp {
             CommandResponse::Integer(id) => id,
@@ -999,7 +1002,7 @@ mod tests {
             .execute_command(Command::GraphCreate(GraphCreateCmd {
                 name: "eg".to_string(),
                 config: None,
-            }))
+            }), None)
             .unwrap();
 
         // Add two nodes via engine.
@@ -1010,7 +1013,7 @@ mod tests {
                 properties: vec![],
                 embedding: None,
                 entity_key: None,
-            }))
+            }), None)
             .unwrap()
         {
             CommandResponse::Integer(id) => id,
@@ -1024,7 +1027,7 @@ mod tests {
                 properties: vec![],
                 embedding: None,
                 entity_key: None,
-            }))
+            }), None)
             .unwrap()
         {
             CommandResponse::Integer(id) => id,
@@ -1059,7 +1062,7 @@ mod tests {
             .execute_command(Command::GraphCreate(GraphCreateCmd {
                 name: "ig".to_string(),
                 config: None,
-            }))
+            }), None)
             .unwrap();
 
         let n1 = match engine
@@ -1069,7 +1072,7 @@ mod tests {
                 properties: vec![],
                 embedding: None,
                 entity_key: None,
-            }))
+            }), None)
             .unwrap()
         {
             CommandResponse::Integer(id) => id,
@@ -1083,7 +1086,7 @@ mod tests {
                 properties: vec![],
                 embedding: None,
                 entity_key: None,
-            }))
+            }), None)
             .unwrap()
         {
             CommandResponse::Integer(id) => id,
@@ -1098,7 +1101,7 @@ mod tests {
                 label: "link".to_string(),
                 weight: 1.0,
                 properties: vec![],
-            }))
+            }), None)
             .unwrap()
         {
             CommandResponse::Integer(id) => id,
@@ -1123,7 +1126,7 @@ mod tests {
             .execute_command(Command::GraphCreate(GraphCreateCmd {
                 name: "ug".to_string(),
                 config: None,
-            }))
+            }), None)
             .unwrap();
 
         let add_resp = engine
@@ -1136,7 +1139,7 @@ mod tests {
                 )],
                 embedding: None,
                 entity_key: None,
-            }))
+            }), None)
             .unwrap();
         let node_id = match add_resp {
             CommandResponse::Integer(id) => id,
@@ -1162,7 +1165,7 @@ mod tests {
             .execute_command(Command::GraphCreate(GraphCreateCmd {
                 name: "bg".to_string(),
                 config: None,
-            }))
+            }), None)
             .unwrap();
 
         let req = Request::builder()
@@ -1190,7 +1193,7 @@ mod tests {
             .execute_command(Command::GraphCreate(GraphCreateCmd {
                 name: "beg".to_string(),
                 config: None,
-            }))
+            }), None)
             .unwrap();
 
         let n1 = match engine
@@ -1200,7 +1203,7 @@ mod tests {
                 properties: vec![],
                 embedding: None,
                 entity_key: None,
-            }))
+            }), None)
             .unwrap()
         {
             CommandResponse::Integer(id) => id,
@@ -1214,7 +1217,7 @@ mod tests {
                 properties: vec![],
                 embedding: None,
                 entity_key: None,
-            }))
+            }), None)
             .unwrap()
         {
             CommandResponse::Integer(id) => id,
@@ -1258,7 +1261,7 @@ mod tests {
             .execute_command(Command::GraphCreate(GraphCreateCmd {
                 name: "dng".to_string(),
                 config: None,
-            }))
+            }), None)
             .unwrap();
 
         let req = Request::builder()
@@ -1295,7 +1298,7 @@ mod tests {
             .execute_command(Command::GraphCreate(GraphCreateCmd {
                 name: "nullg".to_string(),
                 config: None,
-            }))
+            }), None)
             .unwrap();
 
         // Post a node with a null property value.
@@ -1335,7 +1338,7 @@ mod tests {
             .execute_command(Command::GraphCreate(GraphCreateCmd {
                 name: "upg".to_string(),
                 config: None,
-            }))
+            }), None)
             .unwrap();
 
         // Add a node.
@@ -1349,7 +1352,7 @@ mod tests {
                 )],
                 embedding: None,
                 entity_key: None,
-            }))
+            }), None)
             .unwrap();
         let node_id = match add_resp {
             CommandResponse::Integer(id) => id,
@@ -1387,7 +1390,7 @@ mod tests {
             .execute_command(Command::GraphCreate(GraphCreateCmd {
                 name: "cg".to_string(),
                 config: None,
-            }))
+            }), None)
             .unwrap();
 
         // Add a node with entity_key.
@@ -1401,7 +1404,7 @@ mod tests {
                 )],
                 embedding: None,
                 entity_key: Some("alice".to_string()),
-            }))
+            }), None)
             .unwrap();
 
         let body = serde_json::json!({

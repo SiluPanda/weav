@@ -38,6 +38,15 @@ fn weav_error_to_status(err: weav_core::error::WeavError) -> Status {
         weav_core::error::WeavError::DimensionMismatch { .. } => {
             Status::invalid_argument(err.to_string())
         }
+        weav_core::error::WeavError::AuthenticationRequired => {
+            Status::unauthenticated(err.to_string())
+        }
+        weav_core::error::WeavError::AuthenticationFailed(_) => {
+            Status::unauthenticated(err.to_string())
+        }
+        weav_core::error::WeavError::PermissionDenied(_) => {
+            Status::permission_denied(err.to_string())
+        }
         _ => Status::internal(err.to_string()),
     }
 }
@@ -103,7 +112,7 @@ impl WeavService for WeavGrpcService {
             config: None,
         });
         self.engine
-            .execute_command(cmd)
+            .execute_command(cmd, None)
             .map_err(weav_error_to_status)?;
         Ok(Response::new(CreateGraphResponse {}))
     }
@@ -115,7 +124,7 @@ impl WeavService for WeavGrpcService {
         let req = request.into_inner();
         let cmd = Command::GraphDrop(req.name);
         self.engine
-            .execute_command(cmd)
+            .execute_command(cmd, None)
             .map_err(weav_error_to_status)?;
         Ok(Response::new(DropGraphResponse {}))
     }
@@ -126,7 +135,7 @@ impl WeavService for WeavGrpcService {
     ) -> Result<Response<ListGraphsResponse>, Status> {
         match self
             .engine
-            .execute_command(Command::GraphList)
+            .execute_command(Command::GraphList, None)
             .map_err(weav_error_to_status)?
         {
             CommandResponse::StringList(names) => {
@@ -144,7 +153,7 @@ impl WeavService for WeavGrpcService {
         let cmd = Command::GraphInfo(req.name);
         match self
             .engine
-            .execute_command(cmd)
+            .execute_command(cmd, None)
             .map_err(weav_error_to_status)?
         {
             CommandResponse::GraphInfo(info) => Ok(Response::new(GraphInfoResponse {
@@ -183,7 +192,7 @@ impl WeavService for WeavGrpcService {
 
         match self
             .engine
-            .execute_command(cmd)
+            .execute_command(cmd, None)
             .map_err(weav_error_to_status)?
         {
             CommandResponse::Integer(id) => Ok(Response::new(AddNodeResponse { node_id: id })),
@@ -204,7 +213,7 @@ impl WeavService for WeavGrpcService {
 
         match self
             .engine
-            .execute_command(cmd)
+            .execute_command(cmd, None)
             .map_err(weav_error_to_status)?
         {
             CommandResponse::NodeInfo(info) => Ok(Response::new(GetNodeResponse {
@@ -236,7 +245,7 @@ impl WeavService for WeavGrpcService {
         });
 
         self.engine
-            .execute_command(cmd)
+            .execute_command(cmd, None)
             .map_err(weav_error_to_status)?;
         Ok(Response::new(UpdateNodeResponse {}))
     }
@@ -252,7 +261,7 @@ impl WeavService for WeavGrpcService {
         });
 
         self.engine
-            .execute_command(cmd)
+            .execute_command(cmd, None)
             .map_err(weav_error_to_status)?;
         Ok(Response::new(DeleteNodeResponse {}))
     }
@@ -273,7 +282,7 @@ impl WeavService for WeavGrpcService {
 
         match self
             .engine
-            .execute_command(cmd)
+            .execute_command(cmd, None)
             .map_err(weav_error_to_status)?
         {
             CommandResponse::Integer(id) => Ok(Response::new(AddEdgeResponse { edge_id: id })),
@@ -292,7 +301,7 @@ impl WeavService for WeavGrpcService {
         });
 
         self.engine
-            .execute_command(cmd)
+            .execute_command(cmd, None)
             .map_err(weav_error_to_status)?;
         Ok(Response::new(InvalidateEdgeResponse {}))
     }
@@ -346,7 +355,7 @@ impl WeavService for WeavGrpcService {
         let cmd = Command::Context(query);
         match self
             .engine
-            .execute_command(cmd)
+            .execute_command(cmd, None)
             .map_err(weav_error_to_status)?
         {
             CommandResponse::Context(result) => {
@@ -413,7 +422,7 @@ impl WeavService for WeavGrpcService {
 
         match self
             .engine
-            .execute_command(cmd)
+            .execute_command(cmd, None)
             .map_err(weav_error_to_status)?
         {
             CommandResponse::IntegerList(ids) => {
@@ -448,7 +457,7 @@ impl WeavService for WeavGrpcService {
 
         match self
             .engine
-            .execute_command(cmd)
+            .execute_command(cmd, None)
             .map_err(weav_error_to_status)?
         {
             CommandResponse::IntegerList(ids) => {
@@ -509,7 +518,7 @@ impl WeavService for WeavGrpcService {
         let cmd = Command::Context(query);
         let result = match self
             .engine
-            .execute_command(cmd)
+            .execute_command(cmd, None)
             .map_err(weav_error_to_status)?
         {
             CommandResponse::Context(result) => result,
@@ -541,7 +550,7 @@ impl WeavService for WeavGrpcService {
         _request: Request<SnapshotRequest>,
     ) -> Result<Response<SnapshotResponse>, Status> {
         let cmd = Command::Snapshot;
-        match self.engine.execute_command(cmd) {
+        match self.engine.execute_command(cmd, None) {
             Ok(_) => Ok(Response::new(SnapshotResponse {
                 success: true,
                 message: "Snapshot completed successfully".to_string(),
@@ -560,7 +569,7 @@ impl WeavService for WeavGrpcService {
         let cmd = Command::Info;
         let version = match self
             .engine
-            .execute_command(cmd)
+            .execute_command(cmd, None)
             .map_err(weav_error_to_status)?
         {
             CommandResponse::Text(text) => text,
@@ -570,7 +579,7 @@ impl WeavService for WeavGrpcService {
         // Get graph list to count graphs and total nodes/edges.
         let (graph_count, total_nodes, total_edges) = match self
             .engine
-            .execute_command(Command::GraphList)
+            .execute_command(Command::GraphList, None)
             .map_err(weav_error_to_status)?
         {
             CommandResponse::StringList(names) => {
@@ -579,7 +588,7 @@ impl WeavService for WeavGrpcService {
                 let count = names.len() as u32;
                 for name in &names {
                     if let Ok(CommandResponse::GraphInfo(info)) =
-                        self.engine.execute_command(Command::GraphInfo(name.clone()))
+                        self.engine.execute_command(Command::GraphInfo(name.clone()), None)
                     {
                         nodes += info.node_count;
                         edges += info.edge_count;

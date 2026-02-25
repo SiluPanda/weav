@@ -12,6 +12,7 @@ pub struct WeavConfig {
     pub engine: EngineConfig,
     pub persistence: PersistenceConfig,
     pub memory: MemoryConfig,
+    pub auth: AuthConfig,
 }
 
 impl Default for WeavConfig {
@@ -21,6 +22,7 @@ impl Default for WeavConfig {
             engine: EngineConfig::default(),
             persistence: PersistenceConfig::default(),
             memory: MemoryConfig::default(),
+            auth: AuthConfig::default(),
         }
     }
 }
@@ -86,6 +88,19 @@ impl WeavConfig {
             if let Ok(n) = v.parse() {
                 self.memory.max_memory_mb = Some(n);
             }
+        }
+        if let Ok(v) = std::env::var("WEAV_AUTH_ENABLED") {
+            if let Ok(b) = v.parse() {
+                self.auth.enabled = b;
+            }
+        }
+        if let Ok(v) = std::env::var("WEAV_AUTH_REQUIRE_AUTH") {
+            if let Ok(b) = v.parse() {
+                self.auth.require_auth = b;
+            }
+        }
+        if let Ok(v) = std::env::var("WEAV_AUTH_DEFAULT_PASSWORD") {
+            self.auth.default_password = Some(v);
         }
     }
 
@@ -259,6 +274,65 @@ impl Default for TokenCounterType {
     fn default() -> Self {
         TokenCounterType::CharDiv4
     }
+}
+
+/// Authentication and authorization configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AuthConfig {
+    /// Enable the auth subsystem. When false, all auth checks are skipped.
+    pub enabled: bool,
+    /// Require authentication for all connections. When false and auth is enabled,
+    /// unauthenticated connections get default (full) permissions.
+    pub require_auth: bool,
+    /// Path to an ACL file for persistent user definitions.
+    pub acl_file: Option<PathBuf>,
+    /// A default password for Redis-compat single-password AUTH.
+    pub default_password: Option<String>,
+    /// Statically-defined users from config.
+    pub users: Vec<UserConfig>,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            require_auth: false,
+            acl_file: None,
+            default_password: None,
+            users: Vec::new(),
+        }
+    }
+}
+
+/// A user definition in the config file.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserConfig {
+    pub username: String,
+    pub password: Option<String>,
+    /// Command category permissions, e.g. ["+@read", "+@write", "+@admin"]
+    #[serde(default)]
+    pub categories: Vec<String>,
+    /// Graph-level access patterns.
+    #[serde(default)]
+    pub graph_patterns: Vec<GraphPatternConfig>,
+    /// API keys for this user.
+    #[serde(default)]
+    pub api_keys: Vec<String>,
+    /// Whether the user is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Graph-level access pattern configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GraphPatternConfig {
+    pub pattern: String,
+    pub permission: String,
 }
 
 /// Per-graph configuration.
@@ -490,6 +564,65 @@ port = 9999
         assert_eq!(config.engine.num_shards, None);
         assert!(!config.persistence.enabled);
         assert_eq!(config.memory.max_memory_mb, None);
+    }
+
+    #[test]
+    fn test_auth_config_defaults() {
+        let ac = AuthConfig::default();
+        assert!(!ac.enabled);
+        assert!(!ac.require_auth);
+        assert!(ac.acl_file.is_none());
+        assert!(ac.default_password.is_none());
+        assert!(ac.users.is_empty());
+    }
+
+    #[test]
+    fn test_auth_config_in_weav_config_default() {
+        let config = WeavConfig::default();
+        assert!(!config.auth.enabled);
+        assert!(!config.auth.require_auth);
+    }
+
+    #[test]
+    fn test_toml_auth_config() {
+        let toml_str = r#"
+[auth]
+enabled = true
+require_auth = true
+default_password = "mysecret"
+
+[[auth.users]]
+username = "admin"
+password = "supersecret"
+categories = ["+@read", "+@write", "+@admin"]
+
+[[auth.users]]
+username = "reader"
+password = "readonly123"
+categories = ["+@read", "+@connection"]
+graph_patterns = [{ pattern = "*", permission = "read" }]
+api_keys = ["wk_live_abc123"]
+"#;
+        let config: WeavConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.auth.enabled);
+        assert!(config.auth.require_auth);
+        assert_eq!(config.auth.default_password, Some("mysecret".into()));
+        assert_eq!(config.auth.users.len(), 2);
+
+        let admin = &config.auth.users[0];
+        assert_eq!(admin.username, "admin");
+        assert_eq!(admin.password, Some("supersecret".into()));
+        assert_eq!(admin.categories, vec!["+@read", "+@write", "+@admin"]);
+        assert!(admin.graph_patterns.is_empty());
+        assert!(admin.enabled);
+
+        let reader = &config.auth.users[1];
+        assert_eq!(reader.username, "reader");
+        assert_eq!(reader.categories, vec!["+@read", "+@connection"]);
+        assert_eq!(reader.graph_patterns.len(), 1);
+        assert_eq!(reader.graph_patterns[0].pattern, "*");
+        assert_eq!(reader.graph_patterns[0].permission, "read");
+        assert_eq!(reader.api_keys, vec!["wk_live_abc123"]);
     }
 
     #[test]

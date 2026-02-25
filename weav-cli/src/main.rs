@@ -24,6 +24,14 @@ struct Cli {
     /// Execute a single command and exit
     #[arg(short, long)]
     command: Option<String>,
+
+    /// Username for authentication
+    #[arg(short = 'u', long)]
+    user: Option<String>,
+
+    /// Password for authentication
+    #[arg(short = 'a', long)]
+    password: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +218,29 @@ async fn main() {
             }
         }
         return;
+    }
+
+    // Auto-authenticate if credentials are provided.
+    if cli.password.is_some() {
+        let auth_cmd = match &cli.user {
+            Some(u) => format!("AUTH {} {}", u, cli.password.as_ref().unwrap()),
+            None => format!("AUTH {}", cli.password.as_ref().unwrap()),
+        };
+        match send_command(&cli.host, cli.port, &auth_cmd).await {
+            Ok(output) => {
+                if output.starts_with("(error)") {
+                    eprintln!("Authentication failed: {}", output);
+                    std::process::exit(1);
+                }
+                if cli.command.is_none() {
+                    println!("Authenticated: {}", output);
+                }
+            }
+            Err(e) => {
+                eprintln!("Authentication error: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 
     // Interactive REPL mode.

@@ -954,7 +954,7 @@ async fn test_node_deletion_cascades_edges() {
 #[tokio::test]
 async fn test_concurrent_node_creation() {
     let engine = Arc::new(Engine::new(WeavConfig::default()));
-    engine.execute_command(weav_query::parser::Command::GraphCreate(weav_query::parser::GraphCreateCmd { name: "g".to_string(), config: None })).unwrap();
+    engine.execute_command(weav_query::parser::Command::GraphCreate(weav_query::parser::GraphCreateCmd { name: "g".to_string(), config: None }), None).unwrap();
     let server = TestServer::start_with_engine(engine).await;
 
     let mut handles = Vec::new();
@@ -1005,7 +1005,7 @@ async fn test_concurrent_graph_operations() {
 #[tokio::test]
 async fn test_concurrent_read_write() {
     let engine = Arc::new(Engine::new(WeavConfig::default()));
-    engine.execute_command(weav_query::parser::Command::GraphCreate(weav_query::parser::GraphCreateCmd { name: "g".to_string(), config: None })).unwrap();
+    engine.execute_command(weav_query::parser::Command::GraphCreate(weav_query::parser::GraphCreateCmd { name: "g".to_string(), config: None }), None).unwrap();
 
     // Pre-seed 20 nodes via engine
     for i in 0..20u32 {
@@ -1013,7 +1013,7 @@ async fn test_concurrent_read_write() {
             graph: "g".to_string(), label: "item".to_string(),
             properties: vec![("index".to_string(), weav_core::types::Value::Int(i as i64))],
             embedding: None, entity_key: None,
-        })).unwrap();
+        }), None).unwrap();
     }
 
     let server = TestServer::start_with_engine(engine).await;
@@ -1060,7 +1060,7 @@ async fn test_concurrent_read_write() {
 #[tokio::test]
 async fn test_high_concurrency_stress() {
     let engine = Arc::new(Engine::new(WeavConfig::default()));
-    engine.execute_command(weav_query::parser::Command::GraphCreate(weav_query::parser::GraphCreateCmd { name: "stress".to_string(), config: None })).unwrap();
+    engine.execute_command(weav_query::parser::Command::GraphCreate(weav_query::parser::GraphCreateCmd { name: "stress".to_string(), config: None }), None).unwrap();
 
     // Pre-seed 10 nodes
     for i in 0..10u32 {
@@ -1068,7 +1068,7 @@ async fn test_high_concurrency_stress() {
             graph: "stress".to_string(), label: "item".to_string(),
             properties: vec![("seed".to_string(), weav_core::types::Value::Int(i as i64))],
             embedding: None, entity_key: None,
-        })).unwrap();
+        }), None).unwrap();
     }
 
     let server = TestServer::start_with_engine(engine).await;

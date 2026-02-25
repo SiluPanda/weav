@@ -96,6 +96,7 @@ pub struct Engine {
     wal: Option<Mutex<WriteAheadLog>>,
     snapshot_engine: Option<SnapshotEngine>,
     runtime_config: RwLock<HashMap<String, String>>,
+    acl_store: Option<weav_auth::acl::AclStore>,
 }
 
 impl Engine {
@@ -118,6 +119,12 @@ impl Engine {
         } else {
             (None, None)
         };
+        let acl_store = if config.auth.enabled {
+            Some(weav_auth::acl::AclStore::from_config(&config.auth))
+        } else {
+            None
+        };
+
         Self {
             graphs: RwLock::new(HashMap::new()),
             next_graph_id: RwLock::new(1),
@@ -126,6 +133,7 @@ impl Engine {
             wal,
             snapshot_engine,
             runtime_config: RwLock::new(HashMap::new()),
+            acl_store,
         }
     }
 
@@ -319,8 +327,77 @@ impl Engine {
         Ok(())
     }
 
+    /// Whether auth is enabled.
+    pub fn is_auth_enabled(&self) -> bool {
+        self.acl_store.is_some()
+    }
+
+    /// Whether auth is required for all connections.
+    pub fn is_auth_required(&self) -> bool {
+        self.acl_store
+            .as_ref()
+            .map(|s| s.require_auth())
+            .unwrap_or(false)
+    }
+
+    /// Authenticate with username + password.
+    pub fn authenticate(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> WeavResult<weav_auth::identity::SessionIdentity> {
+        let store = self.acl_store.as_ref().ok_or(WeavError::Internal(
+            "auth not enabled".into(),
+        ))?;
+        store.authenticate(username, password)
+    }
+
+    /// Authenticate with default password (Redis-compat).
+    pub fn authenticate_default(
+        &self,
+        password: &str,
+    ) -> WeavResult<weav_auth::identity::SessionIdentity> {
+        let store = self.acl_store.as_ref().ok_or(WeavError::Internal(
+            "auth not enabled".into(),
+        ))?;
+        store.authenticate_default(password)
+    }
+
+    /// Authenticate with an API key.
+    pub fn authenticate_api_key(
+        &self,
+        key: &str,
+    ) -> WeavResult<weav_auth::identity::SessionIdentity> {
+        let store = self.acl_store.as_ref().ok_or(WeavError::Internal(
+            "auth not enabled".into(),
+        ))?;
+        store.authenticate_api_key(key)
+    }
+
     /// Execute a parsed command and return a response.
-    pub fn execute_command(&self, cmd: Command) -> WeavResult<CommandResponse> {
+    ///
+    /// When auth is enabled, `identity` must be `Some` (unless the command is
+    /// AUTH or PING). When auth is disabled, pass `None`.
+    pub fn execute_command(
+        &self,
+        cmd: Command,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
+        // Auth gate: check permissions if auth is enabled.
+        if let Some(ref acl_store) = self.acl_store {
+            // AUTH and PING are always allowed without identity.
+            let is_auth_exempt = matches!(cmd, Command::Auth { .. } | Command::Ping);
+
+            if !is_auth_exempt {
+                if acl_store.require_auth() && identity.is_none() {
+                    return Err(WeavError::AuthenticationRequired);
+                }
+                if let Some(id) = identity {
+                    self.check_authorization(&cmd, id)?;
+                }
+            }
+        }
+
         match cmd {
             Command::Ping => Ok(CommandResponse::Pong),
             Command::Info => Ok(CommandResponse::Text(format!(
@@ -349,6 +426,91 @@ impl Engine {
             Command::EdgeGet(cmd) => self.handle_edge_get(cmd),
             Command::ConfigSet(key, value) => self.handle_config_set(key, value),
             Command::ConfigGet(key) => self.handle_config_get(key),
+            Command::Auth { username, password } => self.handle_auth(username, password),
+            Command::AclSetUser(cmd) => self.handle_acl_set_user(cmd),
+            Command::AclDelUser(name) => self.handle_acl_del_user(&name),
+            Command::AclList => self.handle_acl_list(),
+            Command::AclGetUser(name) => self.handle_acl_get_user(&name),
+            Command::AclWhoAmI => self.handle_acl_whoami(identity),
+            Command::AclSave => self.handle_acl_save(),
+            Command::AclLoad => self.handle_acl_load(),
+        }
+    }
+
+    /// Check authorization for a command against the user's identity.
+    fn check_authorization(
+        &self,
+        cmd: &Command,
+        identity: &weav_auth::identity::SessionIdentity,
+    ) -> WeavResult<()> {
+        use weav_auth::identity::CommandCategory;
+
+        // Classify the command.
+        let category = match cmd {
+            Command::Ping | Command::Info | Command::Auth { .. } => CommandCategory::Connection,
+            Command::NodeGet(_) | Command::EdgeGet(_) | Command::GraphInfo(_)
+            | Command::GraphList | Command::Stats(_) | Command::Context(_)
+            | Command::ConfigGet(_) | Command::AclWhoAmI => CommandCategory::Read,
+            Command::NodeAdd(_) | Command::NodeUpdate(_) | Command::NodeDelete(_)
+            | Command::EdgeAdd(_) | Command::EdgeDelete(_) | Command::EdgeInvalidate(_)
+            | Command::BulkInsertNodes(_) | Command::BulkInsertEdges(_) => CommandCategory::Write,
+            Command::GraphCreate(_) | Command::GraphDrop(_) | Command::Snapshot
+            | Command::ConfigSet(_, _) | Command::AclSetUser(_) | Command::AclDelUser(_)
+            | Command::AclList | Command::AclGetUser(_) | Command::AclSave
+            | Command::AclLoad => CommandCategory::Admin,
+        };
+
+        // Check category permission.
+        if !identity.permissions.has_category(category) {
+            return Err(WeavError::PermissionDenied(format!(
+                "user '{}' lacks {:?} permission",
+                identity.username, category
+            )));
+        }
+
+        // Check graph-level permission for commands that target a specific graph.
+        let graph_name = self.extract_graph_name_from_cmd(cmd);
+        if let Some(ref graph) = graph_name {
+            let needs_write = matches!(
+                category,
+                CommandCategory::Write | CommandCategory::Admin
+            );
+            if needs_write {
+                if !identity.permissions.can_write_graph(graph) {
+                    return Err(WeavError::PermissionDenied(format!(
+                        "user '{}' lacks write access to graph '{}'",
+                        identity.username, graph
+                    )));
+                }
+            } else if !identity.permissions.can_read_graph(graph) {
+                return Err(WeavError::PermissionDenied(format!(
+                    "user '{}' lacks read access to graph '{}'",
+                    identity.username, graph
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Extract graph name from a Command variant.
+    fn extract_graph_name_from_cmd(&self, cmd: &Command) -> Option<String> {
+        match cmd {
+            Command::NodeAdd(c) => Some(c.graph.clone()),
+            Command::NodeGet(c) => Some(c.graph.clone()),
+            Command::NodeUpdate(c) => Some(c.graph.clone()),
+            Command::NodeDelete(c) => Some(c.graph.clone()),
+            Command::EdgeAdd(c) => Some(c.graph.clone()),
+            Command::EdgeInvalidate(c) => Some(c.graph.clone()),
+            Command::EdgeDelete(c) => Some(c.graph.clone()),
+            Command::EdgeGet(c) => Some(c.graph.clone()),
+            Command::BulkInsertNodes(c) => Some(c.graph.clone()),
+            Command::BulkInsertEdges(c) => Some(c.graph.clone()),
+            Command::Context(q) => Some(q.graph.clone()),
+            Command::GraphCreate(c) => Some(c.name.clone()),
+            Command::GraphDrop(name) | Command::GraphInfo(name) => Some(name.clone()),
+            Command::Stats(opt) => opt.clone(),
+            _ => None,
         }
     }
 
@@ -1139,6 +1301,156 @@ impl Engine {
 
         Ok(CommandResponse::Context(result))
     }
+
+    // ── AUTH / ACL handlers ──────────────────────────────────────────────
+
+    fn handle_auth(
+        &self,
+        username: Option<String>,
+        password: String,
+    ) -> WeavResult<CommandResponse> {
+        let store = self.acl_store.as_ref().ok_or(WeavError::Internal(
+            "auth not enabled".into(),
+        ))?;
+
+        let identity = match username {
+            Some(ref u) => store.authenticate(u, &password)?,
+            None => store.authenticate_default(&password)?,
+        };
+
+        // Return OK with the username. The protocol layer uses the identity
+        // from authenticate() directly; this response is for the client.
+        Ok(CommandResponse::Text(format!("OK (user: {})", identity.username)))
+    }
+
+    fn handle_acl_set_user(
+        &self,
+        cmd: weav_query::parser::AclSetUserCmd,
+    ) -> WeavResult<CommandResponse> {
+        let store = self.acl_store.as_ref().ok_or(WeavError::Internal(
+            "auth not enabled".into(),
+        ))?;
+
+        // Get or create user.
+        let mut user = store.get_user(&cmd.username).unwrap_or_else(|| {
+            weav_auth::acl::AclUser {
+                username: cmd.username.clone(),
+                password_hash: None,
+                enabled: true,
+                categories: weav_auth::identity::CommandCategorySet::all(),
+                graph_acl: Vec::new(),
+                api_key_hashes: Vec::new(),
+            }
+        });
+
+        // Apply modifications.
+        if let Some(pw) = &cmd.password {
+            user.password_hash = Some(
+                weav_auth::password::hash_password(pw)
+                    .map_err(|e| WeavError::Internal(e))?,
+            );
+        }
+        if let Some(enabled) = cmd.enabled {
+            user.enabled = enabled;
+        }
+        if !cmd.categories.is_empty() {
+            user.categories = weav_auth::identity::CommandCategorySet::from_acl_strings(&cmd.categories);
+        }
+        if !cmd.graph_patterns.is_empty() {
+            user.graph_acl = cmd
+                .graph_patterns
+                .iter()
+                .map(|(pat, perm)| weav_auth::identity::GraphAcl {
+                    pattern: pat.clone(),
+                    permission: weav_auth::identity::GraphPermission::from_str(perm),
+                })
+                .collect();
+        }
+
+        store.set_user(user);
+        Ok(CommandResponse::Ok)
+    }
+
+    fn handle_acl_del_user(&self, username: &str) -> WeavResult<CommandResponse> {
+        let store = self.acl_store.as_ref().ok_or(WeavError::Internal(
+            "auth not enabled".into(),
+        ))?;
+        if store.delete_user(username) {
+            Ok(CommandResponse::Ok)
+        } else {
+            Err(WeavError::AuthenticationFailed(format!(
+                "user '{}' not found",
+                username
+            )))
+        }
+    }
+
+    fn handle_acl_list(&self) -> WeavResult<CommandResponse> {
+        let store = self.acl_store.as_ref().ok_or(WeavError::Internal(
+            "auth not enabled".into(),
+        ))?;
+        let users = store.list_users();
+        Ok(CommandResponse::StringList(users))
+    }
+
+    fn handle_acl_get_user(&self, username: &str) -> WeavResult<CommandResponse> {
+        let store = self.acl_store.as_ref().ok_or(WeavError::Internal(
+            "auth not enabled".into(),
+        ))?;
+        match store.get_user(username) {
+            Some(user) => {
+                let info = format!(
+                    "user={} enabled={} has_password={}",
+                    user.username, user.enabled, user.password_hash.is_some()
+                );
+                Ok(CommandResponse::Text(info))
+            }
+            None => Err(WeavError::AuthenticationFailed(format!(
+                "user '{}' not found",
+                username
+            ))),
+        }
+    }
+
+    fn handle_acl_whoami(
+        &self,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
+        match identity {
+            Some(id) => Ok(CommandResponse::Text(id.username.clone())),
+            None => Ok(CommandResponse::Text("(unauthenticated)".into())),
+        }
+    }
+
+    fn handle_acl_save(&self) -> WeavResult<CommandResponse> {
+        let store = self.acl_store.as_ref().ok_or(WeavError::Internal(
+            "auth not enabled".into(),
+        ))?;
+        let content = store.serialize_acl();
+        if let Some(ref path) = self.config.auth.acl_file {
+            std::fs::write(path, &content).map_err(|e| {
+                WeavError::PersistenceError(format!("failed to write ACL file: {e}"))
+            })?;
+            Ok(CommandResponse::Ok)
+        } else {
+            Ok(CommandResponse::Text(content))
+        }
+    }
+
+    fn handle_acl_load(&self) -> WeavResult<CommandResponse> {
+        let store = self.acl_store.as_ref().ok_or(WeavError::Internal(
+            "auth not enabled".into(),
+        ))?;
+        if let Some(ref path) = self.config.auth.acl_file {
+            let content = std::fs::read_to_string(path).map_err(|e| {
+                WeavError::PersistenceError(format!("failed to read ACL file: {e}"))
+            })?;
+            store.load_acl(&content);
+            Ok(CommandResponse::Ok)
+        } else {
+            Err(WeavError::InvalidConfig("no ACL file configured".into()))
+        }
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -1154,14 +1466,14 @@ mod tests {
 
     fn create_test_graph(engine: &Engine, name: &str) {
         let cmd = parser::parse_command(&format!("GRAPH CREATE \"{name}\"")).unwrap();
-        engine.execute_command(cmd).unwrap();
+        engine.execute_command(cmd, None).unwrap();
     }
 
     #[test]
     fn test_ping() {
         let engine = make_engine();
         let resp = engine
-            .execute_command(Command::Ping)
+            .execute_command(Command::Ping, None)
             .unwrap();
         assert!(matches!(resp, CommandResponse::Pong));
     }
@@ -1170,7 +1482,7 @@ mod tests {
     fn test_info() {
         let engine = make_engine();
         let resp = engine
-            .execute_command(Command::Info)
+            .execute_command(Command::Info, None)
             .unwrap();
         match resp {
             CommandResponse::Text(t) => assert!(t.contains("weav-server")),
@@ -1184,7 +1496,7 @@ mod tests {
         create_test_graph(&engine, "test1");
         create_test_graph(&engine, "test2");
 
-        let resp = engine.execute_command(Command::GraphList).unwrap();
+        let resp = engine.execute_command(Command::GraphList, None).unwrap();
         match resp {
             CommandResponse::StringList(names) => {
                 assert_eq!(names.len(), 2);
@@ -1200,7 +1512,7 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "dup");
         let cmd = parser::parse_command("GRAPH CREATE \"dup\"").unwrap();
-        let result = engine.execute_command(cmd);
+        let result = engine.execute_command(cmd, None);
         assert!(result.is_err());
     }
 
@@ -1209,9 +1521,9 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "todrop");
         let cmd = parser::parse_command("GRAPH DROP \"todrop\"").unwrap();
-        engine.execute_command(cmd).unwrap();
+        engine.execute_command(cmd, None).unwrap();
 
-        let resp = engine.execute_command(Command::GraphList).unwrap();
+        let resp = engine.execute_command(Command::GraphList, None).unwrap();
         match resp {
             CommandResponse::StringList(names) => assert!(names.is_empty()),
             _ => panic!("expected StringList"),
@@ -1222,7 +1534,7 @@ mod tests {
     fn test_graph_drop_not_found() {
         let engine = make_engine();
         let cmd = parser::parse_command("GRAPH DROP \"nonexistent\"").unwrap();
-        assert!(engine.execute_command(cmd).is_err());
+        assert!(engine.execute_command(cmd, None).is_err());
     }
 
     #[test]
@@ -1231,7 +1543,7 @@ mod tests {
         create_test_graph(&engine, "info_test");
 
         let cmd = parser::parse_command("GRAPH INFO \"info_test\"").unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::GraphInfo(info) => {
                 assert_eq!(info.name, "info_test");
@@ -1246,7 +1558,7 @@ mod tests {
     fn test_graph_info_not_found() {
         let engine = make_engine();
         let cmd = parser::parse_command("GRAPH INFO \"nope\"").unwrap();
-        assert!(engine.execute_command(cmd).is_err());
+        assert!(engine.execute_command(cmd, None).is_err());
     }
 
     #[test]
@@ -1258,7 +1570,7 @@ mod tests {
             r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "Alice", "age": 30} KEY "alice-001""#,
         )
         .unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         let node_id = match resp {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer response"),
@@ -1267,7 +1579,7 @@ mod tests {
 
         // Get by ID.
         let cmd = parser::parse_command(&format!("NODE GET \"g\" {node_id}")).unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::NodeInfo(info) => {
                 assert_eq!(info.node_id, node_id);
@@ -1288,11 +1600,11 @@ mod tests {
             r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "Bob"} KEY "bob-key""#,
         )
         .unwrap();
-        engine.execute_command(cmd).unwrap();
+        engine.execute_command(cmd, None).unwrap();
 
         let cmd =
             parser::parse_command("NODE GET \"g\" WHERE entity_key = \"bob-key\"").unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::NodeInfo(info) => {
                 assert_eq!(info.label, "person");
@@ -1307,7 +1619,7 @@ mod tests {
         create_test_graph(&engine, "g");
 
         let cmd = parser::parse_command("NODE GET \"g\" 999").unwrap();
-        assert!(engine.execute_command(cmd).is_err());
+        assert!(engine.execute_command(cmd, None).is_err());
     }
 
     #[test]
@@ -1319,18 +1631,18 @@ mod tests {
             r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "Charlie"}"#,
         )
         .unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         let node_id = match resp {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
 
         let cmd = parser::parse_command(&format!("NODE DELETE \"g\" {node_id}")).unwrap();
-        engine.execute_command(cmd).unwrap();
+        engine.execute_command(cmd, None).unwrap();
 
         // Should no longer be findable.
         let cmd = parser::parse_command(&format!("NODE GET \"g\" {node_id}")).unwrap();
-        assert!(engine.execute_command(cmd).is_err());
+        assert!(engine.execute_command(cmd, None).is_err());
     }
 
     #[test]
@@ -1343,7 +1655,7 @@ mod tests {
             r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "A"}"#,
         )
         .unwrap();
-        let r1 = engine.execute_command(cmd).unwrap();
+        let r1 = engine.execute_command(cmd, None).unwrap();
         let n1 = match r1 {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -1353,7 +1665,7 @@ mod tests {
             r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "B"}"#,
         )
         .unwrap();
-        let r2 = engine.execute_command(cmd).unwrap();
+        let r2 = engine.execute_command(cmd, None).unwrap();
         let n2 = match r2 {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -1364,7 +1676,7 @@ mod tests {
             r#"EDGE ADD TO "g" FROM {n1} TO {n2} LABEL "knows" WEIGHT 0.9"#,
         ))
         .unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::Integer(eid) => assert!(eid >= 1),
             _ => panic!("expected Integer"),
@@ -1372,7 +1684,7 @@ mod tests {
 
         // Check graph info.
         let cmd = parser::parse_command("GRAPH INFO \"g\"").unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::GraphInfo(info) => {
                 assert_eq!(info.node_count, 2);
@@ -1391,7 +1703,7 @@ mod tests {
             r#"EDGE ADD TO "g" FROM 1 TO 2 LABEL "knows""#,
         )
         .unwrap();
-        assert!(engine.execute_command(cmd).is_err());
+        assert!(engine.execute_command(cmd, None).is_err());
     }
 
     #[test]
@@ -1404,7 +1716,7 @@ mod tests {
             r#"NODE ADD TO "g" LABEL "a" PROPERTIES {"name": "X"}"#,
         )
         .unwrap();
-        let r1 = engine.execute_command(cmd).unwrap();
+        let r1 = engine.execute_command(cmd, None).unwrap();
         let n1 = match r1 {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -1414,7 +1726,7 @@ mod tests {
             r#"NODE ADD TO "g" LABEL "b" PROPERTIES {"name": "Y"}"#,
         )
         .unwrap();
-        let r2 = engine.execute_command(cmd).unwrap();
+        let r2 = engine.execute_command(cmd, None).unwrap();
         let n2 = match r2 {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -1424,7 +1736,7 @@ mod tests {
             r#"EDGE ADD TO "g" FROM {n1} TO {n2} LABEL "rel""#,
         ))
         .unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         let edge_id = match resp {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -1433,7 +1745,7 @@ mod tests {
         // Invalidate the edge.
         let cmd =
             parser::parse_command(&format!("EDGE INVALIDATE \"g\" {edge_id}")).unwrap();
-        engine.execute_command(cmd).unwrap();
+        engine.execute_command(cmd, None).unwrap();
     }
 
     #[test]
@@ -1441,7 +1753,7 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "g");
         let cmd = parser::parse_command("EDGE INVALIDATE \"g\" 999").unwrap();
-        assert!(engine.execute_command(cmd).is_err());
+        assert!(engine.execute_command(cmd, None).is_err());
     }
 
     #[test]
@@ -1454,7 +1766,7 @@ mod tests {
             r#"NODE ADD TO "kg" LABEL "person" PROPERTIES {"name": "Alice", "description": "A developer"} KEY "alice""#,
         )
         .unwrap();
-        let r1 = engine.execute_command(cmd).unwrap();
+        let r1 = engine.execute_command(cmd, None).unwrap();
         let n1 = match r1 {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -1464,7 +1776,7 @@ mod tests {
             r#"NODE ADD TO "kg" LABEL "topic" PROPERTIES {"name": "Rust", "description": "A language"} KEY "rust""#,
         )
         .unwrap();
-        let r2 = engine.execute_command(cmd).unwrap();
+        let r2 = engine.execute_command(cmd, None).unwrap();
         let n2 = match r2 {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -1475,14 +1787,14 @@ mod tests {
             r#"EDGE ADD TO "kg" FROM {n1} TO {n2} LABEL "uses""#,
         ))
         .unwrap();
-        engine.execute_command(cmd).unwrap();
+        engine.execute_command(cmd, None).unwrap();
 
         // Run context query seeded by node key.
         let cmd = parser::parse_command(
             r#"CONTEXT "what does alice use" FROM "kg" SEEDS NODES ["alice"] DEPTH 2"#,
         )
         .unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::Context(result) => {
                 assert!(result.nodes_considered > 0);
@@ -1501,7 +1813,7 @@ mod tests {
             r#"CONTEXT "test" FROM "kg" SEEDS NODES ["nonexistent"]"#,
         )
         .unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::Context(result) => {
                 assert_eq!(result.nodes_considered, 0);
@@ -1518,14 +1830,14 @@ mod tests {
             r#"CONTEXT "test" FROM "nope" SEEDS NODES ["x"]"#,
         )
         .unwrap();
-        assert!(engine.execute_command(cmd).is_err());
+        assert!(engine.execute_command(cmd, None).is_err());
     }
 
     #[test]
     fn test_stats_no_graph() {
         let engine = make_engine();
         let cmd = parser::parse_command("STATS").unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::Text(t) => assert!(t.contains("graphs=")),
             _ => panic!("expected Text"),
@@ -1538,7 +1850,7 @@ mod tests {
         create_test_graph(&engine, "sg");
 
         let cmd = parser::parse_command("STATS \"sg\"").unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::Text(t) => {
                 assert!(t.contains("graph=sg"));
@@ -1552,14 +1864,14 @@ mod tests {
     fn test_stats_graph_not_found() {
         let engine = make_engine();
         let cmd = parser::parse_command("STATS \"missing\"").unwrap();
-        assert!(engine.execute_command(cmd).is_err());
+        assert!(engine.execute_command(cmd, None).is_err());
     }
 
     #[test]
     fn test_snapshot_placeholder() {
         let engine = make_engine();
         let cmd = parser::parse_command("SNAPSHOT").unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         assert!(matches!(resp, CommandResponse::Ok));
     }
 
@@ -1572,7 +1884,7 @@ mod tests {
             r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "Alice"}"#,
         )
         .unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         let node_id = match resp {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -1583,12 +1895,12 @@ mod tests {
             r#"NODE UPDATE "g" {node_id} PROPERTIES {{"name": "Alice Updated", "age": 30}}"#,
         ))
         .unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         assert!(matches!(resp, CommandResponse::Ok));
 
         // Verify the update.
         let cmd = parser::parse_command(&format!("NODE GET \"g\" {node_id}")).unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::NodeInfo(info) => {
                 let name = info.properties.iter().find(|(k, _)| k == "name");
@@ -1612,7 +1924,7 @@ mod tests {
             r#"NODE UPDATE "g" 999 PROPERTIES {"name": "X"}"#,
         )
         .unwrap();
-        assert!(engine.execute_command(cmd).is_err());
+        assert!(engine.execute_command(cmd, None).is_err());
     }
 
     #[test]
@@ -1624,7 +1936,7 @@ mod tests {
             r#"BULK NODES TO "g" DATA [{"label": "person", "properties": {"name": "A"}}, {"label": "person", "properties": {"name": "B"}}]"#,
         )
         .unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::IntegerList(ids) => {
                 assert_eq!(ids.len(), 2);
@@ -1636,7 +1948,7 @@ mod tests {
 
         // Verify graph info.
         let cmd = parser::parse_command("GRAPH INFO \"g\"").unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::GraphInfo(info) => {
                 assert_eq!(info.node_count, 2);
@@ -1655,7 +1967,7 @@ mod tests {
             r#"BULK NODES TO "g" DATA [{"label": "a", "properties": {"name": "X"}}, {"label": "b", "properties": {"name": "Y"}}]"#,
         )
         .unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         let node_ids = match resp {
             CommandResponse::IntegerList(ids) => ids,
             _ => panic!("expected IntegerList"),
@@ -1667,7 +1979,7 @@ mod tests {
             node_ids[0], node_ids[1]
         ))
         .unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::IntegerList(ids) => {
                 assert_eq!(ids.len(), 1);
@@ -1677,7 +1989,7 @@ mod tests {
 
         // Verify graph info.
         let cmd = parser::parse_command("GRAPH INFO \"g\"").unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::GraphInfo(info) => {
                 assert_eq!(info.node_count, 2);
@@ -1697,7 +2009,7 @@ mod tests {
             r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "Alice", "age": 25}"#,
         )
         .unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         let node_id = match resp {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -1708,12 +2020,12 @@ mod tests {
             r#"NODE UPDATE "g" {node_id} PROPERTIES {{"name": "Bob", "city": "NYC"}}"#,
         ))
         .unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         assert!(matches!(resp, CommandResponse::Ok));
 
         // Verify updated properties via NODE GET.
         let cmd = parser::parse_command(&format!("NODE GET \"g\" {node_id}")).unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::NodeInfo(info) => {
                 assert_eq!(info.node_id, node_id);
@@ -1740,7 +2052,7 @@ mod tests {
             r#"NODE ADD TO "g" LABEL "a" PROPERTIES {"name": "X"}"#,
         )
         .unwrap();
-        let n1 = match engine.execute_command(cmd).unwrap() {
+        let n1 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
@@ -1749,7 +2061,7 @@ mod tests {
             r#"NODE ADD TO "g" LABEL "b" PROPERTIES {"name": "Y"}"#,
         )
         .unwrap();
-        let n2 = match engine.execute_command(cmd).unwrap() {
+        let n2 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
@@ -1759,14 +2071,14 @@ mod tests {
             r#"EDGE ADD TO "g" FROM {n1} TO {n2} LABEL "knows" WEIGHT 0.75"#,
         ))
         .unwrap();
-        let edge_id = match engine.execute_command(cmd).unwrap() {
+        let edge_id = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
 
         // Get the edge by ID.
         let cmd = parser::parse_command(&format!("EDGE GET \"g\" {edge_id}")).unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::EdgeInfo(info) => {
                 assert_eq!(info.edge_id, edge_id);
@@ -1789,7 +2101,7 @@ mod tests {
             r#"NODE ADD TO "g" LABEL "a" PROPERTIES {"name": "X"}"#,
         )
         .unwrap();
-        let n1 = match engine.execute_command(cmd).unwrap() {
+        let n1 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
@@ -1798,7 +2110,7 @@ mod tests {
             r#"NODE ADD TO "g" LABEL "b" PROPERTIES {"name": "Y"}"#,
         )
         .unwrap();
-        let n2 = match engine.execute_command(cmd).unwrap() {
+        let n2 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
@@ -1808,25 +2120,25 @@ mod tests {
             r#"EDGE ADD TO "g" FROM {n1} TO {n2} LABEL "link""#,
         ))
         .unwrap();
-        let edge_id = match engine.execute_command(cmd).unwrap() {
+        let edge_id = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
 
         // Delete the edge.
         let cmd = parser::parse_command(&format!("EDGE DELETE \"g\" {edge_id}")).unwrap();
-        engine.execute_command(cmd).unwrap();
+        engine.execute_command(cmd, None).unwrap();
 
         // Verify EDGE GET returns error.
         let cmd = parser::parse_command(&format!("EDGE GET \"g\" {edge_id}")).unwrap();
-        assert!(engine.execute_command(cmd).is_err());
+        assert!(engine.execute_command(cmd, None).is_err());
     }
 
     #[test]
     fn test_node_get_nonexistent_graph() {
         let engine = make_engine();
         let cmd = parser::parse_command("NODE GET \"no_such_graph\" 1").unwrap();
-        assert!(engine.execute_command(cmd).is_err());
+        assert!(engine.execute_command(cmd, None).is_err());
     }
 
     #[test]
@@ -1836,7 +2148,7 @@ mod tests {
             r#"NODE ADD TO "no_such_graph" LABEL "x" PROPERTIES {"a": 1}"#,
         )
         .unwrap();
-        assert!(engine.execute_command(cmd).is_err());
+        assert!(engine.execute_command(cmd, None).is_err());
     }
 
     #[test]
@@ -1856,17 +2168,17 @@ mod tests {
             r#"NODE ADD TO "snap_g" LABEL "person" PROPERTIES {"name": "Alice"}"#,
         )
         .unwrap();
-        engine.execute_command(cmd).unwrap();
+        engine.execute_command(cmd, None).unwrap();
 
         let cmd = parser::parse_command(
             r#"NODE ADD TO "snap_g" LABEL "person" PROPERTIES {"name": "Bob"}"#,
         )
         .unwrap();
-        engine.execute_command(cmd).unwrap();
+        engine.execute_command(cmd, None).unwrap();
 
         // Execute SNAPSHOT command.
         let cmd = parser::parse_command("SNAPSHOT").unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         assert!(matches!(resp, CommandResponse::Ok));
 
         // Clean up temp dir.
@@ -1891,7 +2203,7 @@ mod tests {
             r#"NODE ADD TO "wal_g" LABEL "person" PROPERTIES {"name": "Alice"}"#,
         )
         .unwrap();
-        engine.execute_command(cmd).unwrap();
+        engine.execute_command(cmd, None).unwrap();
 
         // sync_wal should not panic.
         engine.sync_wal();
@@ -1922,7 +2234,7 @@ mod tests {
             r#"NODE ADD TO "g" LABEL "a" PROPERTIES {"name": "N1"}"#,
         )
         .unwrap();
-        let n1 = match engine.execute_command(cmd).unwrap() {
+        let n1 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
@@ -1931,7 +2243,7 @@ mod tests {
             r#"NODE ADD TO "g" LABEL "b" PROPERTIES {"name": "N2"}"#,
         )
         .unwrap();
-        let n2 = match engine.execute_command(cmd).unwrap() {
+        let n2 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
@@ -1941,15 +2253,15 @@ mod tests {
             r#"EDGE ADD TO "g" FROM {n1} TO {n2} LABEL "link""#,
         ))
         .unwrap();
-        engine.execute_command(cmd).unwrap();
+        engine.execute_command(cmd, None).unwrap();
 
         // Delete node 1.
         let cmd = parser::parse_command(&format!("NODE DELETE \"g\" {n1}")).unwrap();
-        engine.execute_command(cmd).unwrap();
+        engine.execute_command(cmd, None).unwrap();
 
         // Edge count should be 0.
         let cmd = parser::parse_command("GRAPH INFO \"g\"").unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::GraphInfo(info) => {
                 assert_eq!(info.node_count, 1);
@@ -1969,7 +2281,7 @@ mod tests {
             r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "Alice", "age": 25} KEY "alice""#,
         )
         .unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         let first_id = match resp {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -1980,7 +2292,7 @@ mod tests {
             r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "Alice Updated", "city": "NYC"} KEY "alice""#,
         )
         .unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         let second_id = match resp {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -1991,7 +2303,7 @@ mod tests {
 
         // Verify properties were merged
         let cmd = parser::parse_command(&format!("NODE GET \"g\" {first_id}")).unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::NodeInfo(info) => {
                 // "name" should be updated (LastWriteWins)
@@ -2007,7 +2319,7 @@ mod tests {
 
         // Graph should still have only 1 node
         let cmd = parser::parse_command("GRAPH INFO \"g\"").unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::GraphInfo(info) => {
                 assert_eq!(info.node_count, 1, "Dedup should not create a second node");
@@ -2026,7 +2338,7 @@ mod tests {
             r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "Alice"}"#,
         )
         .unwrap();
-        let id1 = match engine.execute_command(cmd).unwrap() {
+        let id1 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
@@ -2035,7 +2347,7 @@ mod tests {
             r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "Alice"}"#,
         )
         .unwrap();
-        let id2 = match engine.execute_command(cmd).unwrap() {
+        let id2 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
@@ -2058,7 +2370,7 @@ mod tests {
             embedding: Some(vec![1.0, 0.0, 0.0, 0.0]),
             entity_key: Some("alice".to_string()),
         });
-        let first_id = match engine.execute_command(cmd).unwrap() {
+        let first_id = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
@@ -2071,7 +2383,7 @@ mod tests {
             embedding: Some(vec![0.0, 1.0, 0.0, 0.0]),
             entity_key: Some("alice".to_string()),
         });
-        let second_id = match engine.execute_command(cmd).unwrap() {
+        let second_id = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
@@ -2080,7 +2392,7 @@ mod tests {
 
         // Node count should still be 1
         let cmd = parser::parse_command("GRAPH INFO \"g\"").unwrap();
-        let resp = engine.execute_command(cmd).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::GraphInfo(info) => {
                 assert_eq!(info.node_count, 1);
@@ -2096,14 +2408,14 @@ mod tests {
         let engine = make_engine();
         // Attempt to create a graph with an empty name.
         let cmd = parser::parse_command("GRAPH CREATE \"\"").unwrap();
-        let result = engine.execute_command(cmd);
+        let result = engine.execute_command(cmd, None);
         // The engine may accept or reject an empty name; either outcome is valid.
         // We just verify it does not panic.
         match result {
             Ok(CommandResponse::Ok) => {
                 // If accepted, we should be able to query it.
                 let cmd = parser::parse_command("GRAPH INFO \"\"").unwrap();
-                let resp = engine.execute_command(cmd).unwrap();
+                let resp = engine.execute_command(cmd, None).unwrap();
                 assert!(matches!(resp, CommandResponse::GraphInfo(_)));
             }
             Err(_) => {
@@ -2120,7 +2432,7 @@ mod tests {
 
         // Creating the same graph again should return Conflict.
         let cmd = parser::parse_command("GRAPH CREATE \"dup_test\"").unwrap();
-        let result = engine.execute_command(cmd);
+        let result = engine.execute_command(cmd, None);
         assert!(result.is_err(), "duplicate GRAPH CREATE should return an error");
         let err = result.unwrap_err();
         assert!(
@@ -2137,7 +2449,7 @@ mod tests {
             r#"NODE ADD TO "nonexistent" LABEL "person" PROPERTIES {"name": "X"}"#,
         )
         .unwrap();
-        let result = engine.execute_command(cmd);
+        let result = engine.execute_command(cmd, None);
         assert!(result.is_err(), "NODE ADD to nonexistent graph should fail");
         let err = result.unwrap_err();
         assert!(
@@ -2157,7 +2469,7 @@ mod tests {
             r#"EDGE ADD TO "edge_test" FROM 9990 TO 9991 LABEL "link""#,
         )
         .unwrap();
-        let result = engine.execute_command(cmd);
+        let result = engine.execute_command(cmd, None);
         assert!(
             result.is_err(),
             "EDGE ADD between nonexistent nodes should fail"
@@ -2176,7 +2488,7 @@ mod tests {
         create_test_graph(&engine, "del_node_test");
 
         let cmd = parser::parse_command("NODE DELETE \"del_node_test\" 999").unwrap();
-        let result = engine.execute_command(cmd);
+        let result = engine.execute_command(cmd, None);
         assert!(
             result.is_err(),
             "NODE DELETE on nonexistent node should fail"
@@ -2187,7 +2499,7 @@ mod tests {
     fn test_engine_graph_info_nonexistent() {
         let engine = make_engine();
         let cmd = parser::parse_command("GRAPH INFO \"nonexistent\"").unwrap();
-        let result = engine.execute_command(cmd);
+        let result = engine.execute_command(cmd, None);
         assert!(result.is_err(), "GRAPH INFO for nonexistent graph should fail");
         let err = result.unwrap_err();
         assert!(
