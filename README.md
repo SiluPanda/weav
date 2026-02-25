@@ -50,6 +50,7 @@
   <a href="#quickstart">Quickstart</a> &middot;
   <a href="#architecture">Architecture</a> &middot;
   <a href="#query-language">Query Language</a> &middot;
+  <a href="#authentication--authorization">Auth</a> &middot;
   <a href="#api-reference">API Reference</a> &middot;
   <a href="#sdks">SDKs</a> &middot;
   <a href="#benchmarks">Benchmarks</a>
@@ -58,8 +59,8 @@
 <p align="center">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue.svg">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.85%2B-orange.svg">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-731%20passing-brightgreen.svg">
-  <img alt="Crates" src="https://img.shields.io/badge/crates-9-purple.svg">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-812%20passing-brightgreen.svg">
+  <img alt="Crates" src="https://img.shields.io/badge/crates-10-purple.svg">
 </p>
 
 ---
@@ -85,6 +86,7 @@ Weav is a **Redis-like, in-memory context graph database** purpose-built for AI 
 | **Provenance** | Track source, confidence, and extraction method for every piece of knowledge |
 | **Decay Functions** | Linear, exponential, and gaussian relevance decay over time |
 | **Multi-Protocol** | HTTP REST, RESP3 (Redis protocol), and gRPC — all on one server |
+| **Auth & ACL** | Redis-ACL-inspired auth with command categories, graph-level permissions, API keys |
 | **Persistence** | WAL with CRC32 checksums + periodic snapshots with full recovery |
 
 ---
@@ -116,6 +118,9 @@ cargo build --release
 
 # Single command
 ./target/release/weav-cli -c 'PING'
+
+# Connect with authentication
+./target/release/weav-cli -u admin -a supersecret
 ```
 
 ### Your First Context Graph
@@ -146,6 +151,9 @@ pip install httpx  # dependency
 from weav import WeavClient
 
 client = WeavClient(host="localhost", port=6382)
+# or with authentication:
+# client = WeavClient(host="localhost", port=6382, api_key="wk_live_abc123")
+# client = WeavClient(host="localhost", port=6382, username="admin", password="secret")
 
 # Create a graph
 client.create_graph("research")
@@ -175,6 +183,9 @@ messages = result.to_messages()
 import { WeavClient } from "@weav/client";
 
 const client = new WeavClient({ host: "localhost", port: 6382 });
+// or with authentication:
+// const client = new WeavClient({ host: "localhost", port: 6382, apiKey: "wk_live_abc123" });
+// const client = new WeavClient({ host: "localhost", port: 6382, username: "admin", password: "secret" });
 
 await client.createGraph("research");
 
@@ -204,6 +215,12 @@ const prompt = contextToPrompt(result);
                     └──────┬──────┘  └──────┬──────┘  └──────┬──────┘
                            │               │                │
                            └───────────────┼────────────────┘
+                                           │
+                    ┌──────────────────────────────────────────────┐
+                    │              AUTH LAYER (opt-in)             │
+                    │  Bearer/Basic │  AUTH cmd  │  gRPC metadata  │
+                    │  → ACL Store → Category + Graph ACL check → │
+                    └──────────────────────┬───────────────────────┘
                                            │
                     ┌──────────────────────────────────────────────┐
                     │                   ENGINE                     │
@@ -241,7 +258,8 @@ const prompt = contextToPrompt(result);
 | `weav-core` | Foundation types, config, errors, shard infrastructure, message bus |
 | `weav-graph` | Adjacency store, property store, traversal (BFS, flow scoring), entity dedup |
 | `weav-vector` | HNSW vector index (usearch), token counting (tiktoken-rs) |
-| `weav-query` | Query parser, planner, executor, token budget enforcement |
+| `weav-query` | Query parser (30 commands), planner, executor, token budget enforcement |
+| `weav-auth` | Authentication (Argon2id), API keys (SHA-256), ACL store, command classification |
 | `weav-persist` | Write-ahead log, snapshot engine, crash recovery |
 | `weav-proto` | RESP3 codec, gRPC protobuf definitions, command mapping |
 | `weav-server` | Engine coordinator, HTTP/RESP3/gRPC servers (axum, tonic) |
@@ -353,6 +371,80 @@ STATS ["<graph>"]
 SNAPSHOT
 ```
 
+### Authentication & ACL Commands
+
+```
+AUTH <password>                              # Redis-compat single-password auth
+AUTH <username> <password>                   # Username + password auth
+
+ACL SETUSER <user> [>password] [on|off] [+@cat|-@cat] [~pattern:perm]
+ACL DELUSER <username>
+ACL LIST
+ACL GETUSER <username>
+ACL WHOAMI
+ACL SAVE                                    # Persist ACL to file
+ACL LOAD                                    # Reload ACL from file
+```
+
+**Command categories:** `+@connection`, `+@read`, `+@write`, `+@admin`, `+@all`
+
+**Graph patterns:** `~*:readwrite`, `~app:*:read`, `~shared:admin`
+
+---
+
+## Authentication & Authorization
+
+Weav includes a Redis-ACL-inspired auth system that works across all three protocols. **Auth is disabled by default** — zero config change needed for existing deployments.
+
+### How It Works
+
+| Layer | Mechanism |
+|---|---|
+| **HTTP** | `Authorization: Bearer <api_key>` or `Authorization: Basic <base64>` header |
+| **RESP3** | `AUTH [username] password` command (per-connection identity) |
+| **gRPC** | `authorization` metadata key |
+
+### Permission Model
+
+**Command categories** control what types of operations a user can perform:
+
+| Category | Commands |
+|---|---|
+| `connection` | PING, INFO, AUTH |
+| `read` | NODE.GET, EDGE.GET, GRAPH.INFO, GRAPH.LIST, STATS, CONTEXT, CONFIG.GET, ACL WHOAMI |
+| `write` | NODE.ADD, NODE.UPDATE, NODE.DELETE, EDGE.ADD, EDGE.DELETE, EDGE.INVALIDATE, BULK.INSERT.* |
+| `admin` | GRAPH.CREATE, GRAPH.DROP, SNAPSHOT, CONFIG.SET, ACL SETUSER/DELUSER/LIST/GETUSER/SAVE/LOAD |
+
+**Graph-level ACL** controls which graphs a user can access, using glob patterns:
+
+```toml
+[[auth.users]]
+username = "app_writer"
+password = "writepass"
+categories = ["+@read", "+@write"]
+graph_patterns = [
+  { pattern = "app:*", permission = "readwrite" },
+  { pattern = "shared", permission = "read" },
+]
+```
+
+### API Keys
+
+Users can be assigned API keys (prefixed `wk_`) for Bearer token auth. The server stores only SHA-256 hashes — raw keys are never persisted.
+
+```toml
+[[auth.users]]
+username = "service_account"
+categories = ["+@read"]
+api_keys = ["wk_live_abc123def456"]
+```
+
+### Backward Compatibility
+
+- Auth is **OFF by default** — pass no config and everything works as before
+- `require_auth = false` (the default when auth is enabled) allows mixed authenticated/unauthenticated connections during migration
+- All SDK auth parameters are optional — existing client code is unchanged
+
 ---
 
 ## API Reference
@@ -445,6 +537,10 @@ client = WeavClient(host="localhost", port=6382)
 # Async client
 client = AsyncWeavClient(host="localhost", port=6382)
 
+# With authentication
+client = WeavClient(host="localhost", port=6382, api_key="wk_live_abc123")
+client = WeavClient(host="localhost", port=6382, username="admin", password="secret")
+
 # LLM integrations
 from weav import WeavLangChain, WeavLlamaIndex
 ```
@@ -482,6 +578,9 @@ result = client.context("my_graph",
 import { WeavClient, contextToPrompt, contextToMessages } from "@weav/client";
 
 const client = new WeavClient({ host: "localhost", port: 6382 });
+// With authentication:
+// new WeavClient({ host: "localhost", port: 6382, apiKey: "wk_live_abc123" });
+// new WeavClient({ host: "localhost", port: 6382, username: "admin", password: "secret" });
 
 const result = await client.context({
   graph: "my_graph",
@@ -544,6 +643,24 @@ max_wal_size_mb = 256
 max_memory_mb = 0              # 0 = unlimited
 eviction_policy = "NoEviction"
 arena_size_mb = 64
+
+[auth]
+enabled = false                # Set true to enable auth
+require_auth = false           # Set true to reject unauthenticated connections
+# default_password = "secret" # Redis-compat: AUTH <password> only
+# acl_file = "./weav-data/acl.conf"
+
+# [[auth.users]]
+# username = "admin"
+# password = "supersecret"
+# categories = ["+@all"]
+#
+# [[auth.users]]
+# username = "reader"
+# password = "readonly123"
+# categories = ["+@read", "+@connection"]
+# graph_patterns = [{ pattern = "*", permission = "read" }]
+# api_keys = ["wk_live_abc123def456"]
 ```
 
 ### Environment Variable Overrides
@@ -558,6 +675,9 @@ arena_size_mb = 64
 | `WEAV_PERSISTENCE_ENABLED` | Enable persistence (`true`/`false`) |
 | `WEAV_PERSISTENCE_DATA_DIR` | Persistence directory path |
 | `WEAV_MEMORY_MAX_MEMORY_MB` | Memory limit in MB |
+| `WEAV_AUTH_ENABLED` | Enable authentication (`true`/`false`) |
+| `WEAV_AUTH_REQUIRE_AUTH` | Require auth for all connections (`true`/`false`) |
+| `WEAV_AUTH_DEFAULT_PASSWORD` | Default password for Redis-compat `AUTH <password>` |
 
 ---
 
@@ -656,14 +776,15 @@ cd sdk/python && pip install -e ".[dev]" && pytest
 cd sdk/node && npm test
 ```
 
-**731 Rust tests** across all crates, **805 total** including SDKs — all passing.
+**812 Rust tests** across all crates, **886 total** including SDKs — all passing.
 
 | Crate | Tests |
 |---|---|
-| weav-core | 105 |
+| weav-core | 108 |
 | weav-graph | 138 |
 | weav-vector | 53 |
-| weav-query | 118 |
+| weav-query | 132 |
+| weav-auth | 64 |
 | weav-persist | 44 |
 | weav-proto | 61 |
 | weav-server | 173 (77 unit + 28 integration + 68 E2E) |
@@ -680,7 +801,8 @@ weav/
 ├── weav-core/          Core types, config, errors, shard, message bus
 ├── weav-graph/         Adjacency store, property store, traversal, dedup
 ├── weav-vector/        HNSW vector index, token counter
-├── weav-query/         Parser, planner, executor, budget enforcer
+├── weav-query/         Parser (30 commands), planner, executor, budget enforcer
+├── weav-auth/          Authentication (Argon2id), API keys, ACL store
 ├── weav-persist/       WAL, snapshots, recovery manager
 ├── weav-proto/         RESP3 codec, gRPC proto, command mapping
 ├── weav-server/        Engine, HTTP/RESP3/gRPC servers, binary
@@ -707,7 +829,8 @@ Weav is built on battle-tested Rust crates:
 | Tokenization | tiktoken-rs (cl100k, o200k) |
 | Serialization | serde, bincode, rkyv |
 | Data Structures | roaring, smallvec, compact_str |
-| Hashing | xxhash-rust, crc32fast |
+| Hashing | xxhash-rust, crc32fast, sha2 |
+| Auth | argon2 (Argon2id), rand, glob-match |
 | String Matching | strsim (Jaro-Winkler) |
 | CLI | clap, rustyline |
 | Memory | bumpalo (arena allocator) |
