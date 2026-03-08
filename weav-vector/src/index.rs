@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use roaring::RoaringBitmap;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 use weav_core::error::WeavError;
 use weav_core::types::NodeId;
@@ -52,11 +51,12 @@ impl Default for VectorConfig {
 pub struct VectorIndex {
     inner: Index,
     dimensions: u16,
-    metric: DistanceMetric,
     node_to_key: HashMap<NodeId, u64>,
     key_to_node: HashMap<u64, NodeId>,
+    /// Raw vector storage for snapshot persistence.
+    /// USearch HNSW doesn't support vector retrieval, so we store copies here.
+    vectors: HashMap<NodeId, Vec<f32>>,
     next_key: u64,
-    config: VectorConfig,
 }
 
 impl VectorIndex {
@@ -90,22 +90,27 @@ impl VectorIndex {
         Ok(Self {
             inner,
             dimensions: config.dimensions,
-            metric: config.metric,
             node_to_key: HashMap::new(),
             key_to_node: HashMap::new(),
+            vectors: HashMap::new(),
             next_key: 0,
-            config,
         })
     }
 
-    /// Insert a vector for the given node.
-    pub fn insert(&mut self, node_id: NodeId, vector: &[f32]) -> Result<(), WeavError> {
+    /// Validate that a vector has the expected number of dimensions.
+    fn validate_dims(&self, vector: &[f32]) -> Result<(), WeavError> {
         if vector.len() != self.dimensions as usize {
             return Err(WeavError::DimensionMismatch {
                 expected: self.dimensions,
                 got: vector.len() as u16,
             });
         }
+        Ok(())
+    }
+
+    /// Insert a vector for the given node.
+    pub fn insert(&mut self, node_id: NodeId, vector: &[f32]) -> Result<(), WeavError> {
+        self.validate_dims(vector)?;
 
         let key = self.next_key;
         self.next_key += 1;
@@ -124,27 +129,8 @@ impl VectorIndex {
 
         self.node_to_key.insert(node_id, key);
         self.key_to_node.insert(key, node_id);
+        self.vectors.insert(node_id, vector.to_vec());
         Ok(())
-    }
-
-    /// Update the vector for an existing node (remove old + insert new).
-    pub fn update(&mut self, node_id: NodeId, vector: &[f32]) -> Result<(), WeavError> {
-        if vector.len() != self.dimensions as usize {
-            return Err(WeavError::DimensionMismatch {
-                expected: self.dimensions,
-                got: vector.len() as u16,
-            });
-        }
-
-        // Remove old vector if it exists
-        if let Some(&old_key) = self.node_to_key.get(&node_id) {
-            let _ = self.inner.remove(old_key);
-            self.key_to_node.remove(&old_key);
-            self.node_to_key.remove(&node_id);
-        }
-
-        // Insert new vector
-        self.insert(node_id, vector)
     }
 
     /// Remove a node's vector from the index.
@@ -154,10 +140,21 @@ impl VectorIndex {
                 .remove(key)
                 .map_err(|e| WeavError::Internal(format!("failed to remove vector: {e}")))?;
             self.key_to_node.remove(&key);
+            self.vectors.remove(&node_id);
             Ok(())
         } else {
             Ok(())
         }
+    }
+
+    /// Retrieve the raw vector for a node, if stored.
+    pub fn get_vector(&self, node_id: NodeId) -> Option<&[f32]> {
+        self.vectors.get(&node_id).map(|v| v.as_slice())
+    }
+
+    /// Returns an iterator over all (NodeId, vector) pairs.
+    pub fn all_vectors(&self) -> impl Iterator<Item = (NodeId, &[f32])> {
+        self.vectors.iter().map(|(&nid, v)| (nid, v.as_slice()))
     }
 
     /// Search for the k nearest neighbors of the query vector.
@@ -167,12 +164,7 @@ impl VectorIndex {
         k: u16,
         ef_search: Option<u16>,
     ) -> Result<Vec<(NodeId, f32)>, WeavError> {
-        if query.len() != self.dimensions as usize {
-            return Err(WeavError::DimensionMismatch {
-                expected: self.dimensions,
-                got: query.len() as u16,
-            });
-        }
+        self.validate_dims(query)?;
 
         if self.inner.size() == 0 {
             return Ok(Vec::new());
@@ -209,56 +201,6 @@ impl VectorIndex {
         Ok(results)
     }
 
-    /// Search with a pre-filter: only return results whose NodeId is in `candidates`.
-    /// Uses usearch's native filtered_search with a predicate callback.
-    pub fn search_filtered(
-        &self,
-        query: &[f32],
-        k: u16,
-        candidates: &RoaringBitmap,
-    ) -> Result<Vec<(NodeId, f32)>, WeavError> {
-        if query.len() != self.dimensions as usize {
-            return Err(WeavError::DimensionMismatch {
-                expected: self.dimensions,
-                got: query.len() as u16,
-            });
-        }
-
-        if self.inner.size() == 0 {
-            return Ok(Vec::new());
-        }
-
-        // Use usearch's native filtered search with a predicate
-        let filter = |key: u64| -> bool {
-            if let Some(&node_id) = self.key_to_node.get(&key) {
-                // NodeId is u64, RoaringBitmap stores u32, so we check if it fits
-                if node_id <= u32::MAX as u64 {
-                    candidates.contains(node_id as u32)
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        };
-
-        let matches = self
-            .inner
-            .filtered_search(query, k as usize, filter)
-            .map_err(|e| WeavError::Internal(format!("filtered search failed: {e}")))?;
-
-        let results = matches
-            .keys
-            .iter()
-            .zip(matches.distances.iter())
-            .filter_map(|(&key, &dist)| {
-                self.key_to_node.get(&key).map(|&node_id| (node_id, dist))
-            })
-            .collect();
-
-        Ok(results)
-    }
-
     /// Returns the number of vectors in the index.
     pub fn len(&self) -> usize {
         self.node_to_key.len()
@@ -277,17 +219,6 @@ impl VectorIndex {
     /// Returns true if the index contains a vector for the given node.
     pub fn contains(&self, node_id: NodeId) -> bool {
         self.node_to_key.contains_key(&node_id)
-    }
-
-    /// Estimate the memory usage of this vector index in bytes.
-    ///
-    /// Approximation: each vector costs `dimensions * 4` bytes (f32) plus ~64
-    /// bytes of HNSW graph overhead. Each HashMap entry in the id-maps costs
-    /// roughly 48 bytes.
-    pub fn memory_usage_bytes(&self) -> usize {
-        let vector_bytes = self.len() * (self.dimensions as usize * 4 + 64);
-        let map_bytes = self.node_to_key.len() * 48;
-        vector_bytes + map_bytes
     }
 }
 
@@ -371,25 +302,6 @@ mod tests {
     }
 
     #[test]
-    fn test_update() {
-        let config = make_config(4);
-        let mut index = VectorIndex::new(config).unwrap();
-
-        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        assert_eq!(index.len(), 1);
-
-        // Update node 1 with a new vector
-        index.update(1, &[0.0, 1.0, 0.0, 0.0]).unwrap();
-        assert_eq!(index.len(), 1);
-        assert!(index.contains(1));
-
-        // Search for the updated vector
-        let results = index.search(&[0.0, 1.0, 0.0, 0.0], 1, None).unwrap();
-        assert_eq!(results[0].0, 1);
-        assert!(results[0].1 < 0.01);
-    }
-
-    #[test]
     fn test_remove() {
         let config = make_config(4);
         let mut index = VectorIndex::new(config).unwrap();
@@ -457,36 +369,6 @@ mod tests {
     }
 
     #[test]
-    fn test_filtered_search() {
-        let config = make_config(4);
-        let mut index = VectorIndex::new(config).unwrap();
-
-        // Insert nodes 1..5
-        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        index.insert(2, &[0.9, 0.1, 0.0, 0.0]).unwrap();
-        index.insert(3, &[0.0, 1.0, 0.0, 0.0]).unwrap();
-        index.insert(4, &[0.0, 0.0, 1.0, 0.0]).unwrap();
-
-        // Only allow nodes 3 and 4 in the candidates
-        let mut candidates = RoaringBitmap::new();
-        candidates.insert(3);
-        candidates.insert(4);
-
-        let results = index
-            .search_filtered(&[1.0, 0.0, 0.0, 0.0], 4, &candidates)
-            .unwrap();
-
-        // All results should be in the candidate set
-        for (node_id, _dist) in &results {
-            assert!(
-                candidates.contains(*node_id as u32),
-                "node {} should be in candidates",
-                node_id
-            );
-        }
-    }
-
-    #[test]
     fn test_different_metrics() {
         for metric in [
             DistanceMetric::Cosine,
@@ -504,56 +386,6 @@ mod tests {
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].0, 1);
         }
-    }
-
-    #[test]
-    fn test_update_dimension_mismatch() {
-        let config = make_config(4);
-        let mut index = VectorIndex::new(config).unwrap();
-        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-
-        let err = index.update(1, &[1.0, 0.0]).unwrap_err();
-        match err {
-            WeavError::DimensionMismatch { .. } => {}
-            _ => panic!("expected DimensionMismatch"),
-        }
-    }
-
-    #[test]
-    fn test_memory_usage_empty() {
-        let config = make_config(4);
-        let index = VectorIndex::new(config).unwrap();
-        assert_eq!(index.memory_usage_bytes(), 0);
-    }
-
-    #[test]
-    fn test_memory_usage_with_vectors() {
-        let config = make_config(4);
-        let mut index = VectorIndex::new(config).unwrap();
-        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        index.insert(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
-
-        let usage = index.memory_usage_bytes();
-        // 2 vectors * (4 dims * 4 bytes + 64 overhead) = 2 * 80 = 160
-        // + 2 entries * 48 = 96
-        // Total = 256
-        assert_eq!(usage, 256);
-        assert!(usage > 0);
-    }
-
-    #[test]
-    fn test_memory_usage_after_remove() {
-        let config = make_config(4);
-        let mut index = VectorIndex::new(config).unwrap();
-        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        index.insert(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
-
-        let usage_before = index.memory_usage_bytes();
-        index.remove(1).unwrap();
-        let usage_after = index.memory_usage_bytes();
-        assert!(usage_after < usage_before);
-        // 1 vector * (4*4 + 64) + 1 * 48 = 80 + 48 = 128
-        assert_eq!(usage_after, 128);
     }
 
     #[test]
@@ -598,46 +430,6 @@ mod tests {
         assert!(!results.is_empty());
         // Nearest neighbor should be node 1 (exact match)
         assert_eq!(results[0].0, 1);
-    }
-
-    #[test]
-    fn test_search_filtered_empty_index() {
-        let config = make_config(4);
-        let index = VectorIndex::new(config).unwrap();
-
-        let mut candidates = RoaringBitmap::new();
-        candidates.insert(1);
-        candidates.insert(2);
-        candidates.insert(3);
-
-        // search_filtered on an empty index should return empty, not panic
-        let results = index
-            .search_filtered(&[1.0, 0.0, 0.0, 0.0], 5, &candidates)
-            .unwrap();
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn test_search_filtered_dimension_mismatch() {
-        let config = make_config(4);
-        let mut index = VectorIndex::new(config).unwrap();
-
-        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-
-        let mut candidates = RoaringBitmap::new();
-        candidates.insert(1);
-
-        // Query with wrong dimensions (2 instead of 4) should return DimensionMismatch
-        let err = index
-            .search_filtered(&[1.0, 0.0], 5, &candidates)
-            .unwrap_err();
-        match err {
-            WeavError::DimensionMismatch { expected, got } => {
-                assert_eq!(expected, 4);
-                assert_eq!(got, 2);
-            }
-            _ => panic!("expected DimensionMismatch error"),
-        }
     }
 
     #[test]
@@ -708,16 +500,6 @@ mod tests {
     }
 
     #[test]
-    fn test_update_non_existent_node() {
-        let config = make_config(4);
-        let mut index = VectorIndex::new(config).unwrap();
-        // Node 999 doesn't exist; update uses remove+insert pattern so it should insert
-        index.update(999, &[0.5, 0.5, 0.0, 0.0]).unwrap();
-        assert_eq!(index.len(), 1);
-        assert!(index.contains(999));
-    }
-
-    #[test]
     fn test_insert_after_remove() {
         let config = make_config(4);
         let mut index = VectorIndex::new(config).unwrap();
@@ -731,38 +513,6 @@ mod tests {
         index.insert(1, &[0.0, 1.0, 0.0, 0.0]).unwrap();
         assert_eq!(index.len(), 1);
         assert!(index.contains(1));
-    }
-
-    #[test]
-    fn test_search_filtered_empty_candidates() {
-        let config = make_config(4);
-        let mut index = VectorIndex::new(config).unwrap();
-        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-
-        let candidates = RoaringBitmap::new(); // empty
-        let results = index
-            .search_filtered(&[1.0, 0.0, 0.0, 0.0], 5, &candidates)
-            .unwrap();
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn test_search_filtered_no_matching_candidates() {
-        let config = make_config(4);
-        let mut index = VectorIndex::new(config).unwrap();
-        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
-        index.insert(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
-        index.insert(3, &[0.0, 0.0, 1.0, 0.0]).unwrap();
-
-        // Filter to nodes 100, 200 which don't exist in the index
-        let mut candidates = RoaringBitmap::new();
-        candidates.insert(100);
-        candidates.insert(200);
-
-        let results = index
-            .search_filtered(&[1.0, 0.0, 0.0, 0.0], 5, &candidates)
-            .unwrap();
-        assert!(results.is_empty());
     }
 
     #[test]

@@ -153,8 +153,15 @@ pub fn merge_properties(
                         changed = true;
                     }
                     ConflictPolicy::HighestConfidence | ConflictPolicy::TemporalInvalidation => {
-                        // Without provenance context, fall back to last-write-wins
+                        // These policies require provenance/temporal context not available
+                        // at the property merge level. Record the conflict and apply
+                        // last-write-wins as a fallback.
                         properties.set_node_property(existing, key, new_value.clone());
+                        conflicts.push(PropertyConflict {
+                            key: key.clone(),
+                            existing_value: format!("{:?}", ev),
+                            new_value: format!("{:?}", new_value),
+                        });
                         changed = true;
                     }
                 }
@@ -413,7 +420,7 @@ mod tests {
         match result {
             MergeResult::Merged { node_id, conflicts } => {
                 assert_eq!(node_id, 1);
-                assert!(conflicts.is_empty()); // no conflicts recorded for fallback
+                assert_eq!(conflicts.len(), 1); // conflict recorded since policy can't be fully applied
             }
             MergeResult::NoChange { .. } => panic!("Expected Merged"),
         }
@@ -444,7 +451,7 @@ mod tests {
         match result {
             MergeResult::Merged { node_id, conflicts } => {
                 assert_eq!(node_id, 1);
-                assert!(conflicts.is_empty());
+                assert_eq!(conflicts.len(), 1); // conflict recorded since policy can't be fully applied
             }
             MergeResult::NoChange { .. } => panic!("Expected Merged"),
         }

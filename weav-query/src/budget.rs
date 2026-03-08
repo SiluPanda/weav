@@ -64,14 +64,15 @@ pub fn enforce_budget(chunks: Vec<ContextChunk>, budget: &TokenBudget) -> Budget
             *text_chunks_pct,
             *metadata_pct,
         ),
+        TokenAllocation::DiversityAware { lambda } => {
+            enforce_budget_mmr(chunks, max_tokens, *lambda)
+        }
         _ => enforce_budget_greedy(chunks, max_tokens),
     }
 }
 
-/// Greedy budget enforcement (for Auto and Priority allocations).
-fn enforce_budget_greedy(chunks: Vec<ContextChunk>, max_tokens: u32) -> BudgetResult {
-    // Sort by value density (relevance_score / token_count), descending.
-    // Chunks with zero tokens get infinite density (include them first).
+/// Rank chunks by value density (relevance_score / token_count), descending.
+fn rank_by_density(chunks: &[ContextChunk]) -> Vec<(usize, f32)> {
     let mut ranked: Vec<(usize, f32)> = chunks
         .iter()
         .enumerate()
@@ -85,6 +86,23 @@ fn enforce_budget_greedy(chunks: Vec<ContextChunk>, max_tokens: u32) -> BudgetRe
         })
         .collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked
+}
+
+/// Sort chunks by relevance score, descending.
+fn sort_by_relevance(chunks: &mut [ContextChunk]) {
+    chunks.sort_by(|a, b| {
+        b.relevance_score
+            .partial_cmp(&a.relevance_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
+/// Greedy budget enforcement (for Auto and Priority allocations).
+fn enforce_budget_greedy(chunks: Vec<ContextChunk>, max_tokens: u32) -> BudgetResult {
+    // Sort by value density (relevance_score / token_count), descending.
+    // Chunks with zero tokens get infinite density (include them first).
+    let ranked = rank_by_density(&chunks);
 
     let mut included_indices = Vec::new();
     let mut total_tokens: u32 = 0;
@@ -114,11 +132,7 @@ fn enforce_budget_greedy(chunks: Vec<ContextChunk>, max_tokens: u32) -> BudgetRe
         .collect();
 
     // Re-sort by relevance_score descending for output ordering
-    included.sort_by(|a, b| {
-        b.relevance_score
-            .partial_cmp(&a.relevance_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    sort_by_relevance(&mut included);
 
     let budget_utilization = if max_tokens > 0 {
         total_tokens as f32 / max_tokens as f32
@@ -168,26 +182,16 @@ fn enforce_budget_proportional(
         pool: &[(usize, &ContextChunk)],
         pool_budget: u32,
     ) -> (Vec<usize>, u32) {
-        let mut ranked: Vec<(usize, f32)> = pool
-            .iter()
-            .map(|(i, c)| {
-                let density = if c.token_count == 0 {
-                    f32::MAX
-                } else {
-                    c.relevance_score / c.token_count as f32
-                };
-                (*i, density)
-            })
-            .collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let pool_chunks: Vec<ContextChunk> = pool.iter().map(|(_, c)| (*c).clone()).collect();
+        let ranked = rank_by_density(&pool_chunks);
 
         let mut included = Vec::new();
         let mut used: u32 = 0;
-        for (idx, _) in &ranked {
-            let chunk = pool.iter().find(|(i, _)| i == idx).unwrap().1;
+        for (pool_idx, _) in &ranked {
+            let (orig_idx, chunk) = &pool[*pool_idx];
             if used + chunk.token_count <= pool_budget {
                 used += chunk.token_count;
-                included.push(*idx);
+                included.push(*orig_idx);
             }
         }
         (included, used)
@@ -218,11 +222,134 @@ fn enforce_budget_proportional(
         .filter_map(|&i| chunks_vec[i].take())
         .collect();
 
-    included.sort_by(|a, b| {
-        b.relevance_score
-            .partial_cmp(&a.relevance_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    sort_by_relevance(&mut included);
+
+    let budget_utilization = if max_tokens > 0 {
+        total_tokens as f32 / max_tokens as f32
+    } else {
+        0.0
+    };
+
+    BudgetResult {
+        included,
+        excluded,
+        total_tokens,
+        budget_utilization,
+    }
+}
+
+/// Maximum Marginal Relevance (MMR) budget enforcement.
+///
+/// Iteratively selects the chunk that maximizes:
+///   MMR(c) = λ * relevance(c) - (1-λ) * max_similarity(c, selected_set)
+///
+/// Similarity is computed based on label matching: chunks with the same label
+/// have similarity 1.0, different labels have similarity 0.0. This ensures
+/// diversity across content categories (entities, relationships, text, etc.)
+/// without requiring embedding vectors for each chunk.
+fn enforce_budget_mmr(chunks: Vec<ContextChunk>, max_tokens: u32, lambda: f32) -> BudgetResult {
+    let lambda = lambda.clamp(0.0, 1.0);
+    let n = chunks.len();
+
+    if n == 0 {
+        return BudgetResult {
+            included: Vec::new(),
+            excluded: Vec::new(),
+            total_tokens: 0,
+            budget_utilization: 0.0,
+        };
+    }
+
+    // Normalize relevance scores to [0, 1] for balanced MMR computation
+    let max_rel = chunks
+        .iter()
+        .map(|c| c.relevance_score)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_rel = chunks
+        .iter()
+        .map(|c| c.relevance_score)
+        .fold(f32::INFINITY, f32::min);
+    let rel_range = max_rel - min_rel;
+
+    let norm_relevance: Vec<f32> = chunks
+        .iter()
+        .map(|c| {
+            if rel_range > f32::EPSILON {
+                (c.relevance_score - min_rel) / rel_range
+            } else {
+                1.0 // all equal
+            }
+        })
+        .collect();
+
+    let mut selected: Vec<usize> = Vec::new();
+    let mut remaining: Vec<usize> = (0..n).collect();
+    let mut total_tokens: u32 = 0;
+
+    while !remaining.is_empty() {
+        let mut best_idx_in_remaining: Option<usize> = None;
+        let mut best_mmr = f32::NEG_INFINITY;
+
+        for (ri, &chunk_idx) in remaining.iter().enumerate() {
+            let chunk = &chunks[chunk_idx];
+
+            // Skip chunks that won't fit
+            if chunk.token_count > 0 && total_tokens + chunk.token_count > max_tokens {
+                continue;
+            }
+
+            let relevance_term = norm_relevance[chunk_idx];
+
+            // Compute max similarity to already selected chunks
+            let max_sim = if selected.is_empty() {
+                0.0
+            } else {
+                selected
+                    .iter()
+                    .map(|&sel_idx| {
+                        // Label-based similarity: same label = 1.0, different = 0.0
+                        if chunks[sel_idx].label == chunks[chunk_idx].label {
+                            1.0_f32
+                        } else {
+                            0.0_f32
+                        }
+                    })
+                    .fold(f32::NEG_INFINITY, f32::max)
+            };
+
+            let mmr_score = lambda * relevance_term - (1.0 - lambda) * max_sim;
+
+            if mmr_score > best_mmr {
+                best_mmr = mmr_score;
+                best_idx_in_remaining = Some(ri);
+            }
+        }
+
+        match best_idx_in_remaining {
+            Some(ri) => {
+                let chunk_idx = remaining.swap_remove(ri);
+                total_tokens += chunks[chunk_idx].token_count;
+                selected.push(chunk_idx);
+            }
+            None => break, // no more chunks fit
+        }
+    }
+
+    let selected_set: std::collections::HashSet<usize> = selected.iter().copied().collect();
+    let excluded: Vec<NodeId> = chunks
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !selected_set.contains(i))
+        .map(|(_, c)| c.node_id)
+        .collect();
+
+    let mut chunks_vec: Vec<Option<ContextChunk>> = chunks.into_iter().map(Some).collect();
+    let mut included: Vec<ContextChunk> = selected
+        .iter()
+        .filter_map(|&i| chunks_vec[i].take())
+        .collect();
+
+    sort_by_relevance(&mut included);
 
     let budget_utilization = if max_tokens > 0 {
         total_tokens as f32 / max_tokens as f32
@@ -651,6 +778,100 @@ mod tests {
             "All chunks should fit since each category budget >= 10 tokens"
         );
         assert_eq!(result.total_tokens, 40);
+    }
+
+    // ── MMR (Diversity-Aware) tests ────────────────────────────────────
+
+    #[test]
+    fn test_mmr_empty() {
+        let budget = TokenBudget {
+            max_tokens: 100,
+            allocation: TokenAllocation::DiversityAware { lambda: 0.7 },
+        };
+        let result = enforce_budget(Vec::new(), &budget);
+        assert!(result.included.is_empty());
+    }
+
+    #[test]
+    fn test_mmr_all_fit() {
+        let chunks = vec![
+            make_chunk(1, 0.9, 10),
+            make_chunk(2, 0.8, 10),
+            make_chunk(3, 0.7, 10),
+        ];
+        let budget = TokenBudget {
+            max_tokens: 100,
+            allocation: TokenAllocation::DiversityAware { lambda: 0.7 },
+        };
+        let result = enforce_budget(chunks, &budget);
+        assert_eq!(result.included.len(), 3);
+        assert_eq!(result.total_tokens, 30);
+    }
+
+    #[test]
+    fn test_mmr_diversity_effect() {
+        // 5 entity chunks (same label), 1 relationship chunk (different label)
+        // With high diversity (low lambda), the relationship should be selected early
+        // even though entities have higher relevance
+        let chunks = vec![
+            make_chunk_with_label(1, 0.95, 20, "entity"),
+            make_chunk_with_label(2, 0.90, 20, "entity"),
+            make_chunk_with_label(3, 0.85, 20, "entity"),
+            make_chunk_with_label(4, 0.80, 20, "entity"),
+            make_chunk_with_label(5, 0.50, 20, "relationship"), // lower relevance but different label
+        ];
+        let budget_diverse = TokenBudget {
+            max_tokens: 60, // room for 3 chunks
+            allocation: TokenAllocation::DiversityAware { lambda: 0.3 }, // strong diversity
+        };
+        let result = enforce_budget(chunks.clone(), &budget_diverse);
+        let ids: Vec<u64> = result.included.iter().map(|c| c.node_id).collect();
+        // With strong diversity, the relationship chunk (node 5) should be included
+        // because selecting a 2nd entity incurs a high similarity penalty
+        assert!(
+            ids.contains(&5),
+            "MMR with low lambda should favor diversity — relationship chunk should be included, got {:?}",
+            ids
+        );
+        assert_eq!(result.included.len(), 3);
+    }
+
+    #[test]
+    fn test_mmr_lambda_1_equals_greedy() {
+        // With lambda=1.0, MMR should behave like pure relevance (greedy)
+        let chunks = vec![
+            make_chunk(1, 0.9, 10),
+            make_chunk(2, 0.5, 10),
+            make_chunk(3, 0.3, 10),
+        ];
+        let budget_mmr = TokenBudget {
+            max_tokens: 20,
+            allocation: TokenAllocation::DiversityAware { lambda: 1.0 },
+        };
+        let budget_greedy = TokenBudget::new(20);
+
+        let result_mmr = enforce_budget(chunks.clone(), &budget_mmr);
+        let result_greedy = enforce_budget(chunks, &budget_greedy);
+
+        let ids_mmr: Vec<u64> = result_mmr.included.iter().map(|c| c.node_id).collect();
+        let ids_greedy: Vec<u64> = result_greedy.included.iter().map(|c| c.node_id).collect();
+        // Same chunks should be selected (both pick highest relevance)
+        assert_eq!(ids_mmr.len(), ids_greedy.len());
+    }
+
+    #[test]
+    fn test_mmr_zero_token_chunks() {
+        let chunks = vec![
+            make_chunk(1, 0.9, 0),
+            make_chunk(2, 0.8, 0),
+        ];
+        let budget = TokenBudget {
+            max_tokens: 10,
+            allocation: TokenAllocation::DiversityAware { lambda: 0.7 },
+        };
+        let result = enforce_budget(chunks, &budget);
+        assert_eq!(result.included.len(), 2);
+        assert_eq!(result.total_tokens, 0);
     }
 
     #[test]

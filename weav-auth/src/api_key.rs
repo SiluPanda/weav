@@ -5,6 +5,7 @@
 
 use rand::Rng;
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 const API_KEY_PREFIX: &str = "wk_";
 const API_KEY_RANDOM_BYTES: usize = 32;
@@ -30,8 +31,16 @@ pub fn hash_api_key(key: &str) -> String {
 }
 
 /// Verify an API key against a stored SHA-256 hash.
+///
+/// Uses constant-time comparison to prevent timing attacks.
 pub fn verify_api_key(key: &str, stored_hash: &str) -> bool {
-    hash_api_key(key) == stored_hash
+    let computed = hash_api_key(key);
+    let computed_bytes = computed.as_bytes();
+    let stored_bytes = stored_hash.as_bytes();
+    if computed_bytes.len() != stored_bytes.len() {
+        return false;
+    }
+    computed_bytes.ct_eq(stored_bytes).into()
 }
 
 #[cfg(test)]

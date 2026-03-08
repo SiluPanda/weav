@@ -90,6 +90,32 @@ fn command_response_to_resp3(resp: CommandResponse) -> Resp3Value {
                 Resp3Value::Double(info.weight as f64),
             ),
         ]),
+        CommandResponse::IngestResult(info) => Resp3Value::Map(vec![
+            (
+                Resp3Value::SimpleString("document_id".to_string()),
+                Resp3Value::SimpleString(info.document_id),
+            ),
+            (
+                Resp3Value::SimpleString("chunks_created".to_string()),
+                Resp3Value::Number(info.chunks_created as i64),
+            ),
+            (
+                Resp3Value::SimpleString("entities_created".to_string()),
+                Resp3Value::Number(info.entities_created as i64),
+            ),
+            (
+                Resp3Value::SimpleString("entities_merged".to_string()),
+                Resp3Value::Number(info.entities_merged as i64),
+            ),
+            (
+                Resp3Value::SimpleString("relationships_created".to_string()),
+                Resp3Value::Number(info.relationships_created as i64),
+            ),
+            (
+                Resp3Value::SimpleString("pipeline_duration_ms".to_string()),
+                Resp3Value::Number(info.pipeline_duration_ms as i64),
+            ),
+        ]),
         CommandResponse::Null => Resp3Value::Null,
         CommandResponse::Error(msg) => Resp3Value::SimpleError(msg),
     }

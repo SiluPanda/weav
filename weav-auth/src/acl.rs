@@ -141,7 +141,6 @@ impl AclStore {
 
     /// Authenticate with an API key. Returns a SessionIdentity on success.
     pub fn authenticate_api_key(&self, key: &str) -> WeavResult<SessionIdentity> {
-        let key_hash = api_key::hash_api_key(key);
         let users = self.users.read();
 
         for user in users.values() {
@@ -149,7 +148,7 @@ impl AclStore {
                 continue;
             }
             for stored_hash in &user.api_key_hashes {
-                if *stored_hash == key_hash {
+                if api_key::verify_api_key(key, stored_hash) {
                     return Ok(user.to_identity());
                 }
             }

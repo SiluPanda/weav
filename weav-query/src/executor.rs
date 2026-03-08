@@ -603,8 +603,8 @@ mod tests {
         );
 
         // Add edges
-        let knows_label = interner.intern_label("knows");
-        let uses_label = interner.intern_label("uses");
+        let knows_label = interner.intern_label("knows").unwrap();
+        let uses_label = interner.intern_label("uses").unwrap();
 
         let meta1 = EdgeMeta {
             source: 1,

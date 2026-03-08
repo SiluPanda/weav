@@ -7,6 +7,8 @@ import {
   AddNodeParams,
   AddEdgeParams,
   UpdateNodeParams,
+  IngestParams,
+  IngestResult,
   ApiResponse,
   ContextChunk,
 } from './types.js';
@@ -251,6 +253,46 @@ export class WeavClient {
       body,
     );
     return this.parseContextResult(raw);
+  }
+
+  // ── Ingest (extraction pipeline) ─────────────────────────────────────
+
+  async ingest(graph: string, params: IngestParams): Promise<IngestResult> {
+    const body: Record<string, unknown> = {};
+    if (params.content !== undefined) {
+      body.content = params.content;
+    }
+    if (params.contentBase64 !== undefined) {
+      body.content_base64 = params.contentBase64;
+    }
+    if (params.format !== undefined) {
+      body.format = params.format;
+    }
+    if (params.documentId !== undefined) {
+      body.document_id = params.documentId;
+    }
+    body.skip_extraction = params.skipExtraction ?? false;
+    body.skip_dedup = params.skipDedup ?? false;
+    if (params.chunkSize !== undefined) {
+      body.chunk_size = params.chunkSize;
+    }
+    if (params.entityTypes !== undefined) {
+      body.entity_types = params.entityTypes;
+    }
+
+    const raw = await this.request<Record<string, unknown>>(
+      'POST',
+      `/v1/graphs/${encodeURIComponent(graph)}/ingest`,
+      body,
+    );
+    return {
+      documentId: raw.document_id as string,
+      chunksCreated: raw.chunks_created as number,
+      entitiesCreated: raw.entities_created as number,
+      entitiesMerged: raw.entities_merged as number,
+      relationshipsCreated: raw.relationships_created as number,
+      pipelineDurationMs: raw.pipeline_duration_ms as number,
+    };
   }
 
   private parseContextResult(raw: Record<string, unknown>): ContextResult {

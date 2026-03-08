@@ -106,6 +106,26 @@ export interface UpdateNodeParams {
   embedding?: number[];
 }
 
+export interface IngestParams {
+  content?: string;
+  contentBase64?: string;
+  format?: string;
+  documentId?: string;
+  skipExtraction?: boolean;
+  skipDedup?: boolean;
+  chunkSize?: number;
+  entityTypes?: string[];
+}
+
+export interface IngestResult {
+  documentId: string;
+  chunksCreated: number;
+  entitiesCreated: number;
+  entitiesMerged: number;
+  relationshipsCreated: number;
+  pipelineDurationMs: number;
+}
+
 export interface ApiResponse<T> {
   success: boolean;
   data?: T;

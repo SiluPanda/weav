@@ -1,6 +1,8 @@
-//! Graph traversal algorithms: BFS, flow scoring, ego network, shortest path, scored paths.
+//! Graph traversal algorithms: BFS, flow scoring, ego network, shortest path,
+//! scored paths, Dijkstra, connected components, Personalized PageRank.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use weav_core::types::{Direction, EdgeId, LabelId, NodeId, ScoredNode, ScoredPath, Timestamp};
 
@@ -223,6 +225,7 @@ pub fn bfs(
     property_check: Option<&dyn Fn(NodeId, &str) -> bool>,
 ) -> TraversalResult {
     let mut visited_nodes = Vec::new();
+    let mut visited_edges_set = HashSet::new();
     let mut visited_edges = Vec::new();
     let mut depth_map = HashMap::new();
     let mut parent_map = HashMap::new();
@@ -264,6 +267,7 @@ pub fn bfs(
                 depth_map.insert(neighbor, next_depth);
                 parent_map.insert(neighbor, node);
                 visited_nodes.push(neighbor);
+                visited_edges_set.insert(edge_id);
                 visited_edges.push(edge_id);
                 if visited_nodes.len() >= max_nodes {
                     break;
@@ -271,7 +275,7 @@ pub fn bfs(
                 queue.push_back((neighbor, next_depth));
             } else {
                 // Node already visited, but we may still want to record the edge
-                if !visited_edges.contains(&edge_id) {
+                if visited_edges_set.insert(edge_id) {
                     visited_edges.push(edge_id);
                 }
             }
@@ -490,6 +494,290 @@ pub fn scored_paths(
 
     all_paths.truncate(max_paths as usize);
     all_paths
+}
+
+// ─── Weighted shortest path (Dijkstra) ──────────────────────────────────────
+
+/// A node-distance pair for the priority queue, ordered by minimum distance.
+struct DijkstraState {
+    node: NodeId,
+    cost: f64,
+}
+
+impl PartialEq for DijkstraState {
+    fn eq(&self, other: &Self) -> bool {
+        self.cost == other.cost && self.node == other.node
+    }
+}
+
+impl Eq for DijkstraState {}
+
+impl PartialOrd for DijkstraState {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DijkstraState {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse ordering for min-heap (BinaryHeap is a max-heap by default)
+        other
+            .cost
+            .partial_cmp(&self.cost)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| self.node.cmp(&other.node))
+    }
+}
+
+/// Weighted shortest path result.
+pub struct WeightedPath {
+    pub nodes: Vec<NodeId>,
+    pub total_weight: f64,
+}
+
+/// Find the shortest weighted path between source and target using Dijkstra's algorithm.
+///
+/// Edge weights are used as costs (lower weight = cheaper path).
+/// Returns the path and its total weight, or None if no path exists within max_depth hops.
+pub fn dijkstra_shortest_path(
+    adjacency: &AdjacencyStore,
+    source: NodeId,
+    target: NodeId,
+    max_depth: u8,
+) -> Option<WeightedPath> {
+    if source == target {
+        return Some(WeightedPath {
+            nodes: vec![source],
+            total_weight: 0.0,
+        });
+    }
+
+    let mut dist: HashMap<NodeId, f64> = HashMap::new();
+    let mut depth: HashMap<NodeId, u8> = HashMap::new();
+    let mut parent: HashMap<NodeId, NodeId> = HashMap::new();
+    let mut heap = BinaryHeap::new();
+
+    dist.insert(source, 0.0);
+    depth.insert(source, 0);
+    heap.push(DijkstraState {
+        node: source,
+        cost: 0.0,
+    });
+
+    while let Some(DijkstraState { node, cost }) = heap.pop() {
+        if node == target {
+            // Reconstruct path
+            let mut path = vec![target];
+            let mut current = target;
+            while let Some(&p) = parent.get(&current) {
+                path.push(p);
+                current = p;
+                if current == source {
+                    break;
+                }
+            }
+            path.reverse();
+            return Some(WeightedPath {
+                nodes: path,
+                total_weight: cost,
+            });
+        }
+
+        // Skip if we've already found a better path to this node
+        if let Some(&d) = dist.get(&node) {
+            if cost > d {
+                continue;
+            }
+        }
+
+        let node_depth = depth.get(&node).copied().unwrap_or(0);
+        if node_depth >= max_depth {
+            continue;
+        }
+
+        let neighbors = adjacency.neighbors_out(node, None);
+        for (neighbor, edge_id) in neighbors {
+            let edge_weight = adjacency
+                .get_edge(edge_id)
+                .map(|m| m.weight as f64)
+                .unwrap_or(1.0);
+
+            // Use 1/weight as cost so higher weight = lower cost
+            // (weight represents strength/relevance; we want the strongest path)
+            let edge_cost = if edge_weight > 0.0 {
+                1.0 / edge_weight
+            } else {
+                f64::MAX
+            };
+
+            let next_cost = cost + edge_cost;
+            let is_better = dist.get(&neighbor).map_or(true, |&d| next_cost < d);
+
+            if is_better {
+                dist.insert(neighbor, next_cost);
+                depth.insert(neighbor, node_depth + 1);
+                parent.insert(neighbor, node);
+                heap.push(DijkstraState {
+                    node: neighbor,
+                    cost: next_cost,
+                });
+            }
+        }
+    }
+
+    None
+}
+
+// ─── Connected Components ───────────────────────────────────────────────────
+
+/// Find all connected components in the graph (treating edges as undirected).
+///
+/// Returns a map from NodeId to component ID (0-indexed).
+pub fn connected_components(adjacency: &AdjacencyStore) -> HashMap<NodeId, u32> {
+    let all_nodes = adjacency.all_node_ids();
+    let mut component_map: HashMap<NodeId, u32> = HashMap::new();
+    let mut component_id: u32 = 0;
+
+    for &node in &all_nodes {
+        if component_map.contains_key(&node) {
+            continue;
+        }
+
+        // BFS from this node, treating edges as undirected
+        let mut queue = VecDeque::new();
+        queue.push_back(node);
+        component_map.insert(node, component_id);
+
+        while let Some(current) = queue.pop_front() {
+            // Follow both outgoing and incoming edges
+            let out_neighbors = adjacency.neighbors_out(current, None);
+            let in_neighbors = adjacency.neighbors_in(current, None);
+
+            for (neighbor, _) in out_neighbors.iter().chain(in_neighbors.iter()) {
+                if !component_map.contains_key(neighbor) {
+                    component_map.insert(*neighbor, component_id);
+                    queue.push_back(*neighbor);
+                }
+            }
+        }
+
+        component_id += 1;
+    }
+
+    component_map
+}
+
+// ─── Personalized PageRank ──────────────────────────────────────────────────
+
+/// Compute Personalized PageRank scores relative to a set of seed nodes.
+///
+/// - `seeds`: seed nodes and their teleport weights (will be normalized)
+/// - `alpha`: teleport probability (typically 0.15); higher = more biased toward seeds
+/// - `max_iterations`: maximum number of power iterations
+/// - `tolerance`: convergence threshold (L1 norm of score changes)
+pub fn personalized_pagerank(
+    adjacency: &AdjacencyStore,
+    seeds: &[(NodeId, f32)],
+    alpha: f32,
+    max_iterations: u32,
+    tolerance: f32,
+) -> Vec<ScoredNode> {
+    if seeds.is_empty() {
+        return Vec::new();
+    }
+
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() {
+        return Vec::new();
+    }
+
+    let n = all_nodes.len();
+
+    // Build node index for fast lookup
+    let node_to_idx: HashMap<NodeId, usize> = all_nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &nid)| (nid, i))
+        .collect();
+
+    // Normalize seed teleport distribution
+    let total_seed_weight: f32 = seeds.iter().map(|(_, w)| w).sum();
+    let mut teleport = vec![0.0_f32; n];
+    if total_seed_weight > 0.0 {
+        for &(nid, w) in seeds {
+            if let Some(&idx) = node_to_idx.get(&nid) {
+                teleport[idx] = w / total_seed_weight;
+            }
+        }
+    }
+
+    // Initialize scores uniformly
+    let init_score = 1.0 / n as f32;
+    let mut scores = vec![init_score; n];
+
+    // Pre-compute out-degrees for normalization
+    let out_degrees: Vec<usize> = all_nodes
+        .iter()
+        .map(|&nid| adjacency.neighbors_out(nid, None).len())
+        .collect();
+
+    // Power iteration
+    for _ in 0..max_iterations {
+        let mut new_scores = vec![0.0_f32; n];
+
+        // Distribute score along edges
+        for (i, &nid) in all_nodes.iter().enumerate() {
+            let out_deg = out_degrees[i];
+            if out_deg == 0 {
+                // Dangling node: distribute evenly to all seeds
+                for &(seed_nid, _) in seeds {
+                    if let Some(&seed_idx) = node_to_idx.get(&seed_nid) {
+                        new_scores[seed_idx] += scores[i] / seeds.len() as f32;
+                    }
+                }
+            } else {
+                let share = scores[i] / out_deg as f32;
+                for (neighbor, _) in adjacency.neighbors_out(nid, None) {
+                    if let Some(&j) = node_to_idx.get(&neighbor) {
+                        new_scores[j] += share;
+                    }
+                }
+            }
+        }
+
+        // Apply teleport
+        let mut diff = 0.0_f32;
+        for i in 0..n {
+            new_scores[i] = alpha * teleport[i] + (1.0 - alpha) * new_scores[i];
+            diff += (new_scores[i] - scores[i]).abs();
+        }
+
+        scores = new_scores;
+
+        if diff < tolerance {
+            break;
+        }
+    }
+
+    // Build result
+    let mut result: Vec<ScoredNode> = all_nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &nid)| ScoredNode {
+            node_id: nid,
+            score: scores[i],
+            depth: 0,
+        })
+        .collect();
+
+    result.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    });
+
+    result
 }
 
 #[cfg(test)]
@@ -1466,5 +1754,185 @@ mod tests {
         // Single anchor: no pairs to form, so no paths
         let paths = scored_paths(&adj, &[(1, 1.0)], 10, 5);
         assert!(paths.is_empty());
+    }
+
+    // ── Dijkstra tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_dijkstra_same_node() {
+        let adj = build_linear_graph();
+        let result = dijkstra_shortest_path(&adj, 1, 1, 10).unwrap();
+        assert_eq!(result.nodes, vec![1]);
+        assert_eq!(result.total_weight, 0.0);
+    }
+
+    #[test]
+    fn test_dijkstra_direct_edge() {
+        let adj = build_linear_graph();
+        let result = dijkstra_shortest_path(&adj, 1, 2, 10).unwrap();
+        assert_eq!(result.nodes, vec![1, 2]);
+        assert!(result.total_weight > 0.0);
+    }
+
+    #[test]
+    fn test_dijkstra_multi_hop() {
+        let adj = build_linear_graph();
+        let result = dijkstra_shortest_path(&adj, 1, 4, 10).unwrap();
+        assert_eq!(result.nodes, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_dijkstra_unreachable() {
+        let adj = build_linear_graph();
+        let result = dijkstra_shortest_path(&adj, 4, 1, 10);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_dijkstra_depth_limited() {
+        let adj = build_linear_graph();
+        // Path 1->4 needs 3 hops, but max_depth=2
+        let result = dijkstra_shortest_path(&adj, 1, 4, 2);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_dijkstra_prefers_high_weight() {
+        // Two paths from 1 to 3:
+        //   1 -> 2 -> 3 (weights 0.1, 0.1)  cost = 1/0.1 + 1/0.1 = 20
+        //   1 -> 3 directly (weight 1.0)     cost = 1/1.0 = 1
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_node(3);
+
+        let meta_12 = EdgeMeta {
+            source: 1, target: 2, label: 0,
+            temporal: BiTemporal::new_current(1000),
+            provenance: None, weight: 0.1, token_cost: 0,
+        };
+        adj.add_edge(1, 2, 0, meta_12).unwrap();
+
+        let meta_23 = EdgeMeta {
+            source: 2, target: 3, label: 0,
+            temporal: BiTemporal::new_current(1000),
+            provenance: None, weight: 0.1, token_cost: 0,
+        };
+        adj.add_edge(2, 3, 0, meta_23).unwrap();
+
+        let meta_13 = EdgeMeta {
+            source: 1, target: 3, label: 0,
+            temporal: BiTemporal::new_current(1000),
+            provenance: None, weight: 1.0, token_cost: 0,
+        };
+        adj.add_edge(1, 3, 0, meta_13).unwrap();
+
+        let result = dijkstra_shortest_path(&adj, 1, 3, 10).unwrap();
+        // Should prefer direct path (1->3) because higher weight = lower cost
+        assert_eq!(result.nodes, vec![1, 3]);
+    }
+
+    // ── Connected components tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_connected_components_single() {
+        let adj = build_linear_graph(); // 1->2->3->4 = one component
+        let components = connected_components(&adj);
+        assert_eq!(components.len(), 4);
+        let c = components[&1];
+        assert_eq!(components[&2], c);
+        assert_eq!(components[&3], c);
+        assert_eq!(components[&4], c);
+    }
+
+    #[test]
+    fn test_connected_components_two() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_node(3);
+        adj.add_node(4);
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(3, 4, 0, make_meta(3, 4, 0)).unwrap();
+
+        let components = connected_components(&adj);
+        assert_eq!(components.len(), 4);
+        assert_eq!(components[&1], components[&2]);
+        assert_eq!(components[&3], components[&4]);
+        assert_ne!(components[&1], components[&3]);
+    }
+
+    #[test]
+    fn test_connected_components_isolated() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_node(3);
+        // No edges: each node is its own component
+        let components = connected_components(&adj);
+        assert_eq!(components.len(), 3);
+        let unique: HashSet<u32> = components.values().copied().collect();
+        assert_eq!(unique.len(), 3);
+    }
+
+    #[test]
+    fn test_connected_components_empty() {
+        let adj = AdjacencyStore::new();
+        let components = connected_components(&adj);
+        assert!(components.is_empty());
+    }
+
+    // ── Personalized PageRank tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_ppr_linear_graph() {
+        let adj = build_linear_graph(); // 1->2->3->4
+        let result = personalized_pagerank(&adj, &[(1, 1.0)], 0.15, 100, 1e-6);
+        assert_eq!(result.len(), 4);
+        // Node 1 (seed) should have highest PPR score
+        assert_eq!(result[0].node_id, 1);
+        // Scores should be decreasing (further from seed = lower score)
+        let score_map: HashMap<NodeId, f32> = result.iter().map(|s| (s.node_id, s.score)).collect();
+        assert!(score_map[&1] > score_map[&2]);
+        assert!(score_map[&2] > score_map[&3]);
+    }
+
+    #[test]
+    fn test_ppr_star_graph() {
+        let adj = build_star_graph(); // 1->2, 1->3, 1->4, 1->5
+        let result = personalized_pagerank(&adj, &[(1, 1.0)], 0.15, 100, 1e-6);
+        assert_eq!(result.len(), 5);
+        // Node 1 (seed + hub) should have highest score
+        assert_eq!(result[0].node_id, 1);
+        // All spokes should have roughly equal scores
+        let spoke_scores: Vec<f32> = result
+            .iter()
+            .filter(|s| s.node_id != 1)
+            .map(|s| s.score)
+            .collect();
+        let max_spoke = spoke_scores.iter().cloned().fold(f32::MIN, f32::max);
+        let min_spoke = spoke_scores.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(
+            (max_spoke - min_spoke).abs() < 0.01,
+            "Spoke scores should be roughly equal"
+        );
+    }
+
+    #[test]
+    fn test_ppr_empty_seeds() {
+        let adj = build_linear_graph();
+        let result = personalized_pagerank(&adj, &[], 0.15, 100, 1e-6);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_ppr_multiple_seeds() {
+        let adj = build_linear_graph(); // 1->2->3->4
+        let result = personalized_pagerank(&adj, &[(1, 1.0), (4, 1.0)], 0.15, 100, 1e-6);
+        assert_eq!(result.len(), 4);
+        // Both seed nodes should have high scores
+        let score_map: HashMap<NodeId, f32> = result.iter().map(|s| (s.node_id, s.score)).collect();
+        // Node 1 and 4 (seeds) should score higher than interior nodes
+        assert!(score_map[&1] > score_map[&3]);
     }
 }

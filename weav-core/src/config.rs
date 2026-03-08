@@ -13,6 +13,7 @@ pub struct WeavConfig {
     pub persistence: PersistenceConfig,
     pub memory: MemoryConfig,
     pub auth: AuthConfig,
+    pub extract: ExtractConfig,
 }
 
 impl Default for WeavConfig {
@@ -23,6 +24,7 @@ impl Default for WeavConfig {
             persistence: PersistenceConfig::default(),
             memory: MemoryConfig::default(),
             auth: AuthConfig::default(),
+            extract: ExtractConfig::default(),
         }
     }
 }
@@ -53,55 +55,67 @@ impl WeavConfig {
     }
 
     fn apply_env_overrides(&mut self) {
-        if let Ok(v) = std::env::var("WEAV_SERVER_PORT") {
-            if let Ok(port) = v.parse() {
-                self.server.port = port;
-            }
+        macro_rules! env_override {
+            ($var:expr, $field:expr) => {
+                if let Ok(v) = std::env::var($var) {
+                    if let Ok(val) = v.parse() {
+                        $field = val;
+                    }
+                }
+            };
         }
-        if let Ok(v) = std::env::var("WEAV_SERVER_HTTP_PORT") {
-            if let Ok(port) = v.parse() {
-                self.server.http_port = Some(port);
-            }
+        macro_rules! env_override_str {
+            ($var:expr, $field:expr) => {
+                if let Ok(v) = std::env::var($var) {
+                    $field = v.into();
+                }
+            };
         }
-        if let Ok(v) = std::env::var("WEAV_SERVER_GRPC_PORT") {
-            if let Ok(port) = v.parse() {
-                self.server.grpc_port = Some(port);
-            }
+        macro_rules! env_override_opt {
+            ($var:expr, $field:expr) => {
+                if let Ok(v) = std::env::var($var) {
+                    $field = Some(v);
+                }
+            };
         }
-        if let Ok(v) = std::env::var("WEAV_SERVER_BIND_ADDRESS") {
-            self.server.bind_address = v;
+        macro_rules! env_override_opt_parse {
+            ($var:expr, $field:expr) => {
+                if let Ok(v) = std::env::var($var) {
+                    if let Ok(val) = v.parse() {
+                        $field = Some(val);
+                    }
+                }
+            };
         }
-        if let Ok(v) = std::env::var("WEAV_ENGINE_NUM_SHARDS") {
-            if let Ok(n) = v.parse() {
-                self.engine.num_shards = Some(n);
-            }
-        }
-        if let Ok(v) = std::env::var("WEAV_PERSISTENCE_ENABLED") {
-            if let Ok(b) = v.parse() {
-                self.persistence.enabled = b;
-            }
-        }
-        if let Ok(v) = std::env::var("WEAV_PERSISTENCE_DATA_DIR") {
-            self.persistence.data_dir = PathBuf::from(v);
-        }
-        if let Ok(v) = std::env::var("WEAV_MEMORY_MAX_MEMORY_MB") {
-            if let Ok(n) = v.parse() {
-                self.memory.max_memory_mb = Some(n);
-            }
-        }
-        if let Ok(v) = std::env::var("WEAV_AUTH_ENABLED") {
-            if let Ok(b) = v.parse() {
-                self.auth.enabled = b;
-            }
-        }
-        if let Ok(v) = std::env::var("WEAV_AUTH_REQUIRE_AUTH") {
-            if let Ok(b) = v.parse() {
-                self.auth.require_auth = b;
-            }
-        }
-        if let Ok(v) = std::env::var("WEAV_AUTH_DEFAULT_PASSWORD") {
-            self.auth.default_password = Some(v);
-        }
+
+        env_override!("WEAV_SERVER_PORT", self.server.port);
+        env_override_opt_parse!("WEAV_SERVER_HTTP_PORT", self.server.http_port);
+        env_override_opt_parse!("WEAV_SERVER_GRPC_PORT", self.server.grpc_port);
+        env_override_str!("WEAV_SERVER_BIND_ADDRESS", self.server.bind_address);
+        env_override_opt_parse!("WEAV_ENGINE_NUM_SHARDS", self.engine.num_shards);
+        env_override!("WEAV_PERSISTENCE_ENABLED", self.persistence.enabled);
+        env_override_str!("WEAV_PERSISTENCE_DATA_DIR", self.persistence.data_dir);
+        env_override_opt_parse!("WEAV_MEMORY_MAX_MEMORY_MB", self.memory.max_memory_mb);
+        env_override!("WEAV_AUTH_ENABLED", self.auth.enabled);
+        env_override!("WEAV_AUTH_REQUIRE_AUTH", self.auth.require_auth);
+        env_override_opt!("WEAV_AUTH_DEFAULT_PASSWORD", self.auth.default_password);
+
+        // Extract config overrides.
+        env_override!("WEAV_EXTRACT_ENABLED", self.extract.enabled);
+        env_override_str!("WEAV_EXTRACT_LLM_BACKEND", self.extract.llm_backend);
+        env_override_opt!("WEAV_EXTRACT_LLM_API_KEY", self.extract.llm_api_key);
+        env_override_str!("WEAV_EXTRACT_EXTRACTION_MODEL", self.extract.extraction_model);
+        env_override_opt!("WEAV_EXTRACT_LLM_BASE_URL", self.extract.llm_base_url);
+        env_override_str!("WEAV_EXTRACT_EMBEDDING_BACKEND", self.extract.embedding_backend);
+        env_override_opt!("WEAV_EXTRACT_EMBEDDING_API_KEY", self.extract.embedding_api_key);
+        env_override_str!("WEAV_EXTRACT_EMBEDDING_MODEL", self.extract.embedding_model);
+        env_override!("WEAV_EXTRACT_EMBEDDING_DIMENSIONS", self.extract.embedding_dimensions);
+        env_override!("WEAV_EXTRACT_CHUNK_SIZE", self.extract.chunk_size);
+        env_override!("WEAV_EXTRACT_CHUNK_OVERLAP", self.extract.chunk_overlap);
+        env_override!("WEAV_EXTRACT_MAX_EXTRACTION_TOKENS", self.extract.max_extraction_tokens);
+        env_override!("WEAV_EXTRACT_MAX_CONCURRENT_LLM_CALLS", self.extract.max_concurrent_llm_calls);
+        env_override!("WEAV_EXTRACT_MAX_CONCURRENT_EMBEDDING_CALLS", self.extract.max_concurrent_embedding_calls);
+        env_override!("WEAV_EXTRACT_EMBEDDING_BATCH_SIZE", self.extract.embedding_batch_size);
     }
 
     fn validate(&self) -> Result<(), crate::error::WeavError> {
@@ -273,6 +287,67 @@ pub enum TokenCounterType {
 impl Default for TokenCounterType {
     fn default() -> Self {
         TokenCounterType::CharDiv4
+    }
+}
+
+/// Extraction pipeline configuration (LLM-powered ingestion).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ExtractConfig {
+    /// Enable the extraction pipeline. When false, INGEST commands are rejected.
+    pub enabled: bool,
+    /// LLM backend for entity extraction: "openai", "anthropic", "ollama", etc.
+    pub llm_backend: String,
+    /// API key for the extraction LLM.
+    pub llm_api_key: Option<String>,
+    /// Model name for entity/relationship extraction.
+    pub extraction_model: String,
+    /// Custom base URL for the extraction LLM (e.g. local Ollama).
+    pub llm_base_url: Option<String>,
+    /// LLM backend for embedding generation.
+    pub embedding_backend: String,
+    /// API key for the embedding model (defaults to llm_api_key if not set).
+    pub embedding_api_key: Option<String>,
+    /// Model name for embedding generation.
+    pub embedding_model: String,
+    /// Output dimensions of the embedding model.
+    pub embedding_dimensions: u16,
+    /// Target chunk size in tokens.
+    pub chunk_size: usize,
+    /// Overlap between chunks in tokens.
+    pub chunk_overlap: usize,
+    /// Maximum tokens to send to the LLM per extraction call.
+    pub max_extraction_tokens: usize,
+    /// Temperature for extraction LLM calls.
+    pub extraction_temperature: f32,
+    /// Maximum concurrent LLM extraction calls.
+    pub max_concurrent_llm_calls: usize,
+    /// Maximum concurrent embedding API calls.
+    pub max_concurrent_embedding_calls: usize,
+    /// Number of texts per embedding API batch call.
+    pub embedding_batch_size: usize,
+}
+
+impl Default for ExtractConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            llm_backend: "openai".into(),
+            llm_api_key: None,
+            extraction_model: "gpt-4.1-mini".into(),
+            llm_base_url: None,
+            embedding_backend: "openai".into(),
+            embedding_api_key: None,
+            embedding_model: "text-embedding-3-small".into(),
+            embedding_dimensions: 1536,
+            chunk_size: 512,
+            chunk_overlap: 50,
+            max_extraction_tokens: 4096,
+            extraction_temperature: 0.0,
+            max_concurrent_llm_calls: 4,
+            max_concurrent_embedding_calls: 8,
+            embedding_batch_size: 32,
+        }
     }
 }
 
@@ -636,5 +711,60 @@ api_keys = ["wk_live_abc123"]
         assert!(gc.enable_provenance);
         assert_eq!(gc.vector_dimensions, 1536);
         assert_eq!(gc.auto_dedup_threshold, None);
+    }
+
+    #[test]
+    fn test_extract_config_defaults() {
+        let ec = ExtractConfig::default();
+        assert!(!ec.enabled);
+        assert_eq!(ec.llm_backend, "openai");
+        assert_eq!(ec.llm_api_key, None);
+        assert_eq!(ec.extraction_model, "gpt-4.1-mini");
+        assert_eq!(ec.llm_base_url, None);
+        assert_eq!(ec.embedding_backend, "openai");
+        assert_eq!(ec.embedding_api_key, None);
+        assert_eq!(ec.embedding_model, "text-embedding-3-small");
+        assert_eq!(ec.embedding_dimensions, 1536);
+        assert_eq!(ec.chunk_size, 512);
+        assert_eq!(ec.chunk_overlap, 50);
+        assert_eq!(ec.max_extraction_tokens, 4096);
+        assert_eq!(ec.extraction_temperature, 0.0);
+        assert_eq!(ec.max_concurrent_llm_calls, 4);
+        assert_eq!(ec.max_concurrent_embedding_calls, 8);
+        assert_eq!(ec.embedding_batch_size, 32);
+    }
+
+    #[test]
+    fn test_extract_config_in_weav_config() {
+        let config = WeavConfig::default();
+        assert!(!config.extract.enabled);
+        assert_eq!(config.extract.llm_backend, "openai");
+    }
+
+    #[test]
+    fn test_toml_extract_config() {
+        let toml_str = r#"
+[extract]
+enabled = true
+llm_backend = "anthropic"
+llm_api_key = "sk-test-123"
+extraction_model = "claude-sonnet-4-20250514"
+embedding_model = "text-embedding-3-large"
+embedding_dimensions = 3072
+chunk_size = 1024
+chunk_overlap = 100
+"#;
+        let config: WeavConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.extract.enabled);
+        assert_eq!(config.extract.llm_backend, "anthropic");
+        assert_eq!(config.extract.llm_api_key, Some("sk-test-123".into()));
+        assert_eq!(config.extract.extraction_model, "claude-sonnet-4-20250514");
+        assert_eq!(config.extract.embedding_model, "text-embedding-3-large");
+        assert_eq!(config.extract.embedding_dimensions, 3072);
+        assert_eq!(config.extract.chunk_size, 1024);
+        assert_eq!(config.extract.chunk_overlap, 100);
+        // Defaults preserved for unset fields
+        assert_eq!(config.extract.max_concurrent_llm_calls, 4);
+        assert_eq!(config.extract.embedding_batch_size, 32);
     }
 }

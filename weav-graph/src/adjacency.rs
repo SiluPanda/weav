@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use roaring::RoaringBitmap;
+use roaring::RoaringTreemap;
 use smallvec::SmallVec;
 
 use weav_core::error::WeavError;
@@ -69,7 +69,10 @@ pub struct AdjacencyStore {
     forward: HashMap<LabelId, DirectedAdjacency>,
     backward: HashMap<LabelId, DirectedAdjacency>,
     edge_meta: HashMap<EdgeId, EdgeMeta>,
-    node_bitmap: RoaringBitmap,
+    /// Secondary index: (source, target) -> list of edge IDs between them.
+    /// Enables O(1) lookup for edge_history and edge_between instead of O(E) scans.
+    pair_index: HashMap<(NodeId, NodeId), SmallVec<[EdgeId; 4]>>,
+    node_bitmap: RoaringTreemap,
     next_edge_id: u64,
 }
 
@@ -79,13 +82,14 @@ impl AdjacencyStore {
             forward: HashMap::new(),
             backward: HashMap::new(),
             edge_meta: HashMap::new(),
-            node_bitmap: RoaringBitmap::new(),
+            pair_index: HashMap::new(),
+            node_bitmap: RoaringTreemap::new(),
             next_edge_id: 1,
         }
     }
 
     pub fn add_node(&mut self, node_id: NodeId) {
-        self.node_bitmap.insert(node_id as u32);
+        self.node_bitmap.insert(node_id);
     }
 
     pub fn remove_node(&mut self, node_id: NodeId) -> Result<(), WeavError> {
@@ -119,8 +123,16 @@ impl AdjacencyStore {
             }
         }
 
-        self.node_bitmap.remove(node_id as u32);
+        self.node_bitmap.remove(node_id);
         Ok(())
+    }
+
+    /// Reserve the next edge ID without creating an edge.
+    /// Used for write-ahead logging: allocate the ID, write WAL, then create the edge.
+    pub fn allocate_edge_id(&mut self) -> EdgeId {
+        let id = self.next_edge_id;
+        self.next_edge_id += 1;
+        id
     }
 
     pub fn add_edge(
@@ -130,14 +142,26 @@ impl AdjacencyStore {
         label: LabelId,
         meta: EdgeMeta,
     ) -> Result<EdgeId, WeavError> {
+        let edge_id = self.allocate_edge_id();
+        self.add_edge_with_id(src, tgt, label, meta, edge_id)?;
+        Ok(edge_id)
+    }
+
+    /// Create an edge with a pre-allocated edge ID.
+    pub fn add_edge_with_id(
+        &mut self,
+        src: NodeId,
+        tgt: NodeId,
+        label: LabelId,
+        meta: EdgeMeta,
+        edge_id: EdgeId,
+    ) -> Result<(), WeavError> {
         if !self.has_node(src) {
             return Err(WeavError::NodeNotFound(src, 0));
         }
         if !self.has_node(tgt) {
             return Err(WeavError::NodeNotFound(tgt, 0));
         }
-        let edge_id = self.next_edge_id;
-        self.next_edge_id += 1;
 
         self.forward
             .entry(label)
@@ -148,8 +172,14 @@ impl AdjacencyStore {
             .or_insert_with(DirectedAdjacency::new)
             .add(tgt, src, edge_id);
 
+        // Maintain pair index
+        self.pair_index
+            .entry((src, tgt))
+            .or_default()
+            .push(edge_id);
+
         self.edge_meta.insert(edge_id, meta);
-        Ok(edge_id)
+        Ok(())
     }
 
     pub fn remove_edge(&mut self, edge_id: EdgeId) -> Result<(), WeavError> {
@@ -162,6 +192,13 @@ impl AdjacencyStore {
         }
         if let Some(bwd) = self.backward.get_mut(&meta.label) {
             bwd.remove_edge(meta.target, edge_id);
+        }
+        // Maintain pair index
+        if let Some(pair_edges) = self.pair_index.get_mut(&(meta.source, meta.target)) {
+            pair_edges.retain(|eid| *eid != edge_id);
+            if pair_edges.is_empty() {
+                self.pair_index.remove(&(meta.source, meta.target));
+            }
         }
         Ok(())
     }
@@ -179,46 +216,32 @@ impl AdjacencyStore {
         Ok(())
     }
 
-    pub fn neighbors_out(
-        &self,
+    fn neighbors_directed(
+        map: &HashMap<LabelId, DirectedAdjacency>,
         node: NodeId,
         label: Option<LabelId>,
     ) -> Vec<(NodeId, EdgeId)> {
         match label {
-            Some(l) => self
-                .forward
+            Some(l) => map
                 .get(&l)
-                .map(|fwd| fwd.neighbors(node).to_vec())
+                .map(|adj| adj.neighbors(node).to_vec())
                 .unwrap_or_default(),
             None => {
                 let mut result = Vec::new();
-                for fwd in self.forward.values() {
-                    result.extend_from_slice(fwd.neighbors(node));
+                for adj in map.values() {
+                    result.extend_from_slice(adj.neighbors(node));
                 }
                 result
             }
         }
     }
 
-    pub fn neighbors_in(
-        &self,
-        node: NodeId,
-        label: Option<LabelId>,
-    ) -> Vec<(NodeId, EdgeId)> {
-        match label {
-            Some(l) => self
-                .backward
-                .get(&l)
-                .map(|bwd| bwd.neighbors(node).to_vec())
-                .unwrap_or_default(),
-            None => {
-                let mut result = Vec::new();
-                for bwd in self.backward.values() {
-                    result.extend_from_slice(bwd.neighbors(node));
-                }
-                result
-            }
-        }
+    pub fn neighbors_out(&self, node: NodeId, label: Option<LabelId>) -> Vec<(NodeId, EdgeId)> {
+        Self::neighbors_directed(&self.forward, node, label)
+    }
+
+    pub fn neighbors_in(&self, node: NodeId, label: Option<LabelId>) -> Vec<(NodeId, EdgeId)> {
+        Self::neighbors_directed(&self.backward, node, label)
     }
 
     pub fn neighbors_both(
@@ -242,27 +265,38 @@ impl AdjacencyStore {
         tgt: NodeId,
         label: Option<LabelId>,
     ) -> Option<EdgeId> {
-        let neighbors = self.neighbors_out(src, label);
-        neighbors
-            .into_iter()
-            .find(|&(n, _)| n == tgt)
-            .map(|(_, eid)| eid)
+        if let Some(pair_edges) = self.pair_index.get(&(src, tgt)) {
+            match label {
+                Some(lbl) => pair_edges
+                    .iter()
+                    .find(|&&eid| {
+                        self.edge_meta
+                            .get(&eid)
+                            .map(|m| m.label == lbl)
+                            .unwrap_or(false)
+                    })
+                    .copied(),
+                None => pair_edges.first().copied(),
+            }
+        } else {
+            None
+        }
+    }
+
+    fn degree_directed(map: &HashMap<LabelId, DirectedAdjacency>, node: NodeId) -> u32 {
+        let mut total = 0u32;
+        for adj in map.values() {
+            total += adj.degree(node);
+        }
+        total
     }
 
     pub fn degree_out(&self, node: NodeId) -> u32 {
-        let mut total = 0u32;
-        for fwd in self.forward.values() {
-            total += fwd.degree(node);
-        }
-        total
+        Self::degree_directed(&self.forward, node)
     }
 
     pub fn degree_in(&self, node: NodeId) -> u32 {
-        let mut total = 0u32;
-        for bwd in self.backward.values() {
-            total += bwd.degree(node);
-        }
-        total
+        Self::degree_directed(&self.backward, node)
     }
 
     pub fn node_count(&self) -> u64 {
@@ -274,7 +308,7 @@ impl AdjacencyStore {
     }
 
     pub fn has_node(&self, node_id: NodeId) -> bool {
-        self.node_bitmap.contains(node_id as u32)
+        self.node_bitmap.contains(node_id)
     }
 
     pub fn get_edge(&self, edge_id: EdgeId) -> Option<&EdgeMeta> {
@@ -299,7 +333,7 @@ impl AdjacencyStore {
     }
 
     pub fn all_node_ids(&self) -> Vec<NodeId> {
-        self.node_bitmap.iter().map(|id| id as NodeId).collect()
+        self.node_bitmap.iter().collect()
     }
 
     pub fn all_edges(&self) -> impl Iterator<Item = (EdgeId, &EdgeMeta)> {
@@ -307,10 +341,13 @@ impl AdjacencyStore {
     }
 
     pub fn edge_history(&self, src: NodeId, tgt: NodeId) -> Vec<&EdgeMeta> {
-        self.edge_meta
-            .values()
-            .filter(|m| m.source == src && m.target == tgt)
-            .collect()
+        match self.pair_index.get(&(src, tgt)) {
+            Some(edge_ids) => edge_ids
+                .iter()
+                .filter_map(|eid| self.edge_meta.get(eid))
+                .collect(),
+            None => Vec::new(),
+        }
     }
 }
 

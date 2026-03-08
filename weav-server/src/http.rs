@@ -9,6 +9,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use weav_core::types::{DecayFunction, Direction, TokenBudget, Value};
@@ -204,6 +205,8 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/info", get(server_info))
         // Context query.
         .route("/v1/context", post(context_query))
+        // Ingest (extraction pipeline).
+        .route("/v1/graphs/{graph}/ingest", post(ingest))
         // Prometheus metrics.
         .route("/metrics", get(metrics_handler))
         .with_state(engine)
@@ -224,6 +227,9 @@ fn weav_error_to_response(err: weav_core::error::WeavError) -> impl IntoResponse
         weav_core::error::WeavError::AuthenticationRequired => StatusCode::UNAUTHORIZED,
         weav_core::error::WeavError::AuthenticationFailed(_) => StatusCode::UNAUTHORIZED,
         weav_core::error::WeavError::PermissionDenied(_) => StatusCode::FORBIDDEN,
+        weav_core::error::WeavError::ExtractionNotEnabled => StatusCode::SERVICE_UNAVAILABLE,
+        weav_core::error::WeavError::DocumentParseError(_) => StatusCode::BAD_REQUEST,
+        weav_core::error::WeavError::LlmError(_) => StatusCode::BAD_GATEWAY,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, Json(ApiResponse::<()>::err(err.to_string())))
@@ -705,6 +711,109 @@ async fn context_query(
         Ok(CommandResponse::Context(result)) => {
             (StatusCode::OK, Json(ApiResponse::ok(result))).into_response()
         }
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+        )
+            .into_response(),
+        Err(e) => weav_error_to_response(e).into_response(),
+    }
+}
+
+// ─── Ingest handler ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct IngestRequest {
+    pub content: Option<String>,
+    pub content_base64: Option<String>,
+    pub format: Option<String>,
+    pub document_id: Option<String>,
+    #[serde(default)]
+    pub skip_extraction: bool,
+    #[serde(default)]
+    pub skip_dedup: bool,
+    pub chunk_size: Option<usize>,
+    pub entity_types: Option<Vec<String>>,
+}
+
+#[derive(Serialize)]
+struct IngestResultJson {
+    document_id: String,
+    chunks_created: usize,
+    entities_created: usize,
+    entities_merged: usize,
+    relationships_created: usize,
+    pipeline_duration_ms: u64,
+}
+
+async fn ingest(
+    State(engine): State<Arc<Engine>>,
+    Path(graph): Path<String>,
+    Json(body): Json<IngestRequest>,
+) -> impl IntoResponse {
+    // Resolve content from either text or base64.
+    let content = if let Some(ref text) = body.content {
+        text.clone()
+    } else if let Some(ref b64) = body.content_base64 {
+        match base64::engine::general_purpose::STANDARD.decode(b64) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiResponse::<()>::err(format!(
+                            "content_base64 is not valid UTF-8: {e}"
+                        ))),
+                    )
+                        .into_response();
+                }
+            },
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse::<()>::err(format!(
+                        "invalid base64 in content_base64: {e}"
+                    ))),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::err(
+                "either 'content' or 'content_base64' is required".into(),
+            )),
+        )
+            .into_response();
+    };
+
+    use weav_query::parser::{Command, IngestCmd};
+
+    let cmd = Command::Ingest(IngestCmd {
+        graph,
+        content,
+        format: body.format,
+        document_id: body.document_id,
+        skip_extraction: body.skip_extraction,
+        skip_dedup: body.skip_dedup,
+        chunk_size: body.chunk_size,
+        entity_types: body.entity_types,
+    });
+
+    match engine.execute_command_async(cmd, None).await {
+        Ok(CommandResponse::IngestResult(info)) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(IngestResultJson {
+                document_id: info.document_id,
+                chunks_created: info.chunks_created,
+                entities_created: info.entities_created,
+                entities_merged: info.entities_merged,
+                relationships_created: info.relationships_created,
+                pipeline_duration_ms: info.pipeline_duration_ms,
+            })),
+        )
+            .into_response(),
         Ok(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiResponse::<()>::err("unexpected response type".to_string())),

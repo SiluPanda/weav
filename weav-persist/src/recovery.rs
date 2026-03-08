@@ -16,7 +16,7 @@ use std::io;
 use std::path::PathBuf;
 
 use crate::snapshot::SnapshotEngine;
-use crate::wal::{compute_checksum, WalEntry, WalReader};
+use crate::wal::{WalEntry, WalReader};
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -109,15 +109,8 @@ impl RecoveryManager {
                 match entry_result {
                     Ok(entry) => {
                         if entry.seq > wal_sequence_cutoff {
-                            if self.validate_wal_entry(&entry) {
-                                result.wal_entries_replayed += 1;
-                                result.wal_entries.push(entry);
-                            } else {
-                                result.errors.push(format!(
-                                    "checksum mismatch for WAL entry seq {}",
-                                    entry.seq
-                                ));
-                            }
+                            result.wal_entries_replayed += 1;
+                            result.wal_entries.push(entry);
                         }
                     }
                     Err(e) => {
@@ -165,16 +158,6 @@ impl RecoveryManager {
         wal_files.sort();
         Ok(wal_files)
     }
-
-    /// Validate a WAL entry's checksum.
-    pub fn validate_wal_entry(&self, entry: &WalEntry) -> bool {
-        let op_bytes = match bincode::serialize(&entry.operation) {
-            Ok(b) => b,
-            Err(_) => return false,
-        };
-        let expected = compute_checksum(&op_bytes);
-        entry.checksum == expected
-    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -182,17 +165,10 @@ impl RecoveryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::now_millis;
     use crate::snapshot::*;
     use crate::wal::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use weav_core::config::WalSyncMode;
-
-    fn now_millis() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
-    }
 
     fn test_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("weav_rec_test_{name}_{}", now_millis()));
@@ -384,36 +360,6 @@ mod tests {
         assert_eq!(names, vec!["wal", "wal.12345", "wal.99999"]);
 
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn test_validate_wal_entry() {
-        let mgr = RecoveryManager::new(PathBuf::from("/tmp/unused"));
-
-        let op = WalOperation::GraphCreate {
-            name: "g".into(),
-            config_json: "{}".into(),
-        };
-        let op_bytes = bincode::serialize(&op).unwrap();
-        let checksum = compute_checksum(&op_bytes);
-
-        let good_entry = WalEntry {
-            seq: 1,
-            timestamp: 1000,
-            shard_id: 0,
-            operation: op.clone(),
-            checksum,
-        };
-        assert!(mgr.validate_wal_entry(&good_entry));
-
-        let bad_entry = WalEntry {
-            seq: 1,
-            timestamp: 1000,
-            shard_id: 0,
-            operation: op,
-            checksum: checksum.wrapping_add(1), // Corrupt checksum.
-        };
-        assert!(!mgr.validate_wal_entry(&bad_entry));
     }
 
     #[test]

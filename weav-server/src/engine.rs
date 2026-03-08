@@ -39,8 +39,20 @@ pub enum CommandResponse {
     NodeInfo(NodeInfo),
     GraphInfo(GraphInfoResponse),
     EdgeInfo(EdgeInfoResponse),
+    IngestResult(IngestResultResponse),
     Null,
     Error(String),
+}
+
+/// Result of an INGEST operation.
+#[derive(Debug)]
+pub struct IngestResultResponse {
+    pub document_id: String,
+    pub chunks_created: usize,
+    pub entities_created: usize,
+    pub entities_merged: usize,
+    pub relationships_created: usize,
+    pub pipeline_duration_ms: u64,
 }
 
 /// Information about a single edge.
@@ -137,6 +149,21 @@ impl Engine {
         }
     }
 
+    /// Get a reference to the ACL store, returning an error if auth is not enabled.
+    fn acl_store(&self) -> WeavResult<&weav_auth::acl::AclStore> {
+        self.acl_store.as_ref().ok_or_else(|| {
+            WeavError::Internal("auth not enabled".into())
+        })
+    }
+
+    /// Get the current timestamp in milliseconds since epoch.
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
     fn append_wal(&self, op: WalOperation) {
         if let Some(ref wal_mutex) = self.wal {
             let mut wal = wal_mutex.lock();
@@ -208,7 +235,7 @@ impl Engine {
                         "_label",
                         Value::String(CompactString::from(&ns.label)),
                     );
-                    let label_id = state.interner.intern_label(&ns.label);
+                    let label_id = state.interner.intern_label(&ns.label)?;
                     state.properties.set_node_property(
                         ns.node_id,
                         "_label_id",
@@ -243,7 +270,7 @@ impl Engine {
 
                 // Restore edges.
                 for es in &gs.edges {
-                    let label_id = state.interner.intern_label(&es.label);
+                    let label_id = state.interner.intern_label(&es.label)?;
                     let meta = EdgeMeta {
                         source: es.source,
                         target: es.target,
@@ -318,8 +345,103 @@ impl Engine {
                         let _ = self.handle_node_add(cmd);
                     }
                 }
-                _ => {
-                    // Other WAL operations are handled similarly but less critical for recovery.
+                WalOperation::NodeUpdate {
+                    graph_id,
+                    node_id,
+                    properties_json,
+                } => {
+                    let mut graphs = self.graphs.write();
+                    if let Some(gs) = graphs.values_mut().find(|gs| gs.graph_id == *graph_id) {
+                        if gs.adjacency.has_node(*node_id) {
+                            if !properties_json.is_empty() && properties_json != "{}" {
+                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(properties_json) {
+                                    if let Some(obj) = val.as_object() {
+                                        for (k, v) in obj {
+                                            gs.properties.set_node_property(
+                                                *node_id, k,
+                                                crate::http::json_val_to_value(v),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                WalOperation::NodeDelete {
+                    graph_id,
+                    node_id,
+                } => {
+                    let mut graphs = self.graphs.write();
+                    if let Some(gs) = graphs.values_mut().find(|gs| gs.graph_id == *graph_id) {
+                        if gs.adjacency.has_node(*node_id) {
+                            let _ = gs.adjacency.remove_node(*node_id);
+                            gs.properties.remove_all_node_properties(*node_id);
+                            let _ = gs.vector_index.remove(*node_id);
+                        }
+                    }
+                }
+                WalOperation::EdgeAdd {
+                    graph_id,
+                    edge_id,
+                    source,
+                    target,
+                    label,
+                    weight,
+                } => {
+                    let mut graphs = self.graphs.write();
+                    if let Some(gs) = graphs.values_mut().find(|gs| gs.graph_id == *graph_id) {
+                        if let Ok(label_id) = gs.interner.intern_label(label) {
+                            let now = Self::now_ms();
+                            let meta = EdgeMeta {
+                                source: *source,
+                                target: *target,
+                                label: label_id,
+                                temporal: BiTemporal::new_current(now),
+                                provenance: None,
+                                weight: *weight,
+                                token_cost: 0,
+                            };
+                            let _ = gs.adjacency.add_edge_with_id(*source, *target, label_id, meta, *edge_id);
+                            if *edge_id >= gs.next_edge_id {
+                                gs.next_edge_id = *edge_id + 1;
+                            }
+                        }
+                    }
+                }
+                WalOperation::EdgeInvalidate {
+                    graph_id,
+                    edge_id,
+                    timestamp,
+                } => {
+                    let mut graphs = self.graphs.write();
+                    if let Some(gs) = graphs.values_mut().find(|gs| gs.graph_id == *graph_id) {
+                        let _ = gs.adjacency.invalidate_edge(*edge_id, *timestamp);
+                    }
+                }
+                WalOperation::EdgeDelete {
+                    graph_id,
+                    edge_id,
+                } => {
+                    let mut graphs = self.graphs.write();
+                    if let Some(gs) = graphs.values_mut().find(|gs| gs.graph_id == *graph_id) {
+                        let _ = gs.adjacency.remove_edge(*edge_id);
+                    }
+                }
+                WalOperation::VectorUpdate {
+                    graph_id,
+                    node_id,
+                    vector,
+                } => {
+                    let mut graphs = self.graphs.write();
+                    if let Some(gs) = graphs.values_mut().find(|gs| gs.graph_id == *graph_id) {
+                        let _ = gs.vector_index.remove(*node_id);
+                        let _ = gs.vector_index.insert(*node_id, vector);
+                    }
+                }
+                WalOperation::Ingest { .. } => {
+                    // Ingest WAL entries are metadata only; the actual data changes
+                    // (NodeAdd, EdgeAdd, etc.) are recorded as separate WAL entries.
                 }
             }
         }
@@ -346,9 +468,7 @@ impl Engine {
         username: &str,
         password: &str,
     ) -> WeavResult<weav_auth::identity::SessionIdentity> {
-        let store = self.acl_store.as_ref().ok_or(WeavError::Internal(
-            "auth not enabled".into(),
-        ))?;
+        let store = self.acl_store()?;
         store.authenticate(username, password)
     }
 
@@ -357,9 +477,7 @@ impl Engine {
         &self,
         password: &str,
     ) -> WeavResult<weav_auth::identity::SessionIdentity> {
-        let store = self.acl_store.as_ref().ok_or(WeavError::Internal(
-            "auth not enabled".into(),
-        ))?;
+        let store = self.acl_store()?;
         store.authenticate_default(password)
     }
 
@@ -368,9 +486,7 @@ impl Engine {
         &self,
         key: &str,
     ) -> WeavResult<weav_auth::identity::SessionIdentity> {
-        let store = self.acl_store.as_ref().ok_or(WeavError::Internal(
-            "auth not enabled".into(),
-        ))?;
+        let store = self.acl_store()?;
         store.authenticate_api_key(key)
     }
 
@@ -434,6 +550,36 @@ impl Engine {
             Command::AclWhoAmI => self.handle_acl_whoami(identity),
             Command::AclSave => self.handle_acl_save(),
             Command::AclLoad => self.handle_acl_load(),
+            Command::Ingest(_) => Err(WeavError::Internal(
+                "INGEST requires async execution; use execute_command_async".into(),
+            )),
+        }
+    }
+
+    /// Async command execution — handles INGEST (async LLM calls) and
+    /// delegates all other commands to the sync `execute_command`.
+    pub async fn execute_command_async(
+        &self,
+        cmd: Command,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
+        match cmd {
+            Command::Ingest(ingest_cmd) => {
+                // Auth gate (same as sync path).
+                if let Some(ref acl_store) = self.acl_store {
+                    if acl_store.require_auth() && identity.is_none() {
+                        return Err(WeavError::AuthenticationRequired);
+                    }
+                    if let Some(id) = identity {
+                        self.check_authorization(
+                            &Command::Ingest(ingest_cmd.clone()),
+                            id,
+                        )?;
+                    }
+                }
+                self.handle_ingest(ingest_cmd).await
+            }
+            other => self.execute_command(other, identity),
         }
     }
 
@@ -453,7 +599,8 @@ impl Engine {
             | Command::ConfigGet(_) | Command::AclWhoAmI => CommandCategory::Read,
             Command::NodeAdd(_) | Command::NodeUpdate(_) | Command::NodeDelete(_)
             | Command::EdgeAdd(_) | Command::EdgeDelete(_) | Command::EdgeInvalidate(_)
-            | Command::BulkInsertNodes(_) | Command::BulkInsertEdges(_) => CommandCategory::Write,
+            | Command::BulkInsertNodes(_) | Command::BulkInsertEdges(_)
+            | Command::Ingest(_) => CommandCategory::Write,
             Command::GraphCreate(_) | Command::GraphDrop(_) | Command::Snapshot
             | Command::ConfigSet(_, _) | Command::AclSetUser(_) | Command::AclDelUser(_)
             | Command::AclList | Command::AclGetUser(_) | Command::AclSave
@@ -506,6 +653,7 @@ impl Engine {
             Command::EdgeGet(c) => Some(c.graph.clone()),
             Command::BulkInsertNodes(c) => Some(c.graph.clone()),
             Command::BulkInsertEdges(c) => Some(c.graph.clone()),
+            Command::Ingest(c) => Some(c.graph.clone()),
             Command::Context(q) => Some(q.graph.clone()),
             Command::GraphCreate(c) => Some(c.name.clone()),
             Command::GraphDrop(name) | Command::GraphInfo(name) => Some(name.clone()),
@@ -596,13 +744,12 @@ impl Engine {
             )));
         }
 
-        let graph_name = cmd.name.clone();
-        graphs.insert(cmd.name, graph_state);
-        drop(graphs);
+        // Write-ahead: WAL entry before in-memory mutation
         self.append_wal(WalOperation::GraphCreate {
-            name: graph_name,
+            name: cmd.name.clone(),
             config_json: "{}".to_string(),
         });
+        graphs.insert(cmd.name, graph_state);
         Ok(CommandResponse::Ok)
     }
 
@@ -610,12 +757,12 @@ impl Engine {
         let mut graphs = self
             .graphs
             .write();
-        graphs
-            .remove(name)
-            .ok_or_else(|| WeavError::GraphNotFound(name.to_string()))?;
-        let name_owned = name.to_string();
-        drop(graphs);
-        self.append_wal(WalOperation::GraphDrop { name: name_owned });
+        if !graphs.contains_key(name) {
+            return Err(WeavError::GraphNotFound(name.to_string()));
+        }
+        // Write-ahead: WAL entry before in-memory mutation
+        self.append_wal(WalOperation::GraphDrop { name: name.to_string() });
+        graphs.remove(name);
         Ok(CommandResponse::Ok)
     }
 
@@ -754,23 +901,34 @@ impl Engine {
         // ── No duplicate found: create new node ─────────────────────────
         let node_id = gs.next_node_id;
         gs.next_node_id += 1;
+        let graph_id = gs.graph_id;
 
-        // Add node to adjacency store.
+        // Write-ahead: WAL entry before in-memory mutation
+        let props_json = serde_json::to_string(
+            &cmd.properties.iter().map(|(k, v)| (k.clone(), format!("{v:?}"))).collect::<Vec<_>>()
+        ).unwrap_or_default();
+        self.append_wal(WalOperation::NodeAdd {
+            graph_id,
+            node_id,
+            label: cmd.label.clone(),
+            properties_json: props_json,
+            embedding: cmd.embedding.clone(),
+            entity_key: cmd.entity_key.clone(),
+        });
+
+        // Apply in-memory mutation
         gs.adjacency.add_node(node_id);
 
-        // Set the label as a property.
         gs.properties.set_node_property(
             node_id,
             "_label",
             Value::String(CompactString::from(&cmd.label)),
         );
 
-        // Also intern the label.
-        let label_id = gs.interner.intern_label(&cmd.label);
+        let label_id = gs.interner.intern_label(&cmd.label)?;
         gs.properties
             .set_node_property(node_id, "_label_id", Value::Int(label_id as i64));
 
-        // Set entity_key if provided.
         if let Some(ref key) = cmd.entity_key {
             gs.properties.set_node_property(
                 node_id,
@@ -779,29 +937,13 @@ impl Engine {
             );
         }
 
-        // Set properties.
         for (k, v) in &cmd.properties {
             gs.properties.set_node_property(node_id, k, v.clone());
         }
 
-        // Insert embedding if provided.
         if let Some(ref embedding) = cmd.embedding {
             gs.vector_index.insert(node_id, embedding)?;
         }
-
-        let graph_id = gs.graph_id;
-        let props_json = serde_json::to_string(
-            &cmd.properties.iter().map(|(k, v)| (k.clone(), format!("{v:?}"))).collect::<Vec<_>>()
-        ).unwrap_or_default();
-        drop(graphs);
-        self.append_wal(WalOperation::NodeAdd {
-            graph_id,
-            node_id,
-            label: cmd.label,
-            properties_json: props_json,
-            embedding: cmd.embedding,
-            entity_key: cmd.entity_key,
-        });
 
         Ok(CommandResponse::Integer(node_id))
     }
@@ -872,21 +1014,21 @@ impl Engine {
             .get_mut(&cmd.graph)
             .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
 
-        // Remove from adjacency (also removes connected edges).
-        gs.adjacency.remove_node(cmd.node_id)?;
+        if !gs.adjacency.has_node(cmd.node_id) {
+            return Err(WeavError::NodeNotFound(cmd.node_id, gs.graph_id));
+        }
 
-        // Remove all properties.
-        gs.properties.remove_all_node_properties(cmd.node_id);
-
-        // Remove from vector index.
-        gs.vector_index.remove(cmd.node_id)?;
-
+        // Write-ahead: WAL entry before in-memory mutation
         let graph_id = gs.graph_id;
-        drop(graphs);
         self.append_wal(WalOperation::NodeDelete {
             graph_id,
             node_id: cmd.node_id,
         });
+
+        // Apply in-memory mutation
+        gs.adjacency.remove_node(cmd.node_id)?;
+        gs.properties.remove_all_node_properties(cmd.node_id);
+        gs.vector_index.remove(cmd.node_id)?;
 
         Ok(CommandResponse::Ok)
     }
@@ -906,25 +1048,23 @@ impl Engine {
             return Err(WeavError::NodeNotFound(cmd.node_id, gs.graph_id));
         }
 
-        // Merge properties (overwrite existing keys).
-        for (k, v) in &cmd.properties {
-            gs.properties.set_node_property(cmd.node_id, k, v.clone());
-        }
-
-        // Update embedding if provided.
-        if let Some(ref embedding) = cmd.embedding {
-            // Remove old vector and insert new one.
-            let _ = gs.vector_index.remove(cmd.node_id);
-            gs.vector_index.insert(cmd.node_id, embedding)?;
-        }
-
+        // Write-ahead: WAL entry before in-memory mutation
         let graph_id = gs.graph_id;
-        drop(graphs);
         self.append_wal(WalOperation::NodeUpdate {
             graph_id,
             node_id: cmd.node_id,
             properties_json: "{}".to_string(),
         });
+
+        // Apply in-memory mutation
+        for (k, v) in &cmd.properties {
+            gs.properties.set_node_property(cmd.node_id, k, v.clone());
+        }
+
+        if let Some(ref embedding) = cmd.embedding {
+            let _ = gs.vector_index.remove(cmd.node_id);
+            gs.vector_index.insert(cmd.node_id, embedding)?;
+        }
 
         Ok(CommandResponse::Ok)
     }
@@ -953,7 +1093,7 @@ impl Engine {
                 Value::String(CompactString::from(&node_cmd.label)),
             );
 
-            let label_id = gs.interner.intern_label(&node_cmd.label);
+            let label_id = gs.interner.intern_label(&node_cmd.label)?;
             gs.properties
                 .set_node_property(node_id, "_label_id", Value::Int(label_id as i64));
 
@@ -990,14 +1130,11 @@ impl Engine {
             .get_mut(&cmd.graph)
             .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
 
-        let now = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now = Self::now_ms();
 
         let mut ids = Vec::with_capacity(cmd.edges.len());
         for edge_cmd in &cmd.edges {
-            let label_id = gs.interner.intern_label(&edge_cmd.label);
+            let label_id = gs.interner.intern_label(&edge_cmd.label)?;
             let meta = EdgeMeta {
                 source: edge_cmd.source,
                 target: edge_cmd.target,
@@ -1029,13 +1166,24 @@ impl Engine {
             .get_mut(&cmd.graph)
             .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
 
-        let label_id = gs.interner.intern_label(&cmd.label);
+        let label_id = gs.interner.intern_label(&cmd.label)?;
+        let now = Self::now_ms();
 
-        let now = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        // Pre-allocate edge ID for write-ahead logging
+        let edge_id = gs.adjacency.allocate_edge_id();
+        let graph_id = gs.graph_id;
 
+        // Write-ahead: WAL entry before in-memory mutation
+        self.append_wal(WalOperation::EdgeAdd {
+            graph_id,
+            edge_id,
+            source: cmd.source,
+            target: cmd.target,
+            label: cmd.label.clone(),
+            weight: cmd.weight,
+        });
+
+        // Apply in-memory mutation
         let meta = EdgeMeta {
             source: cmd.source,
             target: cmd.target,
@@ -1045,22 +1193,7 @@ impl Engine {
             weight: cmd.weight,
             token_cost: 0,
         };
-
-        let edge_id = gs
-            .adjacency
-            .add_edge(cmd.source, cmd.target, label_id, meta)?;
-
-        let graph_id = gs.graph_id;
-        let label = cmd.label.clone();
-        drop(graphs);
-        self.append_wal(WalOperation::EdgeAdd {
-            graph_id,
-            edge_id,
-            source: cmd.source,
-            target: cmd.target,
-            label,
-            weight: cmd.weight,
-        });
+        gs.adjacency.add_edge_with_id(cmd.source, cmd.target, label_id, meta, edge_id)?;
 
         Ok(CommandResponse::Integer(edge_id))
     }
@@ -1076,20 +1209,21 @@ impl Engine {
             .get_mut(&cmd.graph)
             .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
 
-        let now = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        gs.adjacency.invalidate_edge(cmd.edge_id, now)?;
-
+        let now = Self::now_ms();
         let graph_id = gs.graph_id;
-        drop(graphs);
+
+        // Verify edge exists before WAL write
+        gs.adjacency.get_edge(cmd.edge_id)
+            .ok_or(WeavError::EdgeNotFound(cmd.edge_id))?;
+
+        // Write-ahead: WAL entry before in-memory mutation
         self.append_wal(WalOperation::EdgeInvalidate {
             graph_id,
             edge_id: cmd.edge_id,
             timestamp: now,
         });
+
+        gs.adjacency.invalidate_edge(cmd.edge_id, now)?;
 
         Ok(CommandResponse::Ok)
     }
@@ -1105,18 +1239,19 @@ impl Engine {
             .get_mut(&cmd.graph)
             .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
 
-        gs.adjacency.remove_edge(cmd.edge_id)?;
-
         let graph_id = gs.graph_id;
-        drop(graphs);
-        self.append_wal(WalOperation::EdgeInvalidate {
+
+        // Verify edge exists before WAL write
+        gs.adjacency.get_edge(cmd.edge_id)
+            .ok_or(WeavError::EdgeNotFound(cmd.edge_id))?;
+
+        // Write-ahead: WAL entry before in-memory mutation
+        self.append_wal(WalOperation::EdgeDelete {
             graph_id,
             edge_id: cmd.edge_id,
-            timestamp: SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
         });
+
+        gs.adjacency.remove_edge(cmd.edge_id)?;
 
         Ok(CommandResponse::Ok)
     }
@@ -1215,11 +1350,16 @@ impl Engine {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
+                // Retrieve embedding from vector index for snapshot persistence
+                let embedding = gs.vector_index
+                    .get_vector(node_id)
+                    .map(|v| v.to_vec());
+
                 node_snapshots.push(NodeSnapshot {
                     node_id,
                     label,
                     properties_json: props_json,
-                    embedding: None,
+                    embedding,
                     entity_key,
                 });
             }
@@ -1253,10 +1393,7 @@ impl Engine {
             });
         }
 
-        let now = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now = Self::now_ms();
 
         let full_snapshot = FullSnapshot {
             meta: SnapshotMeta {
@@ -1302,6 +1439,262 @@ impl Engine {
         Ok(CommandResponse::Context(result))
     }
 
+    // ── Ingest handler ────────────────────────────────────────────────────
+
+    async fn handle_ingest(
+        &self,
+        cmd: weav_query::parser::IngestCmd,
+    ) -> WeavResult<CommandResponse> {
+        if !self.config.extract.enabled {
+            return Err(WeavError::ExtractionNotEnabled);
+        }
+
+        // Verify graph exists.
+        {
+            let graphs = self.graphs.read();
+            if !graphs.contains_key(&cmd.graph) {
+                return Err(WeavError::GraphNotFound(cmd.graph.clone()));
+            }
+        }
+
+        // Parse format.
+        let format = if let Some(ref fmt_str) = cmd.format {
+            weav_extract::types::DocumentFormat::from_str_lossy(fmt_str).ok_or_else(|| {
+                WeavError::QueryParseError(format!("unknown document format: {fmt_str}"))
+            })?
+        } else {
+            weav_extract::types::DocumentFormat::PlainText
+        };
+
+        // Build input document.
+        let document_id = cmd
+            .document_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        let input_doc = weav_extract::types::InputDocument {
+            document_id: document_id.clone(),
+            format,
+            content: weav_extract::types::DocumentContent::Text(cmd.content),
+        };
+
+        let options = weav_extract::types::IngestOptions {
+            document_id: Some(document_id.clone()),
+            format: None,
+            skip_extraction: cmd.skip_extraction,
+            skip_dedup: cmd.skip_dedup,
+            chunk_size: cmd.chunk_size,
+            chunk_overlap: None,
+            entity_types: cmd.entity_types,
+            custom_extraction_prompt: None,
+        };
+
+        // Run extraction pipeline.
+        let result =
+            weav_extract::pipeline::run_pipeline(input_doc, &options, &self.config.extract)
+                .await?;
+
+        // Write-ahead: WAL entry before in-memory mutation
+        self.append_wal(WalOperation::Ingest {
+            graph_name: cmd.graph.clone(),
+            document_id: result.document_id.clone(),
+            chunks_count: result.stats.total_chunks,
+            entities_count: result.stats.total_entities,
+            relationships_count: result.stats.total_relationships,
+        });
+
+        // Apply results to graph.
+        let response = self.apply_extraction_result(&cmd.graph, &result)?;
+
+        Ok(response)
+    }
+
+    /// Apply extraction results to a graph: insert chunk nodes, entity nodes,
+    /// and relationship edges.
+    fn apply_extraction_result(
+        &self,
+        graph_name: &str,
+        result: &weav_extract::types::ExtractionResult,
+    ) -> WeavResult<CommandResponse> {
+        let mut graphs = self.graphs.write();
+        let gs = graphs
+            .get_mut(graph_name)
+            .ok_or_else(|| WeavError::GraphNotFound(graph_name.to_string()))?;
+
+        let now = Self::now_ms();
+        let mut entities_created = 0;
+        let mut entities_merged = result.stats.entities_merged;
+        let mut relationships_created = 0;
+
+        // Insert chunk nodes.
+        for cwe in &result.chunks {
+            let node_id = gs.next_node_id;
+            gs.next_node_id += 1;
+
+            gs.adjacency.add_node(node_id);
+            let label_id = gs.interner.intern_label("chunk")?;
+            gs.properties.set_node_property(
+                node_id,
+                "_label",
+                Value::String(CompactString::from("chunk")),
+            );
+            gs.properties.set_node_property(
+                node_id,
+                "_label_id",
+                Value::Int(label_id as i64),
+            );
+            gs.properties.set_node_property(
+                node_id,
+                "text",
+                Value::String(CompactString::from(&cwe.chunk.text)),
+            );
+            gs.properties.set_node_property(
+                node_id,
+                "document_id",
+                Value::String(CompactString::from(&cwe.chunk.document_id)),
+            );
+            gs.properties.set_node_property(
+                node_id,
+                "chunk_index",
+                Value::Int(cwe.chunk.chunk_index as i64),
+            );
+            gs.properties.set_node_property(
+                node_id,
+                "token_count",
+                Value::Int(cwe.chunk.token_count as i64),
+            );
+
+            // Set temporal metadata.
+            gs.properties.set_node_property(node_id, "_tx_from", Value::Int(now as i64));
+
+            // Insert embedding.
+            if !cwe.embedding.is_empty() {
+                let _ = gs.vector_index.insert(node_id, &cwe.embedding);
+            }
+        }
+
+        // Build entity name -> node_id map for relationship linking.
+        let mut entity_node_map: HashMap<String, NodeId> = HashMap::new();
+
+        // Insert entity nodes.
+        for ewe in &result.entities {
+            let entity = &ewe.entity;
+            let entity_key = entity.name.to_lowercase();
+
+            // Check for existing entity by key.
+            if let Some(existing_id) =
+                weav_graph::dedup::find_duplicate_by_key(&gs.properties, "entity_key", &entity_key)
+            {
+                // Merge properties.
+                weav_graph::dedup::merge_properties(
+                    &mut gs.properties,
+                    existing_id,
+                    &entity.properties,
+                    &ConflictPolicy::LastWriteWins,
+                );
+                entity_node_map.insert(entity_key, existing_id);
+                entities_merged += 1;
+                continue;
+            }
+
+            let node_id = gs.next_node_id;
+            gs.next_node_id += 1;
+
+            gs.adjacency.add_node(node_id);
+            let label_id = gs.interner.intern_label(&entity.entity_type)?;
+            gs.properties.set_node_property(
+                node_id,
+                "_label",
+                Value::String(CompactString::from(&entity.entity_type)),
+            );
+            gs.properties.set_node_property(
+                node_id,
+                "_label_id",
+                Value::Int(label_id as i64),
+            );
+            gs.properties.set_node_property(
+                node_id,
+                "entity_key",
+                Value::String(CompactString::from(&entity_key)),
+            );
+            gs.properties.set_node_property(
+                node_id,
+                "name",
+                Value::String(CompactString::from(&entity.name)),
+            );
+            if !entity.description.is_empty() {
+                gs.properties.set_node_property(
+                    node_id,
+                    "description",
+                    Value::String(CompactString::from(&entity.description)),
+                );
+            }
+            gs.properties.set_node_property(
+                node_id,
+                "confidence",
+                Value::Float(entity.confidence as f64),
+            );
+            gs.properties.set_node_property(
+                node_id,
+                "document_id",
+                Value::String(CompactString::from(&result.document_id)),
+            );
+
+            // Set user properties.
+            for (k, v) in &entity.properties {
+                gs.properties.set_node_property(node_id, k, v.clone());
+            }
+
+            // Set temporal metadata.
+            gs.properties.set_node_property(node_id, "_tx_from", Value::Int(now as i64));
+
+            // Insert embedding.
+            if let Some(ref embedding) = ewe.embedding {
+                let _ = gs.vector_index.insert(node_id, embedding);
+            }
+
+            entity_node_map.insert(entity_key, node_id);
+            entities_created += 1;
+        }
+
+        // Insert relationship edges.
+        for rel in &result.relationships {
+            let source_key = rel.source_entity.to_lowercase();
+            let target_key = rel.target_entity.to_lowercase();
+
+            let source_id = entity_node_map.get(&source_key).copied();
+            let target_id = entity_node_map.get(&target_key).copied();
+
+            if let (Some(src), Some(tgt)) = (source_id, target_id) {
+                let label_id = gs.interner.intern_label(&rel.relationship_type)?;
+                let edge_meta = EdgeMeta {
+                    source: src,
+                    target: tgt,
+                    label: label_id,
+                    temporal: BiTemporal {
+                        valid_from: now,
+                        valid_until: u64::MAX,
+                        tx_from: now,
+                        tx_until: u64::MAX,
+                    },
+                    provenance: None,
+                    weight: rel.weight,
+                    token_cost: 0,
+                };
+                let _ = gs.adjacency.add_edge(src, tgt, label_id, edge_meta);
+                relationships_created += 1;
+            }
+        }
+
+        Ok(CommandResponse::IngestResult(IngestResultResponse {
+            document_id: result.document_id.clone(),
+            chunks_created: result.stats.total_chunks,
+            entities_created,
+            entities_merged,
+            relationships_created,
+            pipeline_duration_ms: result.stats.pipeline_duration_ms,
+        }))
+    }
+
     // ── AUTH / ACL handlers ──────────────────────────────────────────────
 
     fn handle_auth(
@@ -1309,9 +1702,7 @@ impl Engine {
         username: Option<String>,
         password: String,
     ) -> WeavResult<CommandResponse> {
-        let store = self.acl_store.as_ref().ok_or(WeavError::Internal(
-            "auth not enabled".into(),
-        ))?;
+        let store = self.acl_store()?;
 
         let identity = match username {
             Some(ref u) => store.authenticate(u, &password)?,
@@ -1327,9 +1718,7 @@ impl Engine {
         &self,
         cmd: weav_query::parser::AclSetUserCmd,
     ) -> WeavResult<CommandResponse> {
-        let store = self.acl_store.as_ref().ok_or(WeavError::Internal(
-            "auth not enabled".into(),
-        ))?;
+        let store = self.acl_store()?;
 
         // Get or create user.
         let mut user = store.get_user(&cmd.username).unwrap_or_else(|| {
@@ -1372,9 +1761,7 @@ impl Engine {
     }
 
     fn handle_acl_del_user(&self, username: &str) -> WeavResult<CommandResponse> {
-        let store = self.acl_store.as_ref().ok_or(WeavError::Internal(
-            "auth not enabled".into(),
-        ))?;
+        let store = self.acl_store()?;
         if store.delete_user(username) {
             Ok(CommandResponse::Ok)
         } else {
@@ -1386,17 +1773,13 @@ impl Engine {
     }
 
     fn handle_acl_list(&self) -> WeavResult<CommandResponse> {
-        let store = self.acl_store.as_ref().ok_or(WeavError::Internal(
-            "auth not enabled".into(),
-        ))?;
+        let store = self.acl_store()?;
         let users = store.list_users();
         Ok(CommandResponse::StringList(users))
     }
 
     fn handle_acl_get_user(&self, username: &str) -> WeavResult<CommandResponse> {
-        let store = self.acl_store.as_ref().ok_or(WeavError::Internal(
-            "auth not enabled".into(),
-        ))?;
+        let store = self.acl_store()?;
         match store.get_user(username) {
             Some(user) => {
                 let info = format!(
@@ -1423,9 +1806,7 @@ impl Engine {
     }
 
     fn handle_acl_save(&self) -> WeavResult<CommandResponse> {
-        let store = self.acl_store.as_ref().ok_or(WeavError::Internal(
-            "auth not enabled".into(),
-        ))?;
+        let store = self.acl_store()?;
         let content = store.serialize_acl();
         if let Some(ref path) = self.config.auth.acl_file {
             std::fs::write(path, &content).map_err(|e| {
@@ -1438,9 +1819,7 @@ impl Engine {
     }
 
     fn handle_acl_load(&self) -> WeavResult<CommandResponse> {
-        let store = self.acl_store.as_ref().ok_or(WeavError::Internal(
-            "auth not enabled".into(),
-        ))?;
+        let store = self.acl_store()?;
         if let Some(ref path) = self.config.auth.acl_file {
             let content = std::fs::read_to_string(path).map_err(|e| {
                 WeavError::PersistenceError(format!("failed to read ACL file: {e}"))

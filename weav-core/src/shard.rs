@@ -6,6 +6,7 @@
 use bumpalo::Bump;
 
 use crate::config::GraphConfig;
+use crate::error::{WeavError, WeavResult};
 use crate::types::{GraphId, LabelId, PropertyKeyId, ShardId, Timestamp};
 use compact_str::CompactString;
 use std::collections::HashMap;
@@ -69,16 +70,24 @@ impl StringInterner {
 
     /// Intern a label string, returning its compact ID.
     /// If already interned, returns the existing ID.
-    pub fn intern_label(&mut self, label: &str) -> LabelId {
+    ///
+    /// Returns `Err(WeavError::CapacityExceeded)` if the maximum number
+    /// of unique labels (65 536) has been reached.
+    pub fn intern_label(&mut self, label: &str) -> WeavResult<LabelId> {
         if let Some(&id) = self.label_to_id.get(label) {
-            return id;
+            return Ok(id);
+        }
+        if self.next_label_id == u16::MAX {
+            return Err(WeavError::CapacityExceeded(
+                "maximum number of unique labels (65535) exceeded".to_string(),
+            ));
         }
         let id = self.next_label_id;
         self.next_label_id += 1;
         let cs = CompactString::new(label);
         self.label_to_id.insert(cs.clone(), id);
         self.id_to_label.insert(id, cs);
-        id
+        Ok(id)
     }
 
     /// Look up the string for a label ID.
@@ -87,16 +96,24 @@ impl StringInterner {
     }
 
     /// Intern a property key string, returning its compact ID.
-    pub fn intern_property_key(&mut self, key: &str) -> PropertyKeyId {
+    ///
+    /// Returns `Err(WeavError::CapacityExceeded)` if the maximum number
+    /// of unique property keys (65 536) has been reached.
+    pub fn intern_property_key(&mut self, key: &str) -> WeavResult<PropertyKeyId> {
         if let Some(&id) = self.prop_to_id.get(key) {
-            return id;
+            return Ok(id);
+        }
+        if self.next_prop_id == u16::MAX {
+            return Err(WeavError::CapacityExceeded(
+                "maximum number of unique property keys (65535) exceeded".to_string(),
+            ));
         }
         let id = self.next_prop_id;
         self.next_prop_id += 1;
         let cs = CompactString::new(key);
         self.prop_to_id.insert(cs.clone(), id);
         self.id_to_prop.insert(id, cs);
-        id
+        Ok(id)
     }
 
     /// Look up the string for a property key ID.
@@ -104,15 +121,6 @@ impl StringInterner {
         self.id_to_prop.get(&id).map(|s| s.as_str())
     }
 
-    /// Get label ID without interning (returns None if not found).
-    pub fn get_label_id(&self, label: &str) -> Option<LabelId> {
-        self.label_to_id.get(label).copied()
-    }
-
-    /// Get property key ID without interning (returns None if not found).
-    pub fn get_property_key_id(&self, key: &str) -> Option<PropertyKeyId> {
-        self.prop_to_id.get(key).copied()
-    }
 }
 
 impl Default for StringInterner {
@@ -232,9 +240,9 @@ mod tests {
     #[test]
     fn test_string_interner_labels() {
         let mut interner = StringInterner::new();
-        let id1 = interner.intern_label("entity");
-        let id2 = interner.intern_label("relationship");
-        let id3 = interner.intern_label("entity"); // duplicate
+        let id1 = interner.intern_label("entity").unwrap();
+        let id2 = interner.intern_label("relationship").unwrap();
+        let id3 = interner.intern_label("entity").unwrap(); // duplicate
 
         assert_eq!(id1, id3);
         assert_ne!(id1, id2);
@@ -245,9 +253,9 @@ mod tests {
     #[test]
     fn test_string_interner_properties() {
         let mut interner = StringInterner::new();
-        let id1 = interner.intern_property_key("name");
-        let id2 = interner.intern_property_key("type");
-        let id3 = interner.intern_property_key("name");
+        let id1 = interner.intern_property_key("name").unwrap();
+        let id2 = interner.intern_property_key("type").unwrap();
+        let id3 = interner.intern_property_key("name").unwrap();
 
         assert_eq!(id1, id3);
         assert_ne!(id1, id2);
@@ -270,28 +278,6 @@ mod tests {
     }
 
     #[test]
-    fn test_interner_get_label_id() {
-        let mut interner = StringInterner::new();
-        // Non-existent label returns None
-        assert_eq!(interner.get_label_id("missing"), None);
-
-        let id = interner.intern_label("Person");
-        assert_eq!(interner.get_label_id("Person"), Some(id));
-        assert_eq!(interner.get_label_id("NotInterned"), None);
-    }
-
-    #[test]
-    fn test_interner_get_property_key_id() {
-        let mut interner = StringInterner::new();
-        // Non-existent property key returns None
-        assert_eq!(interner.get_property_key_id("missing"), None);
-
-        let id = interner.intern_property_key("name");
-        assert_eq!(interner.get_property_key_id("name"), Some(id));
-        assert_eq!(interner.get_property_key_id("age"), None);
-    }
-
-    #[test]
     fn test_interner_resolve_nonexistent() {
         let interner = StringInterner::new();
         assert_eq!(interner.resolve_label(999), None);
@@ -310,7 +296,7 @@ mod tests {
         let _interner = shard.interner();
 
         // interner_mut() returns mutable reference - intern something
-        let id = shard.interner_mut().intern_label("TestLabel");
+        let id = shard.interner_mut().intern_label("TestLabel").unwrap();
         assert_eq!(shard.interner().resolve_label(id), Some("TestLabel"));
 
         // stats() returns reference
@@ -383,25 +369,25 @@ mod tests {
     #[test]
     fn test_string_interner_empty_string_label() {
         let mut interner = StringInterner::new();
-        let id = interner.intern_label("");
+        let id = interner.intern_label("").unwrap();
         assert_eq!(interner.resolve_label(id), Some(""));
         // Re-interning returns same ID
-        assert_eq!(interner.intern_label(""), id);
+        assert_eq!(interner.intern_label("").unwrap(), id);
     }
 
     #[test]
     fn test_string_interner_empty_string_property() {
         let mut interner = StringInterner::new();
-        let id = interner.intern_property_key("");
+        let id = interner.intern_property_key("").unwrap();
         assert_eq!(interner.resolve_property_key(id), Some(""));
-        assert_eq!(interner.intern_property_key(""), id);
+        assert_eq!(interner.intern_property_key("").unwrap(), id);
     }
 
     #[test]
     fn test_string_interner_case_sensitivity() {
         let mut interner = StringInterner::new();
-        let id_upper = interner.intern_label("Person");
-        let id_lower = interner.intern_label("person");
+        let id_upper = interner.intern_label("Person").unwrap();
+        let id_lower = interner.intern_label("person").unwrap();
         assert_ne!(id_upper, id_lower, "interning is case-sensitive");
         assert_eq!(interner.resolve_label(id_upper), Some("Person"));
         assert_eq!(interner.resolve_label(id_lower), Some("person"));
@@ -410,10 +396,10 @@ mod tests {
     #[test]
     fn test_string_interner_special_characters() {
         let mut interner = StringInterner::new();
-        let id1 = interner.intern_label("hello world");
-        let id2 = interner.intern_label("key/with/slashes");
-        let id3 = interner.intern_label("emoji_test");
-        let id4 = interner.intern_property_key("prop with spaces");
+        let id1 = interner.intern_label("hello world").unwrap();
+        let id2 = interner.intern_label("key/with/slashes").unwrap();
+        let id3 = interner.intern_label("emoji_test").unwrap();
+        let id4 = interner.intern_property_key("prop with spaces").unwrap();
 
         assert_eq!(interner.resolve_label(id1), Some("hello world"));
         assert_eq!(interner.resolve_label(id2), Some("key/with/slashes"));
@@ -426,7 +412,7 @@ mod tests {
         let mut interner = StringInterner::new();
         let mut ids = Vec::new();
         for i in 0..1000 {
-            let id = interner.intern_label(&format!("label_{i}"));
+            let id = interner.intern_label(&format!("label_{i}")).unwrap();
             ids.push(id);
         }
         // IDs should be monotonically increasing
@@ -467,8 +453,8 @@ mod tests {
         let mut shard_a = Shard::new(0);
         let mut shard_b = Shard::new(1);
 
-        let id_a = shard_a.interner_mut().intern_label("Person");
-        let id_b = shard_b.interner_mut().intern_label("Person");
+        let id_a = shard_a.interner_mut().intern_label("Person").unwrap();
+        let id_b = shard_b.interner_mut().intern_label("Person").unwrap();
 
         // Both start from 0, so IDs should be the same value
         assert_eq!(id_a, id_b);

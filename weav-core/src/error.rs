@@ -55,6 +55,18 @@ pub enum WeavError {
 
     #[error("permission denied: {0}")]
     PermissionDenied(String),
+
+    #[error("extraction error: {0}")]
+    ExtractionError(String),
+
+    #[error("document parse error: {0}")]
+    DocumentParseError(String),
+
+    #[error("LLM error: {0}")]
+    LlmError(String),
+
+    #[error("extraction not enabled — set [extract] enabled = true in config")]
+    ExtractionNotEnabled,
 }
 
 /// Convenience type alias for `Result<T, WeavError>`.
@@ -117,6 +129,10 @@ mod tests {
             WeavError::AuthenticationRequired,
             WeavError::AuthenticationFailed("bad password".into()),
             WeavError::PermissionDenied("no write access".into()),
+            WeavError::ExtractionError("entity parse failed".into()),
+            WeavError::DocumentParseError("invalid PDF".into()),
+            WeavError::LlmError("rate limited".into()),
+            WeavError::ExtractionNotEnabled,
         ];
 
         for err in &variants {
@@ -180,6 +196,22 @@ mod tests {
         assert_eq!(
             WeavError::PermissionDenied("no write access".into()).to_string(),
             "permission denied: no write access"
+        );
+        assert_eq!(
+            WeavError::ExtractionError("entity parse failed".into()).to_string(),
+            "extraction error: entity parse failed"
+        );
+        assert_eq!(
+            WeavError::DocumentParseError("invalid PDF".into()).to_string(),
+            "document parse error: invalid PDF"
+        );
+        assert_eq!(
+            WeavError::LlmError("rate limited".into()).to_string(),
+            "LLM error: rate limited"
+        );
+        assert_eq!(
+            WeavError::ExtractionNotEnabled.to_string(),
+            "extraction not enabled — set [extract] enabled = true in config"
         );
     }
 }

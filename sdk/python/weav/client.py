@@ -10,6 +10,7 @@ from .types import (
     ContextChunk,
     ContextResult,
     GraphInfo,
+    IngestResult,
     NodeInfo,
     Provenance,
     RelationshipSummary,
@@ -348,6 +349,54 @@ class WeavClient:
         data = _check_response(resp)
         return _parse_context_result(data)
 
+    # -- Ingest (extraction pipeline) --------------------------------------
+
+    def ingest(
+        self,
+        graph: str,
+        content: str | None = None,
+        content_base64: str | None = None,
+        format: str | None = None,
+        document_id: str | None = None,
+        skip_extraction: bool = False,
+        skip_dedup: bool = False,
+        chunk_size: int | None = None,
+        entity_types: list[str] | None = None,
+    ) -> IngestResult:
+        """Ingest a document into a graph via the extraction pipeline.
+
+        Provide either *content* (UTF-8 text) or *content_base64* (base64-encoded
+        binary). The server will parse, chunk, embed, extract entities/relationships,
+        and build the graph automatically.
+        """
+        body: dict[str, Any] = {
+            "skip_extraction": skip_extraction,
+            "skip_dedup": skip_dedup,
+        }
+        if content is not None:
+            body["content"] = content
+        if content_base64 is not None:
+            body["content_base64"] = content_base64
+        if format is not None:
+            body["format"] = format
+        if document_id is not None:
+            body["document_id"] = document_id
+        if chunk_size is not None:
+            body["chunk_size"] = chunk_size
+        if entity_types is not None:
+            body["entity_types"] = entity_types
+
+        resp = self._client.post(f"/v1/graphs/{graph}/ingest", json=body)
+        data = _check_response(resp)
+        return IngestResult(
+            document_id=data["document_id"],
+            chunks_created=data["chunks_created"],
+            entities_created=data["entities_created"],
+            entities_merged=data["entities_merged"],
+            relationships_created=data["relationships_created"],
+            pipeline_duration_ms=data["pipeline_duration_ms"],
+        )
+
     # -- Health ------------------------------------------------------------
 
     def health(self) -> bool:
@@ -587,6 +636,49 @@ class AsyncWeavClient:
         resp = await self._client.post("/v1/context", json=body)
         data = _check_response(resp)
         return _parse_context_result(data)
+
+    # -- Ingest (extraction pipeline) --------------------------------------
+
+    async def ingest(
+        self,
+        graph: str,
+        content: str | None = None,
+        content_base64: str | None = None,
+        format: str | None = None,
+        document_id: str | None = None,
+        skip_extraction: bool = False,
+        skip_dedup: bool = False,
+        chunk_size: int | None = None,
+        entity_types: list[str] | None = None,
+    ) -> IngestResult:
+        """Ingest a document into a graph via the extraction pipeline."""
+        body: dict[str, Any] = {
+            "skip_extraction": skip_extraction,
+            "skip_dedup": skip_dedup,
+        }
+        if content is not None:
+            body["content"] = content
+        if content_base64 is not None:
+            body["content_base64"] = content_base64
+        if format is not None:
+            body["format"] = format
+        if document_id is not None:
+            body["document_id"] = document_id
+        if chunk_size is not None:
+            body["chunk_size"] = chunk_size
+        if entity_types is not None:
+            body["entity_types"] = entity_types
+
+        resp = await self._client.post(f"/v1/graphs/{graph}/ingest", json=body)
+        data = _check_response(resp)
+        return IngestResult(
+            document_id=data["document_id"],
+            chunks_created=data["chunks_created"],
+            entities_created=data["entities_created"],
+            entities_merged=data["entities_merged"],
+            relationships_created=data["relationships_created"],
+            pipeline_duration_ms=data["pipeline_duration_ms"],
+        )
 
     # -- Health ------------------------------------------------------------
 

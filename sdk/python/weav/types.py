@@ -81,6 +81,18 @@ class GraphInfo:
 
 
 @dataclass
+class IngestResult:
+    """Result of an ingestion pipeline run."""
+
+    document_id: str
+    chunks_created: int
+    entities_created: int
+    entities_merged: int
+    relationships_created: int
+    pipeline_duration_ms: int
+
+
+@dataclass
 class NodeInfo:
     """Information about a single node."""
 

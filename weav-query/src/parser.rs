@@ -74,6 +74,8 @@ pub enum Command {
     AclSave,
     /// ACL LOAD
     AclLoad,
+    /// Ingest a document (extract entities/relationships and build graph).
+    Ingest(IngestCmd),
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +199,19 @@ pub struct EdgeDeleteCmd {
 pub struct EdgeGetCmd {
     pub graph: String,
     pub edge_id: u64,
+}
+
+/// Ingest a document into a graph via the extraction pipeline.
+#[derive(Debug, Clone)]
+pub struct IngestCmd {
+    pub graph: String,
+    pub content: String,
+    pub format: Option<String>,
+    pub document_id: Option<String>,
+    pub skip_extraction: bool,
+    pub skip_dedup: bool,
+    pub chunk_size: Option<usize>,
+    pub entity_types: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -414,6 +429,7 @@ pub fn parse_command(input: &str) -> Result<Command, WeavError> {
         "CONFIG" => parse_config_command(&tokens),
         "AUTH" => parse_auth_command(&tokens),
         "ACL" => parse_acl_command(&tokens),
+        "INGEST" => parse_ingest_command(&tokens),
         _ => Err(parse_err(format!("unknown command: {}", &tokens[0]))),
     }
 }
@@ -1286,6 +1302,85 @@ fn parse_acl_command(tokens: &[String]) -> Result<Command, WeavError> {
     }
 }
 
+/// Parse: INGEST "graph" "content" [FORMAT "pdf"|"text"|"docx"|"csv"]
+///        [DOCID "id"] [SKIP_EXTRACTION] [SKIP_DEDUP] [CHUNK_SIZE 512]
+///        [ENTITY_TYPES "Person,Organization"]
+fn parse_ingest_command(tokens: &[String]) -> Result<Command, WeavError> {
+    if tokens.len() < 3 {
+        return Err(parse_err(
+            "INGEST requires at least a graph name and content",
+        ));
+    }
+    let graph = unquote(&tokens[1]).to_string();
+    let content = unquote(&tokens[2]).to_string();
+
+    let mut format = None;
+    let mut document_id = None;
+    let mut skip_extraction = false;
+    let mut skip_dedup = false;
+    let mut chunk_size = None;
+    let mut entity_types = None;
+
+    let mut i = 3;
+    while i < tokens.len() {
+        let upper = tokens[i].to_uppercase();
+        match upper.as_str() {
+            "FORMAT" => {
+                i += 1;
+                if i < tokens.len() {
+                    format = Some(unquote(&tokens[i]).to_string());
+                }
+            }
+            "DOCID" => {
+                i += 1;
+                if i < tokens.len() {
+                    document_id = Some(unquote(&tokens[i]).to_string());
+                }
+            }
+            "SKIP_EXTRACTION" => {
+                skip_extraction = true;
+            }
+            "SKIP_DEDUP" => {
+                skip_dedup = true;
+            }
+            "CHUNK_SIZE" => {
+                i += 1;
+                if i < tokens.len() {
+                    chunk_size = Some(tokens[i].parse::<usize>().map_err(|_| {
+                        parse_err("CHUNK_SIZE value must be a number")
+                    })?);
+                }
+            }
+            "ENTITY_TYPES" => {
+                i += 1;
+                if i < tokens.len() {
+                    let types_str = unquote(&tokens[i]);
+                    entity_types = Some(
+                        types_str
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect(),
+                    );
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    Ok(Command::Ingest(IngestCmd {
+        graph,
+        content,
+        format,
+        document_id,
+        skip_extraction,
+        skip_dedup,
+        chunk_size,
+        entity_types,
+    }))
+}
+
 /// Find a keyword (case-insensitive) in the token list, starting from index 0.
 fn find_keyword(tokens: &[String], keyword: &str) -> Option<usize> {
     find_keyword_after(tokens, keyword, 0)
@@ -2048,6 +2143,67 @@ mod tests {
     #[test]
     fn test_parse_acl_no_subcommand() {
         let result = parse_command("ACL");
+        assert!(result.is_err());
+    }
+
+    // ── Ingest command tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_ingest_basic() {
+        let cmd = parse_command(r#"INGEST "mygraph" "Hello world text""#).unwrap();
+        if let Command::Ingest(c) = cmd {
+            assert_eq!(c.graph, "mygraph");
+            assert_eq!(c.content, "Hello world text");
+            assert!(c.format.is_none());
+            assert!(c.document_id.is_none());
+            assert!(!c.skip_extraction);
+            assert!(!c.skip_dedup);
+            assert!(c.chunk_size.is_none());
+            assert!(c.entity_types.is_none());
+        } else {
+            panic!("expected Ingest command");
+        }
+    }
+
+    #[test]
+    fn test_parse_ingest_with_options() {
+        let cmd = parse_command(
+            r#"INGEST "mygraph" "some content" FORMAT "pdf" DOCID "doc123" SKIP_EXTRACTION CHUNK_SIZE 1024 ENTITY_TYPES "Person,Organization""#,
+        )
+        .unwrap();
+        if let Command::Ingest(c) = cmd {
+            assert_eq!(c.graph, "mygraph");
+            assert_eq!(c.content, "some content");
+            assert_eq!(c.format, Some("pdf".into()));
+            assert_eq!(c.document_id, Some("doc123".into()));
+            assert!(c.skip_extraction);
+            assert!(!c.skip_dedup);
+            assert_eq!(c.chunk_size, Some(1024));
+            assert_eq!(
+                c.entity_types,
+                Some(vec!["Person".into(), "Organization".into()])
+            );
+        } else {
+            panic!("expected Ingest command");
+        }
+    }
+
+    #[test]
+    fn test_parse_ingest_skip_dedup() {
+        let cmd = parse_command(r#"INGEST "g" "text" SKIP_DEDUP"#).unwrap();
+        if let Command::Ingest(c) = cmd {
+            assert!(c.skip_dedup);
+            assert!(!c.skip_extraction);
+        } else {
+            panic!("expected Ingest command");
+        }
+    }
+
+    #[test]
+    fn test_parse_ingest_missing_args() {
+        let result = parse_command("INGEST");
+        assert!(result.is_err());
+        let result = parse_command(r#"INGEST "mygraph""#);
         assert!(result.is_err());
     }
 }

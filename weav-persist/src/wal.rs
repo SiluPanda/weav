@@ -6,7 +6,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::now_millis;
 
 use serde::{Deserialize, Serialize};
 use weav_core::config::WalSyncMode;
@@ -73,6 +74,13 @@ pub enum WalOperation {
         node_id: NodeId,
         vector: Vec<f32>,
     },
+    Ingest {
+        graph_name: String,
+        document_id: String,
+        chunks_count: usize,
+        entities_count: usize,
+        relationships_count: usize,
+    },
 }
 
 impl WalOperation {
@@ -86,7 +94,9 @@ impl WalOperation {
             | WalOperation::EdgeInvalidate { graph_id, .. }
             | WalOperation::EdgeDelete { graph_id, .. }
             | WalOperation::VectorUpdate { graph_id, .. } => *graph_id,
-            WalOperation::GraphCreate { .. } | WalOperation::GraphDrop { .. } => 0,
+            WalOperation::GraphCreate { .. }
+            | WalOperation::GraphDrop { .. }
+            | WalOperation::Ingest { .. } => 0,
         }
     }
 }
@@ -99,15 +109,6 @@ impl WalOperation {
 /// on supported platforms, with a fast software fallback otherwise.
 pub fn compute_checksum(data: &[u8]) -> u32 {
     crc32fast::hash(data)
-}
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 // ─── WriteAheadLog ──────────────────────────────────────────────────────────

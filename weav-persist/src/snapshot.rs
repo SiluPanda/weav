@@ -6,7 +6,8 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::now_millis;
 
 use serde::{Deserialize, Serialize};
 use weav_core::types::*;
@@ -84,6 +85,7 @@ pub struct FullSnapshot {
 /// Engine for creating, loading, listing, and cleaning up snapshots.
 pub struct SnapshotEngine {
     data_dir: PathBuf,
+    #[allow(dead_code)]
     format: SnapshotFormat,
 }
 
@@ -109,14 +111,12 @@ impl SnapshotEngine {
         let filename = format!("snapshot-{}.bin", snapshot.meta.created_at);
         let path = self.data_dir.join(&filename);
 
-        let data = match &self.format {
-            SnapshotFormat::Bincode => bincode::serialize(snapshot).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("bincode serialize snapshot: {e}"),
-                )
-            })?,
-        };
+        let data = bincode::serialize(snapshot).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bincode serialize snapshot: {e}"),
+            )
+        })?;
 
         let mut file = File::create(&path)?;
         file.write_all(&data)?;
@@ -131,14 +131,12 @@ impl SnapshotEngine {
         let mut data = Vec::new();
         file.read_to_end(&mut data)?;
 
-        let snapshot: FullSnapshot = match &self.format {
-            SnapshotFormat::Bincode => bincode::deserialize(&data).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("bincode deserialize snapshot: {e}"),
-                )
-            })?,
-        };
+        let snapshot: FullSnapshot = bincode::deserialize(&data).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bincode deserialize snapshot: {e}"),
+            )
+        })?;
 
         Ok(snapshot)
     }
@@ -214,15 +212,6 @@ impl SnapshotEngine {
 
         Ok(deleted)
     }
-}
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 /// Create a `SnapshotMeta` with the given parameters. Convenience for building

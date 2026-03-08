@@ -280,6 +280,9 @@ pub enum TokenAllocation {
     Priority(Vec<ContentPriority>),
     /// Engine decides based on query shape.
     Auto,
+    /// Diversity-aware selection using Maximum Marginal Relevance (MMR).
+    /// Lambda controls relevance vs diversity: 1.0 = pure relevance, 0.0 = pure diversity.
+    DiversityAware { lambda: f32 },
 }
 
 /// Content categories for priority-based token allocation.
