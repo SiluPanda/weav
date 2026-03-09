@@ -303,6 +303,8 @@ pub fn flow_score(
 ) -> Vec<ScoredNode> {
     let mut scores: HashMap<NodeId, (f32, u8)> = HashMap::new();
     let mut queue: VecDeque<(NodeId, f32, u8)> = VecDeque::new();
+    let mut work_count: usize = 0;
+    let max_work = seeds_with_scores.len().max(1) * 10000; // bounded work
 
     for &(node, score) in seeds_with_scores {
         scores.insert(node, (score, 0));
@@ -310,6 +312,10 @@ pub fn flow_score(
     }
 
     while let Some((node, score, depth)) = queue.pop_front() {
+        work_count += 1;
+        if work_count > max_work {
+            break;
+        }
         if depth >= max_depth {
             continue;
         }
@@ -2318,5 +2324,55 @@ mod tests {
         let unique_high: HashSet<u64> = comm_high.values().copied().collect();
         // High resolution should have >= as many communities as low resolution
         assert!(unique_high.len() >= unique_low.len());
+    }
+
+    #[test]
+    fn test_dijkstra_zero_weight_edge() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        let meta = EdgeMeta {
+            source: 1, target: 2, label: 0,
+            temporal: BiTemporal::new_current(1000),
+            provenance: None, weight: 0.0, token_cost: 0,
+        };
+        adj.add_edge(1, 2, 0, meta).unwrap();
+        // Zero weight → cost = f64::MAX, so path exists but is very expensive
+        let result = dijkstra_shortest_path(&adj, 1, 2, 10);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().nodes, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_label_propagation_self_loop() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_edge(1, 1, 0, make_meta(1, 1, 0)).unwrap(); // self-loop
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        let communities = label_propagation(&adj, 10);
+        assert_eq!(communities.len(), 2);
+        // Both should converge to same community
+        assert_eq!(communities[&1], communities[&2]);
+    }
+
+    #[test]
+    fn test_ppr_dangling_node() {
+        // Node 3 has no outgoing edges (dangling)
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_node(3);
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        // Node 3 is dangling - no outgoing edges
+        let result = personalized_pagerank(&adj, &[(1, 1.0)], 0.15, 100, 1e-6);
+        assert_eq!(result.len(), 3);
+        // Should not crash, all nodes should have scores
+        for s in &result {
+            assert!(s.score >= 0.0);
+            assert!(!s.score.is_nan());
+        }
     }
 }

@@ -225,7 +225,7 @@ impl Provenance {
     pub fn new(source: impl Into<CompactString>, confidence: f32) -> Self {
         Self {
             source: source.into(),
-            confidence: confidence.clamp(0.0, 1.0),
+            confidence: if confidence.is_nan() { 0.0 } else { confidence.clamp(0.0, 1.0) },
             extraction_method: ExtractionMethod::UserProvided,
             source_document_id: None,
             source_chunk_offset: None,
@@ -1011,8 +1011,8 @@ mod tests {
     #[test]
     fn test_provenance_nan_confidence() {
         let p = Provenance::new("src", f32::NAN);
-        // f32::NAN.clamp(0.0, 1.0) returns NaN in Rust (comparisons with NaN are false)
-        assert!(p.confidence.is_nan());
+        // NaN confidence is rejected and defaults to 0.0
+        assert_eq!(p.confidence, 0.0);
     }
 
     #[test]
