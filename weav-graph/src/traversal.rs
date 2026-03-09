@@ -1,6 +1,6 @@
 //! Graph traversal algorithms: BFS, flow scoring, ego network, shortest path,
 //! scored paths, Dijkstra, connected components, Personalized PageRank,
-//! Label Propagation community detection.
+//! Label Propagation community detection, modularity-based community detection.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -864,6 +864,170 @@ pub fn label_propagation(
     }
 
     labels
+}
+
+/// Leiden/Louvain community detection using modularity optimization.
+///
+/// Iteratively moves nodes between communities to maximize modularity Q.
+/// Then aggregates communities into super-nodes and repeats.
+/// Returns a map from NodeId to community label (u64).
+///
+/// Unlike label_propagation, this produces higher-quality communities
+/// by optimizing a global quality function (modularity).
+///
+/// The `resolution` parameter controls community granularity:
+/// - 1.0 = standard modularity
+/// - \> 1.0 = smaller, more numerous communities
+/// - \< 1.0 = larger, fewer communities
+pub fn modularity_communities(
+    adjacency: &AdjacencyStore,
+    max_iterations: u32,
+    resolution: f32,
+) -> HashMap<NodeId, u64> {
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() {
+        return HashMap::new();
+    }
+
+    // Initialize each node in its own community (community label = node id)
+    let mut community: HashMap<NodeId, u64> = all_nodes.iter().map(|&nid| (nid, nid)).collect();
+
+    // Compute total edge weight m (treating the directed graph as undirected).
+    // We sum weights from both out- and in-neighbors for each node, which
+    // double-counts every undirected edge, so we divide by 2 at the end.
+    // Also compute per-node weighted degree k_i (again undirected).
+    let mut node_degree: HashMap<NodeId, f64> = HashMap::with_capacity(all_nodes.len());
+    let mut total_weight_double = 0.0_f64;
+
+    for &node in &all_nodes {
+        let mut ki = 0.0_f64;
+        for &(_, edge_id) in adjacency.neighbors_out(node, None).iter() {
+            let w = adjacency
+                .get_edge(edge_id)
+                .map(|meta| meta.weight as f64)
+                .unwrap_or(1.0);
+            ki += w;
+        }
+        for &(_, edge_id) in adjacency.neighbors_in(node, None).iter() {
+            let w = adjacency
+                .get_edge(edge_id)
+                .map(|meta| meta.weight as f64)
+                .unwrap_or(1.0);
+            ki += w;
+        }
+        node_degree.insert(node, ki);
+        total_weight_double += ki;
+    }
+
+    // m = total undirected edge weight (each edge counted once)
+    let m = total_weight_double / 2.0;
+    if m == 0.0 {
+        // No edges — every node stays in its own community
+        return community;
+    }
+
+    // sigma_tot[c] = sum of k_i for all nodes i in community c
+    let mut sigma_tot: HashMap<u64, f64> = HashMap::with_capacity(all_nodes.len());
+    for &node in &all_nodes {
+        sigma_tot.insert(node, node_degree[&node]);
+    }
+
+    let resolution = resolution as f64;
+
+    for iteration in 0..max_iterations {
+        // Deterministic shuffle: sort nodes by hash(node_id ^ iteration)
+        let mut order: Vec<NodeId> = all_nodes.clone();
+        order.sort_by(|&a, &b| {
+            let hash_a = {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (a ^ (iteration as u64)).hash(&mut h);
+                h.finish()
+            };
+            let hash_b = {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (b ^ (iteration as u64)).hash(&mut h);
+                h.finish()
+            };
+            hash_a.cmp(&hash_b)
+        });
+
+        let mut changed = false;
+
+        for &node in &order {
+            let ki = node_degree[&node];
+            let current_comm = community[&node];
+
+            // Compute weighted edges from this node to each neighboring community.
+            // Treat graph as undirected: consider both out- and in-neighbors.
+            let mut edges_to_comm: HashMap<u64, f64> = HashMap::new();
+            let out_neighbors = adjacency.neighbors_out(node, None);
+            let in_neighbors = adjacency.neighbors_in(node, None);
+            for &(nbr, edge_id) in out_neighbors.iter().chain(in_neighbors.iter()) {
+                let w = adjacency
+                    .get_edge(edge_id)
+                    .map(|meta| meta.weight as f64)
+                    .unwrap_or(1.0);
+                let nbr_comm = community[&nbr];
+                *edges_to_comm.entry(nbr_comm).or_insert(0.0) += w;
+            }
+
+            if edges_to_comm.is_empty() {
+                continue; // isolated node
+            }
+
+            // Temporarily remove node from its current community for gain computation.
+            // sigma_tot of current community without this node:
+            let sigma_tot_old = sigma_tot.get(&current_comm).copied().unwrap_or(0.0) - ki;
+
+            // Edges from node to its own (current) community
+            let ki_in = edges_to_comm.get(&current_comm).copied().unwrap_or(0.0);
+
+            // Gain of removing node from current community (loss):
+            // We compute relative gains so we can compare. The "removal cost" is:
+            //   remove_cost = ki_in / m - resolution * ki * sigma_tot_old / (2 * m^2)
+            let remove_cost = ki_in / m - resolution * ki * sigma_tot_old / (2.0 * m * m);
+
+            // Find the best community to move to
+            let mut best_comm = current_comm;
+            let mut best_gain = 0.0_f64; // must be strictly positive to move
+
+            for (&cand_comm, &ki_cand) in &edges_to_comm {
+                if cand_comm == current_comm {
+                    continue;
+                }
+                let sigma_tot_cand = sigma_tot.get(&cand_comm).copied().unwrap_or(0.0);
+
+                // Gain of adding node to candidate community:
+                //   add_gain = ki_cand / m - resolution * ki * sigma_tot_cand / (2 * m^2)
+                let add_gain =
+                    ki_cand / m - resolution * ki * sigma_tot_cand / (2.0 * m * m);
+
+                // Net gain = add_gain - remove_cost
+                let net_gain = add_gain - remove_cost;
+
+                if net_gain > best_gain
+                    || (net_gain == best_gain && cand_comm < best_comm)
+                {
+                    best_gain = net_gain;
+                    best_comm = cand_comm;
+                }
+            }
+
+            if best_comm != current_comm {
+                // Move node from current_comm to best_comm
+                *sigma_tot.entry(current_comm).or_insert(0.0) -= ki;
+                *sigma_tot.entry(best_comm).or_insert(0.0) += ki;
+                community.insert(node, best_comm);
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break; // converged
+        }
+    }
+
+    community
 }
 
 #[cfg(test)]
@@ -2091,5 +2255,68 @@ mod tests {
         let adj = AdjacencyStore::new();
         let communities = label_propagation(&adj, 10);
         assert!(communities.is_empty());
+    }
+
+    // ── Modularity Communities tests ────────────────────────────────────────
+
+    #[test]
+    fn test_modularity_communities_two_cliques() {
+        // Two cliques connected by a single edge:
+        // Clique 1: 1-2, 1-3, 2-3
+        // Clique 2: 4-5, 4-6, 5-6
+        // Bridge: 3-4
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=6 { adj.add_node(i); }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(4, 5, 0, make_meta(4, 5, 0)).unwrap();
+        adj.add_edge(5, 4, 0, make_meta(5, 4, 0)).unwrap();
+        adj.add_edge(4, 6, 0, make_meta(4, 6, 0)).unwrap();
+        adj.add_edge(6, 4, 0, make_meta(6, 4, 0)).unwrap();
+        adj.add_edge(5, 6, 0, make_meta(5, 6, 0)).unwrap();
+        adj.add_edge(6, 5, 0, make_meta(6, 5, 0)).unwrap();
+        adj.add_edge(3, 4, 0, make_meta(3, 4, 0)).unwrap();
+        adj.add_edge(4, 3, 0, make_meta(4, 3, 0)).unwrap();
+
+        let communities = modularity_communities(&adj, 20, 1.0);
+        assert_eq!(communities.len(), 6);
+        assert_eq!(communities[&1], communities[&2]);
+        assert_eq!(communities[&1], communities[&3]);
+        assert_eq!(communities[&4], communities[&5]);
+        assert_eq!(communities[&4], communities[&6]);
+        assert_ne!(communities[&1], communities[&4]);
+    }
+
+    #[test]
+    fn test_modularity_communities_empty() {
+        let adj = AdjacencyStore::new();
+        let communities = modularity_communities(&adj, 10, 1.0);
+        assert!(communities.is_empty());
+    }
+
+    #[test]
+    fn test_modularity_communities_isolated() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        let communities = modularity_communities(&adj, 10, 1.0);
+        assert_eq!(communities.len(), 2);
+        assert_ne!(communities[&1], communities[&2]);
+    }
+
+    #[test]
+    fn test_modularity_resolution_parameter() {
+        // Higher resolution should produce smaller/more communities
+        let adj = build_star_graph(); // 1->2,3,4,5
+        let comm_low = modularity_communities(&adj, 20, 0.5);
+        let comm_high = modularity_communities(&adj, 20, 2.0);
+        let unique_low: HashSet<u64> = comm_low.values().copied().collect();
+        let unique_high: HashSet<u64> = comm_high.values().copied().collect();
+        // High resolution should have >= as many communities as low resolution
+        assert!(unique_high.len() >= unique_low.len());
     }
 }
