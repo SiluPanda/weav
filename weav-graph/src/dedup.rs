@@ -1,5 +1,7 @@
 //! Entity deduplication: exact key matching, fuzzy name matching, and property merging.
 
+use std::collections::{HashMap, HashSet};
+
 use weav_core::types::{ConflictPolicy, NodeId, Value};
 
 use crate::properties::PropertyStore;
@@ -104,6 +106,136 @@ pub fn find_duplicate_by_name(
     }
 
     best
+}
+
+/// N-gram blocking index for efficient fuzzy duplicate detection.
+/// Narrows candidate set before expensive string similarity computation.
+pub struct BlockingIndex {
+    /// Trigram -> set of node IDs that contain this trigram
+    trigram_index: HashMap<String, HashSet<NodeId>>,
+    /// Node ID -> stored name (for cleanup on removal)
+    node_names: HashMap<NodeId, String>,
+}
+
+impl BlockingIndex {
+    pub fn new() -> Self {
+        Self {
+            trigram_index: HashMap::new(),
+            node_names: HashMap::new(),
+        }
+    }
+
+    /// Extract character trigrams from a string (lowercased).
+    fn trigrams(s: &str) -> Vec<String> {
+        let lower = s.to_lowercase();
+        let chars: Vec<char> = lower.chars().collect();
+        if chars.len() < 3 {
+            return vec![lower];
+        }
+        chars
+            .windows(3)
+            .map(|w| w.iter().collect::<String>())
+            .collect()
+    }
+
+    /// Index a node's name for future blocking lookups.
+    pub fn insert(&mut self, node_id: NodeId, name: &str) {
+        let trigrams = Self::trigrams(name);
+        for tri in &trigrams {
+            self.trigram_index
+                .entry(tri.clone())
+                .or_default()
+                .insert(node_id);
+        }
+        self.node_names.insert(node_id, name.to_string());
+    }
+
+    /// Remove a node from the blocking index.
+    pub fn remove(&mut self, node_id: NodeId) {
+        if let Some(name) = self.node_names.remove(&node_id) {
+            let trigrams = Self::trigrams(&name);
+            for tri in &trigrams {
+                if let Some(set) = self.trigram_index.get_mut(tri) {
+                    set.remove(&node_id);
+                    if set.is_empty() {
+                        self.trigram_index.remove(tri);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Find candidate nodes that share at least `min_shared_trigrams` trigrams with the query.
+    /// Returns candidates sorted by number of shared trigrams (most shared first).
+    pub fn candidates(&self, name: &str, min_shared_trigrams: usize) -> Vec<NodeId> {
+        let query_trigrams = Self::trigrams(name);
+        let mut counts: HashMap<NodeId, usize> = HashMap::new();
+
+        for tri in &query_trigrams {
+            if let Some(nodes) = self.trigram_index.get(tri) {
+                for &nid in nodes {
+                    *counts.entry(nid).or_default() += 1;
+                }
+            }
+        }
+
+        let min_shared = min_shared_trigrams.max(1);
+        let mut result: Vec<(NodeId, usize)> = counts
+            .into_iter()
+            .filter(|&(_, count)| count >= min_shared)
+            .collect();
+
+        result.sort_by(|a, b| b.1.cmp(&a.1));
+        result.into_iter().map(|(nid, _)| nid).collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.node_names.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.node_names.is_empty()
+    }
+}
+
+impl Default for BlockingIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Find a potential duplicate by fuzzy name matching.
+/// If a `BlockingIndex` is provided, uses it to narrow candidates (fast path).
+/// Otherwise falls back to scanning all nodes (slow path).
+pub fn find_duplicate_by_name_indexed(
+    properties: &PropertyStore,
+    name_field: &str,
+    name: &str,
+    threshold: f32,
+    blocking_index: Option<&BlockingIndex>,
+) -> Option<(NodeId, f32)> {
+    // Fast path: use blocking index
+    if let Some(index) = blocking_index {
+        let candidates = index.candidates(name, 1);
+        let mut best: Option<(NodeId, f32)> = None;
+        for nid in candidates {
+            if let Some(val) = properties.get_node_property(nid, name_field) {
+                if let Some(existing_name) = val.as_str() {
+                    let score = strsim::jaro_winkler(name, existing_name) as f32;
+                    if score >= threshold {
+                        match &best {
+                            Some((_, best_score)) if score <= *best_score => {}
+                            _ => best = Some((nid, score)),
+                        }
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    // Slow path: scan all nodes (original behavior)
+    find_duplicate_by_name(properties, name_field, name, threshold)
 }
 
 /// Merge properties from new data into an existing node.
@@ -597,5 +729,86 @@ mod tests {
         // as_str() returns None for Int, so no match
         let found = find_duplicate_by_key(&props, "email", "42");
         assert!(found.is_none());
+    }
+
+    // ── BlockingIndex tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_blocking_index_insert_and_candidates() {
+        let mut index = BlockingIndex::new();
+        index.insert(1, "Albert Einstein");
+        index.insert(2, "Albert Ellis");
+        index.insert(3, "Marie Curie");
+
+        let candidates = index.candidates("Albert Einsten", 1); // typo
+        assert!(candidates.contains(&1)); // shares many trigrams with "Albert Einstein"
+        assert!(candidates.contains(&2)); // shares "Alb", "lbe", "ber", "ert"
+        // Marie Curie may or may not appear (few/no shared trigrams)
+    }
+
+    #[test]
+    fn test_blocking_index_remove() {
+        let mut index = BlockingIndex::new();
+        index.insert(1, "Albert Einstein");
+        index.insert(2, "Marie Curie");
+        assert_eq!(index.len(), 2);
+
+        index.remove(1);
+        assert_eq!(index.len(), 1);
+
+        let candidates = index.candidates("Albert Einstein", 1);
+        assert!(!candidates.contains(&1)); // removed
+    }
+
+    #[test]
+    fn test_blocking_index_short_names() {
+        let mut index = BlockingIndex::new();
+        index.insert(1, "AI");
+        index.insert(2, "ML");
+
+        let candidates = index.candidates("AI", 1);
+        assert!(candidates.contains(&1));
+        assert!(!candidates.contains(&2));
+    }
+
+    #[test]
+    fn test_blocking_index_empty() {
+        let index = BlockingIndex::new();
+        assert!(index.is_empty());
+        let candidates = index.candidates("test", 1);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn test_find_duplicate_by_name_indexed_fast_path() {
+        let mut props = PropertyStore::new();
+        props.set_node_property(1, "name", Value::String(CompactString::from("Albert Einstein")));
+        props.set_node_property(2, "name", Value::String(CompactString::from("Marie Curie")));
+
+        let mut index = BlockingIndex::new();
+        index.insert(1, "Albert Einstein");
+        index.insert(2, "Marie Curie");
+
+        // Should find Albert Einstein via blocking index
+        let found =
+            find_duplicate_by_name_indexed(&props, "name", "Albert Einsten", 0.85, Some(&index));
+        assert!(found.is_some());
+        let (node_id, score) = found.unwrap();
+        assert_eq!(node_id, 1);
+        assert!(score >= 0.85);
+    }
+
+    #[test]
+    fn test_find_duplicate_by_name_indexed_slow_path() {
+        let mut props = PropertyStore::new();
+        props.set_node_property(1, "name", Value::String(CompactString::from("Alice Johnson")));
+
+        // No blocking index: falls back to full scan
+        let found =
+            find_duplicate_by_name_indexed(&props, "name", "Alice Jonson", 0.85, None);
+        assert!(found.is_some());
+        let (node_id, score) = found.unwrap();
+        assert_eq!(node_id, 1);
+        assert!(score >= 0.85);
     }
 }
