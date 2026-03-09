@@ -67,6 +67,9 @@ pub fn enforce_budget(chunks: Vec<ContextChunk>, budget: &TokenBudget) -> Budget
         TokenAllocation::DiversityAware { lambda } => {
             enforce_budget_mmr(chunks, max_tokens, *lambda)
         }
+        TokenAllocation::SubmodularFacilityLocation { alpha } => {
+            enforce_budget_submodular(chunks, max_tokens, *alpha)
+        }
         _ => enforce_budget_greedy(chunks, max_tokens),
     }
 }
@@ -332,6 +335,210 @@ fn enforce_budget_mmr(chunks: Vec<ContextChunk>, max_tokens: u32, lambda: f32) -
                 selected.push(chunk_idx);
             }
             None => break, // no more chunks fit
+        }
+    }
+
+    let selected_set: std::collections::HashSet<usize> = selected.iter().copied().collect();
+    let excluded: Vec<NodeId> = chunks
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !selected_set.contains(i))
+        .map(|(_, c)| c.node_id)
+        .collect();
+
+    let mut chunks_vec: Vec<Option<ContextChunk>> = chunks.into_iter().map(Some).collect();
+    let mut included: Vec<ContextChunk> = selected
+        .iter()
+        .filter_map(|&i| chunks_vec[i].take())
+        .collect();
+
+    sort_by_relevance(&mut included);
+
+    let budget_utilization = if max_tokens > 0 {
+        total_tokens as f32 / max_tokens as f32
+    } else {
+        0.0
+    };
+
+    BudgetResult {
+        included,
+        excluded,
+        total_tokens,
+        budget_utilization,
+    }
+}
+
+/// Submodular facility location budget enforcement.
+///
+/// Uses lazy greedy algorithm to maximize:
+///   F(S) = alpha * sum relevance(s) + (1-alpha) * sum_all max_{s in S} sim(chunk, s)
+///
+/// The second term (facility location) ensures selected chunks "cover" the
+/// space of all candidates -- each unchosen chunk is represented by its most
+/// similar chosen chunk.
+///
+/// Similarity uses label matching (same label = 1.0, different = 0.0) since
+/// ContextChunks don't carry embedding vectors at budget time.
+///
+/// Provides (1 - 1/e) ~= 0.632 approximation guarantee via the greedy algorithm.
+fn enforce_budget_submodular(
+    chunks: Vec<ContextChunk>,
+    max_tokens: u32,
+    alpha: f32,
+) -> BudgetResult {
+    use std::collections::BinaryHeap;
+
+    let alpha = alpha.clamp(0.0, 1.0);
+    let n = chunks.len();
+
+    if n == 0 {
+        return BudgetResult {
+            included: Vec::new(),
+            excluded: Vec::new(),
+            total_tokens: 0,
+            budget_utilization: 0.0,
+        };
+    }
+
+    // Normalize relevance scores to [0, 1]
+    let max_rel = chunks
+        .iter()
+        .map(|c| c.relevance_score)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_rel = chunks
+        .iter()
+        .map(|c| c.relevance_score)
+        .fold(f32::INFINITY, f32::min);
+    let rel_range = max_rel - min_rel;
+
+    let norm_relevance: Vec<f32> = chunks
+        .iter()
+        .map(|c| {
+            if rel_range > f32::EPSILON {
+                (c.relevance_score - min_rel) / rel_range
+            } else {
+                1.0 // all equal
+            }
+        })
+        .collect();
+
+    // For each chunk j, track max similarity to the selected set S.
+    // With label-based similarity, this is 1.0 if any selected chunk shares
+    // j's label, 0.0 otherwise.
+    let mut max_sim_to_selected: Vec<f32> = vec![0.0; n];
+
+    // Track which labels are covered by the selected set.
+    let mut covered_labels: std::collections::HashSet<&str> = std::collections::HashSet::new();
+
+    // Pre-compute label group sizes for efficient coverage calculation.
+    let mut label_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for chunk in &chunks {
+        *label_counts.entry(chunk.label.as_str()).or_insert(0) += 1;
+    }
+
+    let mut selected: Vec<usize> = Vec::new();
+    let mut in_selected = vec![false; n];
+    let mut total_tokens: u32 = 0;
+
+    // Compute initial marginal gain for each chunk (with S = empty).
+    // Coverage term: adding chunk c covers all chunks with the same label.
+    // Since S is empty, max_sim_to_selected[j] = 0 for all j.
+    // So coverage gain = count of chunks with same label as c (including c itself).
+    let compute_marginal_gain = |c_idx: usize,
+                                  covered_labels: &std::collections::HashSet<&str>,
+                                  label_counts: &std::collections::HashMap<&str, usize>|
+     -> f32 {
+        let relevance_term = alpha * norm_relevance[c_idx];
+
+        // Coverage gain: how many chunks does c newly cover?
+        // A chunk j is newly covered if sim(c, j) > max_{s in S} sim(s, j).
+        // With label similarity: sim(c,j) = 1.0 if same label, else 0.0.
+        // max_{s in S} sim(s, j) = 1.0 if j's label is already covered, else 0.0.
+        // So c newly covers j iff same_label(c, j) AND j's label not yet covered.
+        let c_label = chunks[c_idx].label.as_str();
+        let coverage_gain = if covered_labels.contains(c_label) {
+            0.0
+        } else {
+            *label_counts.get(c_label).unwrap_or(&0) as f32
+        };
+
+        relevance_term + (1.0 - alpha) * coverage_gain
+    };
+
+    // BinaryHeap entry: (gain, chunk_index). Use an ordered float wrapper
+    // to avoid NaN issues with f32's lack of Ord.
+    #[derive(PartialEq)]
+    struct HeapEntry {
+        gain: f32,
+        index: usize,
+    }
+
+    impl Eq for HeapEntry {}
+
+    impl PartialOrd for HeapEntry {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    impl Ord for HeapEntry {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.gain
+                .partial_cmp(&other.gain)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }
+    }
+
+    // Initialize the heap with marginal gains computed against empty S.
+    let mut heap = BinaryHeap::new();
+    for i in 0..n {
+        let gain = compute_marginal_gain(i, &covered_labels, &label_counts);
+        heap.push(HeapEntry { gain, index: i });
+    }
+
+    while let Some(entry) = heap.pop() {
+        let c_idx = entry.index;
+
+        // Skip if already selected.
+        if in_selected[c_idx] {
+            continue;
+        }
+
+        // Skip if chunk won't fit in the budget.
+        if chunks[c_idx].token_count > 0 && total_tokens + chunks[c_idx].token_count > max_tokens {
+            continue;
+        }
+
+        // Recompute actual marginal gain with current S (lazy evaluation).
+        let actual_gain = compute_marginal_gain(c_idx, &covered_labels, &label_counts);
+
+        // Check if this is still the best: compare against the top of heap.
+        // If recomputed gain dropped below the next candidate's cached gain,
+        // push back and let the heap re-order.
+        if let Some(top) = heap.peek() {
+            if actual_gain < top.gain && !in_selected[top.index] {
+                heap.push(HeapEntry {
+                    gain: actual_gain,
+                    index: c_idx,
+                });
+                continue;
+            }
+        }
+
+        // This chunk provides the best marginal gain -- select it.
+        selected.push(c_idx);
+        in_selected[c_idx] = true;
+        total_tokens += chunks[c_idx].token_count;
+
+        // Update coverage: mark this chunk's label as covered.
+        let c_label = chunks[c_idx].label.as_str();
+        covered_labels.insert(c_label);
+
+        // Update max_sim_to_selected for all chunks with the same label.
+        for j in 0..n {
+            if chunks[j].label == chunks[c_idx].label {
+                max_sim_to_selected[j] = 1.0;
+            }
         }
     }
 
@@ -909,5 +1116,67 @@ mod tests {
             "Last should be -1.0, got {}",
             result.included[2].relevance_score
         );
+    }
+
+    // ── Submodular Facility Location tests ─────────────────────────────
+
+    #[test]
+    fn test_submodular_empty() {
+        let budget = TokenBudget {
+            max_tokens: 100,
+            allocation: TokenAllocation::SubmodularFacilityLocation { alpha: 0.5 },
+        };
+        let result = enforce_budget(Vec::new(), &budget);
+        assert!(result.included.is_empty());
+    }
+
+    #[test]
+    fn test_submodular_all_fit() {
+        let chunks = vec![
+            make_chunk(1, 0.9, 10),
+            make_chunk(2, 0.8, 10),
+        ];
+        let budget = TokenBudget {
+            max_tokens: 100,
+            allocation: TokenAllocation::SubmodularFacilityLocation { alpha: 0.5 },
+        };
+        let result = enforce_budget(chunks, &budget);
+        assert_eq!(result.included.len(), 2);
+    }
+
+    #[test]
+    fn test_submodular_diversity() {
+        // 4 entities, 1 relationship -- submodular should select across categories
+        let chunks = vec![
+            make_chunk_with_label(1, 0.95, 20, "entity"),
+            make_chunk_with_label(2, 0.90, 20, "entity"),
+            make_chunk_with_label(3, 0.85, 20, "entity"),
+            make_chunk_with_label(4, 0.80, 20, "entity"),
+            make_chunk_with_label(5, 0.50, 20, "relationship"),
+        ];
+        let budget = TokenBudget {
+            max_tokens: 60, // room for 3
+            allocation: TokenAllocation::SubmodularFacilityLocation { alpha: 0.3 },
+        };
+        let result = enforce_budget(chunks, &budget);
+        let ids: Vec<u64> = result.included.iter().map(|c| c.node_id).collect();
+        // Should include the relationship for coverage diversity
+        assert!(ids.contains(&5), "Submodular should include relationship for diversity, got {:?}", ids);
+        assert_eq!(result.included.len(), 3);
+    }
+
+    #[test]
+    fn test_submodular_alpha_1_prefers_relevance() {
+        let chunks = vec![
+            make_chunk_with_label(1, 0.95, 10, "entity"),
+            make_chunk_with_label(2, 0.10, 10, "relationship"),
+        ];
+        let budget = TokenBudget {
+            max_tokens: 10, // room for 1
+            allocation: TokenAllocation::SubmodularFacilityLocation { alpha: 1.0 },
+        };
+        let result = enforce_budget(chunks, &budget);
+        // Pure relevance -- should pick entity (0.95 > 0.10)
+        assert_eq!(result.included[0].node_id, 1);
     }
 }

@@ -283,6 +283,9 @@ pub enum TokenAllocation {
     /// Diversity-aware selection using Maximum Marginal Relevance (MMR).
     /// Lambda controls relevance vs diversity: 1.0 = pure relevance, 0.0 = pure diversity.
     DiversityAware { lambda: f32 },
+    /// Submodular facility location selection for maximum coverage.
+    /// Alpha balances relevance vs coverage: higher = more relevant, lower = more diverse.
+    SubmodularFacilityLocation { alpha: f32 },
 }
 
 /// Content categories for priority-based token allocation.
