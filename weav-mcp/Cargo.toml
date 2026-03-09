@@ -1,0 +1,22 @@
+[package]
+name = "weav-mcp"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "weav-mcp"
+path = "src/main.rs"
+
+[dependencies]
+weav-core = { path = "../weav-core" }
+weav-server = { path = "../weav-server" }
+weav-query = { path = "../weav-query" }
+rmcp = { version = "1.1", features = ["server", "macros", "transport-io"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+compact_str = { workspace = true }
+schemars = "1.0"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+anyhow = { workspace = true }

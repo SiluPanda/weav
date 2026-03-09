@@ -11,6 +11,7 @@ members = [
     "weav-server",
     "weav-proto",
     "weav-cli",
+    "weav-mcp",
     "benchmarks",
 ]
 

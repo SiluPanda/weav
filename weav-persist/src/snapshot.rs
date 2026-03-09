@@ -105,6 +105,9 @@ impl SnapshotEngine {
     }
 
     /// Save a snapshot to disk. Returns the path of the written file.
+    ///
+    /// Also writes a `.meta.json` sidecar file so `list_snapshots` can read
+    /// metadata without deserializing the full snapshot.
     pub fn save_snapshot(&self, snapshot: &FullSnapshot) -> io::Result<PathBuf> {
         fs::create_dir_all(&self.data_dir)?;
 
@@ -121,6 +124,20 @@ impl SnapshotEngine {
         let mut file = File::create(&path)?;
         file.write_all(&data)?;
         file.sync_all()?;
+
+        // Write metadata sidecar for fast listing
+        let meta_path = self.data_dir.join(format!("snapshot-{}.meta.json", snapshot.meta.created_at));
+        let meta_json = serde_json::json!({
+            "created_at": snapshot.meta.created_at,
+            "size_bytes": data.len() as u64,
+            "node_count": snapshot.meta.node_count,
+            "edge_count": snapshot.meta.edge_count,
+            "graph_count": snapshot.meta.graph_count,
+            "wal_sequence": snapshot.meta.wal_sequence,
+        });
+        if let Ok(json_str) = serde_json::to_string(&meta_json) {
+            let _ = fs::write(&meta_path, json_str);
+        }
 
         Ok(path)
     }
@@ -166,17 +183,34 @@ impl SnapshotEngine {
                 continue;
             }
 
-            // Try to load the snapshot to extract its metadata.
+            // Try sidecar metadata first (fast path), fall back to full deserialization
+            let meta_path = path.with_extension("meta.json");
+            if meta_path.exists() {
+                if let Ok(json_str) = fs::read_to_string(&meta_path) {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                        snapshots.push(SnapshotMeta {
+                            path: path.clone(),
+                            created_at: val["created_at"].as_u64().unwrap_or(0),
+                            size_bytes: val["size_bytes"].as_u64().unwrap_or(entry.metadata()?.len()),
+                            node_count: val["node_count"].as_u64().unwrap_or(0),
+                            edge_count: val["edge_count"].as_u64().unwrap_or(0),
+                            graph_count: val["graph_count"].as_u64().unwrap_or(0) as u32,
+                            wal_sequence: val["wal_sequence"].as_u64().unwrap_or(0),
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            // Fallback: load full snapshot to extract metadata (slow path)
             match self.load_snapshot(&path) {
                 Ok(snap) => {
                     let mut meta = snap.meta;
-                    // Ensure the path in meta matches the actual on-disk path.
                     meta.path = path;
                     meta.size_bytes = entry.metadata()?.len();
                     snapshots.push(meta);
                 }
                 Err(_) => {
-                    // Skip corrupted snapshot files.
                     continue;
                 }
             }
