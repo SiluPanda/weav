@@ -3,6 +3,7 @@
 //! Provides a thread-safe interface for executing commands against graphs.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use parking_lot::{Mutex, RwLock};
@@ -99,9 +100,13 @@ pub struct GraphState {
 
 // ─── Engine ──────────────────────────────────────────────────────────────────
 
-/// The main Weav engine, holding all graphs. Thread-safe via RwLock.
+/// The main Weav engine, holding all graphs. Thread-safe via per-graph RwLock.
+///
+/// The outer `RwLock` protects the registry (graph creation/drop). The inner
+/// per-graph `Arc<RwLock<GraphState>>` allows concurrent operations on
+/// different graphs without contention.
 pub struct Engine {
-    graphs: RwLock<HashMap<String, GraphState>>,
+    graphs: RwLock<HashMap<String, Arc<RwLock<GraphState>>>>,
     next_graph_id: RwLock<GraphId>,
     token_counter: TokenCounter,
     config: WeavConfig,
@@ -164,11 +169,13 @@ impl Engine {
             .as_millis() as u64
     }
 
-    fn append_wal(&self, op: WalOperation) {
+    fn append_wal(&self, op: WalOperation) -> WeavResult<()> {
         if let Some(ref wal_mutex) = self.wal {
             let mut wal = wal_mutex.lock();
-            let _ = wal.append(0, op);
+            wal.append(0, op)
+                .map_err(|e| WeavError::PersistenceError(format!("WAL write failed: {e}")))?;
         }
+        Ok(())
     }
 
     /// Force-sync the WAL file to disk. Called periodically for EverySecond mode.
@@ -182,6 +189,20 @@ impl Engine {
     /// Return the configured WAL sync mode.
     pub fn wal_sync_mode(&self) -> &weav_core::config::WalSyncMode {
         &self.config.persistence.wal_sync_mode
+    }
+
+    /// Look up a graph by name, returning a cloned `Arc` to its per-graph lock.
+    ///
+    /// The outer registry lock is held only for the duration of the HashMap
+    /// lookup (nanoseconds). Callers then acquire the inner per-graph lock
+    /// for the duration of their operation, allowing different graphs to be
+    /// read/written concurrently.
+    fn get_graph(&self, name: &str) -> WeavResult<Arc<RwLock<GraphState>>> {
+        let registry = self.graphs.read();
+        registry
+            .get(name)
+            .cloned()
+            .ok_or_else(|| WeavError::GraphNotFound(name.to_string()))
     }
 
     /// Recover state from a RecoveryResult (snapshot + WAL entries).
@@ -292,17 +313,22 @@ impl Engine {
                 }
 
                 let mut graphs = self.graphs.write();
-                graphs.insert(gs.graph_name.clone(), state);
+                graphs.insert(gs.graph_name.clone(), Arc::new(RwLock::new(state)));
             }
         }
 
         // Step 2: Replay WAL entries.
         for entry in &result.wal_entries {
             match &entry.operation {
-                WalOperation::GraphCreate { name, .. } => {
+                WalOperation::GraphCreate { name, config_json } => {
+                    let config = if config_json.is_empty() || config_json == "{}" {
+                        None
+                    } else {
+                        serde_json::from_str(config_json).ok()
+                    };
                     let cmd = weav_query::parser::GraphCreateCmd {
                         name: name.clone(),
-                        config: None,
+                        config,
                     };
                     let _ = self.handle_graph_create(cmd);
                 }
@@ -319,11 +345,18 @@ impl Engine {
                 } => {
                     // Find graph by ID - we need to find the name
                     // For WAL replay, we use the graph_id to find the graph name
-                    let graphs = self.graphs.read();
-                    let graph_name = graphs.values()
-                        .find(|gs| gs.graph_id == entry.operation.graph_id_hint())
-                        .map(|gs| gs.name.clone());
-                    drop(graphs);
+                    let graph_name = {
+                        let registry = self.graphs.read();
+                        registry.values()
+                            .find_map(|arc| {
+                                let gs = arc.read();
+                                if gs.graph_id == entry.operation.graph_id_hint() {
+                                    Some(gs.name.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                    };
                     if let Some(name) = graph_name {
                         let mut props = Vec::new();
                         if !properties_json.is_empty() && properties_json != "{}" {
@@ -350,8 +383,13 @@ impl Engine {
                     node_id,
                     properties_json,
                 } => {
-                    let mut graphs = self.graphs.write();
-                    if let Some(gs) = graphs.values_mut().find(|gs| gs.graph_id == *graph_id) {
+                    let registry = self.graphs.read();
+                    let graph_arc = registry.values()
+                        .find(|arc| arc.read().graph_id == *graph_id)
+                        .cloned();
+                    drop(registry);
+                    if let Some(graph_arc) = graph_arc {
+                        let mut gs = graph_arc.write();
                         if gs.adjacency.has_node(*node_id) {
                             if !properties_json.is_empty() && properties_json != "{}" {
                                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(properties_json) {
@@ -372,8 +410,13 @@ impl Engine {
                     graph_id,
                     node_id,
                 } => {
-                    let mut graphs = self.graphs.write();
-                    if let Some(gs) = graphs.values_mut().find(|gs| gs.graph_id == *graph_id) {
+                    let registry = self.graphs.read();
+                    let graph_arc = registry.values()
+                        .find(|arc| arc.read().graph_id == *graph_id)
+                        .cloned();
+                    drop(registry);
+                    if let Some(graph_arc) = graph_arc {
+                        let mut gs = graph_arc.write();
                         if gs.adjacency.has_node(*node_id) {
                             let _ = gs.adjacency.remove_node(*node_id);
                             gs.properties.remove_all_node_properties(*node_id);
@@ -389,8 +432,13 @@ impl Engine {
                     label,
                     weight,
                 } => {
-                    let mut graphs = self.graphs.write();
-                    if let Some(gs) = graphs.values_mut().find(|gs| gs.graph_id == *graph_id) {
+                    let registry = self.graphs.read();
+                    let graph_arc = registry.values()
+                        .find(|arc| arc.read().graph_id == *graph_id)
+                        .cloned();
+                    drop(registry);
+                    if let Some(graph_arc) = graph_arc {
+                        let mut gs = graph_arc.write();
                         if let Ok(label_id) = gs.interner.intern_label(label) {
                             let now = Self::now_ms();
                             let meta = EdgeMeta {
@@ -414,8 +462,13 @@ impl Engine {
                     edge_id,
                     timestamp,
                 } => {
-                    let mut graphs = self.graphs.write();
-                    if let Some(gs) = graphs.values_mut().find(|gs| gs.graph_id == *graph_id) {
+                    let registry = self.graphs.read();
+                    let graph_arc = registry.values()
+                        .find(|arc| arc.read().graph_id == *graph_id)
+                        .cloned();
+                    drop(registry);
+                    if let Some(graph_arc) = graph_arc {
+                        let mut gs = graph_arc.write();
                         let _ = gs.adjacency.invalidate_edge(*edge_id, *timestamp);
                     }
                 }
@@ -423,8 +476,13 @@ impl Engine {
                     graph_id,
                     edge_id,
                 } => {
-                    let mut graphs = self.graphs.write();
-                    if let Some(gs) = graphs.values_mut().find(|gs| gs.graph_id == *graph_id) {
+                    let registry = self.graphs.read();
+                    let graph_arc = registry.values()
+                        .find(|arc| arc.read().graph_id == *graph_id)
+                        .cloned();
+                    drop(registry);
+                    if let Some(graph_arc) = graph_arc {
+                        let mut gs = graph_arc.write();
                         let _ = gs.adjacency.remove_edge(*edge_id);
                     }
                 }
@@ -433,8 +491,13 @@ impl Engine {
                     node_id,
                     vector,
                 } => {
-                    let mut graphs = self.graphs.write();
-                    if let Some(gs) = graphs.values_mut().find(|gs| gs.graph_id == *graph_id) {
+                    let registry = self.graphs.read();
+                    let graph_arc = registry.values()
+                        .find(|arc| arc.read().graph_id == *graph_id)
+                        .cloned();
+                    drop(registry);
+                    if let Some(graph_arc) = graph_arc {
+                        let mut gs = graph_arc.write();
                         let _ = gs.vector_index.remove(*node_id);
                         let _ = gs.vector_index.insert(*node_id, vector);
                     }
@@ -523,23 +586,23 @@ impl Engine {
                     .read()
                     .len()
             ))),
-            Command::Stats(graph_name) => self.handle_stats(graph_name),
+            Command::Stats(graph_name) => self.handle_stats(graph_name, identity),
             Command::Snapshot => self.handle_snapshot(),
-            Command::GraphCreate(cmd) => self.handle_graph_create(cmd),
-            Command::GraphDrop(name) => self.handle_graph_drop(&name),
-            Command::GraphInfo(name) => self.handle_graph_info(&name),
+            Command::GraphCreate(cmd) => self.handle_graph_create_authed(cmd, identity),
+            Command::GraphDrop(name) => self.handle_graph_drop_authed(&name, identity),
+            Command::GraphInfo(name) => self.handle_graph_info_authed(&name, identity),
             Command::GraphList => self.handle_graph_list(),
-            Command::NodeAdd(cmd) => self.handle_node_add(cmd),
-            Command::NodeGet(cmd) => self.handle_node_get(cmd),
-            Command::NodeUpdate(cmd) => self.handle_node_update(cmd),
-            Command::NodeDelete(cmd) => self.handle_node_delete(cmd),
-            Command::EdgeAdd(cmd) => self.handle_edge_add(cmd),
-            Command::EdgeInvalidate(cmd) => self.handle_edge_invalidate(cmd),
-            Command::BulkInsertNodes(cmd) => self.handle_bulk_insert_nodes(cmd),
-            Command::BulkInsertEdges(cmd) => self.handle_bulk_insert_edges(cmd),
-            Command::Context(query) => self.handle_context(query),
-            Command::EdgeDelete(cmd) => self.handle_edge_delete(cmd),
-            Command::EdgeGet(cmd) => self.handle_edge_get(cmd),
+            Command::NodeAdd(cmd) => self.handle_node_add_authed(cmd, identity),
+            Command::NodeGet(cmd) => self.handle_node_get_authed(cmd, identity),
+            Command::NodeUpdate(cmd) => self.handle_node_update_authed(cmd, identity),
+            Command::NodeDelete(cmd) => self.handle_node_delete_authed(cmd, identity),
+            Command::EdgeAdd(cmd) => self.handle_edge_add_authed(cmd, identity),
+            Command::EdgeInvalidate(cmd) => self.handle_edge_invalidate_authed(cmd, identity),
+            Command::BulkInsertNodes(cmd) => self.handle_bulk_insert_nodes_authed(cmd, identity),
+            Command::BulkInsertEdges(cmd) => self.handle_bulk_insert_edges_authed(cmd, identity),
+            Command::Context(query) => self.handle_context_authed(query, identity),
+            Command::EdgeDelete(cmd) => self.handle_edge_delete_authed(cmd, identity),
+            Command::EdgeGet(cmd) => self.handle_edge_get_authed(cmd, identity),
             Command::ConfigSet(key, value) => self.handle_config_set(key, value),
             Command::ConfigGet(key) => self.handle_config_get(key),
             Command::Auth { username, password } => self.handle_auth(username, password),
@@ -577,6 +640,12 @@ impl Engine {
                         )?;
                     }
                 }
+                // Defense-in-depth: verify write permission on the target graph.
+                self.check_permission(
+                    identity,
+                    &ingest_cmd.graph,
+                    weav_auth::identity::GraphPermission::ReadWrite,
+                )?;
                 self.handle_ingest(ingest_cmd).await
             }
             other => self.execute_command(other, identity),
@@ -584,6 +653,13 @@ impl Engine {
     }
 
     /// Check authorization for a command against the user's identity.
+    ///
+    /// This is the centralized auth gate invoked at the `execute_command` entry
+    /// point. It enforces both command-category permissions and graph-level
+    /// permissions with three tiers:
+    ///   - Admin operations (GraphCreate, GraphDrop) require `Admin` graph permission
+    ///   - Write operations (NodeAdd, EdgeAdd, ...) require `ReadWrite` graph permission
+    ///   - Read operations (NodeGet, Context, ...) require `Read` graph permission
     fn check_authorization(
         &self,
         cmd: &Command,
@@ -616,27 +692,88 @@ impl Engine {
         }
 
         // Check graph-level permission for commands that target a specific graph.
+        // Use three-tier checks to prevent privilege escalation:
+        //   Admin commands  -> can_admin_graph  (GraphPermission::Admin)
+        //   Write commands  -> can_write_graph  (GraphPermission::ReadWrite)
+        //   Read commands   -> can_read_graph   (GraphPermission::Read)
         let graph_name = self.extract_graph_name_from_cmd(cmd);
         if let Some(ref graph) = graph_name {
-            let needs_write = matches!(
-                category,
-                CommandCategory::Write | CommandCategory::Admin
-            );
-            if needs_write {
-                if !identity.permissions.can_write_graph(graph) {
-                    return Err(WeavError::PermissionDenied(format!(
-                        "user '{}' lacks write access to graph '{}'",
-                        identity.username, graph
-                    )));
+            match category {
+                CommandCategory::Admin => {
+                    if !identity.permissions.can_admin_graph(graph) {
+                        return Err(WeavError::PermissionDenied(format!(
+                            "user '{}' lacks admin access to graph '{}'",
+                            identity.username, graph
+                        )));
+                    }
                 }
-            } else if !identity.permissions.can_read_graph(graph) {
-                return Err(WeavError::PermissionDenied(format!(
-                    "user '{}' lacks read access to graph '{}'",
-                    identity.username, graph
-                )));
+                CommandCategory::Write => {
+                    if !identity.permissions.can_write_graph(graph) {
+                        return Err(WeavError::PermissionDenied(format!(
+                            "user '{}' lacks write access to graph '{}'",
+                            identity.username, graph
+                        )));
+                    }
+                }
+                _ => {
+                    if !identity.permissions.can_read_graph(graph) {
+                        return Err(WeavError::PermissionDenied(format!(
+                            "user '{}' lacks read access to graph '{}'",
+                            identity.username, graph
+                        )));
+                    }
+                }
             }
         }
 
+        Ok(())
+    }
+
+    /// Defense-in-depth permission check for use inside individual handlers.
+    ///
+    /// Returns `Ok(())` immediately when:
+    ///   - Auth is not enabled in the config, OR
+    ///   - Auth does not require authentication (unauthenticated access allowed), OR
+    ///   - No identity is provided (e.g. during WAL recovery)
+    ///
+    /// When auth is active and an identity is present, verifies the user holds
+    /// at least `required` permission on `graph_name`.
+    fn check_permission(
+        &self,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+        graph_name: &str,
+        required: weav_auth::identity::GraphPermission,
+    ) -> WeavResult<()> {
+        if !self.config.auth.enabled || !self.config.auth.require_auth {
+            return Ok(());
+        }
+        let id = match identity {
+            Some(id) => id,
+            None => {
+                // Auth required but no identity — this is an error when
+                // reached through a user-facing path. During recovery the
+                // config has auth disabled so we never get here.
+                return Err(WeavError::AuthenticationRequired);
+            }
+        };
+        let has_perm = match required {
+            weav_auth::identity::GraphPermission::Admin => {
+                id.permissions.can_admin_graph(graph_name)
+            }
+            weav_auth::identity::GraphPermission::ReadWrite => {
+                id.permissions.can_write_graph(graph_name)
+            }
+            weav_auth::identity::GraphPermission::Read => {
+                id.permissions.can_read_graph(graph_name)
+            }
+            weav_auth::identity::GraphPermission::None => true,
+        };
+        if !has_perm {
+            return Err(WeavError::PermissionDenied(format!(
+                "insufficient permission on graph '{}'",
+                graph_name
+            )));
+        }
         Ok(())
     }
 
@@ -662,17 +799,153 @@ impl Engine {
         }
     }
 
+    // ── Authed handler wrappers ─────────────────────────────────────────
+    //
+    // These thin wrappers enforce defense-in-depth graph-level permission
+    // checks before delegating to the original handler. The original handlers
+    // (without `_authed` suffix) remain callable without identity for WAL
+    // recovery and internal use.
+
+    fn handle_graph_create_authed(
+        &self,
+        cmd: weav_query::parser::GraphCreateCmd,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
+        self.check_permission(identity, &cmd.name, weav_auth::identity::GraphPermission::Admin)?;
+        self.handle_graph_create(cmd)
+    }
+
+    fn handle_graph_drop_authed(
+        &self,
+        name: &str,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
+        self.check_permission(identity, name, weav_auth::identity::GraphPermission::Admin)?;
+        self.handle_graph_drop(name)
+    }
+
+    fn handle_graph_info_authed(
+        &self,
+        name: &str,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
+        self.check_permission(identity, name, weav_auth::identity::GraphPermission::Read)?;
+        self.handle_graph_info(name)
+    }
+
+    fn handle_node_add_authed(
+        &self,
+        cmd: weav_query::parser::NodeAddCmd,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
+        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::ReadWrite)?;
+        self.handle_node_add(cmd)
+    }
+
+    fn handle_node_get_authed(
+        &self,
+        cmd: weav_query::parser::NodeGetCmd,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
+        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::Read)?;
+        self.handle_node_get(cmd)
+    }
+
+    fn handle_node_update_authed(
+        &self,
+        cmd: weav_query::parser::NodeUpdateCmd,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
+        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::ReadWrite)?;
+        self.handle_node_update(cmd)
+    }
+
+    fn handle_node_delete_authed(
+        &self,
+        cmd: weav_query::parser::NodeDeleteCmd,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
+        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::ReadWrite)?;
+        self.handle_node_delete(cmd)
+    }
+
+    fn handle_edge_add_authed(
+        &self,
+        cmd: weav_query::parser::EdgeAddCmd,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
+        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::ReadWrite)?;
+        self.handle_edge_add(cmd)
+    }
+
+    fn handle_edge_invalidate_authed(
+        &self,
+        cmd: weav_query::parser::EdgeInvalidateCmd,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
+        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::ReadWrite)?;
+        self.handle_edge_invalidate(cmd)
+    }
+
+    fn handle_edge_delete_authed(
+        &self,
+        cmd: weav_query::parser::EdgeDeleteCmd,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
+        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::ReadWrite)?;
+        self.handle_edge_delete(cmd)
+    }
+
+    fn handle_edge_get_authed(
+        &self,
+        cmd: weav_query::parser::EdgeGetCmd,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
+        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::Read)?;
+        self.handle_edge_get(cmd)
+    }
+
+    fn handle_bulk_insert_nodes_authed(
+        &self,
+        cmd: weav_query::parser::BulkInsertNodesCmd,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
+        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::ReadWrite)?;
+        self.handle_bulk_insert_nodes(cmd)
+    }
+
+    fn handle_bulk_insert_edges_authed(
+        &self,
+        cmd: weav_query::parser::BulkInsertEdgesCmd,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
+        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::ReadWrite)?;
+        self.handle_bulk_insert_edges(cmd)
+    }
+
+    fn handle_context_authed(
+        &self,
+        query: weav_query::parser::ContextQuery,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
+        self.check_permission(identity, &query.graph, weav_auth::identity::GraphPermission::Read)?;
+        self.handle_context(query)
+    }
+
     // ── Stats ────────────────────────────────────────────────────────────
 
-    fn handle_stats(&self, graph_name: Option<String>) -> WeavResult<CommandResponse> {
-        let graphs = self
-            .graphs
-            .read();
+    fn handle_stats(
+        &self,
+        graph_name: Option<String>,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
+        if let Some(ref name) = graph_name {
+            self.check_permission(identity, name, weav_auth::identity::GraphPermission::Read)?;
+        }
 
         if let Some(name) = graph_name {
-            let gs = graphs
-                .get(&name)
-                .ok_or_else(|| WeavError::GraphNotFound(name.clone()))?;
+            let graph_arc = self.get_graph(&name)?;
+            let gs = graph_arc.read();
             Ok(CommandResponse::Text(format!(
                 "graph={} nodes={} edges={} vectors={}",
                 name,
@@ -681,9 +954,10 @@ impl Engine {
                 gs.vector_index.len(),
             )))
         } else {
+            let registry = self.graphs.read();
             Ok(CommandResponse::Text(format!(
                 "graphs={} engine=weav-server",
-                graphs.len(),
+                registry.len(),
             )))
         }
     }
@@ -699,6 +973,7 @@ impl Engine {
             gc.vector_dimensions = self.config.engine.default_vector_dimensions;
             gc
         });
+        let config_json = serde_json::to_string(&graph_config).unwrap_or_default();
 
         let vec_config = VectorConfig {
             dimensions: graph_config.vector_dimensions,
@@ -747,9 +1022,9 @@ impl Engine {
         // Write-ahead: WAL entry before in-memory mutation
         self.append_wal(WalOperation::GraphCreate {
             name: cmd.name.clone(),
-            config_json: "{}".to_string(),
-        });
-        graphs.insert(cmd.name, graph_state);
+            config_json,
+        })?;
+        graphs.insert(cmd.name, Arc::new(RwLock::new(graph_state)));
         Ok(CommandResponse::Ok)
     }
 
@@ -761,18 +1036,14 @@ impl Engine {
             return Err(WeavError::GraphNotFound(name.to_string()));
         }
         // Write-ahead: WAL entry before in-memory mutation
-        self.append_wal(WalOperation::GraphDrop { name: name.to_string() });
+        self.append_wal(WalOperation::GraphDrop { name: name.to_string() })?;
         graphs.remove(name);
         Ok(CommandResponse::Ok)
     }
 
     fn handle_graph_info(&self, name: &str) -> WeavResult<CommandResponse> {
-        let graphs = self
-            .graphs
-            .read();
-        let gs = graphs
-            .get(name)
-            .ok_or_else(|| WeavError::GraphNotFound(name.to_string()))?;
+        let graph_arc = self.get_graph(name)?;
+        let gs = graph_arc.read();
         Ok(CommandResponse::GraphInfo(GraphInfoResponse {
             name: gs.name.clone(),
             node_count: gs.adjacency.node_count(),
@@ -781,10 +1052,8 @@ impl Engine {
     }
 
     fn handle_graph_list(&self) -> WeavResult<CommandResponse> {
-        let graphs = self
-            .graphs
-            .read();
-        let names: Vec<String> = graphs.keys().cloned().collect();
+        let registry = self.graphs.read();
+        let names: Vec<String> = registry.keys().cloned().collect();
         Ok(CommandResponse::StringList(names))
     }
 
@@ -794,12 +1063,8 @@ impl Engine {
         &self,
         cmd: weav_query::parser::NodeAddCmd,
     ) -> WeavResult<CommandResponse> {
-        let mut graphs = self
-            .graphs
-            .write();
-        let gs = graphs
-            .get_mut(&cmd.graph)
-            .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
+        let graph_arc = self.get_graph(&cmd.graph)?;
+        let mut gs = graph_arc.write();
 
         // ── Dedup: entity key (always-on, zero false positives) ─────────
         if let Some(ref key) = cmd.entity_key {
@@ -905,7 +1170,7 @@ impl Engine {
 
         // Write-ahead: WAL entry before in-memory mutation
         let props_json = serde_json::to_string(
-            &cmd.properties.iter().map(|(k, v)| (k.clone(), format!("{v:?}"))).collect::<Vec<_>>()
+            &cmd.properties.iter().map(|(k, v)| (k.as_str(), v)).collect::<std::collections::HashMap<_, _>>()
         ).unwrap_or_default();
         self.append_wal(WalOperation::NodeAdd {
             graph_id,
@@ -914,7 +1179,7 @@ impl Engine {
             properties_json: props_json,
             embedding: cmd.embedding.clone(),
             entity_key: cmd.entity_key.clone(),
-        });
+        })?;
 
         // Apply in-memory mutation
         gs.adjacency.add_node(node_id);
@@ -952,12 +1217,8 @@ impl Engine {
         &self,
         cmd: weav_query::parser::NodeGetCmd,
     ) -> WeavResult<CommandResponse> {
-        let graphs = self
-            .graphs
-            .read();
-        let gs = graphs
-            .get(&cmd.graph)
-            .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
+        let graph_arc = self.get_graph(&cmd.graph)?;
+        let gs = graph_arc.read();
 
         let node_id = if let Some(id) = cmd.node_id {
             id
@@ -1007,12 +1268,8 @@ impl Engine {
         &self,
         cmd: weav_query::parser::NodeDeleteCmd,
     ) -> WeavResult<CommandResponse> {
-        let mut graphs = self
-            .graphs
-            .write();
-        let gs = graphs
-            .get_mut(&cmd.graph)
-            .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
+        let graph_arc = self.get_graph(&cmd.graph)?;
+        let mut gs = graph_arc.write();
 
         if !gs.adjacency.has_node(cmd.node_id) {
             return Err(WeavError::NodeNotFound(cmd.node_id, gs.graph_id));
@@ -1023,7 +1280,7 @@ impl Engine {
         self.append_wal(WalOperation::NodeDelete {
             graph_id,
             node_id: cmd.node_id,
-        });
+        })?;
 
         // Apply in-memory mutation
         gs.adjacency.remove_node(cmd.node_id)?;
@@ -1037,12 +1294,8 @@ impl Engine {
         &self,
         cmd: weav_query::parser::NodeUpdateCmd,
     ) -> WeavResult<CommandResponse> {
-        let mut graphs = self
-            .graphs
-            .write();
-        let gs = graphs
-            .get_mut(&cmd.graph)
-            .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
+        let graph_arc = self.get_graph(&cmd.graph)?;
+        let mut gs = graph_arc.write();
 
         if !gs.adjacency.has_node(cmd.node_id) {
             return Err(WeavError::NodeNotFound(cmd.node_id, gs.graph_id));
@@ -1050,11 +1303,14 @@ impl Engine {
 
         // Write-ahead: WAL entry before in-memory mutation
         let graph_id = gs.graph_id;
+        let props_json = serde_json::to_string(
+            &cmd.properties.iter().map(|(k, v)| (k.as_str(), v)).collect::<std::collections::HashMap<_, _>>()
+        ).unwrap_or_default();
         self.append_wal(WalOperation::NodeUpdate {
             graph_id,
             node_id: cmd.node_id,
-            properties_json: "{}".to_string(),
-        });
+            properties_json: props_json,
+        })?;
 
         // Apply in-memory mutation
         for (k, v) in &cmd.properties {
@@ -1073,17 +1329,27 @@ impl Engine {
         &self,
         cmd: weav_query::parser::BulkInsertNodesCmd,
     ) -> WeavResult<CommandResponse> {
-        let mut graphs = self
-            .graphs
-            .write();
-        let gs = graphs
-            .get_mut(&cmd.graph)
-            .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
+        let graph_arc = self.get_graph(&cmd.graph)?;
+        let mut gs = graph_arc.write();
 
+        let graph_id = gs.graph_id;
         let mut ids = Vec::with_capacity(cmd.nodes.len());
         for node_cmd in &cmd.nodes {
             let node_id = gs.next_node_id;
             gs.next_node_id += 1;
+
+            // Write-ahead: WAL entry before in-memory mutation
+            let props_json = serde_json::to_string(
+                &node_cmd.properties.iter().map(|(k, v)| (k.as_str(), v)).collect::<std::collections::HashMap<_, _>>()
+            ).unwrap_or_default();
+            self.append_wal(WalOperation::NodeAdd {
+                graph_id,
+                node_id,
+                label: node_cmd.label.clone(),
+                properties_json: props_json,
+                embedding: node_cmd.embedding.clone(),
+                entity_key: node_cmd.entity_key.clone(),
+            })?;
 
             gs.adjacency.add_node(node_id);
 
@@ -1123,18 +1389,30 @@ impl Engine {
         &self,
         cmd: weav_query::parser::BulkInsertEdgesCmd,
     ) -> WeavResult<CommandResponse> {
-        let mut graphs = self
-            .graphs
-            .write();
-        let gs = graphs
-            .get_mut(&cmd.graph)
-            .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
+        let graph_arc = self.get_graph(&cmd.graph)?;
+        let mut gs = graph_arc.write();
 
         let now = Self::now_ms();
+        let graph_id = gs.graph_id;
 
         let mut ids = Vec::with_capacity(cmd.edges.len());
         for edge_cmd in &cmd.edges {
             let label_id = gs.interner.intern_label(&edge_cmd.label)?;
+
+            // Pre-allocate edge ID for write-ahead logging
+            let edge_id = gs.adjacency.allocate_edge_id();
+
+            // Write-ahead: WAL entry before in-memory mutation
+            self.append_wal(WalOperation::EdgeAdd {
+                graph_id,
+                edge_id,
+                source: edge_cmd.source,
+                target: edge_cmd.target,
+                label: edge_cmd.label.clone(),
+                weight: edge_cmd.weight,
+            })?;
+
+            // Apply in-memory mutation
             let meta = EdgeMeta {
                 source: edge_cmd.source,
                 target: edge_cmd.target,
@@ -1144,9 +1422,7 @@ impl Engine {
                 weight: edge_cmd.weight,
                 token_cost: 0,
             };
-            let edge_id = gs
-                .adjacency
-                .add_edge(edge_cmd.source, edge_cmd.target, label_id, meta)?;
+            gs.adjacency.add_edge_with_id(edge_cmd.source, edge_cmd.target, label_id, meta, edge_id)?;
             ids.push(edge_id);
         }
 
@@ -1159,12 +1435,8 @@ impl Engine {
         &self,
         cmd: weav_query::parser::EdgeAddCmd,
     ) -> WeavResult<CommandResponse> {
-        let mut graphs = self
-            .graphs
-            .write();
-        let gs = graphs
-            .get_mut(&cmd.graph)
-            .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
+        let graph_arc = self.get_graph(&cmd.graph)?;
+        let mut gs = graph_arc.write();
 
         let label_id = gs.interner.intern_label(&cmd.label)?;
         let now = Self::now_ms();
@@ -1181,7 +1453,7 @@ impl Engine {
             target: cmd.target,
             label: cmd.label.clone(),
             weight: cmd.weight,
-        });
+        })?;
 
         // Apply in-memory mutation
         let meta = EdgeMeta {
@@ -1202,12 +1474,8 @@ impl Engine {
         &self,
         cmd: weav_query::parser::EdgeInvalidateCmd,
     ) -> WeavResult<CommandResponse> {
-        let mut graphs = self
-            .graphs
-            .write();
-        let gs = graphs
-            .get_mut(&cmd.graph)
-            .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
+        let graph_arc = self.get_graph(&cmd.graph)?;
+        let mut gs = graph_arc.write();
 
         let now = Self::now_ms();
         let graph_id = gs.graph_id;
@@ -1221,7 +1489,7 @@ impl Engine {
             graph_id,
             edge_id: cmd.edge_id,
             timestamp: now,
-        });
+        })?;
 
         gs.adjacency.invalidate_edge(cmd.edge_id, now)?;
 
@@ -1232,12 +1500,8 @@ impl Engine {
         &self,
         cmd: weav_query::parser::EdgeDeleteCmd,
     ) -> WeavResult<CommandResponse> {
-        let mut graphs = self
-            .graphs
-            .write();
-        let gs = graphs
-            .get_mut(&cmd.graph)
-            .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
+        let graph_arc = self.get_graph(&cmd.graph)?;
+        let mut gs = graph_arc.write();
 
         let graph_id = gs.graph_id;
 
@@ -1249,7 +1513,7 @@ impl Engine {
         self.append_wal(WalOperation::EdgeDelete {
             graph_id,
             edge_id: cmd.edge_id,
-        });
+        })?;
 
         gs.adjacency.remove_edge(cmd.edge_id)?;
 
@@ -1260,12 +1524,8 @@ impl Engine {
         &self,
         cmd: weav_query::parser::EdgeGetCmd,
     ) -> WeavResult<CommandResponse> {
-        let graphs = self
-            .graphs
-            .read();
-        let gs = graphs
-            .get(&cmd.graph)
-            .ok_or_else(|| WeavError::GraphNotFound(cmd.graph.clone()))?;
+        let graph_arc = self.get_graph(&cmd.graph)?;
+        let gs = graph_arc.read();
 
         let meta = gs
             .adjacency
@@ -1313,9 +1573,7 @@ impl Engine {
             None => return Ok(CommandResponse::Ok), // Persistence not enabled
         };
 
-        let graphs = self
-            .graphs
-            .read();
+        let registry = self.graphs.read();
 
         let wal_sequence = self.wal.as_ref()
             .map(|w| w.lock().sequence_number())
@@ -1325,7 +1583,8 @@ impl Engine {
         let mut total_nodes: u64 = 0;
         let mut total_edges: u64 = 0;
 
-        for gs in graphs.values() {
+        for graph_arc in registry.values() {
+            let gs = graph_arc.read();
             let mut node_snapshots = Vec::new();
             for node_id in gs.adjacency.all_node_ids() {
                 let label = gs.properties
@@ -1336,13 +1595,11 @@ impl Engine {
 
                 let all_props = gs.properties.get_all_node_properties(node_id);
                 let props_json = {
-                    let mut map = serde_json::Map::new();
-                    for (k, v) in &all_props {
-                        if !k.starts_with('_') {
-                            map.insert(k.to_string(), serde_json::json!(format!("{v:?}")));
-                        }
-                    }
-                    serde_json::to_string(&map).unwrap_or_default()
+                    let filtered: std::collections::HashMap<&str, &Value> = all_props
+                        .into_iter()
+                        .filter(|(k, _)| !k.starts_with('_'))
+                        .collect();
+                    serde_json::to_string(&filtered).unwrap_or_default()
                 };
 
                 let entity_key = gs.properties
@@ -1387,7 +1644,7 @@ impl Engine {
             graph_snapshots.push(GraphSnapshot {
                 graph_id: gs.graph_id,
                 graph_name: gs.name.clone(),
-                config_json: "{}".to_string(),
+                config_json: serde_json::to_string(&gs.config).unwrap_or_default(),
                 nodes: node_snapshots,
                 edges: edge_snapshots,
             });
@@ -1420,12 +1677,8 @@ impl Engine {
         &self,
         query: weav_query::parser::ContextQuery,
     ) -> WeavResult<CommandResponse> {
-        let graphs = self
-            .graphs
-            .read();
-        let gs = graphs
-            .get(&query.graph)
-            .ok_or_else(|| WeavError::GraphNotFound(query.graph.clone()))?;
+        let graph_arc = self.get_graph(&query.graph)?;
+        let gs = graph_arc.read();
 
         let result = executor::execute_context_query(
             &query,
@@ -1450,12 +1703,7 @@ impl Engine {
         }
 
         // Verify graph exists.
-        {
-            let graphs = self.graphs.read();
-            if !graphs.contains_key(&cmd.graph) {
-                return Err(WeavError::GraphNotFound(cmd.graph.clone()));
-            }
-        }
+        self.get_graph(&cmd.graph)?;
 
         // Parse format.
         let format = if let Some(ref fmt_str) = cmd.format {
@@ -1500,7 +1748,7 @@ impl Engine {
             chunks_count: result.stats.total_chunks,
             entities_count: result.stats.total_entities,
             relationships_count: result.stats.total_relationships,
-        });
+        })?;
 
         // Apply results to graph.
         let response = self.apply_extraction_result(&cmd.graph, &result)?;
@@ -1515,10 +1763,8 @@ impl Engine {
         graph_name: &str,
         result: &weav_extract::types::ExtractionResult,
     ) -> WeavResult<CommandResponse> {
-        let mut graphs = self.graphs.write();
-        let gs = graphs
-            .get_mut(graph_name)
-            .ok_or_else(|| WeavError::GraphNotFound(graph_name.to_string()))?;
+        let graph_arc = self.get_graph(graph_name)?;
+        let mut gs = graph_arc.write();
 
         let now = Self::now_ms();
         let mut entities_created = 0;
@@ -2886,5 +3132,457 @@ mod tests {
             "expected GraphNotFound, got: {:?}",
             err
         );
+    }
+
+    // ── Authorization enforcement tests ─────────────────────────────────
+
+    fn make_auth_engine() -> Engine {
+        use weav_core::config::{AuthConfig, UserConfig, GraphPatternConfig};
+        let mut config = WeavConfig::default();
+        config.auth = AuthConfig {
+            enabled: true,
+            require_auth: true,
+            acl_file: None,
+            default_password: None,
+            users: vec![
+                // Admin user: full access to everything
+                UserConfig {
+                    username: "admin".into(),
+                    password: Some("admin_pass".into()),
+                    categories: vec!["+@all".into()],
+                    graph_patterns: Vec::new(),
+                    api_keys: Vec::new(),
+                    enabled: true,
+                },
+                // Read-only user: read category, read permission on "shared"
+                UserConfig {
+                    username: "reader".into(),
+                    password: Some("reader_pass".into()),
+                    categories: vec!["+@read".into(), "+@connection".into()],
+                    graph_patterns: vec![GraphPatternConfig {
+                        pattern: "shared".into(),
+                        permission: "read".into(),
+                    }],
+                    api_keys: Vec::new(),
+                    enabled: true,
+                },
+                // Writer user: read+write categories, readwrite on "app:*"
+                UserConfig {
+                    username: "writer".into(),
+                    password: Some("writer_pass".into()),
+                    categories: vec!["+@read".into(), "+@write".into(), "+@connection".into()],
+                    graph_patterns: vec![GraphPatternConfig {
+                        pattern: "app:*".into(),
+                        permission: "readwrite".into(),
+                    }],
+                    api_keys: Vec::new(),
+                    enabled: true,
+                },
+            ],
+        };
+        Engine::new(config)
+    }
+
+    fn auth_identity(engine: &Engine, username: &str, password: &str)
+        -> weav_auth::identity::SessionIdentity
+    {
+        engine
+            .acl_store()
+            .unwrap()
+            .authenticate(username, password)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_auth_required_no_identity() {
+        let engine = make_auth_engine();
+        let cmd = parser::parse_command("GRAPH LIST").unwrap();
+        let result = engine.execute_command(cmd, None);
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), WeavError::AuthenticationRequired),
+            "should require authentication"
+        );
+    }
+
+    #[test]
+    fn test_auth_ping_exempt() {
+        let engine = make_auth_engine();
+        // PING should always work without identity
+        let result = engine.execute_command(Command::Ping, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_auth_admin_can_create_graph() {
+        let engine = make_auth_engine();
+        let id = auth_identity(&engine, "admin", "admin_pass");
+        let cmd = parser::parse_command("GRAPH CREATE \"test\"").unwrap();
+        let result = engine.execute_command(cmd, Some(&id));
+        assert!(result.is_ok(), "admin should be able to create graph");
+    }
+
+    #[test]
+    fn test_auth_reader_cannot_create_graph() {
+        let engine = make_auth_engine();
+        let id = auth_identity(&engine, "reader", "reader_pass");
+        let cmd = parser::parse_command("GRAPH CREATE \"test\"").unwrap();
+        let result = engine.execute_command(cmd, Some(&id));
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WeavError::PermissionDenied(msg) => {
+                assert!(msg.contains("reader"), "error should mention username");
+            }
+            other => panic!("expected PermissionDenied, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_auth_writer_cannot_create_graph() {
+        let engine = make_auth_engine();
+        let id = auth_identity(&engine, "writer", "writer_pass");
+        // Writer has +@write but not +@admin, so graph create should fail
+        let cmd = parser::parse_command("GRAPH CREATE \"app:test\"").unwrap();
+        let result = engine.execute_command(cmd, Some(&id));
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WeavError::PermissionDenied(msg) => {
+                assert!(msg.contains("writer"));
+            }
+            other => panic!("expected PermissionDenied, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_auth_reader_can_read_shared_graph() {
+        let engine = make_auth_engine();
+        // Admin creates the graph
+        let admin_id = auth_identity(&engine, "admin", "admin_pass");
+        let cmd = parser::parse_command("GRAPH CREATE \"shared\"").unwrap();
+        engine.execute_command(cmd, Some(&admin_id)).unwrap();
+
+        // Reader can read it
+        let reader_id = auth_identity(&engine, "reader", "reader_pass");
+        let cmd = parser::parse_command("GRAPH INFO \"shared\"").unwrap();
+        let result = engine.execute_command(cmd, Some(&reader_id));
+        assert!(result.is_ok(), "reader should be able to read shared graph");
+    }
+
+    #[test]
+    fn test_auth_reader_cannot_read_other_graph() {
+        let engine = make_auth_engine();
+        // Admin creates a graph the reader has no access to
+        let admin_id = auth_identity(&engine, "admin", "admin_pass");
+        let cmd = parser::parse_command("GRAPH CREATE \"secret\"").unwrap();
+        engine.execute_command(cmd, Some(&admin_id)).unwrap();
+
+        // Reader cannot read it (pattern "shared" doesn't match "secret")
+        let reader_id = auth_identity(&engine, "reader", "reader_pass");
+        let cmd = parser::parse_command("GRAPH INFO \"secret\"").unwrap();
+        let result = engine.execute_command(cmd, Some(&reader_id));
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WeavError::PermissionDenied(msg) => {
+                assert!(msg.contains("read access"));
+            }
+            other => panic!("expected PermissionDenied, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_auth_reader_cannot_write_shared_graph() {
+        let engine = make_auth_engine();
+        let admin_id = auth_identity(&engine, "admin", "admin_pass");
+        let cmd = parser::parse_command("GRAPH CREATE \"shared\"").unwrap();
+        engine.execute_command(cmd, Some(&admin_id)).unwrap();
+
+        // Reader has +@read but not +@write category, so NodeAdd should fail
+        let reader_id = auth_identity(&engine, "reader", "reader_pass");
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "shared" LABEL "doc""#,
+        )
+        .unwrap();
+        let result = engine.execute_command(cmd, Some(&reader_id));
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WeavError::PermissionDenied(msg) => {
+                assert!(msg.contains("reader"));
+            }
+            other => panic!("expected PermissionDenied, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_auth_writer_can_write_matching_graph() {
+        let engine = make_auth_engine();
+        let admin_id = auth_identity(&engine, "admin", "admin_pass");
+        let cmd = parser::parse_command("GRAPH CREATE \"app:users\"").unwrap();
+        engine.execute_command(cmd, Some(&admin_id)).unwrap();
+
+        // Writer with "app:*" pattern and ReadWrite permission can write
+        let writer_id = auth_identity(&engine, "writer", "writer_pass");
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "app:users" LABEL "user""#,
+        )
+        .unwrap();
+        let result = engine.execute_command(cmd, Some(&writer_id));
+        assert!(result.is_ok(), "writer should be able to add nodes to app:users");
+    }
+
+    #[test]
+    fn test_auth_writer_cannot_write_non_matching_graph() {
+        let engine = make_auth_engine();
+        let admin_id = auth_identity(&engine, "admin", "admin_pass");
+        let cmd = parser::parse_command("GRAPH CREATE \"secret\"").unwrap();
+        engine.execute_command(cmd, Some(&admin_id)).unwrap();
+
+        // Writer with "app:*" pattern cannot write to "secret"
+        let writer_id = auth_identity(&engine, "writer", "writer_pass");
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "secret" LABEL "doc""#,
+        )
+        .unwrap();
+        let result = engine.execute_command(cmd, Some(&writer_id));
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WeavError::PermissionDenied(msg) => {
+                assert!(msg.contains("write access"));
+            }
+            other => panic!("expected PermissionDenied, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_auth_writer_can_read_matching_graph() {
+        let engine = make_auth_engine();
+        let admin_id = auth_identity(&engine, "admin", "admin_pass");
+        let cmd = parser::parse_command("GRAPH CREATE \"app:docs\"").unwrap();
+        engine.execute_command(cmd, Some(&admin_id)).unwrap();
+
+        // ReadWrite permission implies Read
+        let writer_id = auth_identity(&engine, "writer", "writer_pass");
+        let cmd = parser::parse_command("GRAPH INFO \"app:docs\"").unwrap();
+        let result = engine.execute_command(cmd, Some(&writer_id));
+        assert!(result.is_ok(), "writer should be able to read app:docs");
+    }
+
+    #[test]
+    fn test_auth_admin_three_tier_graph_create_requires_admin() {
+        // This test verifies the critical fix: Admin operations on a graph
+        // require Admin-level graph permission, not just ReadWrite.
+        use weav_core::config::{AuthConfig, UserConfig, GraphPatternConfig};
+        let mut config = WeavConfig::default();
+        config.auth = AuthConfig {
+            enabled: true,
+            require_auth: true,
+            acl_file: None,
+            default_password: None,
+            users: vec![
+                // User with Admin category but only ReadWrite graph permission
+                UserConfig {
+                    username: "rw_admin".into(),
+                    password: Some("pass".into()),
+                    categories: vec!["+@all".into()],
+                    graph_patterns: vec![GraphPatternConfig {
+                        pattern: "*".into(),
+                        permission: "readwrite".into(),
+                    }],
+                    api_keys: Vec::new(),
+                    enabled: true,
+                },
+            ],
+        };
+        let engine = Engine::new(config);
+        let id = engine
+            .acl_store()
+            .unwrap()
+            .authenticate("rw_admin", "pass")
+            .unwrap();
+
+        // User has Admin category permission but only ReadWrite graph permission.
+        // Graph create requires Admin graph permission, so this must fail.
+        let cmd = parser::parse_command("GRAPH CREATE \"mydb\"").unwrap();
+        let result = engine.execute_command(cmd, Some(&id));
+        assert!(result.is_err(), "readwrite graph perm should not allow graph create");
+        match result.unwrap_err() {
+            WeavError::PermissionDenied(msg) => {
+                assert!(msg.contains("admin access"), "should mention admin access, got: {}", msg);
+            }
+            other => panic!("expected PermissionDenied, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_auth_admin_three_tier_graph_drop_requires_admin() {
+        use weav_core::config::{AuthConfig, UserConfig, GraphPatternConfig};
+        let mut config = WeavConfig::default();
+        config.auth = AuthConfig {
+            enabled: true,
+            require_auth: true,
+            acl_file: None,
+            default_password: None,
+            users: vec![
+                // Full admin for setup
+                UserConfig {
+                    username: "superadmin".into(),
+                    password: Some("pass".into()),
+                    categories: vec!["+@all".into()],
+                    graph_patterns: Vec::new(),
+                    api_keys: Vec::new(),
+                    enabled: true,
+                },
+                // User with Admin category but only ReadWrite graph permission
+                UserConfig {
+                    username: "rw_only".into(),
+                    password: Some("pass".into()),
+                    categories: vec!["+@all".into()],
+                    graph_patterns: vec![GraphPatternConfig {
+                        pattern: "*".into(),
+                        permission: "readwrite".into(),
+                    }],
+                    api_keys: Vec::new(),
+                    enabled: true,
+                },
+            ],
+        };
+        let engine = Engine::new(config);
+
+        // Superadmin creates the graph
+        let super_id = engine.acl_store().unwrap()
+            .authenticate("superadmin", "pass").unwrap();
+        let cmd = parser::parse_command("GRAPH CREATE \"todrop\"").unwrap();
+        engine.execute_command(cmd, Some(&super_id)).unwrap();
+
+        // User with only ReadWrite graph permission cannot drop it
+        let rw_id = engine.acl_store().unwrap()
+            .authenticate("rw_only", "pass").unwrap();
+        let cmd = parser::parse_command("GRAPH DROP \"todrop\"").unwrap();
+        let result = engine.execute_command(cmd, Some(&rw_id));
+        assert!(result.is_err(), "readwrite graph perm should not allow graph drop");
+        match result.unwrap_err() {
+            WeavError::PermissionDenied(msg) => {
+                assert!(msg.contains("admin access"), "should mention admin access, got: {}", msg);
+            }
+            other => panic!("expected PermissionDenied, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_auth_disabled_allows_all() {
+        // With auth disabled (default config), everything works without identity
+        let engine = make_engine();
+        create_test_graph(&engine, "noauth");
+        let cmd = parser::parse_command(r#"NODE ADD TO "noauth" LABEL "test""#).unwrap();
+        let result = engine.execute_command(cmd, None);
+        assert!(result.is_ok(), "auth disabled should allow all operations");
+    }
+
+    #[test]
+    fn test_check_permission_auth_disabled() {
+        // check_permission should be a no-op when auth is disabled
+        let engine = make_engine();
+        let result = engine.check_permission(
+            None,
+            "anything",
+            weav_auth::identity::GraphPermission::Admin,
+        );
+        assert!(result.is_ok(), "check_permission should pass when auth disabled");
+    }
+
+    #[test]
+    fn test_check_permission_no_identity_auth_enabled() {
+        let engine = make_auth_engine();
+        let result = engine.check_permission(
+            None,
+            "test",
+            weav_auth::identity::GraphPermission::Read,
+        );
+        assert!(result.is_err(), "check_permission with no identity should fail when auth required");
+        assert!(matches!(result.unwrap_err(), WeavError::AuthenticationRequired));
+    }
+
+    #[test]
+    fn test_check_permission_insufficient_level() {
+        let engine = make_auth_engine();
+        let id = auth_identity(&engine, "reader", "reader_pass");
+        // Reader has Read on "shared", but requesting ReadWrite should fail
+        let result = engine.check_permission(
+            Some(&id),
+            "shared",
+            weav_auth::identity::GraphPermission::ReadWrite,
+        );
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WeavError::PermissionDenied(msg) => {
+                assert!(msg.contains("insufficient permission"));
+            }
+            other => panic!("expected PermissionDenied, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_check_permission_sufficient_level() {
+        let engine = make_auth_engine();
+        let id = auth_identity(&engine, "writer", "writer_pass");
+        // Writer has ReadWrite on "app:*", requesting Read should succeed
+        let result = engine.check_permission(
+            Some(&id),
+            "app:test",
+            weav_auth::identity::GraphPermission::Read,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_auth_edge_operations_require_write() {
+        let engine = make_auth_engine();
+        let admin_id = auth_identity(&engine, "admin", "admin_pass");
+
+        // Set up: create graph and nodes
+        let cmd = parser::parse_command("GRAPH CREATE \"shared\"").unwrap();
+        engine.execute_command(cmd, Some(&admin_id)).unwrap();
+        let cmd = parser::parse_command(r#"NODE ADD TO "shared" LABEL "a""#).unwrap();
+        let n1 = match engine.execute_command(cmd, Some(&admin_id)).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+        let cmd = parser::parse_command(r#"NODE ADD TO "shared" LABEL "b""#).unwrap();
+        let n2 = match engine.execute_command(cmd, Some(&admin_id)).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Reader cannot add edges
+        let reader_id = auth_identity(&engine, "reader", "reader_pass");
+        let cmd = parser::parse_command(
+            &format!(r#"EDGE ADD TO "shared" FROM {n1} TO {n2} LABEL "link""#),
+        )
+        .unwrap();
+        let result = engine.execute_command(cmd, Some(&reader_id));
+        assert!(result.is_err(), "reader should not be able to add edges");
+    }
+
+    #[test]
+    fn test_auth_stats_respects_graph_permission() {
+        let engine = make_auth_engine();
+        let admin_id = auth_identity(&engine, "admin", "admin_pass");
+        let cmd = parser::parse_command("GRAPH CREATE \"secret\"").unwrap();
+        engine.execute_command(cmd, Some(&admin_id)).unwrap();
+
+        // Reader cannot access stats for a graph they can't read
+        let reader_id = auth_identity(&engine, "reader", "reader_pass");
+        let cmd = Command::Stats(Some("secret".into()));
+        let result = engine.execute_command(cmd, Some(&reader_id));
+        assert!(result.is_err(), "reader should not see stats for inaccessible graph");
+    }
+
+    #[test]
+    fn test_auth_stats_no_graph_always_allowed() {
+        let engine = make_auth_engine();
+        let reader_id = auth_identity(&engine, "reader", "reader_pass");
+        // Stats without graph name is a read operation, reader has +@read
+        let cmd = Command::Stats(None);
+        let result = engine.execute_command(cmd, Some(&reader_id));
+        assert!(result.is_ok(), "reader should see global stats");
     }
 }

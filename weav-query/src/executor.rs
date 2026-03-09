@@ -157,6 +157,8 @@ pub fn execute_context_query(
         }
     }
 
+    let has_vector_seeds = matches!(&query.seeds, SeedStrategy::Vector { .. } | SeedStrategy::Both { .. });
+
     // ── Step 2: Run flow_score from seeds ───────────────────────────────
     let plan = crate::planner::plan_context_query(query);
     let (alpha, theta) = plan.steps.iter().find_map(|step| {
@@ -175,13 +177,45 @@ pub fn execute_context_query(
         query.max_depth,
     );
 
-    let nodes_considered = scored_nodes.len() as u32;
+    // ── Step 2b: RRF fusion (when vector search is involved) ────────
+    let final_scores: Vec<(NodeId, f32)> = if has_vector_seeds {
+        // Build ranked lists from vector and graph scores
+        let vector_ranked: Vec<NodeId> = seeds_with_scores.iter()
+            .map(|(nid, _)| *nid)
+            .collect();
+        // seeds_with_scores is already sorted by score from vector search
+
+        let graph_ranked: Vec<NodeId> = scored_nodes.iter()
+            .map(|s| s.node_id)
+            .collect();
+        // scored_nodes is already sorted by score from flow_score
+
+        let rrf_config = RrfConfig::default();
+        let fused = reciprocal_rank_fusion(&[vector_ranked, graph_ranked], &rrf_config);
+
+        // Normalize RRF scores to [0, 1] range for consistency
+        let max_rrf = fused.first().map(|(_, s)| *s).unwrap_or(1.0);
+        fused.into_iter()
+            .map(|(nid, score)| (nid, if max_rrf > 0.0 { score / max_rrf } else { 0.0 }))
+            .collect()
+    } else {
+        // No vector search — use flow scores directly
+        scored_nodes.iter()
+            .map(|s| (s.node_id, s.score))
+            .collect()
+    };
+
+    let nodes_considered = final_scores.len() as u32;
+
+    // Build a depth lookup from scored_nodes for use in chunk construction
+    let depth_lookup: std::collections::HashMap<NodeId, u8> = scored_nodes.iter()
+        .map(|s| (s.node_id, s.depth))
+        .collect();
 
     // ── Step 3: Build ContextChunks ─────────────────────────────────────
     let mut chunks: Vec<ContextChunk> = Vec::new();
 
-    for scored in &scored_nodes {
-        let node_id = scored.node_id;
+    for &(node_id, score) in &final_scores {
 
         // Build content by concatenating all string properties
         let all_props = properties.get_all_node_properties(node_id);
@@ -249,12 +283,14 @@ pub fn execute_context_query(
             }
         };
 
+        let depth = depth_lookup.get(&node_id).copied().unwrap_or(0);
+
         chunks.push(ContextChunk {
             node_id,
             content,
             label,
-            relevance_score: scored.score,
-            depth: scored.depth,
+            relevance_score: score,
+            depth,
             token_count,
             provenance,
             relationships: Vec::new(), // Filled in step 7
@@ -476,6 +512,54 @@ pub fn execute_context_query(
         query_time_us: elapsed.as_micros() as u64,
         conflicts,
     })
+}
+
+// ─── Reciprocal Rank Fusion ──────────────────────────────────────────────────
+
+/// Configuration for Reciprocal Rank Fusion.
+pub struct RrfConfig {
+    /// Smoothing constant (default 60.0, from Cormack et al. 2009).
+    pub k: f32,
+    /// Per-ranker weights (default all 1.0). Length must match ranked_lists.
+    pub weights: Vec<f32>,
+}
+
+impl Default for RrfConfig {
+    fn default() -> Self {
+        Self {
+            k: 60.0,
+            weights: vec![1.0, 1.0],
+        }
+    }
+}
+
+/// Fuse multiple ranked lists using Reciprocal Rank Fusion.
+///
+/// RRF score = Σᵢ wᵢ / (k + rankᵢ(d))
+///
+/// Each ranked list is a Vec of NodeIds ordered by relevance (best first).
+/// Returns (NodeId, rrf_score) pairs sorted by RRF score descending.
+pub fn reciprocal_rank_fusion(
+    ranked_lists: &[Vec<NodeId>],
+    config: &RrfConfig,
+) -> Vec<(NodeId, f32)> {
+    let mut scores: std::collections::HashMap<NodeId, f32> = std::collections::HashMap::new();
+
+    for (list_idx, list) in ranked_lists.iter().enumerate() {
+        let weight = config.weights.get(list_idx).copied().unwrap_or(1.0);
+        for (rank_0, &node_id) in list.iter().enumerate() {
+            let rank = (rank_0 + 1) as f32; // 1-indexed
+            *scores.entry(node_id).or_default() += weight / (config.k + rank);
+        }
+    }
+
+    let mut result: Vec<(NodeId, f32)> = scores.into_iter().collect();
+    result.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    result
 }
 
 /// Build a content string from a node's properties by concatenating
@@ -1494,5 +1578,83 @@ mod tests {
             (result_same - score).abs() < f32::EPSILON,
             "Decay with item_ts == now should return score unchanged, got {result_same}"
         );
+    }
+
+    // ── RRF tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_rrf_two_lists() {
+        let list1 = vec![1, 2, 3]; // graph traversal ranking
+        let list2 = vec![2, 1, 4]; // vector search ranking
+        let config = RrfConfig::default();
+
+        let result = reciprocal_rank_fusion(&[list1, list2], &config);
+
+        // Node 2: rank 2 in list1 + rank 1 in list2 = 1/62 + 1/61
+        // Node 1: rank 1 in list1 + rank 2 in list2 = 1/61 + 1/62
+        // Both have the same score, so tie-break by node_id
+        assert_eq!(result.len(), 4);
+        // Nodes 1 and 2 should be top (appear in both lists)
+        let top_ids: Vec<NodeId> = result.iter().take(2).map(|(id, _)| *id).collect();
+        assert!(top_ids.contains(&1));
+        assert!(top_ids.contains(&2));
+        // Nodes 3 and 4 should be below (appear in only one list)
+        let bottom_ids: Vec<NodeId> = result.iter().skip(2).map(|(id, _)| *id).collect();
+        assert!(bottom_ids.contains(&3));
+        assert!(bottom_ids.contains(&4));
+    }
+
+    #[test]
+    fn test_rrf_empty_lists() {
+        let result = reciprocal_rank_fusion(&[], &RrfConfig::default());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_rrf_single_list() {
+        let list = vec![10, 20, 30];
+        let config = RrfConfig { k: 60.0, weights: vec![1.0] };
+        let result = reciprocal_rank_fusion(&[list], &config);
+
+        assert_eq!(result.len(), 3);
+        // Should preserve ranking order
+        assert_eq!(result[0].0, 10);
+        assert_eq!(result[1].0, 20);
+        assert_eq!(result[2].0, 30);
+        // Scores should be decreasing
+        assert!(result[0].1 > result[1].1);
+        assert!(result[1].1 > result[2].1);
+    }
+
+    #[test]
+    fn test_rrf_weighted() {
+        // Give graph results 2x weight over vector results
+        let graph_list = vec![1, 2]; // graph says node 1 is best
+        let vector_list = vec![2, 1]; // vector says node 2 is best
+        let config = RrfConfig {
+            k: 60.0,
+            weights: vec![2.0, 1.0], // graph gets 2x weight
+        };
+
+        let result = reciprocal_rank_fusion(&[graph_list, vector_list], &config);
+
+        // Node 1: 2.0/61 + 1.0/62 = 0.04896
+        // Node 2: 2.0/62 + 1.0/61 = 0.04866
+        // Node 1 should win because graph (weighted 2x) ranked it #1
+        assert_eq!(result[0].0, 1);
+        assert_eq!(result[1].0, 2);
+    }
+
+    #[test]
+    fn test_rrf_disjoint_lists() {
+        let list1 = vec![1, 2];
+        let list2 = vec![3, 4];
+        let config = RrfConfig::default();
+
+        let result = reciprocal_rank_fusion(&[list1, list2], &config);
+        assert_eq!(result.len(), 4);
+        // Top-ranked from each list should be at top (tied by score)
+        let top_scores: Vec<f32> = result.iter().take(2).map(|(_, s)| *s).collect();
+        assert!((top_scores[0] - top_scores[1]).abs() < f32::EPSILON);
     }
 }

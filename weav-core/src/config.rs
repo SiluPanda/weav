@@ -1,7 +1,7 @@
 //! Configuration system for Weav.
 
 use crate::types::ConflictPolicy;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Top-level Weav configuration.
@@ -411,7 +411,7 @@ pub struct GraphPatternConfig {
 }
 
 /// Per-graph configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GraphConfig {
     pub default_conflict_policy: ConflictPolicy,

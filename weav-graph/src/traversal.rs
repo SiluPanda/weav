@@ -1,8 +1,10 @@
 //! Graph traversal algorithms: BFS, flow scoring, ego network, shortest path,
-//! scored paths, Dijkstra, connected components, Personalized PageRank.
+//! scored paths, Dijkstra, connected components, Personalized PageRank,
+//! Label Propagation community detection.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 
 use weav_core::types::{Direction, EdgeId, LabelId, NodeId, ScoredNode, ScoredPath, Timestamp};
 
@@ -778,6 +780,90 @@ pub fn personalized_pagerank(
     });
 
     result
+}
+
+/// Label Propagation community detection.
+///
+/// Each node starts with its own label. Iteratively, each node adopts the most
+/// frequent label among its neighbors (weighted by edge weight). Converges when
+/// no labels change. Treats edges as undirected.
+///
+/// Returns a map from NodeId to community label (u64).
+pub fn label_propagation(
+    adjacency: &AdjacencyStore,
+    max_iterations: u32,
+) -> HashMap<NodeId, u64> {
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() {
+        return HashMap::new();
+    }
+
+    // Initialize each node with its own label
+    let mut labels: HashMap<NodeId, u64> = all_nodes.iter().map(|&nid| (nid, nid)).collect();
+
+    for iteration in 0..max_iterations {
+        // Deterministic shuffle: sort nodes by hash(node_id ^ iteration)
+        let mut order: Vec<NodeId> = all_nodes.clone();
+        order.sort_by(|&a, &b| {
+            let hash_a = {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (a ^ (iteration as u64)).hash(&mut h);
+                h.finish()
+            };
+            let hash_b = {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (b ^ (iteration as u64)).hash(&mut h);
+                h.finish()
+            };
+            hash_a.cmp(&hash_b)
+        });
+
+        let mut changed = false;
+
+        for &node in &order {
+            // Collect all neighbors (both directions) to treat edges as undirected
+            let out_neighbors = adjacency.neighbors_out(node, None);
+            let in_neighbors = adjacency.neighbors_in(node, None);
+
+            // Count weighted label frequencies among neighbors
+            let mut freq: HashMap<u64, f64> = HashMap::new();
+            for &(nbr, edge_id) in out_neighbors.iter().chain(in_neighbors.iter()) {
+                let weight = adjacency
+                    .get_edge(edge_id)
+                    .map(|meta| meta.weight as f64)
+                    .unwrap_or(1.0);
+                let nbr_label = labels[&nbr];
+                *freq.entry(nbr_label).or_insert(0.0) += weight;
+            }
+
+            if freq.is_empty() {
+                continue; // isolated node keeps its label
+            }
+
+            // Find the most frequent label; break ties by smallest label
+            let best_label = freq
+                .iter()
+                .max_by(|&(label_a, weight_a), &(label_b, weight_b)| {
+                    weight_a
+                        .partial_cmp(weight_b)
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| label_b.cmp(label_a)) // prefer smaller label
+                })
+                .map(|(&label, _)| label)
+                .unwrap();
+
+            if labels[&node] != best_label {
+                labels.insert(node, best_label);
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break; // converged
+        }
+    }
+
+    labels
 }
 
 #[cfg(test)]
@@ -1934,5 +2020,76 @@ mod tests {
         let score_map: HashMap<NodeId, f32> = result.iter().map(|s| (s.node_id, s.score)).collect();
         // Node 1 and 4 (seeds) should score higher than interior nodes
         assert!(score_map[&1] > score_map[&3]);
+    }
+
+    // ── Label Propagation tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_label_propagation_two_cliques() {
+        // Two cliques connected by a single edge:
+        // Clique 1: 1-2, 1-3, 2-3
+        // Clique 2: 4-5, 4-6, 5-6
+        // Bridge: 3-4
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=6 { adj.add_node(i); }
+        // Clique 1
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        // Clique 2
+        adj.add_edge(4, 5, 0, make_meta(4, 5, 0)).unwrap();
+        adj.add_edge(5, 4, 0, make_meta(5, 4, 0)).unwrap();
+        adj.add_edge(4, 6, 0, make_meta(4, 6, 0)).unwrap();
+        adj.add_edge(6, 4, 0, make_meta(6, 4, 0)).unwrap();
+        adj.add_edge(5, 6, 0, make_meta(5, 6, 0)).unwrap();
+        adj.add_edge(6, 5, 0, make_meta(6, 5, 0)).unwrap();
+        // Bridge
+        adj.add_edge(3, 4, 0, make_meta(3, 4, 0)).unwrap();
+        adj.add_edge(4, 3, 0, make_meta(4, 3, 0)).unwrap();
+
+        let communities = label_propagation(&adj, 20);
+        assert_eq!(communities.len(), 6);
+        // Nodes in same clique should have same label
+        assert_eq!(communities[&1], communities[&2]);
+        assert_eq!(communities[&1], communities[&3]);
+        assert_eq!(communities[&4], communities[&5]);
+        assert_eq!(communities[&4], communities[&6]);
+        // Different cliques should have different labels
+        assert_ne!(communities[&1], communities[&4]);
+    }
+
+    #[test]
+    fn test_label_propagation_single_component() {
+        let adj = build_linear_graph(); // 1->2->3->4
+        let communities = label_propagation(&adj, 20);
+        assert_eq!(communities.len(), 4);
+        // Linear graph: all nodes should converge to same community
+        let c = communities[&1];
+        assert_eq!(communities[&2], c);
+        assert_eq!(communities[&3], c);
+        assert_eq!(communities[&4], c);
+    }
+
+    #[test]
+    fn test_label_propagation_isolated_nodes() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_node(3);
+        // No edges — each node stays in its own community
+        let communities = label_propagation(&adj, 10);
+        assert_eq!(communities.len(), 3);
+        let unique: HashSet<u64> = communities.values().copied().collect();
+        assert_eq!(unique.len(), 3);
+    }
+
+    #[test]
+    fn test_label_propagation_empty_graph() {
+        let adj = AdjacencyStore::new();
+        let communities = label_propagation(&adj, 10);
+        assert!(communities.is_empty());
     }
 }
