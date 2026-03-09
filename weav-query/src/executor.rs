@@ -8,7 +8,7 @@ use weav_core::types::{BiTemporal, Direction, NodeId, Provenance, Timestamp};
 
 use weav_graph::adjacency::AdjacencyStore;
 use weav_graph::properties::PropertyStore;
-use weav_graph::traversal::flow_score;
+use weav_graph::traversal::{flow_score, modularity_communities};
 use weav_vector::index::VectorIndex;
 use weav_vector::tokens::TokenCounter;
 
@@ -560,6 +560,149 @@ pub fn reciprocal_rank_fusion(
             .then_with(|| a.0.cmp(&b.0))
     });
     result
+}
+
+// ─── Community Summaries (GraphRAG) ─────────────────────────────────────────
+
+/// A community summary containing the nodes and their aggregated content.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CommunitySummary {
+    /// Community ID (from the community detection algorithm).
+    pub community_id: u64,
+    /// Number of nodes in this community.
+    pub node_count: usize,
+    /// Number of internal edges (edges between nodes in this community).
+    pub internal_edge_count: usize,
+    /// Node IDs in this community.
+    pub node_ids: Vec<NodeId>,
+    /// Labels present in this community (deduplicated).
+    pub labels: Vec<String>,
+    /// Concatenated content from all nodes, suitable for LLM summarization.
+    pub content: String,
+    /// Estimated token count for the content.
+    pub token_count: u32,
+    /// Key entities (node names/titles) in this community.
+    pub key_entities: Vec<String>,
+}
+
+/// Extract community summaries from a graph using modularity-based community detection.
+///
+/// This is the preparation step for GraphRAG-style summarization:
+/// 1. Detect communities using modularity optimization
+/// 2. For each community, collect node content, labels, and key entities
+/// 3. Count internal edges
+/// 4. Return structured summaries ready for LLM summarization
+///
+/// The caller can then pass each community's `content` field to an LLM
+/// to generate a natural language summary.
+pub fn extract_community_summaries(
+    adjacency: &AdjacencyStore,
+    properties: &PropertyStore,
+    _interner: &StringInterner,
+    token_counter: &TokenCounter,
+    max_iterations: u32,
+    resolution: f32,
+) -> Vec<CommunitySummary> {
+    let node_to_community = modularity_communities(adjacency, max_iterations, resolution);
+    if node_to_community.is_empty() {
+        return Vec::new();
+    }
+
+    // Group nodes by community ID.
+    let mut communities: std::collections::HashMap<u64, Vec<NodeId>> =
+        std::collections::HashMap::new();
+    for (&node_id, &comm_id) in &node_to_community {
+        communities.entry(comm_id).or_default().push(node_id);
+    }
+
+    // Build a set of node IDs per community for fast membership checks.
+    let community_sets: std::collections::HashMap<u64, std::collections::HashSet<NodeId>> =
+        communities
+            .iter()
+            .map(|(&comm_id, nodes)| {
+                let set: std::collections::HashSet<NodeId> = nodes.iter().copied().collect();
+                (comm_id, set)
+            })
+            .collect();
+
+    let mut summaries: Vec<CommunitySummary> = Vec::with_capacity(communities.len());
+
+    for (&comm_id, nodes) in &communities {
+        let node_set = &community_sets[&comm_id];
+
+        let mut labels: Vec<String> = Vec::new();
+        let mut key_entities: Vec<String> = Vec::new();
+        let mut content_parts: Vec<String> = Vec::new();
+        let mut internal_edge_count: usize = 0;
+
+        // Sort node IDs for deterministic output.
+        let mut sorted_nodes = nodes.clone();
+        sorted_nodes.sort_unstable();
+
+        for &node_id in &sorted_nodes {
+            // Extract label from _label property.
+            if let Some(label_val) = properties.get_node_property(node_id, "_label") {
+                if let Some(label_str) = label_val.as_str() {
+                    if !labels.contains(&label_str.to_string()) {
+                        labels.push(label_str.to_string());
+                    }
+                }
+            }
+
+            // Extract name or title as key entity.
+            let entity_name = properties
+                .get_node_property(node_id, "name")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    properties
+                        .get_node_property(node_id, "title")
+                        .and_then(|v| v.as_str())
+                });
+            if let Some(name) = entity_name {
+                key_entities.push(name.to_string());
+            }
+
+            // Build content from all properties (reusing the build_content pattern).
+            let all_props = properties.get_all_node_properties(node_id);
+            let node_content = build_content(&all_props);
+            if !node_content.is_empty() {
+                content_parts.push(node_content);
+            }
+
+            // Count internal edges: outgoing edges where the target is in the same community.
+            for (neighbor_id, _edge_id) in adjacency.neighbors_out(node_id, None) {
+                if node_set.contains(&neighbor_id) {
+                    internal_edge_count += 1;
+                }
+            }
+        }
+
+        labels.sort();
+        key_entities.sort();
+
+        let content = content_parts.join("\n---\n");
+        let token_count = token_counter.count(&content);
+
+        summaries.push(CommunitySummary {
+            community_id: comm_id,
+            node_count: sorted_nodes.len(),
+            internal_edge_count,
+            node_ids: sorted_nodes,
+            labels,
+            content,
+            token_count,
+            key_entities,
+        });
+    }
+
+    // Sort by node_count descending (largest communities first), break ties by community_id.
+    summaries.sort_by(|a, b| {
+        b.node_count
+            .cmp(&a.node_count)
+            .then_with(|| a.community_id.cmp(&b.community_id))
+    });
+
+    summaries
 }
 
 /// Build a content string from a node's properties by concatenating
@@ -1656,5 +1799,217 @@ mod tests {
         // Top-ranked from each list should be at top (tied by score)
         let top_scores: Vec<f32> = result.iter().take(2).map(|(_, s)| *s).collect();
         assert!((top_scores[0] - top_scores[1]).abs() < f32::EPSILON);
+    }
+
+    // ── Community summary tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_extract_community_summaries_basic() {
+        // Build two cliques with properties.
+        let mut adj = AdjacencyStore::new();
+        let mut props = PropertyStore::new();
+        let mut interner = StringInterner::new();
+
+        let knows_label = interner.intern_label("knows").unwrap();
+
+        // Clique 1: nodes 1,2,3 (Person entities)
+        for id in 1..=3u64 {
+            adj.add_node(id);
+            props.set_node_property(
+                id,
+                "_label",
+                Value::String(CompactString::from("Person")),
+            );
+            props.set_node_property(
+                id,
+                "name",
+                Value::String(CompactString::from(format!("Person{}", id))),
+            );
+        }
+
+        let make_meta = |s: NodeId, t: NodeId| EdgeMeta {
+            source: s,
+            target: t,
+            label: knows_label,
+            temporal: BiTemporal::new_current(1000),
+            provenance: None,
+            weight: 1.0,
+            token_cost: 0,
+        };
+
+        // Fully connect clique 1
+        adj.add_edge(1, 2, knows_label, make_meta(1, 2)).unwrap();
+        adj.add_edge(2, 1, knows_label, make_meta(2, 1)).unwrap();
+        adj.add_edge(1, 3, knows_label, make_meta(1, 3)).unwrap();
+        adj.add_edge(3, 1, knows_label, make_meta(3, 1)).unwrap();
+        adj.add_edge(2, 3, knows_label, make_meta(2, 3)).unwrap();
+        adj.add_edge(3, 2, knows_label, make_meta(3, 2)).unwrap();
+
+        // Clique 2: nodes 4,5,6 (Company entities)
+        for id in 4..=6u64 {
+            adj.add_node(id);
+            props.set_node_property(
+                id,
+                "_label",
+                Value::String(CompactString::from("Company")),
+            );
+            props.set_node_property(
+                id,
+                "name",
+                Value::String(CompactString::from(format!("Corp{}", id))),
+            );
+        }
+
+        adj.add_edge(4, 5, knows_label, make_meta(4, 5)).unwrap();
+        adj.add_edge(5, 4, knows_label, make_meta(5, 4)).unwrap();
+        adj.add_edge(4, 6, knows_label, make_meta(4, 6)).unwrap();
+        adj.add_edge(6, 4, knows_label, make_meta(6, 4)).unwrap();
+        adj.add_edge(5, 6, knows_label, make_meta(5, 6)).unwrap();
+        adj.add_edge(6, 5, knows_label, make_meta(6, 5)).unwrap();
+
+        // Bridge edge between cliques
+        adj.add_edge(3, 4, knows_label, make_meta(3, 4)).unwrap();
+        adj.add_edge(4, 3, knows_label, make_meta(4, 3)).unwrap();
+
+        let counter = TokenCounter::new(TokenCounterType::CharDiv4);
+        let summaries =
+            extract_community_summaries(&adj, &props, &interner, &counter, 20, 1.0);
+
+        assert_eq!(summaries.len(), 2);
+        // Each community should have 3 nodes
+        assert_eq!(summaries[0].node_count, 3);
+        assert_eq!(summaries[1].node_count, 3);
+        // Communities should have different labels
+        assert_ne!(summaries[0].labels, summaries[1].labels);
+        // Key entities should be populated
+        assert!(!summaries[0].key_entities.is_empty());
+        assert!(!summaries[1].key_entities.is_empty());
+        // Content should be non-empty
+        assert!(!summaries[0].content.is_empty());
+        assert!(!summaries[1].content.is_empty());
+        // Internal edges: each fully connected 3-clique has 6 directed edges
+        assert_eq!(summaries[0].internal_edge_count, 6);
+        assert_eq!(summaries[1].internal_edge_count, 6);
+        // Token count should be positive
+        assert!(summaries[0].token_count > 0);
+        assert!(summaries[1].token_count > 0);
+    }
+
+    #[test]
+    fn test_extract_community_summaries_empty() {
+        let adj = AdjacencyStore::new();
+        let props = PropertyStore::new();
+        let interner = StringInterner::new();
+        let counter = TokenCounter::new(TokenCounterType::CharDiv4);
+        let summaries =
+            extract_community_summaries(&adj, &props, &interner, &counter, 10, 1.0);
+        assert!(summaries.is_empty());
+    }
+
+    #[test]
+    fn test_extract_community_summaries_single_node() {
+        // A single node with no edges should be in its own community.
+        let mut adj = AdjacencyStore::new();
+        let mut props = PropertyStore::new();
+        let interner = StringInterner::new();
+
+        adj.add_node(1);
+        props.set_node_property(
+            1,
+            "_label",
+            Value::String(CompactString::from("Entity")),
+        );
+        props.set_node_property(
+            1,
+            "name",
+            Value::String(CompactString::from("Singleton")),
+        );
+
+        let counter = TokenCounter::new(TokenCounterType::CharDiv4);
+        let summaries =
+            extract_community_summaries(&adj, &props, &interner, &counter, 10, 1.0);
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].node_count, 1);
+        assert_eq!(summaries[0].internal_edge_count, 0);
+        assert_eq!(summaries[0].labels, vec!["Entity".to_string()]);
+        assert_eq!(summaries[0].key_entities, vec!["Singleton".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_community_summaries_uses_title_fallback() {
+        // When a node has no "name" property but has "title", use that as key entity.
+        let mut adj = AdjacencyStore::new();
+        let mut props = PropertyStore::new();
+        let interner = StringInterner::new();
+
+        adj.add_node(1);
+        props.set_node_property(
+            1,
+            "title",
+            Value::String(CompactString::from("My Document")),
+        );
+
+        let counter = TokenCounter::new(TokenCounterType::CharDiv4);
+        let summaries =
+            extract_community_summaries(&adj, &props, &interner, &counter, 10, 1.0);
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].key_entities,
+            vec!["My Document".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_extract_community_summaries_sorted_by_size() {
+        // Communities should be sorted largest first.
+        let mut adj = AdjacencyStore::new();
+        let mut props = PropertyStore::new();
+        let mut interner = StringInterner::new();
+        let label = interner.intern_label("rel").unwrap();
+
+        let make_meta = |s: NodeId, t: NodeId| EdgeMeta {
+            source: s,
+            target: t,
+            label,
+            temporal: BiTemporal::new_current(1000),
+            provenance: None,
+            weight: 1.0,
+            token_cost: 0,
+        };
+
+        // Small clique: nodes 1,2 (2 nodes)
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_edge(1, 2, label, make_meta(1, 2)).unwrap();
+        adj.add_edge(2, 1, label, make_meta(2, 1)).unwrap();
+
+        // Large clique: nodes 10,11,12,13 (4 nodes)
+        for id in 10..=13u64 {
+            adj.add_node(id);
+            props.set_node_property(
+                id,
+                "name",
+                Value::String(CompactString::from(format!("Node{}", id))),
+            );
+        }
+        for &a in &[10u64, 11, 12, 13] {
+            for &b in &[10u64, 11, 12, 13] {
+                if a != b {
+                    adj.add_edge(a, b, label, make_meta(a, b)).unwrap();
+                }
+            }
+        }
+
+        let counter = TokenCounter::new(TokenCounterType::CharDiv4);
+        let summaries =
+            extract_community_summaries(&adj, &props, &interner, &counter, 20, 1.0);
+
+        // First community should be the larger one
+        assert!(
+            summaries[0].node_count >= summaries.last().unwrap().node_count,
+            "Summaries should be sorted by node_count descending"
+        );
     }
 }
