@@ -30,6 +30,9 @@ serde_json = { workspace = true }
 # Types
 compact_str = { workspace = true }
 
+# Fuzzy matching
+strsim = { workspace = true }
+
 # Logging
 tracing = { workspace = true }
 

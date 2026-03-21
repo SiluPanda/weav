@@ -234,15 +234,29 @@ fn batch_chunks_by_tokens(
     batches
 }
 
-/// Deduplicate entities by name (case-insensitive), merging source_chunks
-/// and keeping the higher confidence.
+/// Default Jaro-Winkler similarity threshold for entity deduplication.
+const DEDUP_FUZZY_THRESHOLD: f64 = 0.85;
+
+/// Deduplicate entities by fuzzy name matching (Jaro-Winkler similarity),
+/// merging source_chunks and keeping the higher confidence.
 fn dedup_entities(entities: Vec<ExtractedEntity>) -> Vec<ExtractedEntity> {
-    let mut seen: HashMap<String, usize> = HashMap::new();
     let mut result: Vec<ExtractedEntity> = Vec::new();
 
     for entity in entities {
-        let key = entity.name.to_lowercase();
-        if let Some(&idx) = seen.get(&key) {
+        // Find the best fuzzy match among already-seen entities.
+        let match_idx = result.iter().enumerate().find_map(|(idx, existing)| {
+            if weav_graph::dedup::fuzzy_name_match(
+                &entity.name,
+                &existing.name,
+                DEDUP_FUZZY_THRESHOLD,
+            ) {
+                Some(idx)
+            } else {
+                None
+            }
+        });
+
+        if let Some(idx) = match_idx {
             // Merge: combine source_chunks, keep higher confidence.
             let existing = &mut result[idx];
             for chunk_idx in &entity.source_chunks {
@@ -255,7 +269,6 @@ fn dedup_entities(entities: Vec<ExtractedEntity>) -> Vec<ExtractedEntity> {
                 existing.description = entity.description;
             }
         } else {
-            seen.insert(key, result.len());
             result.push(entity);
         }
     }

@@ -8,6 +8,7 @@ use weav_core::types::{BiTemporal, Direction, NodeId, Provenance, Timestamp};
 
 use weav_graph::adjacency::AdjacencyStore;
 use weav_graph::properties::PropertyStore;
+use weav_graph::text_index::TextIndex;
 use weav_graph::traversal::{flow_score, modularity_communities};
 use weav_vector::index::VectorIndex;
 use weav_vector::tokens::TokenCounter;
@@ -103,6 +104,7 @@ pub fn execute_context_query(
     adjacency: &AdjacencyStore,
     properties: &PropertyStore,
     vector_index: &VectorIndex,
+    text_index: &TextIndex,
     token_counter: &TokenCounter,
     interner: &StringInterner,
 ) -> Result<ContextResult, WeavError> {
@@ -177,29 +179,69 @@ pub fn execute_context_query(
         query.max_depth,
     );
 
-    // ── Step 2b: RRF fusion (when vector search is involved) ────────
+    // ── Step 2b: Triple-fusion RRF (vector + BM25 + graph) ─────────
+    // BM25 text search: if query_text is available, get text-ranked results
+    let bm25_ranked: Vec<NodeId> = if let Some(ref query_text) = query.query_text {
+        if !query_text.is_empty() && !text_index.is_empty() {
+            text_index
+                .search(query_text, (adjacency.node_count() as usize).min(500))
+                .into_iter()
+                .map(|(nid, _)| nid)
+                .collect()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
     let final_scores: Vec<(NodeId, f32)> = if has_vector_seeds {
-        // Build ranked lists from vector and graph scores
         let vector_ranked: Vec<NodeId> = seeds_with_scores.iter()
             .map(|(nid, _)| *nid)
             .collect();
-        // seeds_with_scores is already sorted by score from vector search
 
         let graph_ranked: Vec<NodeId> = scored_nodes.iter()
             .map(|s| s.node_id)
             .collect();
-        // scored_nodes is already sorted by score from flow_score
 
-        let rrf_config = RrfConfig::default();
-        let fused = reciprocal_rank_fusion(&[vector_ranked, graph_ranked], &rrf_config);
+        // Triple fusion: vector + graph + BM25 (if text results available)
+        let (ranked_lists, rrf_config) = if bm25_ranked.is_empty() {
+            // 2-way: vector + graph
+            (
+                vec![vector_ranked, graph_ranked],
+                RrfConfig { k: 60.0, weights: vec![1.0, 1.0] },
+            )
+        } else {
+            // 3-way: vector + graph + BM25
+            (
+                vec![vector_ranked, graph_ranked, bm25_ranked],
+                RrfConfig { k: 60.0, weights: vec![1.0, 1.0, 0.8] },
+            )
+        };
 
-        // Normalize RRF scores to [0, 1] range for consistency
+        let fused = reciprocal_rank_fusion(&ranked_lists, &rrf_config);
+
+        // Normalize RRF scores to [0, 1] range
+        let max_rrf = fused.first().map(|(_, s)| *s).unwrap_or(1.0);
+        fused.into_iter()
+            .map(|(nid, score)| (nid, if max_rrf > 0.0 { score / max_rrf } else { 0.0 }))
+            .collect()
+    } else if !bm25_ranked.is_empty() {
+        // No vector search but BM25 available — fuse graph + BM25
+        let graph_ranked: Vec<NodeId> = scored_nodes.iter()
+            .map(|s| s.node_id)
+            .collect();
+
+        let rrf_config = RrfConfig { k: 60.0, weights: vec![1.0, 0.8] };
+        let ranked_lists = vec![graph_ranked, bm25_ranked];
+        let fused = reciprocal_rank_fusion(&ranked_lists, &rrf_config);
+
         let max_rrf = fused.first().map(|(_, s)| *s).unwrap_or(1.0);
         fused.into_iter()
             .map(|(nid, score)| (nid, if max_rrf > 0.0 { score / max_rrf } else { 0.0 }))
             .collect()
     } else {
-        // No vector search — use flow scores directly
+        // No vector search, no BM25 — use flow scores directly
         scored_nodes.iter()
             .map(|s| (s.node_id, s.score))
             .collect()
@@ -741,6 +783,7 @@ mod tests {
         AdjacencyStore,
         PropertyStore,
         VectorIndex,
+        TextIndex,
         TokenCounter,
         StringInterner,
     ) {
@@ -872,13 +915,14 @@ mod tests {
             ..VectorConfig::default()
         };
         let vec_index = VectorIndex::new(vec_config).unwrap();
+        let text_index = TextIndex::new();
 
-        (adj, props, vec_index, token_counter, interner)
+        (adj, props, vec_index, text_index, token_counter, interner)
     }
 
     #[test]
     fn test_execute_context_query_with_node_seeds() {
-        let (adj, props, vec_index, token_counter, interner) = setup_test_stores();
+        let (adj, props, vec_index, text_index, token_counter, interner) = setup_test_stores();
 
         let query = ContextQuery {
             query_text: Some("test".to_string()),
@@ -896,7 +940,7 @@ mod tests {
         };
 
         let result =
-            execute_context_query(&query, &adj, &props, &vec_index, &token_counter, &interner)
+            execute_context_query(&query, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
                 .unwrap();
 
         assert!(result.nodes_considered > 0);
@@ -912,7 +956,7 @@ mod tests {
 
     #[test]
     fn test_execute_context_query_with_budget() {
-        let (adj, props, vec_index, token_counter, interner) = setup_test_stores();
+        let (adj, props, vec_index, text_index, token_counter, interner) = setup_test_stores();
 
         let query = ContextQuery {
             query_text: Some("test".to_string()),
@@ -930,7 +974,7 @@ mod tests {
         };
 
         let result =
-            execute_context_query(&query, &adj, &props, &vec_index, &token_counter, &interner)
+            execute_context_query(&query, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
                 .unwrap();
 
         // Should have budget enforcement applied
@@ -940,7 +984,7 @@ mod tests {
 
     #[test]
     fn test_execute_context_query_with_limit() {
-        let (adj, props, vec_index, token_counter, interner) = setup_test_stores();
+        let (adj, props, vec_index, text_index, token_counter, interner) = setup_test_stores();
 
         let query = ContextQuery {
             query_text: Some("test".to_string()),
@@ -958,7 +1002,7 @@ mod tests {
         };
 
         let result =
-            execute_context_query(&query, &adj, &props, &vec_index, &token_counter, &interner)
+            execute_context_query(&query, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
                 .unwrap();
 
         assert!(result.nodes_included <= 1);
@@ -966,7 +1010,7 @@ mod tests {
 
     #[test]
     fn test_execute_context_query_relationships() {
-        let (adj, props, vec_index, token_counter, interner) = setup_test_stores();
+        let (adj, props, vec_index, text_index, token_counter, interner) = setup_test_stores();
 
         let query = ContextQuery {
             query_text: Some("test".to_string()),
@@ -984,7 +1028,7 @@ mod tests {
         };
 
         let result =
-            execute_context_query(&query, &adj, &props, &vec_index, &token_counter, &interner)
+            execute_context_query(&query, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
                 .unwrap();
 
         // Alice (node 1) should have relationships
@@ -1003,7 +1047,7 @@ mod tests {
 
     #[test]
     fn test_execute_context_query_empty_seeds() {
-        let (adj, props, vec_index, token_counter, interner) = setup_test_stores();
+        let (adj, props, vec_index, text_index, token_counter, interner) = setup_test_stores();
 
         let query = ContextQuery {
             query_text: Some("test".to_string()),
@@ -1021,7 +1065,7 @@ mod tests {
         };
 
         let result =
-            execute_context_query(&query, &adj, &props, &vec_index, &token_counter, &interner)
+            execute_context_query(&query, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
                 .unwrap();
 
         // No seeds found, so no results
@@ -1035,7 +1079,7 @@ mod tests {
         // not from hardcoded values. The planner defaults to alpha=0.5, theta=0.01
         // so we confirm the plan produces those defaults, then run the executor
         // and verify results are consistent (i.e. the plan path is exercised).
-        let (adj, props, vec_index, token_counter, interner) = setup_test_stores();
+        let (adj, props, vec_index, text_index, token_counter, interner) = setup_test_stores();
 
         let query = ContextQuery {
             query_text: Some("plan test".to_string()),
@@ -1066,7 +1110,7 @@ mod tests {
 
         // Step 2: Execute the query (which now reads from the plan internally)
         let result =
-            execute_context_query(&query, &adj, &props, &vec_index, &token_counter, &interner)
+            execute_context_query(&query, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
                 .unwrap();
 
         // The executor should produce results using the plan's parameters
@@ -1092,7 +1136,7 @@ mod tests {
 
     #[test]
     fn test_execute_seed_strategy_both() {
-        let (adj, props, mut vec_index, token_counter, interner) = setup_test_stores();
+        let (adj, props, mut vec_index, text_index, token_counter, interner) = setup_test_stores();
 
         // Add embeddings for node 1 (Alice) so vector search can find it
         vec_index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
@@ -1121,7 +1165,7 @@ mod tests {
         };
 
         let result =
-            execute_context_query(&query, &adj, &props, &vec_index, &token_counter, &interner)
+            execute_context_query(&query, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
                 .unwrap();
 
         assert!(result.nodes_considered > 0);
@@ -1135,7 +1179,7 @@ mod tests {
 
     #[test]
     fn test_execute_empty_seeds() {
-        let (adj, props, vec_index, token_counter, interner) = setup_test_stores();
+        let (adj, props, vec_index, text_index, token_counter, interner) = setup_test_stores();
 
         let query = ContextQuery {
             query_text: Some("test".to_string()),
@@ -1153,7 +1197,7 @@ mod tests {
         };
 
         let result =
-            execute_context_query(&query, &adj, &props, &vec_index, &token_counter, &interner)
+            execute_context_query(&query, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
                 .unwrap();
 
         // Empty seed list means no seeds found, so no results
@@ -1187,7 +1231,7 @@ mod tests {
     fn test_conflict_detection() {
         // Two "person" nodes with the same property key ("name") but different values
         // should produce a ConflictInfo.
-        let (adj, mut props, vec_index, token_counter, interner) = setup_test_stores();
+        let (adj, mut props, vec_index, text_index, token_counter, interner) = setup_test_stores();
 
         // Node 1 (Alice) and Node 2 (Bob) are both label "person" and both have
         // "name" and "description" properties with different values.
@@ -1220,7 +1264,7 @@ mod tests {
         };
 
         let result =
-            execute_context_query(&query, &adj, &props, &vec_index, &token_counter, &interner)
+            execute_context_query(&query, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
                 .unwrap();
 
         // We should have conflicts for "name" and "description" between Alice and Bob
@@ -1259,7 +1303,7 @@ mod tests {
     #[test]
     fn test_sort_order_applied() {
         // Create nodes with temporal metadata to test sorting by recency.
-        let (adj, mut props, vec_index, token_counter, interner) = setup_test_stores();
+        let (adj, mut props, vec_index, text_index, token_counter, interner) = setup_test_stores();
 
         // Give nodes valid_from timestamps: Alice=1000, Bob=3000, Rust=2000
         props.set_node_property(1, "_valid_from", Value::Int(1000));
@@ -1286,7 +1330,7 @@ mod tests {
         };
 
         let result_asc =
-            execute_context_query(&query_asc, &adj, &props, &vec_index, &token_counter, &interner)
+            execute_context_query(&query_asc, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
                 .unwrap();
 
         // Should be ordered by valid_from ascending
@@ -1333,7 +1377,7 @@ mod tests {
         };
 
         let result_desc =
-            execute_context_query(&query_desc, &adj, &props, &vec_index, &token_counter, &interner)
+            execute_context_query(&query_desc, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
                 .unwrap();
 
         // Should be ordered by valid_from descending
@@ -1380,7 +1424,7 @@ mod tests {
         };
 
         let result_rel =
-            execute_context_query(&query_rel, &adj, &props, &vec_index, &token_counter, &interner)
+            execute_context_query(&query_rel, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
                 .unwrap();
 
         // Should be ordered by relevance_score descending
@@ -1476,7 +1520,7 @@ mod tests {
     #[test]
     fn test_execute_temporal_filter_at_zero() {
         // temporal_at=0 should filter out all nodes created after timestamp 0.
-        let (adj, mut props, vec_index, token_counter, interner) = setup_test_stores();
+        let (adj, mut props, vec_index, text_index, token_counter, interner) = setup_test_stores();
 
         // Set _valid_from on all nodes to timestamps > 0
         props.set_node_property(1, "_valid_from", Value::Int(1000));
@@ -1500,7 +1544,7 @@ mod tests {
         };
 
         let result =
-            execute_context_query(&query, &adj, &props, &vec_index, &token_counter, &interner)
+            execute_context_query(&query, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
                 .unwrap();
 
         assert!(
@@ -1513,7 +1557,7 @@ mod tests {
     #[test]
     fn test_execute_temporal_filter_at_max() {
         // temporal_at=u64::MAX-1 should allow all nodes through (since their valid_from < MAX-1).
-        let (adj, mut props, vec_index, token_counter, interner) = setup_test_stores();
+        let (adj, mut props, vec_index, text_index, token_counter, interner) = setup_test_stores();
 
         // Set _valid_from on nodes to various timestamps
         props.set_node_property(1, "_valid_from", Value::Int(1000));
@@ -1536,7 +1580,7 @@ mod tests {
         };
 
         let result =
-            execute_context_query(&query, &adj, &props, &vec_index, &token_counter, &interner)
+            execute_context_query(&query, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
                 .unwrap();
 
         // Should include all reachable nodes (alice + neighbors)
@@ -1556,7 +1600,7 @@ mod tests {
         // While the executor doesn't have a direct SortField::TokenCount, we can verify
         // chunks are correctly sorted by relevance (which correlates), and also verify
         // that token_count values are correctly computed so external sorting works.
-        let (adj, mut props, vec_index, token_counter, interner) = setup_test_stores();
+        let (adj, mut props, vec_index, text_index, token_counter, interner) = setup_test_stores();
 
         // Give nodes varying amounts of content to produce different token counts
         // Node 1 (Alice): short content
@@ -1596,7 +1640,7 @@ mod tests {
         };
 
         let result =
-            execute_context_query(&query, &adj, &props, &vec_index, &token_counter, &interner)
+            execute_context_query(&query, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
                 .unwrap();
 
         // Collect chunks and sort by token_count ascending
@@ -1645,7 +1689,7 @@ mod tests {
     #[test]
     fn test_execute_limit_zero() {
         // limit=0 should produce 0 chunks in result.
-        let (adj, props, vec_index, token_counter, interner) = setup_test_stores();
+        let (adj, props, vec_index, text_index, token_counter, interner) = setup_test_stores();
 
         let query = ContextQuery {
             query_text: Some("test".to_string()),
@@ -1663,7 +1707,7 @@ mod tests {
         };
 
         let result =
-            execute_context_query(&query, &adj, &props, &vec_index, &token_counter, &interner)
+            execute_context_query(&query, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
                 .unwrap();
 
         assert_eq!(

@@ -108,7 +108,9 @@ pub struct TextSearchParams {
 
 #[derive(Deserialize)]
 pub struct TemporalQueryRequest {
-    pub timestamp: u64,
+    pub timestamp: Option<u64>,
+    pub start_time: Option<u64>,
+    pub end_time: Option<u64>,
     pub node_ids: Option<Vec<u64>>,
     pub include_edges: Option<bool>,
 }
@@ -278,6 +280,11 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route(
             "/v1/graphs/{graph}/temporal",
             post(temporal_query),
+        )
+        // Node history.
+        .route(
+            "/v1/graphs/{graph}/nodes/{id}/history",
+            get(node_history),
         )
         // Prometheus metrics.
         .route("/metrics", get(metrics_handler))
@@ -929,8 +936,12 @@ fn value_to_csv_string(v: &Value) -> String {
     }
 }
 
-/// Temporal query: return graph state at a specific point in time.
+/// Temporal query: return graph state at a point in time or during a time range.
 /// POST /v1/graphs/{graph}/temporal
+///
+/// Point-in-time: `{ "timestamp": 12345 }` — returns entities valid at that instant.
+/// Range: `{ "start_time": 100, "end_time": 500 }` — returns entities valid at
+///   any point during the half-open interval [start_time, end_time).
 async fn temporal_query(
     State(engine): State<Arc<Engine>>,
     headers: HeaderMap,
@@ -944,8 +955,23 @@ async fn temporal_query(
     };
     let gs = graph_arc.read();
 
-    let timestamp = body.timestamp;
     let include_edges = body.include_edges.unwrap_or(true);
+
+    // Determine temporal mode: range [start, end) or point-in-time.
+    let is_range = body.start_time.is_some() && body.end_time.is_some();
+    let range_start = body.start_time.unwrap_or(0);
+    let range_end = body.end_time.unwrap_or(0);
+    let timestamp = body.timestamp.unwrap_or(0);
+
+    if !is_range && body.timestamp.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::err(
+                "either 'timestamp' or both 'start_time' and 'end_time' are required".to_string(),
+            )),
+        )
+            .into_response();
+    }
 
     // Determine which nodes to inspect
     let node_ids: Vec<u64> = match body.node_ids {
@@ -953,7 +979,7 @@ async fn temporal_query(
         None => gs.adjacency.all_node_ids(),
     };
 
-    // Filter nodes valid at the given timestamp
+    // Filter nodes valid at the given timestamp or during the range
     let mut result_nodes: Vec<serde_json::Value> = Vec::new();
     let mut result_edges: Vec<serde_json::Value> = Vec::new();
     let mut seen_edges = std::collections::HashSet::new();
@@ -981,15 +1007,19 @@ async fn temporal_query(
                 _ => None,
             });
 
-        // Node is valid at timestamp if created before/at timestamp and not expired
-        if let Some(created) = created_at
-            && timestamp < created
-        {
-            continue;
-        }
-        if let Some(expires) = expires_at
-            && timestamp >= expires
-        {
+        // Construct the node's effective valid window: [created_at, expires_at)
+        let node_valid_from = created_at.unwrap_or(0);
+        let node_valid_until = expires_at.unwrap_or(u64::MAX);
+
+        let node_passes = if is_range {
+            // Overlap check: node_valid_from < range_end && node_valid_until > range_start
+            node_valid_from < range_end && node_valid_until > range_start
+        } else {
+            // Point-in-time: created_at <= timestamp < expires_at
+            node_valid_from <= timestamp && timestamp < node_valid_until
+        };
+
+        if !node_passes {
             continue;
         }
 
@@ -1014,46 +1044,199 @@ async fn temporal_query(
             "properties": props_map,
         }));
 
-        // Collect edges valid at this timestamp
+        // Collect edges valid at this timestamp or during the range
         if include_edges {
-            let temporal_neighbors = gs.adjacency.neighbors_at(nid, timestamp, None);
-            for (neighbor_id, edge_id) in temporal_neighbors {
-                if seen_edges.insert(edge_id)
-                    && let Some(meta) = gs.adjacency.get_edge(edge_id)
-                {
-                    let edge_label = gs
-                        .interner
-                        .resolve_label(meta.label)
-                        .unwrap_or("unknown")
-                        .to_string();
-                    result_edges.push(serde_json::json!({
-                        "edge_id": edge_id,
-                        "source": meta.source,
-                        "target": meta.target,
-                        "label": edge_label,
-                        "weight": meta.weight,
-                        "neighbor": neighbor_id,
-                        "valid_from": meta.temporal.valid_from,
-                        "valid_until": if meta.temporal.valid_until == u64::MAX {
-                            serde_json::Value::Null
-                        } else {
-                            serde_json::json!(meta.temporal.valid_until)
-                        },
-                    }));
+            if is_range {
+                // For range queries, iterate all outgoing edges and check overlap
+                let all_neighbors = gs.adjacency.neighbors_out(nid, None);
+                for (neighbor_id, edge_id) in all_neighbors {
+                    if seen_edges.insert(edge_id)
+                        && let Some(meta) = gs.adjacency.get_edge(edge_id)
+                        && meta.temporal.is_valid_during(range_start, range_end)
+                    {
+                        let edge_label = gs
+                            .interner
+                            .resolve_label(meta.label)
+                            .unwrap_or("unknown")
+                            .to_string();
+                        result_edges.push(serde_json::json!({
+                            "edge_id": edge_id,
+                            "source": meta.source,
+                            "target": meta.target,
+                            "label": edge_label,
+                            "weight": meta.weight,
+                            "neighbor": neighbor_id,
+                            "valid_from": meta.temporal.valid_from,
+                            "valid_until": if meta.temporal.valid_until == u64::MAX {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::json!(meta.temporal.valid_until)
+                            },
+                        }));
+                    }
+                }
+            } else {
+                let temporal_neighbors = gs.adjacency.neighbors_at(nid, timestamp, None);
+                for (neighbor_id, edge_id) in temporal_neighbors {
+                    if seen_edges.insert(edge_id)
+                        && let Some(meta) = gs.adjacency.get_edge(edge_id)
+                    {
+                        let edge_label = gs
+                            .interner
+                            .resolve_label(meta.label)
+                            .unwrap_or("unknown")
+                            .to_string();
+                        result_edges.push(serde_json::json!({
+                            "edge_id": edge_id,
+                            "source": meta.source,
+                            "target": meta.target,
+                            "label": edge_label,
+                            "weight": meta.weight,
+                            "neighbor": neighbor_id,
+                            "valid_from": meta.temporal.valid_from,
+                            "valid_until": if meta.temporal.valid_until == u64::MAX {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::json!(meta.temporal.valid_until)
+                            },
+                        }));
+                    }
                 }
             }
         }
     }
 
+    let time_info = if is_range {
+        serde_json::json!({
+            "start_time": range_start,
+            "end_time": range_end,
+        })
+    } else {
+        serde_json::json!({ "timestamp": timestamp })
+    };
+
     (
         StatusCode::OK,
         Json(ApiResponse::ok(serde_json::json!({
             "graph": graph,
-            "timestamp": timestamp,
+            "query": time_info,
             "node_count": result_nodes.len(),
             "edge_count": result_edges.len(),
             "nodes": result_nodes,
             "edges": result_edges,
+        }))),
+    )
+        .into_response()
+}
+
+/// Node history: return all temporal versions of a node's data.
+/// GET /v1/graphs/{graph}/nodes/{id}/history
+async fn node_history(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path((graph, node_id)): Path<(String, u64)>,
+) -> impl IntoResponse {
+    let _identity = extract_identity(&engine, &headers);
+    let graph_arc = match engine.get_graph(&graph) {
+        Ok(g) => g,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
+    let gs = graph_arc.read();
+
+    if !gs.adjacency.has_node(node_id) {
+        return weav_error_to_response(weav_core::error::WeavError::NodeNotFound(
+            node_id,
+            gs.graph_id,
+        ))
+        .into_response();
+    }
+
+    // Node's current properties
+    let label = gs
+        .properties
+        .get_node_property(node_id, "_label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let props = gs.properties.get_all_node_properties(node_id);
+    let mut props_map = serde_json::Map::new();
+    for (k, v) in &props {
+        if !k.starts_with('_') {
+            props_map.insert(k.to_string(), value_to_json(v));
+        }
+    }
+
+    // Node temporal metadata from stored properties
+    let created_at = gs
+        .properties
+        .get_node_property(node_id, "_tx_from")
+        .and_then(|v| match v {
+            Value::Int(ts) => Some(*ts as u64),
+            Value::Timestamp(ts) => Some(*ts),
+            _ => None,
+        });
+    let expires_at = gs
+        .properties
+        .get_node_property(node_id, "_ttl_expires_at")
+        .and_then(|v| match v {
+            Value::Timestamp(ts) => Some(*ts),
+            Value::Int(ts) => Some(*ts as u64),
+            _ => None,
+        });
+
+    let temporal = serde_json::json!({
+        "valid_from": created_at.unwrap_or(0),
+        "valid_until": expires_at.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null),
+        "tx_from": created_at.unwrap_or(0),
+        "tx_until": serde_json::Value::Null,
+    });
+
+    // All edges connected to this node (outgoing and incoming), including invalidated ones
+    let mut edges: Vec<serde_json::Value> = Vec::new();
+    for (edge_id, meta) in gs.adjacency.all_edges() {
+        if meta.source != node_id && meta.target != node_id {
+            continue;
+        }
+        let edge_label = gs
+            .interner
+            .resolve_label(meta.label)
+            .unwrap_or("unknown")
+            .to_string();
+        let is_active = meta.temporal.valid_until == u64::MAX;
+        edges.push(serde_json::json!({
+            "edge_id": edge_id,
+            "source": meta.source,
+            "target": meta.target,
+            "label": edge_label,
+            "weight": meta.weight,
+            "active": is_active,
+            "temporal": {
+                "valid_from": meta.temporal.valid_from,
+                "valid_until": if meta.temporal.valid_until == u64::MAX {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(meta.temporal.valid_until)
+                },
+                "tx_from": meta.temporal.tx_from,
+                "tx_until": if meta.temporal.tx_until == u64::MAX {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(meta.temporal.tx_until)
+                },
+            },
+        }));
+    }
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::ok(serde_json::json!({
+            "node_id": node_id,
+            "graph": graph,
+            "label": label,
+            "properties": props_map,
+            "temporal": temporal,
+            "edges": edges,
+            "edge_count": edges.len(),
         }))),
     )
         .into_response()
@@ -1924,6 +2107,17 @@ struct HitsResponse {
     hubs: Vec<AlgoNodeScore>,
 }
 
+#[derive(Serialize)]
+struct FastRPEmbedding {
+    node_id: u64,
+    embedding: Vec<f32>,
+}
+
+#[derive(Serialize)]
+struct FastRPResponse {
+    embeddings: Vec<FastRPEmbedding>,
+}
+
 // ─── Algorithm handler ──────────────────────────────────────────────────────
 
 async fn run_algorithm(
@@ -2202,12 +2396,26 @@ async fn run_algorithm(
             (StatusCode::OK, Json(ApiResponse::ok(HitsResponse { authorities, hubs }))).into_response()
         }
 
+        "fastrp" => {
+            let dim = body.get("embedding_dim").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
+            let iterations = body.get("iterations").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+            let norm = body.get("normalization_strength").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let seed = body.get("seed").and_then(|v| v.as_u64()).unwrap_or(42);
+            let embeddings = weav_graph::traversal::fastrp_embeddings(&gs.adjacency, dim, iterations, norm, seed);
+            let mut results: Vec<FastRPEmbedding> = embeddings
+                .into_iter()
+                .map(|(nid, emb)| FastRPEmbedding { node_id: nid, embedding: emb })
+                .collect();
+            results.sort_by_key(|e| e.node_id);
+            (StatusCode::OK, Json(ApiResponse::ok(FastRPResponse { embeddings: results }))).into_response()
+        }
+
         _ => (
             StatusCode::BAD_REQUEST,
             Json(ApiResponse::<()>::err(format!(
                 "unknown algorithm: {algorithm}. Supported: pagerank, betweenness, closeness, \
                  communities, label_propagation, leiden, shortest_path, components, scc, \
-                 topological_sort, triangle_count, degree, eigenvector, hits"
+                 topological_sort, triangle_count, degree, eigenvector, hits, fastrp"
             ))),
         )
             .into_response(),
@@ -3880,6 +4088,255 @@ mod tests {
             .body(Body::from(
                 serde_json::json!({ "timestamp": 1700000000000_u64 }).to_string(),
             ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_temporal_range_query() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "tr".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        // Add nodes
+        let n1 = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "tr".to_string(),
+                    label: "event".to_string(),
+                    properties: vec![("name".to_string(), Value::String("A".into()))],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+        let n2 = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "tr".to_string(),
+                    label: "event".to_string(),
+                    properties: vec![("name".to_string(), Value::String("B".into()))],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Add edge
+        engine
+            .execute_command(
+                Command::EdgeAdd(EdgeAddCmd {
+                    graph: "tr".to_string(),
+                    source: n1,
+                    target: n2,
+                    label: "related".to_string(),
+                    weight: 1.0,
+                    properties: vec![],
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Range query that includes current time should find both nodes
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/tr/temporal")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "start_time": now_ms - 5000,
+                    "end_time": now_ms + 5000,
+                    "include_edges": true
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["node_count"].as_u64().unwrap(), 2);
+        assert!(json["data"]["edge_count"].as_u64().unwrap() >= 1);
+        assert!(json["data"]["query"]["start_time"].is_number());
+        assert!(json["data"]["query"]["end_time"].is_number());
+
+        // Range query should also include edges with range info in response
+        let edges = json["data"]["edges"].as_array().unwrap();
+        assert!(!edges.is_empty());
+        assert!(edges[0]["valid_from"].is_number());
+
+        // Verify response contains range query metadata (not point-in-time)
+        assert!(json["data"]["query"]["start_time"].is_number());
+        assert!(json["data"]["query"]["end_time"].is_number());
+        assert!(json["data"]["query"]["timestamp"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_temporal_query_missing_params() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "tp".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        // Neither timestamp nor start_time+end_time => bad request
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/tp/temporal")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "include_edges": true }).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_node_history_endpoint() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "nh".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let n1 = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "nh".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![("name".to_string(), Value::String("Alice".into()))],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+        let n2 = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "nh".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![("name".to_string(), Value::String("Bob".into()))],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Add edge between them
+        engine
+            .execute_command(
+                Command::EdgeAdd(EdgeAddCmd {
+                    graph: "nh".to_string(),
+                    source: n1,
+                    target: n2,
+                    label: "knows".to_string(),
+                    weight: 0.9,
+                    properties: vec![],
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        // Get node history for n1
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/v1/graphs/nh/nodes/{n1}/history"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["node_id"].as_u64().unwrap(), n1);
+        assert_eq!(json["data"]["graph"], "nh");
+        assert_eq!(json["data"]["label"], "person");
+        assert!(json["data"]["properties"]["name"].is_string());
+        assert!(json["data"]["temporal"]["valid_from"].is_number());
+        // Should have at least 1 edge
+        assert!(json["data"]["edge_count"].as_u64().unwrap() >= 1);
+        let edges = json["data"]["edges"].as_array().unwrap();
+        assert!(!edges.is_empty());
+        // Verify edge has temporal metadata
+        let edge = &edges[0];
+        assert!(edge["temporal"]["valid_from"].is_number());
+        assert!(edge["active"].is_boolean());
+    }
+
+    #[tokio::test]
+    async fn test_node_history_not_found() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "nh2".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/graphs/nh2/nodes/9999/history")
+            .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);

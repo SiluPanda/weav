@@ -1045,7 +1045,7 @@ impl WeavMcpServer {
     }
 
     /// Run a graph algorithm.
-    #[tool(description = "Run a graph algorithm on a graph. Supported algorithms: 'pagerank' (Personalized PageRank), 'communities' (Louvain modularity), 'label_propagation', 'shortest_path' (Dijkstra, requires source+target), 'connected_components', 'betweenness' (centrality), 'closeness' (centrality), 'degree' (centrality), 'triangle_count', 'scc' (strongly connected components), 'topological_sort'. Returns algorithm-specific results.")]
+    #[tool(description = "Run a graph algorithm on a graph. Supported algorithms: 'pagerank' (Personalized PageRank), 'communities' (Louvain modularity), 'label_propagation', 'shortest_path' (Dijkstra, requires source+target), 'connected_components', 'betweenness' (centrality), 'closeness' (centrality), 'degree' (centrality), 'triangle_count', 'scc' (strongly connected components), 'topological_sort', 'fastrp' (Fast Random Projection node embeddings). Returns algorithm-specific results.")]
     fn run_algorithm(
         &self,
         Parameters(params): Parameters<RunAlgorithmParams>,
@@ -1289,10 +1289,25 @@ impl WeavMcpServer {
                 }
                 Err(e) => weav_error(e),
             },
+            "fastrp" => {
+                let dim = 128usize;
+                let iterations = params.max_iterations.unwrap_or(3) as usize;
+                let embeddings = traversal::fastrp_embeddings(&gs.adjacency, dim, iterations, 1.0, 42);
+                let results: Vec<serde_json::Value> = embeddings
+                    .into_iter()
+                    .take(limit)
+                    .map(|(nid, emb)| serde_json::json!({"node_id": nid, "embedding": emb}))
+                    .collect();
+                success_json(&serde_json::json!({
+                    "algorithm": "fastrp",
+                    "count": results.len(),
+                    "results": results,
+                }))
+            }
             other => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Unknown algorithm '{other}'. Supported: pagerank, communities, label_propagation, \
                  shortest_path, connected_components, betweenness, closeness, degree, \
-                 triangle_count, scc, topological_sort"
+                 triangle_count, scc, topological_sort, fastrp"
             ))])),
         }
     }

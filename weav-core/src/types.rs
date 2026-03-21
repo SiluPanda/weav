@@ -84,6 +84,22 @@ impl BiTemporal {
     pub fn supersede(&mut self, tx_ts: Timestamp) {
         self.tx_until = tx_ts;
     }
+
+    /// Returns `true` if this record's valid period overlaps with [start, end).
+    /// Both the record interval and query interval are half-open: [from, until).
+    /// Empty intervals (start == end or valid_from == valid_until) never overlap.
+    pub fn is_valid_during(&self, start: Timestamp, end: Timestamp) -> bool {
+        start < end && self.valid_from < self.valid_until
+            && self.valid_from < end && self.valid_until > start
+    }
+
+    /// Returns `true` if this record was created in the database during [start, end).
+    /// Both the record interval and query interval are half-open: [from, until).
+    /// Empty intervals (start == end or tx_from == tx_until) never overlap.
+    pub fn was_current_during(&self, start: Timestamp, end: Timestamp) -> bool {
+        start < end && self.tx_from < self.tx_until
+            && self.tx_from < end && self.tx_until > start
+    }
 }
 
 impl Default for BiTemporal {
@@ -1045,5 +1061,86 @@ mod tests {
             assert_eq!(p.len(), 3);
             assert_eq!(p[0], p[1]); // duplicates are allowed
         }
+    }
+
+    #[test]
+    fn test_bitemporal_is_valid_during() {
+        // Record valid [100, 500)
+        let bt = BiTemporal {
+            valid_from: 100,
+            valid_until: 500,
+            tx_from: 100,
+            tx_until: BiTemporal::OPEN,
+        };
+        // Range fully contains record
+        assert!(bt.is_valid_during(0, 600));
+        // Range overlaps start
+        assert!(bt.is_valid_during(0, 200));
+        // Range overlaps end
+        assert!(bt.is_valid_during(400, 600));
+        // Range fully within record
+        assert!(bt.is_valid_during(200, 300));
+        // Range touches exact boundaries
+        assert!(bt.is_valid_during(100, 500));
+        // Single-point range at valid_from
+        assert!(bt.is_valid_during(100, 101));
+        // Open record (valid_until = OPEN)
+        let open = BiTemporal::new_current(100);
+        assert!(open.is_valid_during(200, 300));
+        assert!(open.is_valid_during(0, 200));
+    }
+
+    #[test]
+    fn test_bitemporal_is_valid_during_no_overlap() {
+        // Record valid [100, 500)
+        let bt = BiTemporal {
+            valid_from: 100,
+            valid_until: 500,
+            tx_from: 100,
+            tx_until: BiTemporal::OPEN,
+        };
+        // Range entirely before
+        assert!(!bt.is_valid_during(0, 50));
+        // Range ends exactly at valid_from (half-open: [0,100) doesn't touch [100,500))
+        assert!(!bt.is_valid_during(0, 100));
+        // Range entirely after
+        assert!(!bt.is_valid_during(600, 700));
+        // Range starts exactly at valid_until
+        assert!(!bt.is_valid_during(500, 600));
+        // Zero-width range
+        assert!(!bt.is_valid_during(200, 200));
+        // Zero-width record
+        let zero = BiTemporal {
+            valid_from: 100,
+            valid_until: 100,
+            tx_from: 100,
+            tx_until: BiTemporal::OPEN,
+        };
+        assert!(!zero.is_valid_during(0, 200));
+    }
+
+    #[test]
+    fn test_bitemporal_was_current_during() {
+        // Record current in DB during [500, 1000)
+        let bt = BiTemporal {
+            valid_from: 100,
+            valid_until: BiTemporal::OPEN,
+            tx_from: 500,
+            tx_until: 1000,
+        };
+        // Range overlaps tx window
+        assert!(bt.was_current_during(600, 700));
+        assert!(bt.was_current_during(0, 600));
+        assert!(bt.was_current_during(900, 1100));
+        assert!(bt.was_current_during(500, 1000));
+        // Range does not overlap
+        assert!(!bt.was_current_during(0, 500));
+        assert!(!bt.was_current_during(1000, 2000));
+        assert!(!bt.was_current_during(0, 100));
+        // Open tx record
+        let open = BiTemporal::new_current(500);
+        assert!(open.was_current_during(600, 700));
+        assert!(open.was_current_during(500, 501));
+        assert!(!open.was_current_during(0, 500));
     }
 }

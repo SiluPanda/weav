@@ -2781,6 +2781,7 @@ impl Engine {
             &gs.adjacency,
             &gs.properties,
             &gs.vector_index,
+            &gs.text_index,
             &self.token_counter,
             &gs.interner,
         )?;

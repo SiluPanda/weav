@@ -64,6 +64,16 @@ pub fn find_duplicate_by_vector(
         .copied()
 }
 
+/// Check if two entity names are fuzzy matches using Jaro-Winkler similarity.
+/// Returns true if similarity >= threshold.
+pub fn fuzzy_name_match(name_a: &str, name_b: &str, threshold: f64) -> bool {
+    if name_a.eq_ignore_ascii_case(name_b) {
+        return true; // Exact match (fast path)
+    }
+    let sim = strsim::jaro_winkler(&name_a.to_lowercase(), &name_b.to_lowercase());
+    sim >= threshold
+}
+
 /// Find a duplicate node by exact key match.
 pub fn find_duplicate_by_key(
     properties: &PropertyStore,
@@ -810,5 +820,43 @@ mod tests {
         let (node_id, score) = found.unwrap();
         assert_eq!(node_id, 1);
         assert!(score >= 0.85);
+    }
+
+    // ── fuzzy_name_match tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_fuzzy_match_exact() {
+        assert!(fuzzy_name_match("Apple Inc", "Apple Inc", 0.85));
+    }
+
+    #[test]
+    fn test_fuzzy_match_similar() {
+        // "Microsoft Corp" vs "Microsoft Corporation" — high Jaro-Winkler similarity
+        assert!(fuzzy_name_match(
+            "Microsoft Corp",
+            "Microsoft Corporation",
+            0.85
+        ));
+    }
+
+    #[test]
+    fn test_fuzzy_match_different() {
+        assert!(!fuzzy_name_match("Apple", "Samsung", 0.85));
+    }
+
+    #[test]
+    fn test_fuzzy_match_case_insensitive() {
+        // Exact match fast path is case-insensitive
+        assert!(fuzzy_name_match("john DOE", "John Doe", 0.85));
+    }
+
+    #[test]
+    fn test_fuzzy_threshold() {
+        // At a very high threshold, partial matches are rejected
+        assert!(!fuzzy_name_match(
+            "Microsoft Corp",
+            "Microsoft Corporation",
+            0.99
+        ));
     }
 }

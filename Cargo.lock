@@ -5378,6 +5378,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "strsim",
  "text-splitter",
  "tiktoken-rs 0.6.0",
  "tokio",

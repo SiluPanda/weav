@@ -4,7 +4,8 @@
 //! betweenness centrality, closeness centrality, triangle counting,
 //! Tarjan's strongly connected components, topological sort, Leiden community
 //! detection, Node2Vec random walks, A* shortest path, Yen's K-shortest paths,
-//! degree centrality, eigenvector centrality, HITS (hubs & authorities).
+//! degree centrality, eigenvector centrality, HITS (hubs & authorities),
+//! FastRP node embeddings.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -22,6 +23,8 @@ pub struct EdgeFilter {
     pub max_age_ms: Option<u64>,
     pub min_confidence: Option<f32>,
     pub valid_at: Option<Timestamp>,
+    /// If set, edges must have been valid during the half-open range [start, end).
+    pub valid_during: Option<(Timestamp, Timestamp)>,
 }
 
 impl EdgeFilter {
@@ -32,6 +35,7 @@ impl EdgeFilter {
             max_age_ms: None,
             min_confidence: None,
             valid_at: None,
+            valid_during: None,
         }
     }
 }
@@ -100,6 +104,12 @@ fn edge_passes_filter(adj: &AdjacencyStore, edge_id: EdgeId, filter: &EdgeFilter
 
     if let Some(ts) = filter.valid_at
         && !meta.temporal.is_valid_at(ts)
+    {
+        return false;
+    }
+
+    if let Some((start, end)) = filter.valid_during
+        && !meta.temporal.is_valid_during(start, end)
     {
         return false;
     }
@@ -2428,6 +2438,137 @@ pub fn hits(
     (auth_result, hub_result)
 }
 
+// ─── FastRP Node Embeddings ─────────────────────────────────────────────────
+
+/// Generate node embeddings using Fast Random Projection (FastRP).
+///
+/// FastRP creates dense vector representations of nodes by iteratively
+/// aggregating neighborhood structure through sparse random projections.
+/// This is Neo4j's most-used embedding algorithm, implemented here in pure Rust.
+///
+/// Parameters:
+/// - `embedding_dim`: Dimension of output embeddings (e.g., 128, 256)
+/// - `iterations`: Number of neighborhood aggregation rounds (typically 2-4)
+/// - `normalization_strength`: Controls L2 normalization strength (0.0 = none, 1.0 = full)
+/// - `seed`: Random seed for reproducibility
+///
+/// Returns a map from NodeId to embedding vector.
+pub fn fastrp_embeddings(
+    adjacency: &AdjacencyStore,
+    embedding_dim: usize,
+    iterations: usize,
+    normalization_strength: f64,
+    seed: u64,
+) -> HashMap<NodeId, Vec<f32>> {
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() || embedding_dim == 0 {
+        return HashMap::new();
+    }
+
+    let n = all_nodes.len();
+    let node_idx: HashMap<NodeId, usize> = all_nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &nid)| (nid, i))
+        .collect();
+
+    // Step 1: Generate sparse random initial embeddings.
+    // Each component is: +sqrt(3) with prob 1/6, 0 with prob 2/3, -sqrt(3) with prob 1/6.
+    // This gives an unbiased sparse random projection matrix (Achlioptas, 2003).
+    let sqrt3 = 3.0_f64.sqrt();
+    let mut embeddings: Vec<Vec<f64>> = Vec::with_capacity(n);
+    for (i, _) in all_nodes.iter().enumerate() {
+        let mut vec = vec![0.0_f64; embedding_dim];
+        for (j, slot) in vec.iter_mut().enumerate() {
+            let h = fastrp_hash(seed ^ (i as u64).wrapping_mul(1_000_003) ^ (j as u64).wrapping_mul(999_983));
+            let r = h % 6;
+            *slot = match r {
+                0 => sqrt3,
+                5 => -sqrt3,
+                _ => 0.0,
+            };
+        }
+        embeddings.push(vec);
+    }
+
+    // Collect per-iteration embeddings for aggregation.
+    let mut iteration_embeddings: Vec<Vec<Vec<f64>>> = vec![embeddings.clone()];
+
+    // Step 2: Iterative neighborhood aggregation (mean aggregation with edge weights).
+    for iter in 0..iterations {
+        let prev = &iteration_embeddings[iter];
+        let mut new_embeddings: Vec<Vec<f64>> = vec![vec![0.0; embedding_dim]; n];
+
+        for (i, &node) in all_nodes.iter().enumerate() {
+            let out_neighbors = adjacency.neighbors_out(node, None);
+            let in_neighbors = adjacency.neighbors_in(node, None);
+
+            let mut degree = 0usize;
+            for &(nbr, edge_id) in out_neighbors.iter().chain(in_neighbors.iter()) {
+                if let Some(&nbr_idx) = node_idx.get(&nbr) {
+                    let weight = adjacency
+                        .get_edge(edge_id)
+                        .map(|m| m.weight as f64)
+                        .unwrap_or(1.0);
+                    for (dst, src) in new_embeddings[i].iter_mut().zip(prev[nbr_idx].iter()) {
+                        *dst += src * weight;
+                    }
+                    degree += 1;
+                }
+            }
+
+            // Normalize by degree (mean aggregation).
+            if degree > 0 {
+                let inv_deg = 1.0 / degree as f64;
+                for val in new_embeddings[i].iter_mut() {
+                    *val *= inv_deg;
+                }
+            }
+        }
+
+        // Optional L2 normalization per iteration.
+        if normalization_strength > 0.0 {
+            for emb in &mut new_embeddings {
+                let norm: f64 = emb.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if norm > 1e-10 {
+                    let factor = normalization_strength / norm;
+                    for d in emb.iter_mut() {
+                        *d *= factor;
+                    }
+                }
+            }
+        }
+
+        iteration_embeddings.push(new_embeddings);
+    }
+
+    // Step 3: Use the last iteration's embeddings (standard approach).
+    let final_emb = iteration_embeddings.last().unwrap();
+
+    // L2-normalize final embeddings.
+    let mut result: HashMap<NodeId, Vec<f32>> = HashMap::with_capacity(n);
+    for (i, &node) in all_nodes.iter().enumerate() {
+        let mut vec: Vec<f32> = final_emb[i].iter().map(|&x| x as f32).collect();
+        let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 1e-10 {
+            for v in &mut vec {
+                *v /= norm;
+            }
+        }
+        result.insert(node, vec);
+    }
+
+    result
+}
+
+/// Deterministic hash function for FastRP sparse random projection.
+fn fastrp_hash(mut x: u64) -> u64 {
+    x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2897,6 +3038,70 @@ mod tests {
         assert_eq!(result.visited_nodes.len(), 2); // seed + node 2
         assert!(result.visited_nodes.contains(&2));
         assert!(!result.visited_nodes.contains(&3));
+    }
+
+    #[test]
+    fn test_edge_filter_valid_during() {
+        // Build graph: 1 -> 2 (valid [100, 500)) and 1 -> 3 (valid [600, 900))
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_node(3);
+
+        let meta1 = EdgeMeta {
+            source: 1, target: 2, label: 0,
+            temporal: BiTemporal {
+                valid_from: 100, valid_until: 500,
+                tx_from: 100, tx_until: BiTemporal::OPEN,
+            },
+            provenance: None, weight: 1.0, token_cost: 0,
+        };
+        adj.add_edge(1, 2, 0, meta1).unwrap();
+
+        let meta2 = EdgeMeta {
+            source: 1, target: 3, label: 0,
+            temporal: BiTemporal {
+                valid_from: 600, valid_until: 900,
+                tx_from: 600, tx_until: BiTemporal::OPEN,
+            },
+            provenance: None, weight: 1.0, token_cost: 0,
+        };
+        adj.add_edge(1, 3, 0, meta2).unwrap();
+
+        // Range [200, 400) overlaps only edge 1->2
+        let filter = EdgeFilter {
+            valid_during: Some((200, 400)),
+            ..EdgeFilter::none()
+        };
+        let result = bfs(
+            &adj, &[1], 1, 100, &filter, &NodeFilter::none(), Direction::Outgoing,
+            None, None,
+        );
+        assert_eq!(result.visited_nodes.len(), 2); // seed + node 2
+        assert!(result.visited_nodes.contains(&2));
+        assert!(!result.visited_nodes.contains(&3));
+
+        // Range [400, 700) overlaps both edges
+        let filter2 = EdgeFilter {
+            valid_during: Some((400, 700)),
+            ..EdgeFilter::none()
+        };
+        let result2 = bfs(
+            &adj, &[1], 1, 100, &filter2, &NodeFilter::none(), Direction::Outgoing,
+            None, None,
+        );
+        assert_eq!(result2.visited_nodes.len(), 3); // seed + nodes 2 and 3
+
+        // Range [500, 600) overlaps neither edge (gap between them)
+        let filter3 = EdgeFilter {
+            valid_during: Some((500, 600)),
+            ..EdgeFilter::none()
+        };
+        let result3 = bfs(
+            &adj, &[1], 1, 100, &filter3, &NodeFilter::none(), Direction::Outgoing,
+            None, None,
+        );
+        assert_eq!(result3.visited_nodes.len(), 1); // only seed
     }
 
     #[test]
@@ -4771,5 +4976,169 @@ mod tests {
         // All hub scores should be equal
         assert!((hub_map[&1] - hub_map[&2]).abs() < 1e-6);
         assert!((hub_map[&2] - hub_map[&3]).abs() < 1e-6);
+    }
+
+    // ── FastRP tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fastrp_basic() {
+        // Triangle: 1 <-> 2 <-> 3 <-> 1
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let embeddings = fastrp_embeddings(&adj, 64, 3, 1.0, 42);
+        assert_eq!(embeddings.len(), 3);
+        // Each embedding should have the requested dimension
+        for (_, emb) in &embeddings {
+            assert_eq!(emb.len(), 64);
+        }
+    }
+
+    #[test]
+    fn test_fastrp_deterministic() {
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=4 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 4, 0, make_meta(3, 4, 0)).unwrap();
+
+        let emb1 = fastrp_embeddings(&adj, 32, 2, 1.0, 123);
+        let emb2 = fastrp_embeddings(&adj, 32, 2, 1.0, 123);
+
+        // Same seed must produce identical embeddings
+        for (&nid, vec1) in &emb1 {
+            let vec2 = &emb2[&nid];
+            for (a, b) in vec1.iter().zip(vec2.iter()) {
+                assert!((a - b).abs() < 1e-10, "embeddings differ for node {nid}");
+            }
+        }
+
+        // Different seed must produce different embeddings
+        let emb3 = fastrp_embeddings(&adj, 32, 2, 1.0, 999);
+        let mut any_different = false;
+        for (&nid, vec1) in &emb1 {
+            let vec3 = &emb3[&nid];
+            for (a, b) in vec1.iter().zip(vec3.iter()) {
+                if (a - b).abs() > 1e-6 {
+                    any_different = true;
+                    break;
+                }
+            }
+            if any_different {
+                break;
+            }
+        }
+        assert!(any_different, "different seeds should produce different embeddings");
+    }
+
+    #[test]
+    fn test_fastrp_empty_graph() {
+        let adj = AdjacencyStore::new();
+        let embeddings = fastrp_embeddings(&adj, 64, 3, 1.0, 42);
+        assert!(embeddings.is_empty());
+    }
+
+    #[test]
+    fn test_fastrp_connected_similar() {
+        // Build two disconnected clusters:
+        // Cluster A: 1 <-> 2 <-> 3 (fully connected)
+        // Cluster B: 10 <-> 11 <-> 12 (fully connected)
+        // No edges between clusters.
+        let mut adj = AdjacencyStore::new();
+        for &id in &[1, 2, 3, 10, 11, 12] {
+            adj.add_node(id);
+        }
+        // Cluster A
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+        // Cluster B
+        adj.add_edge(10, 11, 0, make_meta(10, 11, 0)).unwrap();
+        adj.add_edge(11, 10, 0, make_meta(11, 10, 0)).unwrap();
+        adj.add_edge(11, 12, 0, make_meta(11, 12, 0)).unwrap();
+        adj.add_edge(12, 11, 0, make_meta(12, 11, 0)).unwrap();
+        adj.add_edge(10, 12, 0, make_meta(10, 12, 0)).unwrap();
+        adj.add_edge(12, 10, 0, make_meta(12, 10, 0)).unwrap();
+
+        let embeddings = fastrp_embeddings(&adj, 128, 3, 1.0, 42);
+
+        // Cosine similarity helper
+        let cosine = |a: &[f32], b: &[f32]| -> f32 {
+            let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+            let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if na < 1e-10 || nb < 1e-10 {
+                return 0.0;
+            }
+            dot / (na * nb)
+        };
+
+        // Within-cluster similarity (nodes 1 and 2)
+        let sim_within = cosine(&embeddings[&1], &embeddings[&2]);
+        // Cross-cluster similarity (node 1 vs node 10)
+        let sim_cross = cosine(&embeddings[&1], &embeddings[&10]);
+
+        assert!(
+            sim_within > sim_cross,
+            "within-cluster similarity ({sim_within}) should exceed cross-cluster ({sim_cross})"
+        );
+    }
+
+    #[test]
+    fn test_fastrp_dimension() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+
+        for dim in [16, 64, 128, 256] {
+            let embeddings = fastrp_embeddings(&adj, dim, 2, 1.0, 42);
+            for (_, emb) in &embeddings {
+                assert_eq!(emb.len(), dim, "embedding dim should be {dim}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_fastrp_zero_dim() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        let embeddings = fastrp_embeddings(&adj, 0, 2, 1.0, 42);
+        assert!(embeddings.is_empty());
+    }
+
+    #[test]
+    fn test_fastrp_normalized() {
+        // Verify final embeddings are L2-normalized (unit vectors)
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=5 {
+            adj.add_node(i);
+        }
+        for i in 1..=4 {
+            adj.add_edge(i, i + 1, 0, make_meta(i, i + 1, 0)).unwrap();
+            adj.add_edge(i + 1, i, 0, make_meta(i + 1, i, 0)).unwrap();
+        }
+
+        let embeddings = fastrp_embeddings(&adj, 64, 3, 1.0, 42);
+        for (&nid, emb) in &embeddings {
+            let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-4,
+                "node {nid} embedding norm={norm}, expected ~1.0"
+            );
+        }
     }
 }
