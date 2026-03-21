@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use weav_core::config::{WalSyncMode, WeavConfig};
 use weav_server::{engine::Engine, grpc_server::WeavGrpcService, http, resp3_server};
 use weav_proto::grpc::weav_service_server::WeavServiceServer;
@@ -33,17 +34,49 @@ async fn main() {
         }
     }
 
+    // Set up graceful shutdown.
+    let shutdown_token = CancellationToken::new();
+    {
+        let token = shutdown_token.clone();
+        tokio::spawn(async move {
+            let ctrl_c = tokio::signal::ctrl_c();
+            #[cfg(unix)]
+            {
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("failed to register SIGTERM handler");
+                tokio::select! {
+                    _ = ctrl_c => {}
+                    _ = sigterm.recv() => {}
+                };
+            }
+            #[cfg(not(unix))]
+            ctrl_c.await.ok();
+
+            tracing::info!("shutdown signal received, draining connections...");
+            token.cancel();
+        });
+    }
+
     // Spawn background WAL sync task if configured for EverySecond mode.
     if config.persistence.enabled
         && matches!(config.persistence.wal_sync_mode, WalSyncMode::EverySecond)
     {
         let engine_wal = engine.clone();
+        let token = shutdown_token.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
-                interval.tick().await;
-                if let Err(e) = engine_wal.sync_wal() {
-                    tracing::error!("WAL sync failed: {e}");
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Err(e) = engine_wal.sync_wal() {
+                            tracing::error!("WAL sync failed: {e}");
+                        }
+                    }
+                    _ = token.cancelled() => {
+                        tracing::info!("WAL sync task shutting down");
+                        break;
+                    }
                 }
             }
         });
@@ -53,13 +86,21 @@ async fn main() {
     // Spawn background TTL sweep task (every 10 seconds)
     {
         let engine_ttl = engine.clone();
+        let token = shutdown_token.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
             loop {
-                interval.tick().await;
-                let expired = engine_ttl.sweep_ttl();
-                if expired > 0 {
-                    tracing::info!("TTL sweep: removed {expired} expired entities");
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let expired = engine_ttl.sweep_ttl();
+                        if expired > 0 {
+                            tracing::info!("TTL sweep: removed {expired} expired entities");
+                        }
+                    }
+                    _ = token.cancelled() => {
+                        tracing::info!("TTL sweep task shutting down");
+                        break;
+                    }
                 }
             }
         });
@@ -94,8 +135,12 @@ async fn main() {
     });
 
     let http_listener = tokio::net::TcpListener::bind(&http_addr).await.unwrap();
+    let http_shutdown_token = shutdown_token.clone();
     let http_handle = tokio::spawn(async move {
-        axum::serve(http_listener, app).await.unwrap();
+        axum::serve(http_listener, app)
+            .with_graceful_shutdown(async move { http_shutdown_token.cancelled().await })
+            .await
+            .unwrap();
     });
 
     let grpc_service = WeavGrpcService {
@@ -103,10 +148,13 @@ async fn main() {
     };
     tracing::info!("Weav gRPC server listening on {}", grpc_addr);
     let grpc_addr_parsed: std::net::SocketAddr = grpc_addr.parse().unwrap();
+    let grpc_shutdown_token = shutdown_token.clone();
     let grpc_handle = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(WeavServiceServer::new(grpc_service))
-            .serve(grpc_addr_parsed)
+            .serve_with_shutdown(grpc_addr_parsed, async move {
+                grpc_shutdown_token.cancelled().await;
+            })
             .await
             .unwrap();
     });

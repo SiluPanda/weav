@@ -61,6 +61,7 @@ bincode = "1"
 bytes = "1"
 axum = "0.8"
 tower = "0.5"
+tower-http = { version = "0.6", features = ["timeout", "limit"] }
 tonic = "0.12"
 prost = "0.13"
 

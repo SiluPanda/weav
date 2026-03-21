@@ -4,13 +4,16 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use std::time::Duration;
+
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use tower_http::timeout::TimeoutLayer;
 
 use weav_core::types::{DecayFunction, Direction, TokenBudget, Value};
 use weav_query::parser::{
@@ -288,6 +291,8 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         )
         // Prometheus metrics.
         .route("/metrics", get(metrics_handler))
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB
+        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(30)))
         .with_state(engine)
 }
 
@@ -4503,5 +4508,52 @@ mod tests {
         let graph_arc = engine.get_graph("csv_rt2").unwrap();
         let gs = graph_arc.read();
         assert_eq!(gs.adjacency.node_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_token_lifecycle() {
+        use tokio_util::sync::CancellationToken;
+
+        let token = CancellationToken::new();
+        assert!(!token.is_cancelled());
+
+        let child = token.child_token();
+        assert!(!child.is_cancelled());
+
+        token.cancel();
+        assert!(token.is_cancelled());
+        assert!(child.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_body_size_limit_rejects_oversized() {
+        let app = make_app();
+
+        // Create a body larger than 10 MB.
+        let oversized = "x".repeat(11 * 1024 * 1024);
+        let body = serde_json::json!({ "name": oversized });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn test_body_within_limit_succeeds() {
+        let app = make_app();
+
+        // A normal-sized request should succeed.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name": "limit_test"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
     }
 }
