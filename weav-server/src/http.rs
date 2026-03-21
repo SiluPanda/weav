@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
@@ -90,6 +90,13 @@ pub struct ContextRequest {
     pub sort_direction: Option<String>,
     pub edge_labels: Option<Vec<String>>,
     pub direction: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct SearchParams {
+    pub key: String,
+    pub value: String,
+    pub limit: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -232,6 +239,15 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/context", post(context_query))
         // Ingest (extraction pipeline).
         .route("/v1/graphs/{graph}/ingest", post(ingest))
+        // Node search by property.
+        .route("/v1/graphs/{graph}/search", get(search_nodes))
+        // Graph export/import.
+        .route("/v1/graphs/{graph}/export", get(export_graph))
+        // Graph algorithms.
+        .route(
+            "/v1/graphs/{graph}/algorithms/{algorithm}",
+            post(run_algorithm),
+        )
         // Prometheus metrics.
         .route("/metrics", get(metrics_handler))
         .with_state(engine)
@@ -298,6 +314,145 @@ async fn health() -> impl IntoResponse {
     Json(ApiResponse::ok(HealthResponse {
         status: "ok".to_string(),
     }))
+}
+
+/// Search nodes by property key/value.
+/// GET /v1/graphs/{graph}/search?key=name&value=Alice&limit=100
+async fn search_nodes(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+    Query(params): Query<SearchParams>,
+) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
+    let graph_arc = match engine.get_graph(&graph) {
+        Ok(g) => g,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
+    let gs = graph_arc.read();
+
+    let limit = params.limit.unwrap_or(100) as usize;
+    let value_clone = params.value.clone();
+
+    let matching_nodes: Vec<u64> = gs.properties.nodes_where(&params.key, &move |v| {
+        match v {
+            Value::String(s) => s.as_str() == value_clone,
+            Value::Int(i) => i.to_string() == value_clone,
+            Value::Float(f) => f.to_string() == value_clone,
+            Value::Bool(b) => b.to_string() == value_clone,
+            _ => false,
+        }
+    });
+
+    let results: Vec<serde_json::Value> = matching_nodes.iter().take(limit).map(|&nid| {
+        let label = gs.properties
+            .get_node_property(nid, "_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let props = gs.properties.get_all_node_properties(nid);
+        let mut props_map = serde_json::Map::new();
+        for (k, v) in props {
+            if !k.starts_with('_') {
+                props_map.insert(k.to_string(), value_to_json(v));
+            }
+        }
+        serde_json::json!({
+            "node_id": nid,
+            "label": label,
+            "properties": props_map,
+        })
+    }).collect();
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::ok(serde_json::json!({
+            "matches": results,
+            "total": matching_nodes.len(),
+            "limit": limit,
+        }))),
+    ).into_response()
+}
+
+/// Export an entire graph as JSON.
+/// GET /v1/graphs/{graph}/export
+async fn export_graph(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
+    let graph_arc = match engine.get_graph(&graph) {
+        Ok(g) => g,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
+    let gs = graph_arc.read();
+
+    // Export all nodes
+    let nodes: Vec<serde_json::Value> = gs.adjacency.all_node_ids().iter().map(|&nid| {
+        let label = gs.properties
+            .get_node_property(nid, "_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let entity_key = gs.properties
+            .get_node_property(nid, "entity_key")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let props = gs.properties.get_all_node_properties(nid);
+        let mut props_map = serde_json::Map::new();
+        for (k, v) in props {
+            if !k.starts_with('_') && k != "entity_key" {
+                props_map.insert(k.to_string(), value_to_json(v));
+            }
+        }
+        let mut node = serde_json::json!({
+            "node_id": nid,
+            "label": label,
+            "properties": props_map,
+        });
+        if let Some(key) = entity_key {
+            node["entity_key"] = serde_json::Value::String(key);
+        }
+        if let Some(vec) = gs.vector_index.get_vector(nid) {
+            node["embedding"] = serde_json::json!(vec);
+        }
+        node
+    }).collect();
+
+    // Export all edges
+    let edges: Vec<serde_json::Value> = gs.adjacency.all_edges().map(|(eid, meta)| {
+        let label = gs.interner
+            .resolve_label(meta.label)
+            .unwrap_or("unknown")
+            .to_string();
+        let edge_props = gs.properties.get_all_edge_properties(eid);
+        let mut props_map = serde_json::Map::new();
+        for (k, v) in edge_props {
+            props_map.insert(k.to_string(), value_to_json(v));
+        }
+        serde_json::json!({
+            "edge_id": eid,
+            "source": meta.source,
+            "target": meta.target,
+            "label": label,
+            "weight": meta.weight,
+            "valid_from": meta.temporal.valid_from,
+            "valid_until": meta.temporal.valid_until,
+            "properties": props_map,
+        })
+    }).collect();
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::ok(serde_json::json!({
+            "graph": graph,
+            "node_count": nodes.len(),
+            "edge_count": edges.len(),
+            "nodes": nodes,
+            "edges": edges,
+        }))),
+    ).into_response()
 }
 
 async fn metrics_handler() -> impl IntoResponse {
@@ -1099,6 +1254,291 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         }
         Value::Timestamp(ts) => serde_json::json!(*ts),
     }
+}
+
+// ─── Algorithm response types ────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct AlgoNodeScore {
+    node_id: u64,
+    score: f64,
+}
+
+#[derive(Serialize)]
+struct PageRankResponse {
+    scores: Vec<AlgoNodeScore>,
+}
+
+#[derive(Serialize)]
+struct BetweennessResponse {
+    scores: Vec<AlgoNodeScore>,
+}
+
+#[derive(Serialize)]
+struct CommunitiesResponse {
+    communities: Vec<Vec<u64>>,
+    modularity: f64,
+}
+
+#[derive(Serialize)]
+struct ShortestPathResponse {
+    path: Option<Vec<u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    length: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct ComponentsResponse {
+    components: Vec<Vec<u64>>,
+    count: usize,
+}
+
+// ─── Algorithm handler ──────────────────────────────────────────────────────
+
+async fn run_algorithm(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path((graph, algorithm)): Path<(String, String)>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::Read,
+    ) {
+        return weav_error_to_response(e).into_response();
+    }
+
+    let graph_arc = match engine.get_graph(&graph) {
+        Ok(arc) => arc,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
+    let gs = graph_arc.read();
+
+    match algorithm.as_str() {
+        "pagerank" => {
+            let damping = body
+                .get("damping")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.85) as f32;
+            let iterations = body
+                .get("iterations")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(20) as u32;
+
+            // Uniform PPR = standard PageRank: seed every node with equal weight.
+            let all_nodes = gs.adjacency.all_node_ids();
+            let seeds: Vec<(u64, f32)> = all_nodes.iter().map(|&nid| (nid, 1.0)).collect();
+
+            let scored = weav_graph::traversal::personalized_pagerank(
+                &gs.adjacency,
+                &seeds,
+                damping,
+                iterations,
+                1e-6,
+            );
+
+            let mut scores: Vec<AlgoNodeScore> = scored
+                .iter()
+                .map(|s| AlgoNodeScore {
+                    node_id: s.node_id,
+                    score: s.score as f64,
+                })
+                .collect();
+            scores.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+            (StatusCode::OK, Json(ApiResponse::ok(PageRankResponse { scores }))).into_response()
+        }
+
+        "betweenness" => {
+            let filter = weav_graph::traversal::EdgeFilter::none();
+            let mut result = weav_graph::traversal::betweenness_centrality(&gs.adjacency, &filter);
+            result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let scores: Vec<AlgoNodeScore> = result
+                .into_iter()
+                .map(|(node_id, score)| AlgoNodeScore { node_id, score })
+                .collect();
+
+            (StatusCode::OK, Json(ApiResponse::ok(BetweennessResponse { scores }))).into_response()
+        }
+
+        "communities" => {
+            let resolution = body
+                .get("resolution")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0) as f32;
+
+            let community_map =
+                weav_graph::traversal::modularity_communities(&gs.adjacency, 100, resolution);
+
+            // Group nodes by community.
+            let mut groups: std::collections::HashMap<u64, Vec<u64>> =
+                std::collections::HashMap::new();
+            for (&node_id, &comm_id) in &community_map {
+                groups.entry(comm_id).or_default().push(node_id);
+            }
+            let mut communities: Vec<Vec<u64>> = groups.into_values().collect();
+            for c in &mut communities {
+                c.sort();
+            }
+            communities.sort_by_key(|c| std::cmp::Reverse(c.len()));
+
+            // Compute modularity Q.
+            let modularity = compute_modularity(&gs.adjacency, &community_map);
+
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(CommunitiesResponse {
+                    communities,
+                    modularity,
+                })),
+            )
+                .into_response()
+        }
+
+        "shortest_path" => {
+            let source = match body.get("source").and_then(|v| v.as_u64()) {
+                Some(s) => s,
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiResponse::<()>::err(
+                            "missing required field: source".to_string(),
+                        )),
+                    )
+                        .into_response()
+                }
+            };
+            let target = match body.get("target").and_then(|v| v.as_u64()) {
+                Some(t) => t,
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiResponse::<()>::err(
+                            "missing required field: target".to_string(),
+                        )),
+                    )
+                        .into_response()
+                }
+            };
+            let max_depth = body
+                .get("max_depth")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10) as u8;
+
+            let path =
+                weav_graph::traversal::shortest_path(&gs.adjacency, source, target, max_depth);
+
+            let (path_out, length) = match path {
+                Some(ref p) => (Some(p.clone()), Some(p.len() - 1)),
+                None => (None, None),
+            };
+
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(ShortestPathResponse {
+                    path: path_out,
+                    length,
+                })),
+            )
+                .into_response()
+        }
+
+        "components" => {
+            let component_map = weav_graph::traversal::connected_components(&gs.adjacency);
+
+            // Group nodes by component.
+            let mut groups: std::collections::HashMap<u32, Vec<u64>> =
+                std::collections::HashMap::new();
+            for (&node_id, &comp_id) in &component_map {
+                groups.entry(comp_id).or_default().push(node_id);
+            }
+            let mut components: Vec<Vec<u64>> = groups.into_values().collect();
+            for c in &mut components {
+                c.sort();
+            }
+            components.sort_by_key(|c| std::cmp::Reverse(c.len()));
+            let count = components.len();
+
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(ComponentsResponse { components, count })),
+            )
+                .into_response()
+        }
+
+        _ => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::err(format!(
+                "unknown algorithm: {algorithm}. Supported: pagerank, betweenness, communities, shortest_path, components"
+            ))),
+        )
+            .into_response(),
+    }
+}
+
+/// Compute the modularity Q for a given community assignment.
+///
+/// Q = (1/2m) * sum_ij [ A_ij - (k_i * k_j) / (2m) ] * delta(c_i, c_j)
+fn compute_modularity(
+    adjacency: &weav_graph::adjacency::AdjacencyStore,
+    community: &std::collections::HashMap<u64, u64>,
+) -> f64 {
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() {
+        return 0.0;
+    }
+
+    // Compute total weight m and per-node degree k_i (undirected).
+    let mut node_degree: std::collections::HashMap<u64, f64> =
+        std::collections::HashMap::with_capacity(all_nodes.len());
+    let mut total_weight = 0.0_f64;
+
+    for &node in &all_nodes {
+        let mut ki = 0.0_f64;
+        for &(_, edge_id) in adjacency.neighbors_out(node, None).iter() {
+            let w = adjacency
+                .get_edge(edge_id)
+                .map(|meta| meta.weight as f64)
+                .unwrap_or(1.0);
+            ki += w;
+        }
+        for &(_, edge_id) in adjacency.neighbors_in(node, None).iter() {
+            let w = adjacency
+                .get_edge(edge_id)
+                .map(|meta| meta.weight as f64)
+                .unwrap_or(1.0);
+            ki += w;
+        }
+        total_weight += ki;
+        node_degree.insert(node, ki);
+    }
+
+    let m = total_weight / 2.0;
+    if m == 0.0 {
+        return 0.0;
+    }
+
+    let mut q = 0.0_f64;
+    for &node in &all_nodes {
+        let ci = community.get(&node).copied().unwrap_or(node);
+        let ki = node_degree.get(&node).copied().unwrap_or(0.0);
+        for &(neighbor, edge_id) in adjacency.neighbors_out(node, None).iter() {
+            let cj = community.get(&neighbor).copied().unwrap_or(neighbor);
+            if ci == cj {
+                let w = adjacency
+                    .get_edge(edge_id)
+                    .map(|meta| meta.weight as f64)
+                    .unwrap_or(1.0);
+                let kj = node_degree.get(&neighbor).copied().unwrap_or(0.0);
+                q += w - (ki * kj) / (2.0 * m);
+            }
+        }
+    }
+
+    q / (2.0 * m)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
