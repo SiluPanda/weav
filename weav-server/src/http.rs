@@ -95,6 +95,12 @@ pub struct ContextRequest {
     pub direction: Option<String>,
     /// If true, return the query plan without executing.
     pub explain: Option<bool>,
+    /// Named budget preset: "small"/"4k", "medium"/"8k", "large"/"16k",
+    /// "xl"/"32k", "xxl"/"128k". Overrides `budget` when set.
+    pub budget_preset: Option<String>,
+    /// Output format: "raw" (default), "anthropic", "openai".
+    /// When set, the result includes LLM-ready formatted messages.
+    pub output_format: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -307,6 +313,16 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route(
             "/v1/graphs/{graph}/nodes/{id}/history",
             get(node_history),
+        )
+        // Node importance scoring.
+        .route(
+            "/v1/graphs/{graph}/nodes/{id}/importance",
+            get(get_node_importance),
+        )
+        // Top-N nodes by importance.
+        .route(
+            "/v1/graphs/{graph}/importance",
+            get(get_graph_importance),
         )
         // Prometheus metrics.
         .route("/metrics", get(metrics_handler))
@@ -1344,6 +1360,112 @@ async fn node_history(
         .into_response()
 }
 
+/// Node importance score.
+/// GET /v1/graphs/{graph}/nodes/{id}/importance
+async fn get_node_importance(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path((graph, node_id)): Path<(String, u64)>,
+) -> impl IntoResponse {
+    let _identity = extract_identity(&engine, &headers);
+    let graph_arc = match engine.get_graph(&graph) {
+        Ok(g) => g,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
+    let gs = graph_arc.read();
+
+    if !gs.adjacency.has_node(node_id) {
+        return weav_error_to_response(weav_core::error::WeavError::NodeNotFound(
+            node_id,
+            gs.graph_id,
+        ))
+        .into_response();
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let score = crate::engine::compute_node_importance(&gs, node_id, now);
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::ok(serde_json::json!({
+            "node_id": score.node_id,
+            "importance": score.importance,
+            "structural": score.structural,
+            "recency": score.recency,
+            "access": score.access,
+        }))),
+    )
+        .into_response()
+}
+
+/// Top-N nodes by importance.
+/// GET /v1/graphs/{graph}/importance?limit=10
+#[derive(Deserialize)]
+pub struct ImportanceParams {
+    pub limit: Option<usize>,
+}
+
+async fn get_graph_importance(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+    Query(params): Query<ImportanceParams>,
+) -> impl IntoResponse {
+    let _identity = extract_identity(&engine, &headers);
+    let graph_arc = match engine.get_graph(&graph) {
+        Ok(g) => g,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
+    let gs = graph_arc.read();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let limit = params.limit.unwrap_or(10);
+
+    let mut scores: Vec<crate::engine::NodeImportanceScore> = gs
+        .adjacency
+        .all_node_ids()
+        .iter()
+        .map(|&nid| crate::engine::compute_node_importance(&gs, nid, now))
+        .collect();
+
+    scores.sort_by(|a, b| {
+        b.importance
+            .partial_cmp(&a.importance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    });
+    scores.truncate(limit);
+
+    let results: Vec<serde_json::Value> = scores
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "node_id": s.node_id,
+                "importance": s.importance,
+                "structural": s.structural,
+                "recency": s.recency,
+                "access": s.access,
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::ok(serde_json::json!({
+            "graph": graph,
+            "limit": limit,
+            "nodes": results,
+        }))),
+    )
+        .into_response()
+}
+
 async fn metrics_handler() -> impl IntoResponse {
     use prometheus::Encoder;
     let encoder = prometheus::TextEncoder::new();
@@ -2020,10 +2142,17 @@ async fn context_query(
         }
     });
 
+    // Resolve budget: preset overrides explicit budget.
+    let resolved_budget = if let Some(ref preset) = body.budget_preset {
+        weav_query::parser::budget_preset(preset).map(TokenBudget::new)
+    } else {
+        body.budget.map(TokenBudget::new)
+    };
+
     let query = ContextQuery {
         query_text: body.query,
         graph: body.graph,
-        budget: body.budget.map(TokenBudget::new),
+        budget: resolved_budget,
         seeds,
         max_depth: body.max_depth.unwrap_or(2),
         direction,
@@ -2034,6 +2163,7 @@ async fn context_query(
         limit: body.limit,
         sort,
         explain: body.explain.unwrap_or(false),
+        output_format: body.output_format,
     };
 
     let cmd = Command::Context(query);

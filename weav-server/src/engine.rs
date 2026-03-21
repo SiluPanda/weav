@@ -136,6 +136,73 @@ pub struct Engine {
     event_log: RwLock<Vec<GraphEvent>>,
 }
 
+/// Compute composite importance score for a node.
+///
+/// Combines three signals:
+/// - **Structural** (40%): degree centrality — `degree / max_degree`
+/// - **Recency** (30%): exponential decay from `_created_at` with a 1-week half-life
+/// - **Access recency** (30%): exponential decay from last access time with a 1-day half-life
+///
+/// Returns a struct with the composite score clamped to `[0.0, 1.0]` and
+/// the individual components for transparency.
+pub struct NodeImportanceScore {
+    pub node_id: NodeId,
+    pub importance: f32,
+    pub structural: f32,
+    pub recency: f32,
+    pub access: f32,
+}
+
+pub fn compute_node_importance(
+    gs: &GraphState,
+    node_id: NodeId,
+    now: u64,
+) -> NodeImportanceScore {
+    // 1. Degree centrality (structural importance): degree / max_degree
+    let degree = gs.adjacency.neighbors_both(node_id, None).len() as f32;
+    let max_degree = gs
+        .adjacency
+        .all_node_ids()
+        .iter()
+        .map(|&nid| gs.adjacency.neighbors_both(nid, None).len())
+        .max()
+        .unwrap_or(1) as f32;
+    let structural = if max_degree > 0.0 {
+        degree / max_degree
+    } else {
+        0.0
+    };
+
+    // 2. Recency: exponential decay from creation time (half-life = 1 week = 168 hours)
+    let created_at = gs
+        .properties
+        .get_node_property(node_id, "_created_at")
+        .and_then(|v| v.as_int())
+        .unwrap_or(0) as u64;
+    let age_hours = (now.saturating_sub(created_at)) as f64 / 3_600_000.0;
+    let recency = (-(age_hours / 168.0)).exp() as f32;
+
+    // 3. Access frequency: exponential decay from last access (half-life = 1 day = 24 hours)
+    let access_time = gs.access_times.get(&node_id).copied().unwrap_or(0);
+    let access = if access_time > 0 {
+        let access_age_hours = (now.saturating_sub(access_time)) as f64 / 3_600_000.0;
+        (-(access_age_hours / 24.0)).exp() as f32
+    } else {
+        0.0
+    };
+
+    // Weighted combination: 40% structural, 30% recency, 30% access
+    let importance = (0.4 * structural + 0.3 * recency + 0.3 * access).clamp(0.0, 1.0);
+
+    NodeImportanceScore {
+        node_id,
+        importance,
+        structural,
+        recency,
+        access,
+    }
+}
+
 /// Extract graph name and operation type from a WAL operation for metric labels.
 fn wal_op_labels(op: &WalOperation) -> (&str, &str) {
     match op {
@@ -8314,5 +8381,134 @@ mod tests {
         idx_results.sort();
         assert_eq!(no_idx_sorted, idx_results);
         assert_eq!(idx_results.len(), 2);
+    }
+
+    // ── Node Importance Tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_node_importance_basic() {
+        let engine = make_engine();
+        create_test_graph(&engine, "imp_basic");
+
+        // Add a node
+        let n1 = match engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "imp_basic".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let graph_arc = engine.get_graph("imp_basic").unwrap();
+        let gs = graph_arc.read();
+        let now = Engine::now_ms();
+        let score = compute_node_importance(&gs, n1, now);
+
+        // Score must be in [0.0, 1.0]
+        assert!(
+            score.importance >= 0.0 && score.importance <= 1.0,
+            "importance {} out of range [0.0, 1.0]",
+            score.importance
+        );
+        assert!(score.structural >= 0.0 && score.structural <= 1.0);
+        assert!(score.recency >= 0.0 && score.recency <= 1.0);
+        assert!(score.access >= 0.0 && score.access <= 1.0);
+        assert_eq!(score.node_id, n1);
+    }
+
+    #[test]
+    fn test_node_importance_high_degree_node() {
+        let engine = make_engine();
+        create_test_graph(&engine, "imp_hub");
+
+        // Create a hub node and several leaf nodes connected to it
+        let hub = match engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "imp_hub".to_string(),
+                    label: "hub".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let mut leaf_ids = Vec::new();
+        for i in 0..5 {
+            let lid = match engine
+                .execute_command(
+                    Command::NodeAdd(parser::NodeAddCmd {
+                        graph: "imp_hub".to_string(),
+                        label: "leaf".to_string(),
+                        properties: vec![("idx".to_string(), Value::Int(i))],
+                        embedding: None,
+                        entity_key: None,
+                        ttl_ms: None,
+                    }),
+                    None,
+                )
+                .unwrap()
+            {
+                CommandResponse::Integer(id) => id,
+                _ => panic!("expected Integer"),
+            };
+            leaf_ids.push(lid);
+
+            // Connect leaf to hub
+            engine
+                .execute_command(
+                    Command::EdgeAdd(parser::EdgeAddCmd {
+                        graph: "imp_hub".to_string(),
+                        source: lid,
+                        target: hub,
+                        label: "connects".to_string(),
+                        weight: 1.0,
+                        properties: vec![],
+                        ttl_ms: None,
+                    }),
+                    None,
+                )
+                .unwrap();
+        }
+
+        let graph_arc = engine.get_graph("imp_hub").unwrap();
+        let gs = graph_arc.read();
+        let now = Engine::now_ms();
+
+        let hub_score = compute_node_importance(&gs, hub, now);
+        let leaf_score = compute_node_importance(&gs, leaf_ids[0], now);
+
+        // Hub node has degree 5 (connected to all leaves), leaf has degree 1
+        // Structural component should be higher for hub
+        assert!(
+            hub_score.structural > leaf_score.structural,
+            "hub structural ({}) should be > leaf structural ({})",
+            hub_score.structural,
+            leaf_score.structural
+        );
+        // Overall importance should also be higher for hub
+        assert!(
+            hub_score.importance > leaf_score.importance,
+            "hub importance ({}) should be > leaf importance ({})",
+            hub_score.importance,
+            leaf_score.importance
+        );
     }
 }

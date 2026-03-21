@@ -64,6 +64,9 @@ pub struct ContextResult {
     /// Query plan description (populated when explain=true).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
+    /// LLM-ready formatted messages (populated when output_format is set).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub formatted_messages: Option<String>,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -157,6 +160,7 @@ pub fn execute_context_query(
             chunk_time_us: 0,
             budget_time_us: 0,
             plan: Some(plan_description),
+            formatted_messages: None,
         });
     }
 
@@ -606,6 +610,13 @@ pub fn execute_context_query(
     let elapsed = start.elapsed();
     let nodes_included = result_chunks.len() as u32;
 
+    // ── Step 8b: Format messages for LLM output ─────────────────────
+    let formatted_messages = format_llm_messages(
+        query.output_format.as_deref(),
+        query.query_text.as_deref(),
+        &result_chunks,
+    );
+
     Ok(ContextResult {
         chunks: result_chunks,
         total_tokens,
@@ -620,6 +631,7 @@ pub fn execute_context_query(
         chunk_time_us,
         budget_time_us,
         plan: None,
+        formatted_messages,
     })
 }
 
@@ -814,6 +826,58 @@ pub fn extract_community_summaries(
     summaries
 }
 
+/// Format context chunks as LLM-ready messages for the given output format.
+///
+/// Returns `None` for `None` / `"raw"` format, or a JSON string containing
+/// a `messages` array for `"anthropic"` or `"openai"` formats.
+pub fn format_llm_messages(
+    output_format: Option<&str>,
+    query_text: Option<&str>,
+    chunks: &[ContextChunk],
+) -> Option<String> {
+    let format = match output_format {
+        Some(f) if f != "raw" => f,
+        _ => return None,
+    };
+
+    let context_content: String = chunks
+        .iter()
+        .map(|c| c.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    let query_str = query_text.unwrap_or("");
+
+    let messages = match format {
+        "anthropic" => {
+            let user_content = format!(
+                "Based on the following context from the knowledge graph:\n\n\
+                 <context>\n{context_content}\n</context>\n\n{query_str}"
+            );
+            serde_json::json!({
+                "messages": [
+                    { "role": "user", "content": user_content }
+                ]
+            })
+        }
+        "openai" => {
+            let system_content = format!(
+                "You have access to the following context from a knowledge graph:\n\n\
+                 {context_content}"
+            );
+            serde_json::json!({
+                "messages": [
+                    { "role": "system", "content": system_content },
+                    { "role": "user", "content": query_str }
+                ]
+            })
+        }
+        _ => return None,
+    };
+
+    Some(messages.to_string())
+}
+
 /// Build a content string from a node's properties by concatenating
 /// all string-typed values.
 fn build_content(props: &[(&str, &weav_core::types::Value)]) -> String {
@@ -1005,6 +1069,7 @@ mod tests {
             limit: None,
             sort: None,
             explain: false,
+            output_format: None,
         };
 
         let result =
@@ -1040,6 +1105,7 @@ mod tests {
             limit: None,
             sort: None,
             explain: false,
+            output_format: None,
         };
 
         let result =
@@ -1069,6 +1135,7 @@ mod tests {
             limit: Some(1),
             sort: None,
             explain: false,
+            output_format: None,
         };
 
         let result =
@@ -1096,6 +1163,7 @@ mod tests {
             limit: None,
             sort: None,
             explain: false,
+            output_format: None,
         };
 
         let result =
@@ -1134,6 +1202,7 @@ mod tests {
             limit: None,
             sort: None,
             explain: false,
+            output_format: None,
         };
 
         let result =
@@ -1167,6 +1236,7 @@ mod tests {
             limit: None,
             sort: None,
             explain: false,
+            output_format: None,
         };
 
         // Step 1: Confirm the planner produces the expected default alpha/theta
@@ -1236,6 +1306,7 @@ mod tests {
             limit: None,
             sort: None,
             explain: false,
+            output_format: None,
         };
 
         let result =
@@ -1269,6 +1340,7 @@ mod tests {
             limit: None,
             sort: None,
             explain: false,
+            output_format: None,
         };
 
         let result =
@@ -1337,6 +1409,7 @@ mod tests {
             limit: None,
             sort: None,
             explain: false,
+            output_format: None,
         };
 
         let result =
@@ -1404,6 +1477,7 @@ mod tests {
                 direction: SortDirection::Asc,
             }),
             explain: false,
+            output_format: None,
         };
 
         let result_asc =
@@ -1452,6 +1526,7 @@ mod tests {
                 direction: SortDirection::Desc,
             }),
             explain: false,
+            output_format: None,
         };
 
         let result_desc =
@@ -1500,6 +1575,7 @@ mod tests {
                 direction: SortDirection::Desc,
             }),
             explain: false,
+            output_format: None,
         };
 
         let result_rel =
@@ -1621,6 +1697,7 @@ mod tests {
             limit: None,
             sort: None,
             explain: false,
+            output_format: None,
         };
 
         let result =
@@ -1658,6 +1735,7 @@ mod tests {
             limit: None,
             sort: None,
             explain: false,
+            output_format: None,
         };
 
         let result =
@@ -1719,6 +1797,7 @@ mod tests {
             limit: None,
             sort: None,
             explain: false,
+            output_format: None,
         };
 
         let result =
@@ -1787,6 +1866,7 @@ mod tests {
             limit: Some(0),
             sort: None,
             explain: false,
+            output_format: None,
         };
 
         let result =
@@ -2160,6 +2240,7 @@ mod tests {
             limit: None,
             sort: None,
             explain: true,
+            output_format: None,
         };
 
         let result =
@@ -2212,6 +2293,7 @@ mod tests {
             limit: None,
             sort: None,
             explain: true,
+            output_format: None,
         };
 
         let result =
@@ -2241,6 +2323,7 @@ mod tests {
             limit: None,
             sort: None,
             explain: true,
+            output_format: None,
         };
 
         let result =
@@ -2270,6 +2353,7 @@ mod tests {
             limit: None,
             sort: None,
             explain: false,
+            output_format: None,
         };
 
         let result =
@@ -2316,6 +2400,7 @@ mod tests {
             limit: None,
             sort: None,
             explain: false,
+            output_format: None,
         };
 
         let result =
@@ -2347,6 +2432,7 @@ mod tests {
             limit: None,
             sort: None,
             explain: true,
+            output_format: None,
         };
 
         let result =
@@ -2371,5 +2457,97 @@ mod tests {
                 i + 1
             );
         }
+    }
+
+    // ── LLM Output Format Tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_context_output_format_anthropic() {
+        let chunks = vec![
+            ContextChunk {
+                node_id: 1,
+                content: "Alice is a software engineer.".to_string(),
+                label: "person".to_string(),
+                relevance_score: 0.9,
+                depth: 0,
+                token_count: 7,
+                provenance: None,
+                relationships: Vec::new(),
+                temporal: None,
+            },
+            ContextChunk {
+                node_id: 2,
+                content: "Bob is a data scientist.".to_string(),
+                label: "person".to_string(),
+                relevance_score: 0.8,
+                depth: 1,
+                token_count: 6,
+                provenance: None,
+                relationships: Vec::new(),
+                temporal: None,
+            },
+        ];
+
+        let result = format_llm_messages(
+            Some("anthropic"),
+            Some("Who knows about Rust?"),
+            &chunks,
+        );
+        assert!(result.is_some(), "anthropic format should produce output");
+
+        let json: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+        let messages = json["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(content.contains("<context>"));
+        assert!(content.contains("</context>"));
+        assert!(content.contains("Alice is a software engineer."));
+        assert!(content.contains("Bob is a data scientist."));
+        assert!(content.contains("Who knows about Rust?"));
+    }
+
+    #[test]
+    fn test_context_output_format_openai() {
+        let chunks = vec![ContextChunk {
+            node_id: 1,
+            content: "Rust is a systems programming language.".to_string(),
+            label: "topic".to_string(),
+            relevance_score: 0.95,
+            depth: 0,
+            token_count: 8,
+            provenance: None,
+            relationships: Vec::new(),
+            temporal: None,
+        }];
+
+        let result = format_llm_messages(
+            Some("openai"),
+            Some("Tell me about Rust."),
+            &chunks,
+        );
+        assert!(result.is_some(), "openai format should produce output");
+
+        let json: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+        let messages = json["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "user");
+
+        let system_content = messages[0]["content"].as_str().unwrap();
+        assert!(system_content.contains("Rust is a systems programming language."));
+        assert!(system_content.contains("knowledge graph"));
+
+        let user_content = messages[1]["content"].as_str().unwrap();
+        assert_eq!(user_content, "Tell me about Rust.");
+    }
+
+    #[test]
+    fn test_context_output_format_raw_returns_none() {
+        let chunks = vec![];
+        assert!(format_llm_messages(None, None, &chunks).is_none());
+        assert!(format_llm_messages(Some("raw"), None, &chunks).is_none());
+        assert!(format_llm_messages(Some("unknown_provider"), None, &chunks).is_none());
     }
 }

@@ -2376,11 +2376,16 @@ pub fn k_shortest_paths(
 
 /// Compute degree centrality for every node.
 ///
-/// Degree centrality = `degree(node) / (n - 1)` where `n` is the total number
-/// of nodes. The graph is treated as undirected: both in-degree and out-degree
-/// are counted, with shared edges deduplicated.
+/// Degree centrality = `degree(node) / (n - 1)` where `n` is the total
+/// number of nodes. The graph is treated as undirected: both in-degree
+/// and out-degree are counted, with shared neighbors deduplicated.
+///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
 ///
 /// Returns a list of `(NodeId, centrality)` sorted descending by score.
+///
+/// Complexity: O(V + E).
 pub fn degree_centrality(adjacency: &AdjacencyStore) -> Vec<(NodeId, f64)> {
     let all_nodes = adjacency.all_node_ids();
     if all_nodes.is_empty() {
@@ -2422,14 +2427,21 @@ pub fn degree_centrality(adjacency: &AdjacencyStore) -> Vec<(NodeId, f64)> {
 
 /// Compute eigenvector centrality using the power iteration method.
 ///
-/// A node's score is proportional to the sum of its neighbors' scores (treating
-/// the graph as undirected). Scores are normalized by the L-infinity norm
-/// (maximum score) each iteration.
+/// A node's score is proportional to the sum of its neighbors' scores
+/// (treating the graph as undirected). Scores are normalized by the
+/// L-infinity norm (maximum score) each iteration. Convergence is
+/// reached when the maximum score change between iterations falls below
+/// `tolerance`.
 ///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
 /// - `max_iterations`: maximum number of power iterations.
-/// - `tolerance`: convergence threshold on the maximum score change between iterations.
+/// - `tolerance`: convergence threshold on the maximum score change.
 ///
 /// Returns a list of `(NodeId, centrality)` sorted descending by score.
+///
+/// Complexity: O(I * (V + E)) where I is the number of iterations until
+/// convergence.
 pub fn eigenvector_centrality(
     adjacency: &AdjacencyStore,
     max_iterations: u32,
@@ -2524,19 +2536,25 @@ pub fn eigenvector_centrality(
 /// Ranked list of `(NodeId, score)` pairs, sorted descending by score.
 pub type RankedScores = Vec<(NodeId, f64)>;
 
-/// Compute HITS authority and hub scores.
+/// Compute HITS (Hyperlink-Induced Topic Search) authority and hub scores.
 ///
-/// - Authority: a node is a good authority if many good hubs point to it.
-/// - Hub: a node is a good hub if it points to many good authorities.
+/// Authority: a node is a good authority if many good hubs point to it.
+/// Hub: a node is a good hub if it points to many good authorities.
 ///
-/// Authority update: `auth[v] = sum(hub[u])` for all `u` that point to `v`.
-/// Hub update: `hub[v] = sum(auth[u])` for all `u` that `v` points to.
+/// Authority update: `auth[v] = sum(hub[u])` for all `u -> v`.
+/// Hub update: `hub[v] = sum(auth[u])` for all `v -> u`.
 /// Both vectors are normalized by their L2 norm each iteration.
 ///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
 /// - `max_iterations`: maximum number of iterations.
 /// - `tolerance`: convergence threshold on the maximum score change.
 ///
-/// Returns `(authority_scores, hub_scores)`, each sorted descending by score.
+/// Returns `(authority_scores, hub_scores)` as `HitsScores`, each sorted
+/// descending by score.
+///
+/// Complexity: O(I * (V + E)) where I is the number of iterations until
+/// convergence.
 pub fn hits(
     adjacency: &AdjacencyStore,
     max_iterations: u32,
@@ -2659,15 +2677,21 @@ pub fn hits(
 ///
 /// FastRP creates dense vector representations of nodes by iteratively
 /// aggregating neighborhood structure through sparse random projections.
-/// This is Neo4j's most-used embedding algorithm, implemented here in pure Rust.
+/// Each node starts with a sparse random vector, then each iteration
+/// averages in the embeddings of its neighbors, capturing progressively
+/// higher-order structural information. This is Neo4j's most-used
+/// embedding algorithm, implemented here in pure Rust.
 ///
 /// Parameters:
-/// - `embedding_dim`: Dimension of output embeddings (e.g., 128, 256)
-/// - `iterations`: Number of neighborhood aggregation rounds (typically 2-4)
-/// - `normalization_strength`: Controls L2 normalization strength (0.0 = none, 1.0 = full)
-/// - `seed`: Random seed for reproducibility
+/// - `adjacency`: the graph's adjacency store.
+/// - `embedding_dim`: dimension of output embeddings (e.g., 128, 256).
+/// - `iterations`: number of neighborhood aggregation rounds (typically 2--4).
+/// - `normalization_strength`: controls L2 normalization strength (0.0 = none, 1.0 = full).
+/// - `seed`: random seed for reproducibility.
 ///
-/// Returns a map from NodeId to embedding vector.
+/// Returns a map from `NodeId` to embedding vector (`Vec<f32>`).
+///
+/// Complexity: O(iterations * (V + E) * embedding_dim).
 pub fn fastrp_embeddings(
     adjacency: &AdjacencyStore,
     embedding_dim: usize,

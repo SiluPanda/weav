@@ -240,6 +240,7 @@ mod tests {
             limit: None,
             sort: None,
             explain: false,
+            output_format: None,
         }
     }
 
@@ -421,6 +422,7 @@ mod tests {
             limit: Some(20),
             sort: None,
             explain: false,
+            output_format: None,
         };
 
         let plan = plan_context_query(&query);
@@ -585,6 +587,7 @@ mod tests {
                 direction: SortDirection::Asc,
             }),
             explain: false,
+            output_format: None,
         };
 
         let plan = plan_context_query(&query);

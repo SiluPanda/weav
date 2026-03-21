@@ -355,6 +355,7 @@ mod tests {
         chunk_time_us: 0,
         budget_time_us: 0,
         plan: None,
+        formatted_messages: None,
         }
     }
 
@@ -422,6 +423,7 @@ mod tests {
         chunk_time_us: 0,
         budget_time_us: 0,
         plan: None,
+        formatted_messages: None,
         };
         let val = context_result_to_resp3(&result);
         match &val {
@@ -470,6 +472,7 @@ mod tests {
         chunk_time_us: 0,
         budget_time_us: 0,
         plan: None,
+        formatted_messages: None,
         };
 
         let val = context_result_to_resp3(&result);
@@ -637,6 +640,7 @@ mod tests {
         chunk_time_us: 0,
         budget_time_us: 0,
         plan: None,
+        formatted_messages: None,
         };
 
         let val = context_result_to_resp3(&result);
@@ -704,6 +708,7 @@ mod tests {
         chunk_time_us: 0,
         budget_time_us: 0,
         plan: None,
+        formatted_messages: None,
         };
 
         let val = context_result_to_resp3(&result);

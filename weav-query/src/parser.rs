@@ -175,6 +175,31 @@ pub struct ContextQuery {
     pub sort: Option<SortOrder>,
     /// If true, return the query plan without executing.
     pub explain: bool,
+    /// Output format: "raw" (default), "anthropic", "openai".
+    /// When set, the result includes a `formatted_messages` field with
+    /// the context packaged in the provider's message format.
+    pub output_format: Option<String>,
+}
+
+/// Map a named budget preset to a token count.
+///
+/// Recognized presets:
+/// - `"small"` / `"4k"` -> 4096
+/// - `"medium"` / `"8k"` -> 8192
+/// - `"large"` / `"16k"` -> 16384
+/// - `"xl"` / `"32k"` -> 32768
+/// - `"xxl"` / `"128k"` -> 131072
+///
+/// Returns `None` for unrecognized names.
+pub fn budget_preset(name: &str) -> Option<u32> {
+    match name {
+        "small" | "4k" => Some(4096),
+        "medium" | "8k" => Some(8192),
+        "large" | "16k" => Some(16384),
+        "xl" | "32k" => Some(32768),
+        "xxl" | "128k" => Some(131072),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1238,6 +1263,7 @@ fn parse_context_command(tokens: &[String]) -> Result<Command, WeavError> {
         limit,
         sort,
         explain: false,
+        output_format: None,
     }))
 }
 
@@ -3090,5 +3116,44 @@ mod tests {
     fn test_parse_index_unknown_subcommand() {
         let result = parse_command(r#"INDEX DROP "my_graph" "name""#);
         assert!(result.is_err());
+    }
+
+    // ── Budget Preset Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_budget_preset_small() {
+        assert_eq!(budget_preset("small"), Some(4096));
+        assert_eq!(budget_preset("4k"), Some(4096));
+    }
+
+    #[test]
+    fn test_budget_preset_medium() {
+        assert_eq!(budget_preset("medium"), Some(8192));
+        assert_eq!(budget_preset("8k"), Some(8192));
+    }
+
+    #[test]
+    fn test_budget_preset_large() {
+        assert_eq!(budget_preset("large"), Some(16384));
+        assert_eq!(budget_preset("16k"), Some(16384));
+    }
+
+    #[test]
+    fn test_budget_preset_xl() {
+        assert_eq!(budget_preset("xl"), Some(32768));
+        assert_eq!(budget_preset("32k"), Some(32768));
+    }
+
+    #[test]
+    fn test_budget_preset_xxl() {
+        assert_eq!(budget_preset("xxl"), Some(131072));
+        assert_eq!(budget_preset("128k"), Some(131072));
+    }
+
+    #[test]
+    fn test_budget_preset_unknown() {
+        assert_eq!(budget_preset("unknown"), None);
+        assert_eq!(budget_preset(""), None);
+        assert_eq!(budget_preset("64k"), None);
     }
 }

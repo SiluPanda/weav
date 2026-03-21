@@ -178,6 +178,12 @@ pub struct ContextQueryParams {
     /// If true, return the query plan without executing.
     #[serde(default)]
     pub explain: bool,
+    /// Named budget preset: "small"/"4k", "medium"/"8k", "large"/"16k",
+    /// "xl"/"32k", "xxl"/"128k". Overrides `max_tokens` when set.
+    pub budget_preset: Option<String>,
+    /// Output format: "raw" (default), "anthropic", "openai".
+    /// When set, the result includes LLM-ready formatted messages.
+    pub output_format: Option<String>,
 }
 
 /// Parameters for vector similarity search.
@@ -952,11 +958,18 @@ impl WeavMcpServer {
             _ => TokenAllocation::Auto,
         };
 
+        // Resolve budget from preset or explicit max_tokens.
+        let resolved_tokens = if let Some(ref preset) = params.budget_preset {
+            weav_query::parser::budget_preset(preset).unwrap_or(max_tokens)
+        } else {
+            max_tokens
+        };
+
         let cmd = Command::Context(ContextQuery {
             query_text: params.query,
             graph: params.graph,
             budget: Some(TokenBudget {
-                max_tokens,
+                max_tokens: resolved_tokens,
                 allocation,
             }),
             seeds,
@@ -969,6 +982,7 @@ impl WeavMcpServer {
             limit: None,
             sort: None,
             explain: params.explain,
+            output_format: params.output_format.clone(),
         });
 
         match self.engine.execute_command(cmd, None) {
