@@ -122,7 +122,7 @@ impl AclStore {
         Ok(user.to_identity())
     }
 
-    /// Authenticate with default password (Redis-compat AUTH <password>).
+    /// Authenticate with default password (Redis-compat `AUTH password`).
     pub fn authenticate_default(&self, password_raw: &str) -> WeavResult<SessionIdentity> {
         match &self.default_password {
             Some(default_pw) if default_pw == password_raw => {

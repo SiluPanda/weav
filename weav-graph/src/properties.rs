@@ -24,9 +24,9 @@ fn value_to_index_string(value: &Value) -> String {
 }
 
 /// Secondary index for fast property lookups.
-/// Maps property_key -> (value_string -> Vec<NodeId>) for O(1) exact-match queries.
+/// Maps `property_key -> (value_string -> Vec<NodeId>)` for O(1) exact-match queries.
 pub struct PropertyIndex {
-    /// property_key -> (value_string -> Vec<NodeId>)
+    /// `property_key -> (value_string -> Vec<NodeId>)`
     index: HashMap<String, HashMap<String, Vec<NodeId>>>,
 }
 

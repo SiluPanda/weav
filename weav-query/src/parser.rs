@@ -55,12 +55,12 @@ pub enum Command {
     ConfigSet(String, String),
     /// Get a config key.
     ConfigGet(String),
-    /// Authenticate: AUTH [username] password
+    /// Authenticate: `AUTH [username] password`
     Auth {
         username: Option<String>,
         password: String,
     },
-    /// ACL SETUSER username [>password] [on|off] [+@cat|-@cat] [~pattern]
+    /// ACL SETUSER: `username [>password] [on|off] [+@cat|-@cat] [~pattern]`
     AclSetUser(AclSetUserCmd),
     /// ACL DELUSER username
     AclDelUser(String),

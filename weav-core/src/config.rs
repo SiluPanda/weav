@@ -347,7 +347,7 @@ pub struct AuthConfig {
 pub struct UserConfig {
     pub username: String,
     pub password: Option<String>,
-    /// Command category permissions, e.g. ["+@read", "+@write", "+@admin"]
+    /// Command category permissions, e.g. `["+@read", "+@write", "+@admin"]`
     #[serde(default)]
     pub categories: Vec<String>,
     /// Graph-level access patterns.
