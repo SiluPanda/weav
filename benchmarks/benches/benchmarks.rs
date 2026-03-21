@@ -509,6 +509,153 @@ fn bench_persistence(c: &mut Criterion) {
     group.finish();
 }
 
+// ---- Algorithm Benchmarks ----
+
+fn bench_algorithms(c: &mut Criterion) {
+    use weav_graph::adjacency::{AdjacencyStore, EdgeMeta};
+    use weav_graph::traversal;
+    use weav_core::types::BiTemporal;
+
+    // Build a scale-free-ish graph: 1000 nodes, ~3000 edges
+    let mut adj = AdjacencyStore::new();
+    let n = 1000u64;
+    for i in 1..=n {
+        adj.add_node(i);
+    }
+    let temporal = BiTemporal::new_current(1000);
+    let mut edge_id = 0u64;
+    for i in 2..=n {
+        // Connect to a random earlier node (preferential-ish attachment)
+        let target = ((i * 7 + 13) % (i - 1)) + 1;
+        let meta = EdgeMeta {
+            source: i, target, label: 0,
+            temporal, provenance: None, weight: 1.0, token_cost: 0,
+        };
+        adj.add_edge(i, target, edge_id, meta).unwrap();
+        edge_id += 1;
+        // Add a second edge for some nodes
+        if i % 3 == 0 {
+            let target2 = ((i * 11 + 7) % (i - 1)) + 1;
+            let meta2 = EdgeMeta {
+                source: i, target: target2, label: 0,
+                temporal, provenance: None, weight: 0.5, token_cost: 0,
+            };
+            adj.add_edge(i, target2, edge_id, meta2).unwrap();
+            edge_id += 1;
+        }
+    }
+
+    let mut group = c.benchmark_group("algorithms");
+    group.sample_size(20);
+
+    group.bench_function("pagerank_1k", |b| {
+        let seeds: Vec<(u64, f32)> = (1..=n).map(|i| (i, 1.0)).collect();
+        b.iter(|| {
+            black_box(traversal::personalized_pagerank(&adj, &seeds, 0.85, 20, 1e-6));
+        });
+    });
+
+    group.bench_function("communities_1k", |b| {
+        b.iter(|| {
+            black_box(traversal::modularity_communities(&adj, 50, 1.0));
+        });
+    });
+
+    group.bench_function("betweenness_1k", |b| {
+        let filter = traversal::EdgeFilter::none();
+        b.iter(|| {
+            black_box(traversal::betweenness_centrality(&adj, &filter));
+        });
+    });
+
+    group.bench_function("closeness_1k", |b| {
+        let filter = traversal::EdgeFilter::none();
+        b.iter(|| {
+            black_box(traversal::closeness_centrality(&adj, &filter));
+        });
+    });
+
+    group.bench_function("connected_components_1k", |b| {
+        b.iter(|| {
+            black_box(traversal::connected_components(&adj));
+        });
+    });
+
+    group.bench_function("tarjan_scc_1k", |b| {
+        b.iter(|| {
+            black_box(traversal::tarjan_scc(&adj));
+        });
+    });
+
+    group.bench_function("triangle_count_1k", |b| {
+        let filter = traversal::EdgeFilter::none();
+        b.iter(|| {
+            black_box(traversal::triangle_count(&adj, &filter));
+        });
+    });
+
+    group.bench_function("eigenvector_1k", |b| {
+        b.iter(|| {
+            black_box(traversal::eigenvector_centrality(&adj, 50, 1e-6));
+        });
+    });
+
+    group.bench_function("hits_1k", |b| {
+        b.iter(|| {
+            black_box(traversal::hits(&adj, 50, 1e-6));
+        });
+    });
+
+    group.bench_function("degree_centrality_1k", |b| {
+        b.iter(|| {
+            black_box(traversal::degree_centrality(&adj));
+        });
+    });
+
+    group.bench_function("label_propagation_1k", |b| {
+        b.iter(|| {
+            black_box(traversal::label_propagation(&adj, 50));
+        });
+    });
+
+    group.bench_function("fastrp_1k_128d", |b| {
+        b.iter(|| {
+            black_box(traversal::fastrp_embeddings(&adj, 128, 3, 1.0, 42));
+        });
+    });
+
+    group.finish();
+}
+
+// ---- BM25 Search Benchmark ----
+
+fn bench_text_search(c: &mut Criterion) {
+    use weav_graph::text_index::TextIndex;
+
+    let mut index = TextIndex::new();
+    // Index 10K documents
+    for i in 0..10_000u64 {
+        let content = format!("document {i} about graph databases and knowledge retrieval systems for AI workloads number {i}");
+        index.index_node(i, &content);
+    }
+
+    let mut group = c.benchmark_group("text_search");
+
+    group.bench_function("bm25_10k_docs", |b| {
+        b.iter(|| {
+            black_box(index.search("graph databases AI", 20));
+        });
+    });
+
+    group.bench_function("bm25_10k_single_term", |b| {
+        b.iter(|| {
+            black_box(index.search("knowledge", 20));
+        });
+    });
+
+    group.finish();
+}
+
 // ---- Criterion Groups and Main ----
 
 criterion_group!(
@@ -522,6 +669,8 @@ criterion_group!(
     bench_engine,
     bench_context_query,
     bench_persistence,
+    bench_algorithms,
+    bench_text_search,
 );
 
 criterion_main!(benches);

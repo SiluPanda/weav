@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  weav:
+    build: .
+    ports:
+      - "6380:6380"   # RESP3
+      - "6381:6381"   # gRPC
+      - "6382:6382"   # HTTP
+    volumes:
+      - weav-data:/data
+    environment:
+      - WEAV_PERSISTENCE_ENABLED=true
+      - WEAV_PERSISTENCE_DATA_DIR=/data
+      - WEAV_AUTH_ENABLED=false
+      - WEAV_EXTRACT_ENABLED=false
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6382/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  weav-data:
