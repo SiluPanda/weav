@@ -859,4 +859,25 @@ mod tests {
             0.99
         ));
     }
+
+    #[test]
+    fn test_fuzzy_match_unicode() {
+        assert!(fuzzy_name_match("François", "Francois", 0.80));
+    }
+
+    #[test]
+    fn test_fuzzy_match_empty_strings() {
+        // Empty strings should match each other
+        assert!(fuzzy_name_match("", "", 0.85));
+        // Empty vs non-empty should not match
+        assert!(!fuzzy_name_match("", "something", 0.85));
+    }
+
+    #[test]
+    fn test_fuzzy_match_very_long_strings() {
+        let long_a = "a".repeat(1000);
+        let long_b = "a".repeat(999) + "b";
+        // Very similar long strings
+        assert!(fuzzy_name_match(&long_a, &long_b, 0.85));
+    }
 }

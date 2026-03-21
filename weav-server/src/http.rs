@@ -5175,4 +5175,105 @@ mod tests {
             .unwrap();
         assert_eq!(ct, "text/vnd.graphviz");
     }
+
+    #[tokio::test]
+    async fn test_export_dot_special_characters() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "dotspec".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        // Add node with quotes in name
+        engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "dotspec".to_string(),
+                    label: "Person".to_string(),
+                    properties: vec![(
+                        "name".to_string(),
+                        Value::String("Dr. \"Smith\"".into()),
+                    )],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let req = Request::builder()
+            .uri("/v1/graphs/dotspec/export/dot")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let dot = String::from_utf8(body.to_vec()).unwrap();
+        // Should be valid DOT (contains digraph)
+        assert!(dot.contains("digraph"));
+    }
+
+    #[tokio::test]
+    async fn test_csv_import_empty_values() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "csvempty".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let csv_body = "_label,name,age\nPerson,,30\nPerson,Bob,\n";
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/csvempty/import/csv")
+            .body(Body::from(csv_body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_csv_import_header_only() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "csvhdr".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let csv_body = "_label,name\n";
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/csvhdr/import/csv")
+            .body(Body::from(csv_body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["data"]["nodes_created"], 0);
+    }
 }

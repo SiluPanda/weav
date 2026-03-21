@@ -2792,4 +2792,20 @@ mod tests {
             "subgraph should be None when include_subgraph=false"
         );
     }
+
+    #[test]
+    fn test_format_llm_messages_empty_chunks_anthropic() {
+        let result = format_llm_messages(Some("anthropic"), Some("test query"), &[]);
+        assert!(result.is_some());
+        let json: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert!(json["messages"].is_array());
+    }
+
+    #[test]
+    fn test_format_llm_messages_empty_chunks_openai() {
+        let result = format_llm_messages(Some("openai"), Some("test query"), &[]);
+        assert!(result.is_some());
+        let json: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert!(json["messages"].is_array());
+    }
 }

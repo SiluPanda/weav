@@ -1143,4 +1143,40 @@ mod tests {
         assert!(open.was_current_during(500, 501));
         assert!(!open.was_current_during(0, 500));
     }
+
+    #[test]
+    fn test_bitemporal_zero_width_range() {
+        let bt = BiTemporal {
+            valid_from: 100,
+            valid_until: 200,
+            tx_from: 100,
+            tx_until: BiTemporal::OPEN,
+        };
+        // Zero-width range [150, 150) should return false (empty interval)
+        assert!(!bt.is_valid_during(150, 150));
+    }
+
+    #[test]
+    fn test_bitemporal_inverted_range() {
+        let bt = BiTemporal {
+            valid_from: 100,
+            valid_until: 200,
+            tx_from: 100,
+            tx_until: BiTemporal::OPEN,
+        };
+        // Inverted range [200, 100) — start > end, should return false
+        assert!(!bt.is_valid_during(200, 100));
+    }
+
+    #[test]
+    fn test_bitemporal_max_timestamp() {
+        let bt = BiTemporal {
+            valid_from: 100,
+            valid_until: BiTemporal::OPEN,
+            tx_from: 100,
+            tx_until: BiTemporal::OPEN,
+        };
+        // Far future should be valid (open-ended)
+        assert!(bt.is_valid_during(u64::MAX - 1, u64::MAX));
+    }
 }

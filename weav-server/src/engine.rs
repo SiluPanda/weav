@@ -8712,4 +8712,73 @@ mod tests {
             _ => panic!("expected Text response from condense"),
         }
     }
+
+    #[test]
+    fn test_backup_without_persistence() {
+        // Create engine with persistence disabled (default)
+        let engine = make_engine();
+        let cmd = parser::parse_command("BACKUP").unwrap();
+        let resp = engine.execute_command(cmd, None);
+        // Should succeed gracefully or return informational message
+        assert!(resp.is_ok());
+    }
+
+    #[test]
+    fn test_node_importance_isolated_node() {
+        // Create graph with a single isolated node (no edges)
+        let engine = make_engine();
+        create_test_graph(&engine, "iso");
+        // Add single node, no edges
+        engine
+            .execute_command(
+                parser::parse_command(
+                    r#"NODE ADD TO "iso" LABEL "Orphan" PROPERTIES {"name": "lonely"}"#,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+        // Should not panic, should return valid [0,1] score
+        let graph_arc = engine.get_graph("iso").unwrap();
+        let gs = graph_arc.read();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let nids = gs.adjacency.all_node_ids();
+        let score = super::compute_node_importance(&gs, nids[0], now);
+        assert!(
+            score.importance >= 0.0 && score.importance <= 1.0,
+            "score out of range: {}",
+            score.importance
+        );
+    }
+
+    #[test]
+    fn test_condense_never_accessed_nodes() {
+        let engine = make_engine();
+        create_test_graph(&engine, "cond_na");
+        // Add nodes but never access them (access_time = 0)
+        for i in 0..5 {
+            engine
+                .execute_command(
+                    parser::parse_command(&format!(
+                        r#"NODE ADD TO "cond_na" LABEL "Thing" PROPERTIES {{"name": "item{i}"}}"#
+                    ))
+                    .unwrap(),
+                    None,
+                )
+                .unwrap();
+        }
+        // Condense with low threshold — never-accessed nodes should have low importance
+        let graph_arc = engine.get_graph("cond_na").unwrap();
+        let gs = graph_arc.read();
+        let node_count_before = gs.adjacency.node_count();
+        drop(gs);
+
+        // Should not panic
+        let result = engine.handle_condense("cond_na", 0.5);
+        assert!(result.is_ok());
+        assert!(node_count_before > 0, "should have added nodes");
+    }
 }
