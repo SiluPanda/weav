@@ -137,7 +137,8 @@ impl Engine {
             (None, None)
         };
         let acl_store = if config.auth.enabled {
-            Some(weav_auth::acl::AclStore::from_config(&config.auth))
+            Some(weav_auth::acl::AclStore::from_config(&config.auth)
+                .expect("failed to initialize auth — check user password configuration"))
         } else {
             None
         };

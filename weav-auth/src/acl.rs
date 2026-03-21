@@ -53,12 +53,12 @@ pub struct AclStore {
 
 impl AclStore {
     /// Create a new AclStore from the auth config.
-    pub fn from_config(config: &AuthConfig) -> Self {
+    pub fn from_config(config: &AuthConfig) -> WeavResult<Self> {
         let mut users = HashMap::new();
 
         // Load statically-defined users from config.
         for user_config in &config.users {
-            let user = acl_user_from_config(user_config);
+            let user = acl_user_from_config(user_config)?;
             users.insert(user.username.clone(), user);
         }
 
@@ -67,7 +67,9 @@ impl AclStore {
             let hash = config
                 .default_password
                 .as_ref()
-                .map(|p| password::hash_password(p).unwrap_or_default());
+                .map(|p| password::hash_password(p)
+                    .map_err(|e| WeavError::Internal(format!("password hash failed: {e}"))))
+                .transpose()?;
             users.insert(
                 "default".into(),
                 AclUser {
@@ -81,11 +83,11 @@ impl AclStore {
             );
         }
 
-        Self {
+        Ok(Self {
             users: RwLock::new(users),
             default_password: config.default_password.clone(),
             require_auth: config.require_auth,
-        }
+        })
     }
 
     /// Whether authentication is required.
@@ -220,11 +222,13 @@ impl AclStore {
 }
 
 /// Build an AclUser from a UserConfig.
-fn acl_user_from_config(config: &UserConfig) -> AclUser {
+fn acl_user_from_config(config: &UserConfig) -> WeavResult<AclUser> {
     let password_hash = config
         .password
         .as_ref()
-        .map(|p| password::hash_password(p).unwrap_or_default());
+        .map(|p| password::hash_password(p)
+            .map_err(|e| WeavError::Internal(format!("password hash failed for '{}': {e}", config.username))))
+        .transpose()?;
 
     let categories = if config.categories.is_empty() {
         CommandCategorySet::all()
@@ -247,14 +251,14 @@ fn acl_user_from_config(config: &UserConfig) -> AclUser {
         .map(|k| api_key::hash_api_key(k))
         .collect();
 
-    AclUser {
+    Ok(AclUser {
         username: config.username.clone(),
         password_hash,
         enabled: config.enabled,
         categories,
         graph_acl,
         api_key_hashes,
-    }
+    })
 }
 
 /// Parse a single ACL file line into an AclUser.
@@ -281,9 +285,9 @@ fn parse_acl_line(line: &str) -> Option<AclUser> {
             }
             p if p.starts_with('>') => {
                 // Plaintext password — hash it.
-                password_hash = Some(
-                    password::hash_password(&p[1..]).unwrap_or_default(),
-                );
+                if let Ok(hash) = password::hash_password(&p[1..]) {
+                    password_hash = Some(hash);
+                }
             }
             p if p.starts_with('~') => {
                 // Graph pattern: ~pattern:permission
@@ -338,14 +342,14 @@ mod tests {
     #[test]
     fn test_acl_store_from_config_empty() {
         let config = make_config(vec![]);
-        let store = AclStore::from_config(&config);
+        let store = AclStore::from_config(&config).unwrap();
         assert!(store.list_users().is_empty());
     }
 
     #[test]
     fn test_acl_store_authenticate_success() {
         let config = make_config(vec![make_user_config("alice", "secret123")]);
-        let store = AclStore::from_config(&config);
+        let store = AclStore::from_config(&config).unwrap();
 
         let identity = store.authenticate("alice", "secret123").unwrap();
         assert_eq!(identity.username, "alice");
@@ -355,7 +359,7 @@ mod tests {
     #[test]
     fn test_acl_store_authenticate_wrong_password() {
         let config = make_config(vec![make_user_config("alice", "secret123")]);
-        let store = AclStore::from_config(&config);
+        let store = AclStore::from_config(&config).unwrap();
 
         let result = store.authenticate("alice", "wrong");
         assert!(result.is_err());
@@ -364,7 +368,7 @@ mod tests {
     #[test]
     fn test_acl_store_authenticate_unknown_user() {
         let config = make_config(vec![make_user_config("alice", "secret123")]);
-        let store = AclStore::from_config(&config);
+        let store = AclStore::from_config(&config).unwrap();
 
         let result = store.authenticate("bob", "anything");
         assert!(result.is_err());
@@ -375,7 +379,7 @@ mod tests {
         let mut uc = make_user_config("alice", "secret123");
         uc.enabled = false;
         let config = make_config(vec![uc]);
-        let store = AclStore::from_config(&config);
+        let store = AclStore::from_config(&config).unwrap();
 
         let result = store.authenticate("alice", "secret123");
         assert!(result.is_err());
@@ -391,7 +395,7 @@ mod tests {
             default_password: Some("defaultpass".into()),
             users: vec![],
         };
-        let store = AclStore::from_config(&config);
+        let store = AclStore::from_config(&config).unwrap();
 
         let identity = store.authenticate_default("defaultpass").unwrap();
         assert_eq!(identity.username, "default");
@@ -412,7 +416,7 @@ mod tests {
             enabled: true,
         };
         let config = make_config(vec![uc]);
-        let store = AclStore::from_config(&config);
+        let store = AclStore::from_config(&config).unwrap();
 
         let identity = store.authenticate_api_key(api_key).unwrap();
         assert_eq!(identity.username, "apiuser");
@@ -424,7 +428,7 @@ mod tests {
     #[test]
     fn test_acl_store_crud() {
         let config = make_config(vec![]);
-        let store = AclStore::from_config(&config);
+        let store = AclStore::from_config(&config).unwrap();
 
         // Create.
         let user = AclUser {
@@ -462,7 +466,7 @@ mod tests {
             require_auth: true,
             ..Default::default()
         };
-        let store = AclStore::from_config(&config);
+        let store = AclStore::from_config(&config).unwrap();
         assert!(store.require_auth());
 
         let config2 = AuthConfig {
@@ -470,7 +474,7 @@ mod tests {
             require_auth: false,
             ..Default::default()
         };
-        let store2 = AclStore::from_config(&config2);
+        let store2 = AclStore::from_config(&config2).unwrap();
         assert!(!store2.require_auth());
     }
 
@@ -490,7 +494,7 @@ mod tests {
             enabled: true,
         };
         let config = make_config(vec![uc]);
-        let store = AclStore::from_config(&config);
+        let store = AclStore::from_config(&config).unwrap();
 
         let identity = store.authenticate("reader", "pass").unwrap();
         assert!(identity.permissions.can_read_graph("app:users"));
@@ -524,7 +528,7 @@ mod tests {
     #[test]
     fn test_load_acl() {
         let config = make_config(vec![]);
-        let store = AclStore::from_config(&config);
+        let store = AclStore::from_config(&config).unwrap();
 
         let acl_content = "# comment\nuser alice on >pass123\nuser bob off\n";
         store.load_acl(acl_content);
@@ -538,7 +542,7 @@ mod tests {
     #[test]
     fn test_serialize_acl() {
         let config = make_config(vec![make_user_config("alice", "pass")]);
-        let store = AclStore::from_config(&config);
+        let store = AclStore::from_config(&config).unwrap();
 
         let serialized = store.serialize_acl();
         assert!(serialized.contains("user alice"));
@@ -571,7 +575,7 @@ mod tests {
             enabled: true,
         };
         let config = make_config(vec![uc]);
-        let store = AclStore::from_config(&config);
+        let store = AclStore::from_config(&config).unwrap();
 
         let result = store.authenticate("nopass", "anything");
         assert!(result.is_err());
