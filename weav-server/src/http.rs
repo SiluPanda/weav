@@ -250,6 +250,8 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/context", post(context_query))
         // Ingest (extraction pipeline).
         .route("/v1/graphs/{graph}/ingest", post(ingest))
+        // Schema introspection.
+        .route("/v1/graphs/{graph}/schema", get(get_graph_schema))
         // Node search by property.
         .route("/v1/graphs/{graph}/search", get(search_nodes))
         // Graph export/import.
@@ -331,6 +333,92 @@ async fn health() -> impl IntoResponse {
     Json(ApiResponse::ok(HealthResponse {
         status: "ok".to_string(),
     }))
+}
+
+/// Schema introspection: discover node labels, edge labels, and property keys.
+/// GET /v1/graphs/{graph}/schema
+async fn get_graph_schema(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+) -> impl IntoResponse {
+    let _identity = extract_identity(&engine, &headers);
+    let graph_arc = match engine.get_graph(&graph) {
+        Ok(g) => g,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
+    let gs = graph_arc.read();
+
+    // Collect node labels and their property keys
+    let mut node_labels: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for nid in gs.adjacency.all_node_ids() {
+        let label = gs.properties
+            .get_node_property(nid, "_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let entry = node_labels.entry(label).or_default();
+        for (k, _) in gs.properties.get_all_node_properties(nid) {
+            if !k.starts_with('_') {
+                entry.insert(k.to_string());
+            }
+        }
+    }
+
+    // Collect edge labels and (source_label, target_label) pairs
+    let mut edge_labels: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+    for (_, meta) in gs.adjacency.all_edges() {
+        let label = gs.interner
+            .resolve_label(meta.label)
+            .unwrap_or("unknown")
+            .to_string();
+        let src_label = gs.properties
+            .get_node_property(meta.source, "_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let tgt_label = gs.properties
+            .get_node_property(meta.target, "_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let entry = edge_labels.entry(label).or_default();
+        let pair = (src_label, tgt_label);
+        if !entry.contains(&pair) {
+            entry.push(pair);
+        }
+    }
+
+    // Format output
+    let node_types: Vec<serde_json::Value> = node_labels.iter().map(|(label, keys)| {
+        let mut sorted_keys: Vec<&String> = keys.iter().collect();
+        sorted_keys.sort();
+        serde_json::json!({
+            "label": label,
+            "count": gs.properties.nodes_where("_label", &|v| v.as_str() == Some(label)).len(),
+            "properties": sorted_keys,
+        })
+    }).collect();
+
+    let edge_types: Vec<serde_json::Value> = edge_labels.iter().map(|(label, pairs)| {
+        serde_json::json!({
+            "label": label,
+            "connections": pairs.iter().map(|(s, t)| {
+                serde_json::json!({"from": s, "to": t})
+            }).collect::<Vec<_>>(),
+        })
+    }).collect();
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::ok(serde_json::json!({
+            "graph": graph,
+            "node_types": node_types,
+            "edge_types": edge_types,
+        }))),
+    ).into_response()
 }
 
 /// Search nodes by property key/value.

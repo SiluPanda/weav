@@ -1530,6 +1530,16 @@ impl Engine {
         }
 
         // ── No duplicate found: create new node ─────────────────────────
+
+        // Enforce max_nodes capacity if configured
+        if let Some(max) = gs.config.max_nodes {
+            if gs.adjacency.node_count() >= max {
+                return Err(WeavError::CapacityExceeded(format!(
+                    "graph '{}' reached max_nodes limit ({})", cmd.graph, max
+                )));
+            }
+        }
+
         let node_id = gs.next_node_id;
         gs.next_node_id += 1;
         let graph_id = gs.graph_id;
@@ -1848,6 +1858,15 @@ impl Engine {
 
         let label_id = gs.interner.intern_label(&cmd.label)?;
         let now = Self::now_ms();
+
+        // Enforce max_edges capacity if configured
+        if let Some(max) = gs.config.max_edges {
+            if gs.adjacency.edge_count() >= max {
+                return Err(WeavError::CapacityExceeded(format!(
+                    "graph '{}' reached max_edges limit ({})", cmd.graph, max
+                )));
+            }
+        }
 
         // Pre-allocate edge ID for write-ahead logging
         let edge_id = gs.adjacency.allocate_edge_id();
@@ -4675,5 +4694,107 @@ mod tests {
             }
             _ => panic!("expected GraphInfo"),
         }
+    }
+
+    #[test]
+    fn test_max_nodes_enforcement() {
+        let engine = make_engine();
+        let mut gc = weav_core::config::GraphConfig::default();
+        gc.max_nodes = Some(2);
+        let cmd = Command::GraphCreate(parser::GraphCreateCmd {
+            name: "limited".to_string(),
+            config: Some(gc),
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        // First two nodes should succeed
+        for i in 0..2 {
+            let cmd = Command::NodeAdd(parser::NodeAddCmd {
+                graph: "limited".to_string(),
+                label: "x".to_string(),
+                properties: vec![("i".to_string(), Value::Int(i))],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            });
+            engine.execute_command(cmd, None).unwrap();
+        }
+
+        // Third should fail
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "limited".to_string(),
+            label: "x".to_string(),
+            properties: vec![],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        let result = engine.execute_command(cmd, None);
+        assert!(result.is_err(), "should reject when max_nodes reached");
+        match result.unwrap_err() {
+            WeavError::CapacityExceeded(_) => {}
+            other => panic!("expected CapacityExceeded, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_max_edges_enforcement() {
+        let engine = make_engine();
+        let mut gc = weav_core::config::GraphConfig::default();
+        gc.max_edges = Some(1);
+        let cmd = Command::GraphCreate(parser::GraphCreateCmd {
+            name: "edge_limited".to_string(),
+            config: Some(gc),
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        // Add two nodes
+        let n1 = match engine.execute_command(Command::NodeAdd(parser::NodeAddCmd {
+            graph: "edge_limited".to_string(),
+            label: "a".to_string(),
+            properties: vec![],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        }), None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+        let n2 = match engine.execute_command(Command::NodeAdd(parser::NodeAddCmd {
+            graph: "edge_limited".to_string(),
+            label: "b".to_string(),
+            properties: vec![],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        }), None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // First edge succeeds
+        let cmd = Command::EdgeAdd(parser::EdgeAddCmd {
+            graph: "edge_limited".to_string(),
+            source: n1,
+            target: n2,
+            label: "link".to_string(),
+            weight: 1.0,
+            properties: vec![],
+            ttl_ms: None,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        // Second edge should fail
+        let cmd = Command::EdgeAdd(parser::EdgeAddCmd {
+            graph: "edge_limited".to_string(),
+            source: n2,
+            target: n1,
+            label: "link2".to_string(),
+            weight: 1.0,
+            properties: vec![],
+            ttl_ms: None,
+        });
+        let result = engine.execute_command(cmd, None);
+        assert!(result.is_err(), "should reject when max_edges reached");
     }
 }
