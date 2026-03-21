@@ -963,4 +963,227 @@ mod tests {
         assert!(router.has_route("export_graph"));
         assert!(router.has_route("graph_stats"));
     }
+
+    /// Helper: create a graph and add two connected nodes for testing new tools.
+    fn setup_graph_with_nodes(server: &WeavMcpServer) -> (u64, u64) {
+        use weav_query::parser::{Command, EdgeAddCmd, GraphCreateCmd, NodeAddCmd};
+        use weav_server::engine::CommandResponse;
+
+        server
+            .engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "tg".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let n1 = match server
+            .engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "tg".to_string(),
+                    label: "Person".to_string(),
+                    properties: vec![
+                        ("name".to_string(), weav_core::types::Value::String("Alice".into())),
+                        ("age".to_string(), weav_core::types::Value::Int(30)),
+                    ],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        let n2 = match server
+            .engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "tg".to_string(),
+                    label: "Document".to_string(),
+                    properties: vec![
+                        ("name".to_string(), weav_core::types::Value::String("Report".into())),
+                    ],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        server
+            .engine
+            .execute_command(
+                Command::EdgeAdd(EdgeAddCmd {
+                    graph: "tg".to_string(),
+                    source: n1,
+                    target: n2,
+                    label: "AUTHORED".to_string(),
+                    weight: 0.8,
+                    properties: vec![],
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        (n1, n2)
+    }
+
+    #[test]
+    fn test_search_nodes_by_name() {
+        let server = test_server();
+        let (n1, _n2) = setup_graph_with_nodes(&server);
+
+        let graph_arc = server.engine.get_graph("tg").unwrap();
+        let gs = graph_arc.read();
+
+        // Search for "Alice" by name property.
+        let matching = gs.properties.nodes_where("name", &|v| {
+            v.as_str() == Some("Alice")
+        });
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0], n1);
+    }
+
+    #[test]
+    fn test_search_nodes_by_int_property() {
+        let server = test_server();
+        let (n1, _n2) = setup_graph_with_nodes(&server);
+
+        let graph_arc = server.engine.get_graph("tg").unwrap();
+        let gs = graph_arc.read();
+
+        // Search for age=30 by integer match.
+        let search_value = "30".to_string();
+        let matching = gs.properties.nodes_where("age", &move |v| {
+            if let Some(i) = v.as_int() {
+                if let Ok(parsed) = search_value.parse::<i64>() {
+                    return i == parsed;
+                }
+            }
+            false
+        });
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0], n1);
+    }
+
+    #[test]
+    fn test_search_nodes_no_match() {
+        let server = test_server();
+        let _ = setup_graph_with_nodes(&server);
+
+        let graph_arc = server.engine.get_graph("tg").unwrap();
+        let gs = graph_arc.read();
+
+        let matching = gs.properties.nodes_where("name", &|v| {
+            v.as_str() == Some("NonExistent")
+        });
+        assert!(matching.is_empty());
+    }
+
+    #[test]
+    fn test_get_neighbors() {
+        let server = test_server();
+        let (n1, n2) = setup_graph_with_nodes(&server);
+
+        let graph_arc = server.engine.get_graph("tg").unwrap();
+        let gs = graph_arc.read();
+
+        // n1 should have one outgoing neighbor (n2).
+        let neighbors = gs.adjacency.neighbors_both(n1, None);
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].0, n2);
+
+        // n2 should have one incoming neighbor (n1).
+        let neighbors = gs.adjacency.neighbors_both(n2, None);
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].0, n1);
+    }
+
+    #[test]
+    fn test_get_neighbors_nonexistent_node() {
+        let server = test_server();
+        let _ = setup_graph_with_nodes(&server);
+
+        let graph_arc = server.engine.get_graph("tg").unwrap();
+        let gs = graph_arc.read();
+
+        assert!(!gs.adjacency.has_node(999999));
+    }
+
+    #[test]
+    fn test_export_graph() {
+        let server = test_server();
+        let _ = setup_graph_with_nodes(&server);
+
+        let graph_arc = server.engine.get_graph("tg").unwrap();
+        let gs = graph_arc.read();
+
+        let node_ids = gs.adjacency.all_node_ids();
+        assert_eq!(node_ids.len(), 2);
+
+        let edge_count = gs.adjacency.all_edges().count();
+        assert_eq!(edge_count, 1);
+    }
+
+    #[test]
+    fn test_graph_stats() {
+        let server = test_server();
+        let _ = setup_graph_with_nodes(&server);
+
+        let graph_arc = server.engine.get_graph("tg").unwrap();
+        let gs = graph_arc.read();
+
+        assert_eq!(gs.adjacency.node_count(), 2);
+        assert_eq!(gs.adjacency.edge_count(), 1);
+        assert_eq!(gs.vector_index.len(), 0);
+
+        // Check label distribution.
+        let node_ids = gs.adjacency.all_node_ids();
+        let mut label_counts: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        for &nid in &node_ids {
+            let label = gs
+                .properties
+                .get_node_property(nid, "_label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            *label_counts.entry(label).or_insert(0) += 1;
+        }
+        assert_eq!(label_counts.get("Person"), Some(&1));
+        assert_eq!(label_counts.get("Document"), Some(&1));
+    }
+
+    #[test]
+    fn test_graph_stats_avg_degree() {
+        let server = test_server();
+        let _ = setup_graph_with_nodes(&server);
+
+        let graph_arc = server.engine.get_graph("tg").unwrap();
+        let gs = graph_arc.read();
+
+        // 2 nodes, 1 edge. Each node sees 1 neighbor (n1->outgoing, n2->incoming).
+        // Total degree = 2, avg = 2/2 = 1.0
+        let node_ids = gs.adjacency.all_node_ids();
+        let total_degree: u64 = node_ids
+            .iter()
+            .map(|&nid| gs.adjacency.neighbors_both(nid, None).len() as u64)
+            .sum();
+        let avg_degree = total_degree as f64 / gs.adjacency.node_count() as f64;
+        assert!((avg_degree - 1.0).abs() < f64::EPSILON);
+    }
 }
