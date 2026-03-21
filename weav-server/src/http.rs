@@ -376,6 +376,7 @@ async fn add_node(
         properties,
         embedding: body.embedding,
         entity_key: body.entity_key,
+        ttl_ms: None,
     });
 
     match engine.execute_command(cmd, identity.as_ref()) {
@@ -464,6 +465,7 @@ async fn add_edge(
         label: body.label,
         weight: body.weight.unwrap_or(1.0),
         properties,
+        ttl_ms: None,
     });
 
     match engine.execute_command(cmd, identity.as_ref()) {
@@ -624,6 +626,7 @@ async fn bulk_add_nodes(
                 properties,
                 embedding: n.embedding,
                 entity_key: n.entity_key,
+                ttl_ms: None,
             }
         })
         .collect();
@@ -669,6 +672,7 @@ async fn bulk_add_edges(
                 label: e.label,
                 weight: e.weight.unwrap_or(1.0),
                 properties,
+                ttl_ms: None,
             }
         })
         .collect();
@@ -1151,6 +1155,7 @@ mod tests {
                 properties: vec![],
                 embedding: None,
                 entity_key: None,
+                ttl_ms: None,
             }), None)
             .unwrap();
         let node_id = match add_resp {
@@ -1187,6 +1192,7 @@ mod tests {
                 properties: vec![],
                 embedding: None,
                 entity_key: None,
+                ttl_ms: None,
             }), None)
             .unwrap()
         {
@@ -1201,6 +1207,7 @@ mod tests {
                 properties: vec![],
                 embedding: None,
                 entity_key: None,
+                ttl_ms: None,
             }), None)
             .unwrap()
         {
@@ -1246,6 +1253,7 @@ mod tests {
                 properties: vec![],
                 embedding: None,
                 entity_key: None,
+                ttl_ms: None,
             }), None)
             .unwrap()
         {
@@ -1260,6 +1268,7 @@ mod tests {
                 properties: vec![],
                 embedding: None,
                 entity_key: None,
+                ttl_ms: None,
             }), None)
             .unwrap()
         {
@@ -1275,6 +1284,7 @@ mod tests {
                 label: "link".to_string(),
                 weight: 1.0,
                 properties: vec![],
+                ttl_ms: None,
             }), None)
             .unwrap()
         {
@@ -1313,6 +1323,7 @@ mod tests {
                 )],
                 embedding: None,
                 entity_key: None,
+                ttl_ms: None,
             }), None)
             .unwrap();
         let node_id = match add_resp {
@@ -1377,6 +1388,7 @@ mod tests {
                 properties: vec![],
                 embedding: None,
                 entity_key: None,
+                ttl_ms: None,
             }), None)
             .unwrap()
         {
@@ -1391,6 +1403,7 @@ mod tests {
                 properties: vec![],
                 embedding: None,
                 entity_key: None,
+                ttl_ms: None,
             }), None)
             .unwrap()
         {
@@ -1526,6 +1539,7 @@ mod tests {
                 )],
                 embedding: None,
                 entity_key: None,
+                ttl_ms: None,
             }), None)
             .unwrap();
         let node_id = match add_resp {
@@ -1578,6 +1592,7 @@ mod tests {
                 )],
                 embedding: None,
                 entity_key: Some("alice".to_string()),
+                ttl_ms: None,
             }), None)
             .unwrap();
 

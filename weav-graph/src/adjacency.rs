@@ -111,7 +111,7 @@ impl AdjacencyStore {
         edge_ids_to_remove.sort_unstable();
         edge_ids_to_remove.dedup();
 
-        // Remove edges from adjacency structures and edge_meta
+        // Remove edges from adjacency structures, edge_meta, and pair_index
         for eid in &edge_ids_to_remove {
             if let Some(meta) = self.edge_meta.remove(eid) {
                 if let Some(fwd) = self.forward.get_mut(&meta.label) {
@@ -119,6 +119,13 @@ impl AdjacencyStore {
                 }
                 if let Some(bwd) = self.backward.get_mut(&meta.label) {
                     bwd.remove_edge(meta.target, *eid);
+                }
+                // Clean up pair_index
+                if let Some(pair_edges) = self.pair_index.get_mut(&(meta.source, meta.target)) {
+                    pair_edges.retain(|e| *e != *eid);
+                    if pair_edges.is_empty() {
+                        self.pair_index.remove(&(meta.source, meta.target));
+                    }
                 }
             }
         }
@@ -907,5 +914,69 @@ mod tests {
             WeavError::NodeNotFound(id, _) => assert_eq!(id, 1),
             other => panic!("expected NodeNotFound, got: {other}"),
         }
+    }
+
+    #[test]
+    fn test_remove_node_cleans_pair_index() {
+        let mut store = AdjacencyStore::new();
+        store.add_node(1);
+        store.add_node(2);
+        store.add_node(3);
+
+        store.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        store.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        store.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        // Before removal, pair_index should have entries
+        assert!(store.edge_between(1, 2, None).is_some());
+        assert!(store.edge_between(2, 3, None).is_some());
+        assert!(store.edge_between(3, 1, None).is_some());
+
+        // Remove node 2 — edges 1->2 and 2->3 should be cleaned from pair_index
+        store.remove_node(2).unwrap();
+
+        // pair_index should no longer contain stale entries
+        assert!(store.edge_between(1, 2, None).is_none());
+        assert!(store.edge_between(2, 3, None).is_none());
+        // Edge 3->1 should still exist
+        assert!(store.edge_between(3, 1, None).is_some());
+
+        // edge_history should also be clean
+        assert!(store.edge_history(1, 2).is_empty());
+        assert!(store.edge_history(2, 3).is_empty());
+        assert_eq!(store.edge_history(3, 1).len(), 1);
+    }
+
+    #[test]
+    fn test_remove_node_pair_index_self_loop() {
+        let mut store = AdjacencyStore::new();
+        store.add_node(1);
+        store.add_edge(1, 1, 0, make_meta(1, 1, 0)).unwrap();
+
+        assert!(store.edge_between(1, 1, None).is_some());
+        store.remove_node(1).unwrap();
+        assert!(store.edge_between(1, 1, None).is_none());
+        assert!(store.edge_history(1, 1).is_empty());
+    }
+
+    #[test]
+    fn test_remove_node_pair_index_multi_edges() {
+        let mut store = AdjacencyStore::new();
+        store.add_node(1);
+        store.add_node(2);
+
+        // Add multiple edges between same pair
+        store.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        store.add_edge(1, 2, 1, make_meta(1, 2, 1)).unwrap();
+        store.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+
+        assert_eq!(store.edge_history(1, 2).len(), 3);
+
+        store.remove_node(1).unwrap();
+
+        // All pair_index entries for (1,2) should be cleaned
+        assert!(store.edge_between(1, 2, None).is_none());
+        assert!(store.edge_history(1, 2).is_empty());
+        assert_eq!(store.edge_count(), 0);
     }
 }

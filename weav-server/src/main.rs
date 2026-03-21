@@ -41,11 +41,29 @@ async fn main() {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
                 loop {
                     interval.tick().await;
-                    engine_wal.sync_wal();
+                    if let Err(e) = engine_wal.sync_wal() {
+                        tracing::error!("WAL sync failed: {e}");
+                    }
                 }
             });
             tracing::info!("WAL EverySecond sync task started");
         }
+    }
+
+    // Spawn background TTL sweep task (every 10 seconds)
+    {
+        let engine_ttl = engine.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                let expired = engine_ttl.sweep_ttl();
+                if expired > 0 {
+                    tracing::info!("TTL sweep: removed {expired} expired entities");
+                }
+            }
+        });
+        tracing::info!("TTL sweep task started (10s interval)");
     }
 
     let app = http::build_router(engine.clone());

@@ -1,11 +1,14 @@
 //! Graph traversal algorithms: BFS, flow scoring, ego network, shortest path,
 //! scored paths, Dijkstra, connected components, Personalized PageRank,
-//! Label Propagation community detection, modularity-based community detection.
+//! Label Propagation community detection, modularity-based community detection,
+//! betweenness centrality, closeness centrality, triangle counting,
+//! Tarjan's strongly connected components, topological sort.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
+use weav_core::error::{WeavError, WeavResult};
 use weav_core::types::{Direction, EdgeId, LabelId, NodeId, ScoredNode, ScoredPath, Timestamp};
 
 use crate::adjacency::AdjacencyStore;
@@ -1040,6 +1043,431 @@ pub fn modularity_communities(
     }
 
     community
+}
+
+// ─── Betweenness Centrality (Brandes) ────────────────────────────────────────
+
+/// Compute betweenness centrality for every node using Brandes' algorithm.
+///
+/// Betweenness centrality measures how often a node lies on shortest paths
+/// between other node pairs. Edges are treated as undirected and unweighted.
+///
+/// An optional `edge_filter` restricts which edges are traversed.
+///
+/// Returns a list of `(NodeId, centrality)` sorted descending by score.
+pub fn betweenness_centrality(
+    adjacency: &AdjacencyStore,
+    edge_filter: &EdgeFilter,
+) -> Vec<(NodeId, f64)> {
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() {
+        return Vec::new();
+    }
+
+    let mut cb: HashMap<NodeId, f64> = all_nodes.iter().map(|&n| (n, 0.0)).collect();
+
+    for &s in &all_nodes {
+        // Single-source shortest-path DAG via BFS
+        let mut stack: Vec<NodeId> = Vec::new();
+        let mut pred: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        let mut sigma: HashMap<NodeId, f64> = HashMap::new();
+        let mut dist: HashMap<NodeId, i64> = HashMap::new();
+
+        for &v in &all_nodes {
+            pred.insert(v, Vec::new());
+            sigma.insert(v, 0.0);
+            dist.insert(v, -1);
+        }
+        *sigma.get_mut(&s).unwrap() = 1.0;
+        *dist.get_mut(&s).unwrap() = 0;
+
+        let mut queue: VecDeque<NodeId> = VecDeque::new();
+        queue.push_back(s);
+
+        while let Some(v) = queue.pop_front() {
+            stack.push(v);
+            let d_v = dist[&v];
+
+            // Undirected: follow both out and in neighbors
+            let out_nbrs = adjacency.neighbors_out(v, None);
+            let in_nbrs = adjacency.neighbors_in(v, None);
+            for &(w, eid) in out_nbrs.iter().chain(in_nbrs.iter()) {
+                if !edge_passes_filter(adjacency, eid, edge_filter) {
+                    continue;
+                }
+                if dist[&w] < 0 {
+                    // First visit
+                    *dist.get_mut(&w).unwrap() = d_v + 1;
+                    queue.push_back(w);
+                }
+                if dist[&w] == d_v + 1 {
+                    *sigma.get_mut(&w).unwrap() += sigma[&v];
+                    pred.get_mut(&w).unwrap().push(v);
+                }
+            }
+        }
+
+        // Back-propagation of dependencies
+        let mut delta: HashMap<NodeId, f64> = all_nodes.iter().map(|&n| (n, 0.0)).collect();
+        while let Some(w) = stack.pop() {
+            if sigma[&w] > 0.0 {
+                for v in &pred[&w] {
+                    let d = (sigma[v] / sigma[&w]) * (1.0 + delta[&w]);
+                    *delta.get_mut(v).unwrap() += d;
+                }
+            }
+            if w != s {
+                *cb.get_mut(&w).unwrap() += delta[&w];
+            }
+        }
+    }
+
+    // Undirected graph: each pair (s,t) is counted from both directions,
+    // so divide by 2.
+    for val in cb.values_mut() {
+        *val /= 2.0;
+    }
+
+    let mut result: Vec<(NodeId, f64)> = cb.into_iter().collect();
+    result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0)));
+    result
+}
+
+// ─── Closeness Centrality ────────────────────────────────────────────────────
+
+/// Compute closeness centrality for every node.
+///
+/// For each node, closeness = (number of reachable nodes - 1) / (sum of shortest
+/// path distances to all reachable nodes). If a node cannot reach any other node,
+/// its closeness is 0. This uses the Wasserman-Faust normalization so that nodes
+/// in smaller components still receive meaningful scores.
+///
+/// Edges are treated as undirected and unweighted. An optional `edge_filter`
+/// restricts which edges are traversed.
+///
+/// Returns a list of `(NodeId, closeness)` sorted descending by score.
+pub fn closeness_centrality(
+    adjacency: &AdjacencyStore,
+    edge_filter: &EdgeFilter,
+) -> Vec<(NodeId, f64)> {
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() {
+        return Vec::new();
+    }
+
+    let mut result: Vec<(NodeId, f64)> = Vec::with_capacity(all_nodes.len());
+
+    for &source in &all_nodes {
+        // BFS to compute shortest distances from source (undirected)
+        let mut dist: HashMap<NodeId, u64> = HashMap::new();
+        dist.insert(source, 0);
+        let mut queue: VecDeque<NodeId> = VecDeque::new();
+        queue.push_back(source);
+
+        while let Some(v) = queue.pop_front() {
+            let d_v = dist[&v];
+            let out_nbrs = adjacency.neighbors_out(v, None);
+            let in_nbrs = adjacency.neighbors_in(v, None);
+            for &(w, eid) in out_nbrs.iter().chain(in_nbrs.iter()) {
+                if !edge_passes_filter(adjacency, eid, edge_filter) {
+                    continue;
+                }
+                if !dist.contains_key(&w) {
+                    dist.insert(w, d_v + 1);
+                    queue.push_back(w);
+                }
+            }
+        }
+
+        let reachable = dist.len() - 1; // exclude self
+        if reachable == 0 {
+            result.push((source, 0.0));
+        } else {
+            let total_dist: u64 = dist.values().sum();
+            result.push((source, reachable as f64 / total_dist as f64));
+        }
+    }
+
+    result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0)));
+    result
+}
+
+// ─── Triangle Counting / Clustering Coefficient ─────────────────────────────
+
+/// Result of triangle counting and clustering coefficient computation.
+pub struct TriangleResult {
+    /// Total number of triangles in the graph (each triangle counted once).
+    pub total_triangles: u64,
+    /// Per-node data: `(node_id, triangle_count, clustering_coefficient)`.
+    pub per_node: Vec<(NodeId, u32, f64)>,
+}
+
+/// Count triangles and compute local clustering coefficients.
+///
+/// Edges are treated as undirected. A triangle is a set of three mutually
+/// connected nodes. The local clustering coefficient for a node with degree k
+/// and t triangles is `2t / (k * (k - 1))`.
+///
+/// An optional `edge_filter` restricts which edges are considered.
+pub fn triangle_count(
+    adjacency: &AdjacencyStore,
+    edge_filter: &EdgeFilter,
+) -> TriangleResult {
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() {
+        return TriangleResult {
+            total_triangles: 0,
+            per_node: Vec::new(),
+        };
+    }
+
+    // Build undirected neighbor sets (filtered)
+    let mut neighbors: HashMap<NodeId, HashSet<NodeId>> = HashMap::with_capacity(all_nodes.len());
+    for &node in &all_nodes {
+        let mut nbr_set = HashSet::new();
+        for &(w, eid) in adjacency.neighbors_out(node, None).iter() {
+            if edge_passes_filter(adjacency, eid, edge_filter) {
+                nbr_set.insert(w);
+            }
+        }
+        for &(w, eid) in adjacency.neighbors_in(node, None).iter() {
+            if edge_passes_filter(adjacency, eid, edge_filter) {
+                nbr_set.insert(w);
+            }
+        }
+        nbr_set.remove(&node); // remove self-loops
+        neighbors.insert(node, nbr_set);
+    }
+
+    // Count triangles per node. For each node u, for each pair of neighbors
+    // (v, w) where v < w, check if v and w are neighbors. Each triangle
+    // u-v-w is counted once at each of the three vertices.
+    let mut node_triangles: HashMap<NodeId, u32> = all_nodes.iter().map(|&n| (n, 0)).collect();
+    let mut total: u64 = 0;
+
+    for &u in &all_nodes {
+        let u_nbrs = &neighbors[&u];
+        let u_nbrs_sorted: Vec<NodeId> = {
+            let mut v: Vec<NodeId> = u_nbrs.iter().copied().collect();
+            v.sort_unstable();
+            v
+        };
+
+        for (i, &v) in u_nbrs_sorted.iter().enumerate() {
+            if v <= u {
+                continue; // only count each triangle once: u < v < w
+            }
+            for &w in &u_nbrs_sorted[i + 1..] {
+                if neighbors[&v].contains(&w) {
+                    // Triangle u-v-w found
+                    *node_triangles.get_mut(&u).unwrap() += 1;
+                    *node_triangles.get_mut(&v).unwrap() += 1;
+                    *node_triangles.get_mut(&w).unwrap() += 1;
+                    total += 1;
+                }
+            }
+        }
+    }
+
+    let per_node: Vec<(NodeId, u32, f64)> = all_nodes
+        .iter()
+        .map(|&n| {
+            let t = node_triangles[&n];
+            let k = neighbors[&n].len() as u64;
+            let cc = if k >= 2 {
+                (2 * t as u64) as f64 / (k * (k - 1)) as f64
+            } else {
+                0.0
+            };
+            (n, t, cc)
+        })
+        .collect();
+
+    TriangleResult {
+        total_triangles: total,
+        per_node,
+    }
+}
+
+// ─── Strongly Connected Components (Tarjan's SCC) ───────────────────────────
+
+/// Find all strongly connected components using Tarjan's algorithm.
+///
+/// Unlike `connected_components` which treats edges as undirected, this respects
+/// edge direction. A strongly connected component is a maximal set of nodes
+/// where every node is reachable from every other node following directed edges.
+///
+/// Returns a list of components, each being a `Vec<NodeId>`. Components are
+/// returned in reverse topological order of the condensation DAG.
+pub fn tarjan_scc(adjacency: &AdjacencyStore) -> Vec<Vec<NodeId>> {
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() {
+        return Vec::new();
+    }
+
+    let mut index_counter: u64 = 0;
+    let mut stack: Vec<NodeId> = Vec::new();
+    let mut on_stack: HashSet<NodeId> = HashSet::new();
+    let mut index_map: HashMap<NodeId, u64> = HashMap::new();
+    let mut lowlink: HashMap<NodeId, u64> = HashMap::new();
+    let mut result: Vec<Vec<NodeId>> = Vec::new();
+
+    // Iterative Tarjan to avoid stack overflow on large graphs.
+    // Each frame on the work stack represents either entering a node
+    // or returning from a child.
+    enum Frame {
+        Enter(NodeId),
+        Resume {
+            node: NodeId,
+            neighbors: Vec<NodeId>,
+            next_idx: usize,
+        },
+    }
+
+    for &start in &all_nodes {
+        if index_map.contains_key(&start) {
+            continue;
+        }
+
+        let mut work: Vec<Frame> = vec![Frame::Enter(start)];
+
+        while let Some(frame) = work.pop() {
+            match frame {
+                Frame::Enter(v) => {
+                    if index_map.contains_key(&v) {
+                        continue;
+                    }
+                    let idx = index_counter;
+                    index_counter += 1;
+                    index_map.insert(v, idx);
+                    lowlink.insert(v, idx);
+                    stack.push(v);
+                    on_stack.insert(v);
+
+                    let neighbors: Vec<NodeId> = adjacency
+                        .neighbors_out(v, None)
+                        .iter()
+                        .map(|&(n, _)| n)
+                        .collect();
+
+                    work.push(Frame::Resume {
+                        node: v,
+                        neighbors: neighbors.clone(),
+                        next_idx: 0,
+                    });
+                }
+                Frame::Resume {
+                    node: v,
+                    neighbors,
+                    next_idx,
+                } => {
+                    // Process the child we just returned from (if any)
+                    if next_idx > 0 {
+                        let child = neighbors[next_idx - 1];
+                        if let Some(&child_ll) = lowlink.get(&child) {
+                            let v_ll = lowlink[&v];
+                            if child_ll < v_ll {
+                                lowlink.insert(v, child_ll);
+                            }
+                        }
+                    }
+
+                    // Find next unvisited/on-stack child
+                    let mut i = next_idx;
+                    while i < neighbors.len() {
+                        let w = neighbors[i];
+                        if !index_map.contains_key(&w) {
+                            // Push resume frame, then enter child
+                            work.push(Frame::Resume {
+                                node: v,
+                                neighbors: neighbors.clone(),
+                                next_idx: i + 1,
+                            });
+                            work.push(Frame::Enter(w));
+                            break;
+                        } else if on_stack.contains(&w) {
+                            let v_ll = lowlink[&v];
+                            let w_idx = index_map[&w];
+                            if w_idx < v_ll {
+                                lowlink.insert(v, w_idx);
+                            }
+                        }
+                        i += 1;
+                    }
+
+                    // If we exhausted all neighbors, check if v is a root
+                    if i == neighbors.len() {
+                        if lowlink[&v] == index_map[&v] {
+                            let mut component = Vec::new();
+                            loop {
+                                let w = stack.pop().unwrap();
+                                on_stack.remove(&w);
+                                component.push(w);
+                                if w == v {
+                                    break;
+                                }
+                            }
+                            result.push(component);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    result
+}
+
+// ─── Topological Sort ────────────────────────────────────────────────────────
+
+/// Compute a topological ordering of the graph using Kahn's algorithm.
+///
+/// Returns an error if the graph contains a cycle (i.e., is not a DAG).
+/// Nodes with no dependencies appear first in the result.
+pub fn topological_sort(adjacency: &AdjacencyStore) -> WeavResult<Vec<NodeId>> {
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Compute in-degree for each node
+    let mut in_degree: HashMap<NodeId, usize> = all_nodes.iter().map(|&n| (n, 0)).collect();
+    for &node in &all_nodes {
+        for &(target, _) in adjacency.neighbors_out(node, None).iter() {
+            *in_degree.entry(target).or_insert(0) += 1;
+        }
+    }
+
+    // Start with all nodes that have in-degree 0
+    // Use a BinaryHeap (max-heap with Reverse) for deterministic output
+    let mut queue: BinaryHeap<std::cmp::Reverse<NodeId>> = BinaryHeap::new();
+    for (&node, &deg) in &in_degree {
+        if deg == 0 {
+            queue.push(std::cmp::Reverse(node));
+        }
+    }
+
+    let mut sorted: Vec<NodeId> = Vec::with_capacity(all_nodes.len());
+
+    while let Some(std::cmp::Reverse(node)) = queue.pop() {
+        sorted.push(node);
+        for &(target, _) in adjacency.neighbors_out(node, None).iter() {
+            if let Some(deg) = in_degree.get_mut(&target) {
+                *deg -= 1;
+                if *deg == 0 {
+                    queue.push(std::cmp::Reverse(target));
+                }
+            }
+        }
+    }
+
+    if sorted.len() != all_nodes.len() {
+        return Err(WeavError::Conflict(
+            "graph contains a cycle — topological sort requires a DAG".into(),
+        ));
+    }
+
+    Ok(sorted)
 }
 
 #[cfg(test)]
@@ -2478,5 +2906,414 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].node_id, 1);
         assert_eq!(result[0].score, 1.0);
+    }
+
+    // ── Betweenness Centrality tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_betweenness_empty_graph() {
+        let adj = AdjacencyStore::new();
+        let result = betweenness_centrality(&adj, &EdgeFilter::none());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_betweenness_single_node() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        let result = betweenness_centrality(&adj, &EdgeFilter::none());
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 1);
+        assert_eq!(result[0].1, 0.0);
+    }
+
+    #[test]
+    fn test_betweenness_linear_graph() {
+        // 1 -- 2 -- 3 -- 4 (undirected via both directions)
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=4 { adj.add_node(i); }
+        for i in 1..=3 {
+            adj.add_edge(i, i + 1, 0, make_meta(i, i + 1, 0)).unwrap();
+            adj.add_edge(i + 1, i, 0, make_meta(i + 1, i, 0)).unwrap();
+        }
+
+        let result = betweenness_centrality(&adj, &EdgeFilter::none());
+        let bc: HashMap<NodeId, f64> = result.into_iter().collect();
+        // In a path graph of 4 nodes (undirected), interior nodes 2 and 3
+        // have higher betweenness than endpoints 1 and 4.
+        assert!(bc[&2] > bc[&1]);
+        assert!(bc[&3] > bc[&4]);
+        // Endpoints have zero betweenness
+        assert_eq!(bc[&1], 0.0);
+        assert_eq!(bc[&4], 0.0);
+    }
+
+    #[test]
+    fn test_betweenness_star_graph() {
+        // Center node 1 connects to 2,3,4,5 (undirected)
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=5 { adj.add_node(i); }
+        for i in 2..=5 {
+            adj.add_edge(1, i, 0, make_meta(1, i, 0)).unwrap();
+            adj.add_edge(i, 1, 0, make_meta(i, 1, 0)).unwrap();
+        }
+
+        let result = betweenness_centrality(&adj, &EdgeFilter::none());
+        let bc: HashMap<NodeId, f64> = result.into_iter().collect();
+        // Center node should have highest betweenness
+        assert!(bc[&1] > 0.0);
+        // All spokes have zero betweenness
+        for i in 2..=5 {
+            assert_eq!(bc[&i], 0.0);
+        }
+    }
+
+    #[test]
+    fn test_betweenness_disconnected() {
+        // Two isolated nodes
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        let result = betweenness_centrality(&adj, &EdgeFilter::none());
+        let bc: HashMap<NodeId, f64> = result.into_iter().collect();
+        assert_eq!(bc[&1], 0.0);
+        assert_eq!(bc[&2], 0.0);
+    }
+
+    // ── Closeness Centrality tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_closeness_empty_graph() {
+        let adj = AdjacencyStore::new();
+        let result = closeness_centrality(&adj, &EdgeFilter::none());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_closeness_single_node() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        let result = closeness_centrality(&adj, &EdgeFilter::none());
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 1);
+        assert_eq!(result[0].1, 0.0); // no reachable nodes
+    }
+
+    #[test]
+    fn test_closeness_linear_graph() {
+        // 1 -- 2 -- 3 (undirected)
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 { adj.add_node(i); }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+
+        let result = closeness_centrality(&adj, &EdgeFilter::none());
+        let cc: HashMap<NodeId, f64> = result.into_iter().collect();
+        // Node 2 is central: distances = {1:1, 3:1}, sum=2, closeness=2/2=1.0
+        // Node 1: distances = {2:1, 3:2}, sum=3, closeness=2/3
+        assert!(cc[&2] > cc[&1]);
+        assert!(cc[&2] > cc[&3]);
+        // Endpoints should have equal closeness (symmetric)
+        assert!((cc[&1] - cc[&3]).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_closeness_disconnected() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        let result = closeness_centrality(&adj, &EdgeFilter::none());
+        let cc: HashMap<NodeId, f64> = result.into_iter().collect();
+        assert_eq!(cc[&1], 0.0);
+        assert_eq!(cc[&2], 0.0);
+    }
+
+    #[test]
+    fn test_closeness_complete_triangle() {
+        // 1--2, 2--3, 1--3 (complete, undirected)
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 { adj.add_node(i); }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let result = closeness_centrality(&adj, &EdgeFilter::none());
+        let cc: HashMap<NodeId, f64> = result.into_iter().collect();
+        // All nodes equidistant: distance sum = 2, closeness = 2/2 = 1.0
+        assert!((cc[&1] - 1.0).abs() < 1e-10);
+        assert!((cc[&2] - 1.0).abs() < 1e-10);
+        assert!((cc[&3] - 1.0).abs() < 1e-10);
+    }
+
+    // ── Triangle Counting / Clustering Coefficient tests ──────────────────────
+
+    #[test]
+    fn test_triangles_empty_graph() {
+        let adj = AdjacencyStore::new();
+        let result = triangle_count(&adj, &EdgeFilter::none());
+        assert_eq!(result.total_triangles, 0);
+        assert!(result.per_node.is_empty());
+    }
+
+    #[test]
+    fn test_triangles_single_node() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        let result = triangle_count(&adj, &EdgeFilter::none());
+        assert_eq!(result.total_triangles, 0);
+        assert_eq!(result.per_node.len(), 1);
+        assert_eq!(result.per_node[0], (1, 0, 0.0));
+    }
+
+    #[test]
+    fn test_triangles_single_triangle() {
+        // Triangle: 1-2-3 (undirected)
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 { adj.add_node(i); }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let result = triangle_count(&adj, &EdgeFilter::none());
+        assert_eq!(result.total_triangles, 1);
+        let node_map: HashMap<NodeId, (u32, f64)> = result
+            .per_node.iter().map(|&(n, t, c)| (n, (t, c))).collect();
+        // Each node participates in 1 triangle
+        assert_eq!(node_map[&1].0, 1);
+        assert_eq!(node_map[&2].0, 1);
+        assert_eq!(node_map[&3].0, 1);
+        // Clustering coefficient = 2*1 / (2*1) = 1.0
+        assert!((node_map[&1].1 - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_triangles_no_triangle() {
+        // Star: 1-2, 1-3, 1-4 (no triangles since spokes not connected)
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=4 { adj.add_node(i); }
+        for i in 2..=4 {
+            adj.add_edge(1, i, 0, make_meta(1, i, 0)).unwrap();
+            adj.add_edge(i, 1, 0, make_meta(i, 1, 0)).unwrap();
+        }
+
+        let result = triangle_count(&adj, &EdgeFilter::none());
+        assert_eq!(result.total_triangles, 0);
+        let node_map: HashMap<NodeId, (u32, f64)> = result
+            .per_node.iter().map(|&(n, t, c)| (n, (t, c))).collect();
+        // Center has 3 neighbors but 0 triangles → cc = 0
+        assert_eq!(node_map[&1].0, 0);
+        assert_eq!(node_map[&1].1, 0.0);
+    }
+
+    #[test]
+    fn test_triangles_disconnected() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        let result = triangle_count(&adj, &EdgeFilter::none());
+        assert_eq!(result.total_triangles, 0);
+    }
+
+    #[test]
+    fn test_triangles_two_triangles_shared_edge() {
+        // 1-2-3 triangle + 2-3-4 triangle (share edge 2-3)
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=4 { adj.add_node(i); }
+        // Triangle 1-2-3
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+        // Triangle 2-3-4
+        adj.add_edge(3, 4, 0, make_meta(3, 4, 0)).unwrap();
+        adj.add_edge(4, 3, 0, make_meta(4, 3, 0)).unwrap();
+        adj.add_edge(2, 4, 0, make_meta(2, 4, 0)).unwrap();
+        adj.add_edge(4, 2, 0, make_meta(4, 2, 0)).unwrap();
+
+        let result = triangle_count(&adj, &EdgeFilter::none());
+        assert_eq!(result.total_triangles, 2);
+        let node_map: HashMap<NodeId, (u32, f64)> = result
+            .per_node.iter().map(|&(n, t, c)| (n, (t, c))).collect();
+        // Nodes 2 and 3 participate in both triangles
+        assert_eq!(node_map[&2].0, 2);
+        assert_eq!(node_map[&3].0, 2);
+        // Nodes 1 and 4 participate in one triangle each
+        assert_eq!(node_map[&1].0, 1);
+        assert_eq!(node_map[&4].0, 1);
+    }
+
+    // ── Tarjan's SCC tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_scc_empty_graph() {
+        let adj = AdjacencyStore::new();
+        let result = tarjan_scc(&adj);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_scc_single_node() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        let result = tarjan_scc(&adj);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], vec![1]);
+    }
+
+    #[test]
+    fn test_scc_simple_cycle() {
+        // 1 -> 2 -> 3 -> 1
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 { adj.add_node(i); }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let result = tarjan_scc(&adj);
+        assert_eq!(result.len(), 1); // all 3 nodes in one SCC
+        let mut component = result[0].clone();
+        component.sort();
+        assert_eq!(component, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_scc_dag() {
+        // 1 -> 2 -> 3 (no cycles, each node is its own SCC)
+        let adj = build_linear_graph(); // 1->2->3->4
+        let result = tarjan_scc(&adj);
+        assert_eq!(result.len(), 4); // 4 singleton SCCs
+        for component in &result {
+            assert_eq!(component.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_scc_two_components() {
+        // SCC 1: 1 -> 2 -> 1
+        // SCC 2: 3 -> 4 -> 3
+        // Bridge: 2 -> 3 (not creating a larger SCC)
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=4 { adj.add_node(i); }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 4, 0, make_meta(3, 4, 0)).unwrap();
+        adj.add_edge(4, 3, 0, make_meta(4, 3, 0)).unwrap();
+
+        let result = tarjan_scc(&adj);
+        assert_eq!(result.len(), 2);
+        let mut sizes: Vec<usize> = result.iter().map(|c| c.len()).collect();
+        sizes.sort();
+        assert_eq!(sizes, vec![2, 2]);
+    }
+
+    #[test]
+    fn test_scc_disconnected() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        let result = tarjan_scc(&adj);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_scc_self_loop() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_edge(1, 1, 0, make_meta(1, 1, 0)).unwrap();
+        let result = tarjan_scc(&adj);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], vec![1]);
+    }
+
+    // ── Topological Sort tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_topo_sort_empty_graph() {
+        let adj = AdjacencyStore::new();
+        let result = topological_sort(&adj).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_topo_sort_single_node() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        let result = topological_sort(&adj).unwrap();
+        assert_eq!(result, vec![1]);
+    }
+
+    #[test]
+    fn test_topo_sort_linear() {
+        let adj = build_linear_graph(); // 1->2->3->4
+        let result = topological_sort(&adj).unwrap();
+        assert_eq!(result, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_topo_sort_diamond() {
+        // 1 -> 2, 1 -> 3, 2 -> 4, 3 -> 4
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=4 { adj.add_node(i); }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(2, 4, 0, make_meta(2, 4, 0)).unwrap();
+        adj.add_edge(3, 4, 0, make_meta(3, 4, 0)).unwrap();
+
+        let result = topological_sort(&adj).unwrap();
+        // Node 1 must come first, node 4 must come last
+        assert_eq!(result[0], 1);
+        assert_eq!(result[3], 4);
+        // All 4 nodes present
+        assert_eq!(result.len(), 4);
+    }
+
+    #[test]
+    fn test_topo_sort_cycle_error() {
+        // 1 -> 2 -> 3 -> 1
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 { adj.add_node(i); }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let result = topological_sort(&adj);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WeavError::Conflict(msg) => assert!(msg.contains("cycle")),
+            other => panic!("expected Conflict, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_topo_sort_disconnected() {
+        // Two independent nodes (both have in-degree 0)
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        let result = topological_sort(&adj).unwrap();
+        assert_eq!(result.len(), 2);
+        // Deterministic ordering: smallest node ID first
+        assert_eq!(result, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_topo_sort_self_loop_error() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_edge(1, 1, 0, make_meta(1, 1, 0)).unwrap();
+
+        let result = topological_sort(&adj);
+        assert!(result.is_err());
     }
 }

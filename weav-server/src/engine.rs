@@ -180,16 +180,79 @@ impl Engine {
     }
 
     /// Force-sync the WAL file to disk. Called periodically for EverySecond mode.
-    pub fn sync_wal(&self) {
+    pub fn sync_wal(&self) -> WeavResult<()> {
         if let Some(ref wal_mutex) = self.wal {
             let mut wal = wal_mutex.lock();
-            let _ = wal.sync();
+            wal.sync()
+                .map_err(|e| WeavError::PersistenceError(format!("WAL sync failed: {e}")))?;
         }
+        Ok(())
     }
 
     /// Return the configured WAL sync mode.
     pub fn wal_sync_mode(&self) -> &weav_core::config::WalSyncMode {
         &self.config.persistence.wal_sync_mode
+    }
+
+    /// Sweep expired nodes and edges across all graphs.
+    /// Called periodically to enforce TTL.
+    /// Returns the total number of expired entities removed.
+    pub fn sweep_ttl(&self) -> u64 {
+        let now = Self::now_ms();
+        let mut total_expired = 0u64;
+
+        let graph_arcs: Vec<(String, Arc<RwLock<GraphState>>)> = {
+            let registry = self.graphs.read();
+            registry.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+
+        for (graph_name, graph_arc) in &graph_arcs {
+            let mut gs = graph_arc.write();
+
+            // Sweep expired nodes (those with _ttl_expires_at <= now)
+            let expired_nodes: Vec<NodeId> = gs.properties
+                .nodes_where("_ttl_expires_at", &|v| {
+                    match v {
+                        Value::Timestamp(ts) => *ts <= now,
+                        Value::Int(ts) => (*ts as u64) <= now,
+                        _ => false,
+                    }
+                });
+
+            for node_id in &expired_nodes {
+                let _ = gs.adjacency.remove_node(*node_id);
+                gs.properties.remove_all_node_properties(*node_id);
+                let _ = gs.vector_index.remove(*node_id);
+            }
+            total_expired += expired_nodes.len() as u64;
+
+            // Sweep expired edges (those with valid_until <= now)
+            let expired_edges: Vec<EdgeId> = gs.adjacency
+                .all_edges()
+                .filter(|(_, meta)| {
+                    meta.temporal.valid_until != BiTemporal::OPEN
+                        && meta.temporal.valid_until <= now
+                })
+                .map(|(eid, _)| eid)
+                .collect();
+
+            for edge_id in &expired_edges {
+                let _ = gs.adjacency.remove_edge(*edge_id);
+            }
+            total_expired += expired_edges.len() as u64;
+
+            // Update metrics after sweep
+            if !expired_nodes.is_empty() || !expired_edges.is_empty() {
+                crate::metrics::NODES_TOTAL
+                    .with_label_values(&[graph_name])
+                    .set(gs.adjacency.node_count() as i64);
+                crate::metrics::EDGES_TOTAL
+                    .with_label_values(&[graph_name])
+                    .set(gs.adjacency.edge_count() as i64);
+            }
+        }
+
+        total_expired
     }
 
     /// Look up a graph by name, returning a cloned `Arc` to its per-graph lock.
@@ -375,6 +438,7 @@ impl Engine {
                             properties: props,
                             embedding: embedding.clone(),
                             entity_key: entity_key.clone(),
+                            ttl_ms: None,
                         };
                         let _ = self.handle_node_add(cmd);
                     }
@@ -559,6 +623,29 @@ impl Engine {
     /// When auth is enabled, `identity` must be `Some` (unless the command is
     /// AUTH or PING). When auth is disabled, pass `None`.
     pub fn execute_command(
+        &self,
+        cmd: Command,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
+        let cmd_type = cmd.type_name();
+        let start = std::time::Instant::now();
+
+        let result = self.execute_command_inner(cmd, identity);
+
+        // Record metrics
+        let elapsed = start.elapsed().as_secs_f64();
+        let status = if result.is_ok() { "ok" } else { "error" };
+        crate::metrics::QUERY_DURATION
+            .with_label_values(&[cmd_type])
+            .observe(elapsed);
+        crate::metrics::QUERY_TOTAL
+            .with_label_values(&[cmd_type, status])
+            .inc();
+
+        result
+    }
+
+    fn execute_command_inner(
         &self,
         cmd: Command,
         identity: Option<&weav_auth::identity::SessionIdentity>,
@@ -1211,6 +1298,21 @@ impl Engine {
             gs.vector_index.insert(node_id, embedding)?;
         }
 
+        // Store TTL expiry timestamp if provided
+        if let Some(ttl_ms) = cmd.ttl_ms {
+            let expires_at = Self::now_ms() + ttl_ms;
+            gs.properties.set_node_property(
+                node_id,
+                "_ttl_expires_at",
+                Value::Timestamp(expires_at),
+            );
+        }
+
+        // Update metrics
+        crate::metrics::NODES_TOTAL
+            .with_label_values(&[&cmd.graph])
+            .set(gs.adjacency.node_count() as i64);
+
         Ok(CommandResponse::Integer(node_id))
     }
 
@@ -1288,6 +1390,14 @@ impl Engine {
         gs.properties.remove_all_node_properties(cmd.node_id);
         gs.vector_index.remove(cmd.node_id)?;
 
+        // Update metrics
+        crate::metrics::NODES_TOTAL
+            .with_label_values(&[&cmd.graph])
+            .set(gs.adjacency.node_count() as i64);
+        crate::metrics::EDGES_TOTAL
+            .with_label_values(&[&cmd.graph])
+            .set(gs.adjacency.edge_count() as i64);
+
         Ok(CommandResponse::Ok)
     }
 
@@ -1319,6 +1429,12 @@ impl Engine {
         }
 
         if let Some(ref embedding) = cmd.embedding {
+            // Write-ahead: persist embedding update to WAL
+            self.append_wal(WalOperation::VectorUpdate {
+                graph_id,
+                node_id: cmd.node_id,
+                vector: embedding.clone(),
+            })?;
             let _ = gs.vector_index.remove(cmd.node_id);
             gs.vector_index.insert(cmd.node_id, embedding)?;
         }
@@ -1457,16 +1573,31 @@ impl Engine {
         })?;
 
         // Apply in-memory mutation
+        let temporal = if let Some(ttl_ms) = cmd.ttl_ms {
+            BiTemporal {
+                valid_from: now,
+                valid_until: now + ttl_ms,
+                tx_from: now,
+                tx_until: BiTemporal::OPEN,
+            }
+        } else {
+            BiTemporal::new_current(now)
+        };
         let meta = EdgeMeta {
             source: cmd.source,
             target: cmd.target,
             label: label_id,
-            temporal: BiTemporal::new_current(now),
+            temporal,
             provenance: None,
             weight: cmd.weight,
             token_cost: 0,
         };
         gs.adjacency.add_edge_with_id(cmd.source, cmd.target, label_id, meta, edge_id)?;
+
+        // Update metrics
+        crate::metrics::EDGES_TOTAL
+            .with_label_values(&[&cmd.graph])
+            .set(gs.adjacency.edge_count() as i64);
 
         Ok(CommandResponse::Integer(edge_id))
     }
@@ -1574,7 +1705,11 @@ impl Engine {
             None => return Ok(CommandResponse::Ok), // Persistence not enabled
         };
 
-        let registry = self.graphs.read();
+        // Clone Arc handles then release registry lock to avoid blocking graph creation/drop.
+        let graph_arcs: Vec<Arc<RwLock<GraphState>>> = {
+            let registry = self.graphs.read();
+            registry.values().cloned().collect()
+        };
 
         let wal_sequence = self.wal.as_ref()
             .map(|w| w.lock().sequence_number())
@@ -1584,7 +1719,7 @@ impl Engine {
         let mut total_nodes: u64 = 0;
         let mut total_edges: u64 = 0;
 
-        for graph_arc in registry.values() {
+        for graph_arc in &graph_arcs {
             let gs = graph_arc.read();
             let mut node_snapshots = Vec::new();
             for node_id in gs.adjacency.all_node_ids() {
@@ -2831,8 +2966,8 @@ mod tests {
         .unwrap();
         engine.execute_command(cmd, None).unwrap();
 
-        // sync_wal should not panic.
-        engine.sync_wal();
+        // sync_wal should not panic and should succeed.
+        engine.sync_wal().unwrap();
 
         // Verify wal_sync_mode returns the expected mode.
         assert!(matches!(
@@ -2847,7 +2982,7 @@ mod tests {
     fn test_sync_wal_without_persistence() {
         // sync_wal on an engine without persistence should be a no-op.
         let engine = make_engine();
-        engine.sync_wal(); // Should not panic
+        engine.sync_wal().unwrap(); // Should succeed as no-op
     }
 
     #[test]
@@ -2995,6 +3130,7 @@ mod tests {
             properties: vec![("name".to_string(), Value::String(CompactString::from("Alice")))],
             embedding: Some(vec![1.0, 0.0, 0.0, 0.0]),
             entity_key: Some("alice".to_string()),
+            ttl_ms: None,
         });
         let first_id = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
@@ -3008,6 +3144,7 @@ mod tests {
             properties: vec![("name".to_string(), Value::String(CompactString::from("Alice")))],
             embedding: Some(vec![0.0, 1.0, 0.0, 0.0]),
             entity_key: Some("alice".to_string()),
+            ttl_ms: None,
         });
         let second_id = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
@@ -3585,5 +3722,204 @@ mod tests {
         let cmd = Command::Stats(None);
         let result = engine.execute_command(cmd, Some(&reader_id));
         assert!(result.is_ok(), "reader should see global stats");
+    }
+
+    #[test]
+    fn test_metrics_recorded_on_execute() {
+        let engine = make_engine();
+        create_test_graph(&engine, "metrics_g");
+
+        // Execute a few commands
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "metrics_g" LABEL "person" PROPERTIES {"name": "Alice"}"#,
+        ).unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = parser::parse_command("PING").unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        // Verify query_total counter was incremented
+        let node_add_ok = crate::metrics::QUERY_TOTAL
+            .with_label_values(&["node_add", "ok"])
+            .get();
+        assert!(node_add_ok >= 1, "node_add ok count should be >= 1, got {node_add_ok}");
+
+        let ping_ok = crate::metrics::QUERY_TOTAL
+            .with_label_values(&["ping", "ok"])
+            .get();
+        assert!(ping_ok >= 1, "ping ok count should be >= 1, got {ping_ok}");
+
+        // Verify duration was recorded (any observation means it works)
+        let duration_count = crate::metrics::QUERY_DURATION
+            .with_label_values(&["node_add"])
+            .get_sample_count();
+        assert!(duration_count >= 1, "duration should have at least 1 observation");
+    }
+
+    #[test]
+    fn test_command_type_name() {
+        let cmd = parser::parse_command("PING").unwrap();
+        assert_eq!(cmd.type_name(), "ping");
+
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "g" LABEL "x" PROPERTIES {"k": "v"}"#,
+        ).unwrap();
+        assert_eq!(cmd.type_name(), "node_add");
+
+        let cmd = parser::parse_command("GRAPH LIST").unwrap();
+        assert_eq!(cmd.type_name(), "graph_list");
+    }
+
+    #[test]
+    fn test_node_update_with_embedding_persisted() {
+        // Verify that node update with embedding creates in-memory vector
+        let engine = make_engine();
+        create_test_graph(&engine, "emb_g");
+
+        // Add a node first
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "emb_g" LABEL "entity" PROPERTIES {"name": "test"}"#,
+        ).unwrap();
+        let node_id = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Update with embedding
+        let update_cmd = weav_query::parser::NodeUpdateCmd {
+            graph: "emb_g".to_string(),
+            node_id,
+            properties: vec![("updated".to_string(), Value::Bool(true))],
+            embedding: Some(vec![1.0; 1536]),
+        };
+        engine.execute_command(Command::NodeUpdate(update_cmd), None).unwrap();
+
+        // Verify the embedding is searchable via context query
+        let graph_arc = engine.get_graph("emb_g").unwrap();
+        let gs = graph_arc.read();
+        let results = gs.vector_index.search(&vec![1.0; 1536], 1, None).unwrap();
+        assert!(!results.is_empty(), "embedding should be searchable after update");
+        assert_eq!(results[0].0, node_id);
+    }
+
+    #[test]
+    fn test_ttl_node_expiry() {
+        let engine = make_engine();
+        create_test_graph(&engine, "ttl_g");
+
+        // Add a node with TTL of 1ms (already expired by the time we sweep)
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "ttl_g".to_string(),
+            label: "temp".to_string(),
+            properties: vec![("name".to_string(), Value::String(CompactString::from("ephemeral")))],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: Some(1), // 1ms TTL — will expire almost immediately
+        });
+        let node_id = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Add a permanent node
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "ttl_g".to_string(),
+            label: "perm".to_string(),
+            properties: vec![("name".to_string(), Value::String(CompactString::from("permanent")))],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        let perm_id = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Wait a tiny bit for TTL to expire
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Sweep should remove the expired node
+        let expired = engine.sweep_ttl();
+        assert!(expired >= 1, "at least 1 expired entity should be removed, got {expired}");
+
+        // Expired node should be gone
+        let graph_arc = engine.get_graph("ttl_g").unwrap();
+        let gs = graph_arc.read();
+        assert!(!gs.adjacency.has_node(node_id), "expired node should be removed");
+        assert!(gs.adjacency.has_node(perm_id), "permanent node should remain");
+    }
+
+    #[test]
+    fn test_ttl_edge_expiry() {
+        let engine = make_engine();
+        create_test_graph(&engine, "ttl_e");
+
+        // Add two nodes
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "ttl_e" LABEL "a" PROPERTIES {"name": "A"}"#,
+        ).unwrap();
+        let n1 = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "ttl_e" LABEL "b" PROPERTIES {"name": "B"}"#,
+        ).unwrap();
+        let n2 = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Add edge with 1ms TTL
+        let cmd = Command::EdgeAdd(parser::EdgeAddCmd {
+            graph: "ttl_e".to_string(),
+            source: n1,
+            target: n2,
+            label: "temp_link".to_string(),
+            weight: 1.0,
+            properties: vec![],
+            ttl_ms: Some(1),
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        // Add permanent edge
+        let cmd = Command::EdgeAdd(parser::EdgeAddCmd {
+            graph: "ttl_e".to_string(),
+            source: n2,
+            target: n1,
+            label: "perm_link".to_string(),
+            weight: 1.0,
+            properties: vec![],
+            ttl_ms: None,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let expired = engine.sweep_ttl();
+        assert!(expired >= 1, "at least 1 expired edge should be removed");
+
+        // Permanent edge should remain
+        let graph_arc = engine.get_graph("ttl_e").unwrap();
+        let gs = graph_arc.read();
+        assert_eq!(gs.adjacency.edge_count(), 1, "only permanent edge should remain");
+    }
+
+    #[test]
+    fn test_sweep_ttl_empty_graphs() {
+        let engine = make_engine();
+        // Sweep on empty engine should not panic
+        let expired = engine.sweep_ttl();
+        assert_eq!(expired, 0);
+
+        // Sweep on engine with graph but no TTL nodes
+        create_test_graph(&engine, "no_ttl");
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "no_ttl" LABEL "x" PROPERTIES {"k": "v"}"#,
+        ).unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        let expired = engine.sweep_ttl();
+        assert_eq!(expired, 0);
     }
 }

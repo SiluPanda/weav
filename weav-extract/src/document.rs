@@ -31,9 +31,16 @@ fn extract_pdf_text(content: &DocumentContent) -> WeavResult<String> {
         DocumentContent::Text(s) => s.as_bytes(),
     };
 
-    // pdf_oxide requires a file path, so write bytes to a temp file.
+    // pdf_oxide requires a file path, so write bytes to a unique temp file.
+    // Use pid + nanos + thread-id hash to avoid collisions under concurrent requests.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp_dir = std::env::temp_dir();
-    let tmp_path = tmp_dir.join(format!("weav_pdf_{}.pdf", std::process::id()));
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = tmp_dir.join(format!(
+        "weav_pdf_{}_{}.pdf",
+        std::process::id(),
+        seq,
+    ));
     std::fs::write(&tmp_path, bytes).map_err(|e| {
         WeavError::DocumentParseError(format!("failed to write temp PDF file: {e}"))
     })?;

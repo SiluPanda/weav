@@ -78,6 +78,44 @@ pub enum Command {
     Ingest(IngestCmd),
 }
 
+impl Command {
+    /// Returns a short, stable string label for this command variant (for metrics/logging).
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Command::Context(_) => "context",
+            Command::NodeAdd(_) => "node_add",
+            Command::NodeGet(_) => "node_get",
+            Command::NodeDelete(_) => "node_delete",
+            Command::NodeUpdate(_) => "node_update",
+            Command::EdgeAdd(_) => "edge_add",
+            Command::EdgeInvalidate(_) => "edge_invalidate",
+            Command::EdgeDelete(_) => "edge_delete",
+            Command::EdgeGet(_) => "edge_get",
+            Command::GraphCreate(_) => "graph_create",
+            Command::GraphDrop(_) => "graph_drop",
+            Command::GraphInfo(_) => "graph_info",
+            Command::GraphList => "graph_list",
+            Command::BulkInsertNodes(_) => "bulk_insert_nodes",
+            Command::BulkInsertEdges(_) => "bulk_insert_edges",
+            Command::Ping => "ping",
+            Command::Info => "info",
+            Command::Stats(_) => "stats",
+            Command::Snapshot => "snapshot",
+            Command::ConfigSet(_, _) => "config_set",
+            Command::ConfigGet(_) => "config_get",
+            Command::Auth { .. } => "auth",
+            Command::AclSetUser(_) => "acl_set_user",
+            Command::AclDelUser(_) => "acl_del_user",
+            Command::AclList => "acl_list",
+            Command::AclGetUser(_) => "acl_get_user",
+            Command::AclWhoAmI => "acl_whoami",
+            Command::AclSave => "acl_save",
+            Command::AclLoad => "acl_load",
+            Command::Ingest(_) => "ingest",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AclSetUserCmd {
     pub username: String,
@@ -132,6 +170,8 @@ pub struct NodeAddCmd {
     pub properties: Vec<(String, Value)>,
     pub embedding: Option<Vec<f32>>,
     pub entity_key: Option<String>,
+    /// Time-to-live in milliseconds. If set, the node will be auto-expired after this duration.
+    pub ttl_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +195,8 @@ pub struct EdgeAddCmd {
     pub label: String,
     pub weight: f32,
     pub properties: Vec<(String, Value)>,
+    /// Time-to-live in milliseconds. If set, the edge will be auto-expired after this duration.
+    pub ttl_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -541,6 +583,7 @@ fn parse_node_add(tokens: &[String]) -> Result<Command, WeavError> {
         properties,
         embedding,
         entity_key,
+        ttl_ms: None,
     }))
 }
 
@@ -678,6 +721,7 @@ fn parse_edge_add(tokens: &[String]) -> Result<Command, WeavError> {
         label,
         weight,
         properties,
+        ttl_ms: None,
     }))
 }
 
@@ -1092,6 +1136,7 @@ fn parse_bulk_nodes(tokens: &[String]) -> Result<Command, WeavError> {
             properties,
             embedding,
             entity_key,
+            ttl_ms: None,
         });
     }
 
@@ -1161,6 +1206,7 @@ fn parse_bulk_edges(tokens: &[String]) -> Result<Command, WeavError> {
             label,
             weight,
             properties,
+            ttl_ms: None,
         });
     }
 

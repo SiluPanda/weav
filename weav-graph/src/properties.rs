@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use weav_core::error::{WeavError, WeavResult};
 use weav_core::types::{EdgeId, NodeId, PropertyKeyId, Value, ValueType};
 
 /// Column-oriented storage for a single property key across all nodes.
@@ -33,19 +34,26 @@ impl PropertyStore {
 
     /// Intern a property key name, returning its compact id.
     /// Returns existing id if already interned.
-    pub fn intern_key(&mut self, key: &str) -> PropertyKeyId {
+    /// Returns an error if the key space (u16) is exhausted.
+    pub fn intern_key(&mut self, key: &str) -> WeavResult<PropertyKeyId> {
         if let Some(&id) = self.schema.get(key) {
-            return id;
+            return Ok(id);
+        }
+        if self.next_key_id == PropertyKeyId::MAX {
+            return Err(WeavError::CapacityExceeded(format!(
+                "property key space exhausted (max {} unique keys)",
+                PropertyKeyId::MAX
+            )));
         }
         let id = self.next_key_id;
         self.next_key_id += 1;
         self.schema.insert(key.to_string(), id);
         self.schema_reverse.insert(id, key.to_string());
-        id
+        Ok(id)
     }
 
     pub fn set_node_property(&mut self, node: NodeId, key: &str, value: Value) {
-        let key_id = self.intern_key(key);
+        let key_id = self.intern_key(key).expect("property key space exhausted");
         let column = self
             .node_columns
             .entry(key_id)
@@ -120,7 +128,7 @@ impl PropertyStore {
 
     /// Set a property on an edge.
     pub fn set_edge_property(&mut self, edge_id: EdgeId, key: &str, value: Value) {
-        let key_id = self.intern_key(key);
+        let key_id = self.intern_key(key).expect("property key space exhausted");
         let entry = self.edge_overflow.entry(edge_id).or_insert_with(Vec::new);
         // Update existing key or append
         if let Some(pair) = entry.iter_mut().find(|(k, _)| *k == key_id) {
@@ -197,9 +205,9 @@ mod tests {
     #[test]
     fn test_intern_key() {
         let mut store = PropertyStore::new();
-        let id1 = store.intern_key("name");
-        let id2 = store.intern_key("name");
-        let id3 = store.intern_key("age");
+        let id1 = store.intern_key("name").unwrap();
+        let id2 = store.intern_key("name").unwrap();
+        let id3 = store.intern_key("age").unwrap();
         assert_eq!(id1, id2);
         assert_ne!(id1, id3);
     }
@@ -559,5 +567,21 @@ mod tests {
         assert_eq!(store.get_edge_property(200, "weight"), Some(&Value::Float(0.9)));
         assert_eq!(store.get_all_edge_properties(100).len(), 1);
         assert_eq!(store.get_all_edge_properties(200).len(), 2);
+    }
+
+    #[test]
+    fn test_intern_key_overflow_check() {
+        let mut store = PropertyStore::new();
+        // Fill up to near-max (set next_key_id close to MAX)
+        store.next_key_id = PropertyKeyId::MAX - 1;
+        // This should succeed (one slot left)
+        let result = store.intern_key("last_key");
+        assert!(result.is_ok());
+        // Next new key should fail (already at MAX)
+        let result = store.intern_key("overflow_key");
+        assert!(result.is_err());
+        // But re-interning an existing key should still work
+        let result = store.intern_key("last_key");
+        assert!(result.is_ok());
     }
 }

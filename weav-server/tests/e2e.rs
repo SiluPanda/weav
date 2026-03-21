@@ -1012,7 +1012,7 @@ async fn test_concurrent_read_write() {
         engine.execute_command(weav_query::parser::Command::NodeAdd(weav_query::parser::NodeAddCmd {
             graph: "g".to_string(), label: "item".to_string(),
             properties: vec![("index".to_string(), weav_core::types::Value::Int(i as i64))],
-            embedding: None, entity_key: None,
+            embedding: None, entity_key: None, ttl_ms: None,
         }), None).unwrap();
     }
 
@@ -1067,7 +1067,7 @@ async fn test_high_concurrency_stress() {
         engine.execute_command(weav_query::parser::Command::NodeAdd(weav_query::parser::NodeAddCmd {
             graph: "stress".to_string(), label: "item".to_string(),
             properties: vec![("seed".to_string(), weav_core::types::Value::Int(i as i64))],
-            embedding: None, entity_key: None,
+            embedding: None, entity_key: None, ttl_ms: None,
         }), None).unwrap();
     }
 

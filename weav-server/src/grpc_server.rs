@@ -218,6 +218,7 @@ impl WeavService for WeavGrpcService {
             properties,
             embedding,
             entity_key,
+            ttl_ms: None,
         });
 
         match self
@@ -312,6 +313,7 @@ impl WeavService for WeavGrpcService {
             label: req.label,
             weight: req.weight,
             properties: Vec::new(),
+            ttl_ms: None,
         });
 
         match self
@@ -448,6 +450,7 @@ impl WeavService for WeavGrpcService {
                     properties,
                     embedding,
                     entity_key,
+                    ttl_ms: None,
                 }
             })
             .collect();
@@ -485,6 +488,7 @@ impl WeavService for WeavGrpcService {
                 label: e.label,
                 weight: e.weight,
                 properties: Vec::new(),
+                ttl_ms: None,
             })
             .collect();
 

@@ -267,6 +267,7 @@ impl WeavMcpServer {
             properties: props_to_pairs(&params.properties),
             embedding: None,
             entity_key: params.entity_key,
+            ttl_ms: None,
         });
         match self.engine.execute_command(cmd, None) {
             Ok(CommandResponse::Integer(node_id)) => success_json(&serde_json::json!({
@@ -326,6 +327,7 @@ impl WeavMcpServer {
             label: params.label,
             weight: params.weight.unwrap_or(1.0),
             properties: props_to_pairs(&params.properties),
+            ttl_ms: None,
         });
         match self.engine.execute_command(cmd, None) {
             Ok(CommandResponse::Integer(edge_id)) => success_json(&serde_json::json!({
@@ -470,6 +472,7 @@ mod tests {
             ],
             embedding: None,
             entity_key: Some("alice".to_string()),
+            ttl_ms: None,
         });
         let resp = server.engine.execute_command(cmd, None).unwrap();
         let node_id = match resp {
@@ -522,6 +525,7 @@ mod tests {
                     properties: vec![],
                     embedding: None,
                     entity_key: None,
+                    ttl_ms: None,
                 }),
                 None,
             )
@@ -540,6 +544,7 @@ mod tests {
                     properties: vec![],
                     embedding: None,
                     entity_key: None,
+                    ttl_ms: None,
                 }),
                 None,
             )
@@ -557,6 +562,7 @@ mod tests {
             label: "KNOWS".to_string(),
             weight: 0.9,
             properties: vec![],
+            ttl_ms: None,
         });
         let resp = server.engine.execute_command(cmd, None).unwrap();
         match resp {

@@ -109,8 +109,14 @@ impl VectorIndex {
     }
 
     /// Insert a vector for the given node.
+    /// If the node already has a vector, the old one is removed first to avoid orphaned keys.
     pub fn insert(&mut self, node_id: NodeId, vector: &[f32]) -> Result<(), WeavError> {
         self.validate_dims(vector)?;
+
+        // Remove any existing vector for this node to prevent orphaned keys
+        if self.node_to_key.contains_key(&node_id) {
+            self.remove(node_id)?;
+        }
 
         let key = self.next_key;
         self.next_key += 1;
@@ -566,5 +572,37 @@ mod tests {
         assert_eq!(results[0].0, 1);
         // The distances should be ordered
         assert!(results[0].1 <= results[1].1);
+    }
+
+    #[test]
+    fn test_insert_replaces_existing_vector() {
+        let config = VectorConfig {
+            dimensions: 4,
+            metric: DistanceMetric::Cosine,
+            hnsw_m: 16,
+            hnsw_ef_construction: 200,
+            hnsw_ef_search: 50,
+            quantization: Quantization::None,
+        };
+        let mut index = VectorIndex::new(config).unwrap();
+
+        // Insert initial vector for node 1
+        index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        assert!(index.get_vector(1).is_some());
+        assert_eq!(index.len(), 1);
+
+        // Re-insert with a different vector — should replace, not duplicate
+        index.insert(1, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        assert!(index.get_vector(1).is_some());
+        assert_eq!(index.len(), 1); // Still only one entry
+
+        // The new vector should be returned
+        let vec = index.get_vector(1).unwrap();
+        assert_eq!(vec[1], 1.0); // Second dimension should be 1.0 now
+
+        // Search should only return this node once
+        let results = index.search(&[0.0, 1.0, 0.0, 0.0], 5, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, 1);
     }
 }
