@@ -390,6 +390,7 @@ impl WeavService for WeavGrpcService {
             sort: None,
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         let cmd = Command::Context(query);
@@ -560,6 +561,7 @@ impl WeavService for WeavGrpcService {
             sort: None,
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         let cmd = Command::Context(query);

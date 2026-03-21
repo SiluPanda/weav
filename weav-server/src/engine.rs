@@ -3157,6 +3157,95 @@ impl Engine {
         Ok(CommandResponse::Context(result))
     }
 
+    // ── Condense handler ─────────────────────────────────────────────────
+
+    /// Condense a graph by removing low-importance nodes and merging their
+    /// connections into higher-importance neighbors.
+    pub fn handle_condense(
+        &self,
+        graph_name: &str,
+        importance_threshold: f32,
+    ) -> WeavResult<CommandResponse> {
+        let graph_arc = self.get_graph(graph_name)?;
+        let mut gs = graph_arc.write();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        // Find nodes below importance threshold
+        let all_nodes = gs.adjacency.all_node_ids();
+        let mut candidates: Vec<(NodeId, f32)> = Vec::new();
+        for &nid in &all_nodes {
+            let score = compute_node_importance(&gs, nid, now);
+            if score.importance < importance_threshold {
+                candidates.push((nid, score.importance));
+            }
+        }
+
+        // Sort by importance (lowest first)
+        candidates.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut condensed = 0u64;
+        for (victim_id, _) in &candidates {
+            // Skip if already removed (neighbor of a previously condensed node)
+            if !gs.adjacency.all_node_ids().contains(victim_id) {
+                continue;
+            }
+
+            let neighbors = gs.adjacency.neighbors_both(*victim_id, None);
+            if neighbors.is_empty() {
+                // Isolated node -- just remove
+                let _ = gs.adjacency.remove_node(*victim_id);
+                gs.properties.remove_all_node_properties(*victim_id);
+                gs.text_index.remove_node(*victim_id);
+                let _ = gs.vector_index.remove(*victim_id);
+                gs.access_times.remove(victim_id);
+                condensed += 1;
+                continue;
+            }
+
+            // Find best neighbor (highest importance)
+            let best_neighbor = neighbors
+                .iter()
+                .map(|&(nbr, _, _)| {
+                    (nbr, compute_node_importance(&gs, nbr, now).importance)
+                })
+                .max_by(|a, b| {
+                    a.1.partial_cmp(&b.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(nid, _)| nid);
+
+            if let Some(_target) = best_neighbor {
+                // Remove the victim node (cascades edges via AdjacencyStore::remove_node)
+                let _ = gs.adjacency.remove_node(*victim_id);
+                gs.properties.remove_all_node_properties(*victim_id);
+                gs.text_index.remove_node(*victim_id);
+                let _ = gs.vector_index.remove(*victim_id);
+                gs.access_times.remove(victim_id);
+                condensed += 1;
+            }
+        }
+
+        // Update metrics
+        crate::metrics::NODES_TOTAL
+            .with_label_values(&[graph_name])
+            .set(gs.adjacency.node_count() as i64);
+        crate::metrics::EDGES_TOTAL
+            .with_label_values(&[graph_name])
+            .set(gs.adjacency.edge_count() as i64);
+
+        Ok(CommandResponse::Text(format!(
+            "Condensed {} nodes (threshold: {})",
+            condensed, importance_threshold
+        )))
+    }
+
     // ── Ingest handler ────────────────────────────────────────────────────
 
     async fn handle_ingest(
@@ -8510,5 +8599,117 @@ mod tests {
             hub_score.importance,
             leaf_score.importance
         );
+    }
+
+    // ── Condense tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_condense_removes_low_importance_nodes() {
+        let engine = make_engine();
+        create_test_graph(&engine, "condense_test");
+
+        // Add several nodes: one hub with many connections and isolated leaves
+        let graph_arc = engine.get_graph("condense_test").unwrap();
+        {
+            let mut gs = graph_arc.write();
+            let label = gs.interner.intern_label("entity").unwrap();
+
+            // Create hub node (id=1)
+            gs.adjacency.add_node(1);
+            gs.properties.set_node_property(
+                1,
+                "_label",
+                weav_core::types::Value::String(compact_str::CompactString::from("hub")),
+            );
+            gs.properties.set_node_property(
+                1,
+                "name",
+                weav_core::types::Value::String(compact_str::CompactString::from("Hub")),
+            );
+            gs.next_node_id = 10;
+
+            // Create leaf nodes (ids 2..=5) connected to hub
+            for i in 2u64..=5 {
+                gs.adjacency.add_node(i);
+                gs.properties.set_node_property(
+                    i,
+                    "_label",
+                    weav_core::types::Value::String(compact_str::CompactString::from("leaf")),
+                );
+                gs.properties.set_node_property(
+                    i,
+                    "name",
+                    weav_core::types::Value::String(compact_str::CompactString::from(
+                        format!("Leaf{i}"),
+                    )),
+                );
+                let meta = weav_graph::adjacency::EdgeMeta {
+                    source: 1,
+                    target: i,
+                    label,
+                    temporal: weav_core::types::BiTemporal::new_current(1000),
+                    provenance: None,
+                    weight: 0.5,
+                    token_cost: 0,
+                };
+                gs.adjacency.add_edge(1, i, label, meta).unwrap();
+            }
+
+            // Create an isolated node (id=6, no connections)
+            gs.adjacency.add_node(6);
+            gs.properties.set_node_property(
+                6,
+                "_label",
+                weav_core::types::Value::String(compact_str::CompactString::from("isolated")),
+            );
+        }
+
+        let node_count_before = {
+            let gs = graph_arc.read();
+            gs.adjacency.node_count()
+        };
+        assert_eq!(node_count_before, 6);
+
+        // Condense with a high threshold that should remove low-importance nodes.
+        // All nodes have low recency/access (created_at=0, no access), so
+        // isolated + leaf nodes will have low importance.
+        let result = engine.handle_condense("condense_test", 1.0).unwrap();
+        match result {
+            CommandResponse::Text(msg) => {
+                assert!(msg.starts_with("Condensed"), "message: {msg}");
+                // The threshold of 1.0 means every node below perfect importance gets condensed
+                assert!(msg.contains("threshold: 1"), "message: {msg}");
+            }
+            _ => panic!("expected Text response from condense"),
+        }
+
+        // After condensation, node count should be reduced
+        let node_count_after = {
+            let gs = graph_arc.read();
+            gs.adjacency.node_count()
+        };
+        assert!(
+            node_count_after < node_count_before,
+            "node count should decrease after condensation: before={}, after={}",
+            node_count_before,
+            node_count_after
+        );
+    }
+
+    #[test]
+    fn test_condense_empty_graph() {
+        let engine = make_engine();
+        create_test_graph(&engine, "condense_empty");
+
+        let result = engine.handle_condense("condense_empty", 0.5).unwrap();
+        match result {
+            CommandResponse::Text(msg) => {
+                assert!(
+                    msg.starts_with("Condensed 0 nodes"),
+                    "empty graph should condense 0 nodes, got: {msg}"
+                );
+            }
+            _ => panic!("expected Text response from condense"),
+        }
     }
 }

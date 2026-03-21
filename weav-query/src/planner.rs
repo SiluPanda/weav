@@ -241,6 +241,7 @@ mod tests {
             sort: None,
             explain: false,
             output_format: None,
+            include_subgraph: false,
         }
     }
 
@@ -423,6 +424,7 @@ mod tests {
             sort: None,
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         let plan = plan_context_query(&query);
@@ -588,6 +590,7 @@ mod tests {
             }),
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         let plan = plan_context_query(&query);

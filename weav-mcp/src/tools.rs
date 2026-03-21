@@ -184,6 +184,9 @@ pub struct ContextQueryParams {
     /// Output format: "raw" (default), "anthropic", "openai".
     /// When set, the result includes LLM-ready formatted messages.
     pub output_format: Option<String>,
+    /// If true, include the subgraph structure (nodes + edges) in the result.
+    #[serde(default)]
+    pub include_subgraph: bool,
 }
 
 /// Parameters for vector similarity search.
@@ -983,6 +986,7 @@ impl WeavMcpServer {
             sort: None,
             explain: params.explain,
             output_format: params.output_format.clone(),
+            include_subgraph: params.include_subgraph,
         });
 
         match self.engine.execute_command(cmd, None) {

@@ -67,6 +67,33 @@ pub struct ContextResult {
     /// LLM-ready formatted messages (populated when output_format is set).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub formatted_messages: Option<String>,
+    /// Optional subgraph of relevant nodes and edges (when include_subgraph=true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subgraph: Option<ContextSubgraph>,
+}
+
+/// A subgraph extracted from the context query results.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ContextSubgraph {
+    pub nodes: Vec<SubgraphNode>,
+    pub edges: Vec<SubgraphEdge>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SubgraphNode {
+    pub node_id: u64,
+    pub label: String,
+    pub importance: f32,
+    pub properties: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SubgraphEdge {
+    pub edge_id: u64,
+    pub source: u64,
+    pub target: u64,
+    pub label: String,
+    pub weight: f32,
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -161,6 +188,7 @@ pub fn execute_context_query(
             budget_time_us: 0,
             plan: Some(plan_description),
             formatted_messages: None,
+            subgraph: None,
         });
     }
 
@@ -617,6 +645,62 @@ pub fn execute_context_query(
         &result_chunks,
     );
 
+    // ── Step 8c: Build subgraph if requested ────────────────────────
+    let subgraph = if query.include_subgraph {
+        let result_node_ids: std::collections::HashSet<NodeId> =
+            result_chunks.iter().map(|c| c.node_id).collect();
+
+        // Collect nodes
+        let sg_nodes: Vec<SubgraphNode> = result_chunks
+            .iter()
+            .map(|c| {
+                SubgraphNode {
+                    node_id: c.node_id,
+                    label: c.label.clone(),
+                    importance: c.relevance_score,
+                    properties: properties
+                        .get_all_node_properties(c.node_id)
+                        .into_iter()
+                        .filter(|(k, _)| !k.starts_with('_'))
+                        .map(|(k, v)| (k.to_string(), format!("{v:?}")))
+                        .collect(),
+                }
+            })
+            .collect();
+
+        // Collect edges between result nodes
+        let mut sg_edges = Vec::new();
+        for &nid in &result_node_ids {
+            for (neighbor, edge_id, _) in &adjacency.neighbors_both(nid, None) {
+                if result_node_ids.contains(neighbor) {
+                    if let Some(meta) = adjacency.get_edge(*edge_id) {
+                        let label = interner
+                            .resolve_label(meta.label)
+                            .unwrap_or("")
+                            .to_string();
+                        sg_edges.push(SubgraphEdge {
+                            edge_id: *edge_id,
+                            source: meta.source,
+                            target: meta.target,
+                            label,
+                            weight: meta.weight,
+                        });
+                    }
+                }
+            }
+        }
+        // Deduplicate edges (each edge seen from both endpoints)
+        sg_edges.sort_by_key(|e| e.edge_id);
+        sg_edges.dedup_by_key(|e| e.edge_id);
+
+        Some(ContextSubgraph {
+            nodes: sg_nodes,
+            edges: sg_edges,
+        })
+    } else {
+        None
+    };
+
     Ok(ContextResult {
         chunks: result_chunks,
         total_tokens,
@@ -632,6 +716,7 @@ pub fn execute_context_query(
         budget_time_us,
         plan: None,
         formatted_messages,
+        subgraph,
     })
 }
 
@@ -1070,6 +1155,7 @@ mod tests {
             sort: None,
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         let result =
@@ -1106,6 +1192,7 @@ mod tests {
             sort: None,
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         let result =
@@ -1136,6 +1223,7 @@ mod tests {
             sort: None,
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         let result =
@@ -1164,6 +1252,7 @@ mod tests {
             sort: None,
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         let result =
@@ -1203,6 +1292,7 @@ mod tests {
             sort: None,
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         let result =
@@ -1237,6 +1327,7 @@ mod tests {
             sort: None,
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         // Step 1: Confirm the planner produces the expected default alpha/theta
@@ -1307,6 +1398,7 @@ mod tests {
             sort: None,
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         let result =
@@ -1341,6 +1433,7 @@ mod tests {
             sort: None,
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         let result =
@@ -1410,6 +1503,7 @@ mod tests {
             sort: None,
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         let result =
@@ -1478,6 +1572,7 @@ mod tests {
             }),
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         let result_asc =
@@ -1527,6 +1622,7 @@ mod tests {
             }),
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         let result_desc =
@@ -1576,6 +1672,7 @@ mod tests {
             }),
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         let result_rel =
@@ -1698,6 +1795,7 @@ mod tests {
             sort: None,
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         let result =
@@ -1736,6 +1834,7 @@ mod tests {
             sort: None,
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         let result =
@@ -1798,6 +1897,7 @@ mod tests {
             sort: None,
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         let result =
@@ -1867,6 +1967,7 @@ mod tests {
             sort: None,
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         let result =
@@ -2241,6 +2342,7 @@ mod tests {
             sort: None,
             explain: true,
             output_format: None,
+            include_subgraph: false,
         };
 
         let result =
@@ -2294,6 +2396,7 @@ mod tests {
             sort: None,
             explain: true,
             output_format: None,
+            include_subgraph: false,
         };
 
         let result =
@@ -2324,6 +2427,7 @@ mod tests {
             sort: None,
             explain: true,
             output_format: None,
+            include_subgraph: false,
         };
 
         let result =
@@ -2354,6 +2458,7 @@ mod tests {
             sort: None,
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         let result =
@@ -2401,6 +2506,7 @@ mod tests {
             sort: None,
             explain: false,
             output_format: None,
+            include_subgraph: false,
         };
 
         let result =
@@ -2433,6 +2539,7 @@ mod tests {
             sort: None,
             explain: true,
             output_format: None,
+            include_subgraph: false,
         };
 
         let result =
@@ -2549,5 +2656,140 @@ mod tests {
         assert!(format_llm_messages(None, None, &chunks).is_none());
         assert!(format_llm_messages(Some("raw"), None, &chunks).is_none());
         assert!(format_llm_messages(Some("unknown_provider"), None, &chunks).is_none());
+    }
+
+    // ── Context Subgraph Tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_context_subgraph_returns_nodes_and_edges() {
+        let (adj, props, vec_index, text_index, token_counter, interner) = setup_test_stores();
+
+        let query = ContextQuery {
+            query_text: Some("test".to_string()),
+            graph: "test".to_string(),
+            budget: None,
+            seeds: SeedStrategy::Nodes(vec!["alice".to_string()]),
+            max_depth: 2,
+            direction: Direction::Both,
+            edge_filter: None,
+            decay: None,
+            include_provenance: false,
+            temporal_at: None,
+            limit: None,
+            sort: None,
+            explain: false,
+            output_format: None,
+            include_subgraph: true,
+        };
+
+        let result =
+            execute_context_query(&query, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
+                .unwrap();
+
+        assert!(result.subgraph.is_some(), "subgraph should be present when include_subgraph=true");
+        let sg = result.subgraph.unwrap();
+
+        // Should have nodes matching the result chunks
+        assert_eq!(
+            sg.nodes.len(),
+            result.chunks.len(),
+            "subgraph node count should match chunk count"
+        );
+
+        // Each subgraph node should correspond to a chunk
+        let chunk_ids: std::collections::HashSet<u64> =
+            result.chunks.iter().map(|c| c.node_id).collect();
+        for node in &sg.nodes {
+            assert!(
+                chunk_ids.contains(&node.node_id),
+                "subgraph node {} should be in chunk results",
+                node.node_id
+            );
+            assert!(!node.label.is_empty(), "subgraph node should have a label");
+            assert!(node.importance > 0.0, "subgraph node should have positive importance");
+        }
+
+        // If we have at least 2 nodes that are connected, we should have edges
+        if sg.nodes.len() >= 2 {
+            // Node 1 (Alice) knows Node 2 (Bob) and uses Node 3 (Rust)
+            // If both are in the subgraph, there should be an edge between them
+            let has_connected_pair = sg.nodes.iter().any(|n| n.node_id == 1)
+                && (sg.nodes.iter().any(|n| n.node_id == 2)
+                    || sg.nodes.iter().any(|n| n.node_id == 3));
+            if has_connected_pair {
+                assert!(
+                    !sg.edges.is_empty(),
+                    "subgraph should have edges between connected nodes"
+                );
+            }
+        }
+
+        // Edges should not have duplicates
+        let edge_ids: Vec<u64> = sg.edges.iter().map(|e| e.edge_id).collect();
+        let unique_edge_ids: std::collections::HashSet<u64> = edge_ids.iter().copied().collect();
+        assert_eq!(
+            edge_ids.len(),
+            unique_edge_ids.len(),
+            "subgraph edges should be deduplicated"
+        );
+
+        // Each edge should have source and target in the subgraph
+        let sg_node_ids: std::collections::HashSet<u64> =
+            sg.nodes.iter().map(|n| n.node_id).collect();
+        for edge in &sg.edges {
+            assert!(
+                sg_node_ids.contains(&edge.source),
+                "edge source {} should be in subgraph nodes",
+                edge.source
+            );
+            assert!(
+                sg_node_ids.contains(&edge.target),
+                "edge target {} should be in subgraph nodes",
+                edge.target
+            );
+            assert!(edge.weight > 0.0, "edge should have positive weight");
+        }
+
+        // Subgraph node properties should not contain internal (_) properties
+        for node in &sg.nodes {
+            for (key, _) in &node.properties {
+                assert!(
+                    !key.starts_with('_'),
+                    "subgraph node properties should not include internal property '{key}'"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_context_subgraph_false_returns_none() {
+        let (adj, props, vec_index, text_index, token_counter, interner) = setup_test_stores();
+
+        let query = ContextQuery {
+            query_text: Some("test".to_string()),
+            graph: "test".to_string(),
+            budget: None,
+            seeds: SeedStrategy::Nodes(vec!["alice".to_string()]),
+            max_depth: 2,
+            direction: Direction::Both,
+            edge_filter: None,
+            decay: None,
+            include_provenance: false,
+            temporal_at: None,
+            limit: None,
+            sort: None,
+            explain: false,
+            output_format: None,
+            include_subgraph: false,
+        };
+
+        let result =
+            execute_context_query(&query, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
+                .unwrap();
+
+        assert!(
+            result.subgraph.is_none(),
+            "subgraph should be None when include_subgraph=false"
+        );
     }
 }

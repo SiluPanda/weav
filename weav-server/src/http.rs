@@ -101,6 +101,8 @@ pub struct ContextRequest {
     /// Output format: "raw" (default), "anthropic", "openai".
     /// When set, the result includes LLM-ready formatted messages.
     pub output_format: Option<String>,
+    /// If true, include the subgraph structure (nodes + edges) in the result.
+    pub include_subgraph: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -323,6 +325,11 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route(
             "/v1/graphs/{graph}/importance",
             get(get_graph_importance),
+        )
+        // Graph condensation.
+        .route(
+            "/v1/graphs/{graph}/condense",
+            post(condense_graph),
         )
         // Prometheus metrics.
         .route("/metrics", get(metrics_handler))
@@ -1466,6 +1473,38 @@ async fn get_graph_importance(
         .into_response()
 }
 
+// ─── Graph condensation ─────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct CondenseRequest {
+    pub importance_threshold: f32,
+}
+
+async fn condense_graph(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+    Json(body): Json<CondenseRequest>,
+) -> impl IntoResponse {
+    let _identity = extract_identity(&engine, &headers);
+    match engine.handle_condense(&graph, body.importance_threshold) {
+        Ok(CommandResponse::Text(msg)) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serde_json::json!({
+                "graph": graph,
+                "message": msg,
+            }))),
+        )
+            .into_response(),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+        )
+            .into_response(),
+        Err(e) => weav_error_to_response(e).into_response(),
+    }
+}
+
 async fn metrics_handler() -> impl IntoResponse {
     use prometheus::Encoder;
     let encoder = prometheus::TextEncoder::new();
@@ -2164,6 +2203,7 @@ async fn context_query(
         sort,
         explain: body.explain.unwrap_or(false),
         output_format: body.output_format,
+        include_subgraph: body.include_subgraph.unwrap_or(false),
     };
 
     let cmd = Command::Context(query);

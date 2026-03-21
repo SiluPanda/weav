@@ -179,6 +179,8 @@ pub struct ContextQuery {
     /// When set, the result includes a `formatted_messages` field with
     /// the context packaged in the provider's message format.
     pub output_format: Option<String>,
+    /// If true, include the subgraph structure (nodes + edges) in the result.
+    pub include_subgraph: bool,
 }
 
 /// Map a named budget preset to a token count.
@@ -1264,6 +1266,7 @@ fn parse_context_command(tokens: &[String]) -> Result<Command, WeavError> {
         sort,
         explain: false,
         output_format: None,
+        include_subgraph: false,
     }))
 }
 

@@ -356,6 +356,7 @@ mod tests {
         budget_time_us: 0,
         plan: None,
         formatted_messages: None,
+        subgraph: None,
         }
     }
 
@@ -424,6 +425,7 @@ mod tests {
         budget_time_us: 0,
         plan: None,
         formatted_messages: None,
+        subgraph: None,
         };
         let val = context_result_to_resp3(&result);
         match &val {
@@ -473,6 +475,7 @@ mod tests {
         budget_time_us: 0,
         plan: None,
         formatted_messages: None,
+        subgraph: None,
         };
 
         let val = context_result_to_resp3(&result);
@@ -641,6 +644,7 @@ mod tests {
         budget_time_us: 0,
         plan: None,
         formatted_messages: None,
+        subgraph: None,
         };
 
         let val = context_result_to_resp3(&result);
@@ -709,6 +713,7 @@ mod tests {
         budget_time_us: 0,
         plan: None,
         formatted_messages: None,
+        subgraph: None,
         };
 
         let val = context_result_to_resp3(&result);
