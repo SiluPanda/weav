@@ -3316,4 +3316,38 @@ mod tests {
         let result = topological_sort(&adj);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_betweenness_centrality_star() {
+        // Star graph: center node 1, spokes to 2,3,4,5
+        // All shortest paths between spoke pairs go through center,
+        // so node 1 should have the highest betweenness centrality.
+        let adj = build_star_graph();
+        let result = betweenness_centrality(&adj, &EdgeFilter::none());
+
+        assert_eq!(result.len(), 5);
+
+        // Find center node (1) and its score
+        let center_score = result.iter()
+            .find(|&&(nid, _)| nid == 1)
+            .map(|&(_, score)| score)
+            .expect("center node should be in results");
+
+        // All spoke nodes should have lower betweenness than center
+        for &(nid, score) in &result {
+            if nid != 1 {
+                assert!(score < center_score,
+                    "spoke node {} (score={}) should have lower betweenness than center (score={})",
+                    nid, score, center_score);
+            }
+        }
+
+        // Spoke nodes are leaves — they lie on no shortest paths between other pairs
+        for &(nid, score) in &result {
+            if nid != 1 {
+                assert_eq!(score, 0.0,
+                    "spoke node {} should have betweenness 0, got {}", nid, score);
+            }
+        }
+    }
 }

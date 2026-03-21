@@ -2511,4 +2511,26 @@ mod tests {
         let result = parse_command(r#"SEARCH "g""#);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_parse_search_with_equals_sign() {
+        let cmd = parse_command(
+            r#"SEARCH "g" WHERE email = "a@b.com""#,
+        ).unwrap();
+        match cmd {
+            Command::Search(c) => {
+                assert_eq!(c.graph, "g");
+                assert_eq!(c.key, "email");
+                assert_eq!(c.value, "a@b.com");
+                assert_eq!(c.limit, None);
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn test_parse_neighbors_invalid_id() {
+        let result = parse_command(r#"NEIGHBORS "g" abc"#);
+        assert!(result.is_err(), "non-numeric node_id should fail parsing");
+    }
 }

@@ -4797,4 +4797,298 @@ mod tests {
         let result = engine.execute_command(cmd, None);
         assert!(result.is_err(), "should reject when max_edges reached");
     }
+
+    #[test]
+    fn test_search_command() {
+        let engine = make_engine();
+        create_test_graph(&engine, "sg");
+
+        // Add nodes with searchable properties
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "sg" LABEL "person" PROPERTIES {"name": "Alice", "role": "engineer"}"#,
+        ).unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "sg" LABEL "person" PROPERTIES {"name": "Bob", "role": "designer"}"#,
+        ).unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "sg" LABEL "person" PROPERTIES {"name": "Charlie", "role": "engineer"}"#,
+        ).unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        // Search by role = "engineer" — should find 2
+        let cmd = parser::parse_command(
+            r#"SEARCH "sg" WHERE role = "engineer""#,
+        ).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::StringList(results) => {
+                assert_eq!(results.len(), 2);
+                for r in &results {
+                    assert!(r.ends_with(":person"), "expected label suffix, got {}", r);
+                }
+            }
+            _ => panic!("expected StringList"),
+        }
+    }
+
+    #[test]
+    fn test_neighbors_command() {
+        let engine = make_engine();
+        create_test_graph(&engine, "ng");
+
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "ng" LABEL "person" PROPERTIES {"name": "A"}"#,
+        ).unwrap();
+        let n1 = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "ng" LABEL "person" PROPERTIES {"name": "B"}"#,
+        ).unwrap();
+        let n2 = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "ng" LABEL "person" PROPERTIES {"name": "C"}"#,
+        ).unwrap();
+        let n3 = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Add edges: n1->n2, n1->n3
+        let cmd = parser::parse_command(&format!(
+            r#"EDGE ADD TO "ng" FROM {n1} TO {n2} LABEL "knows""#,
+        )).unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = parser::parse_command(&format!(
+            r#"EDGE ADD TO "ng" FROM {n1} TO {n3} LABEL "likes""#,
+        )).unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        // Get all neighbors of n1 (default BOTH direction)
+        let cmd = parser::parse_command(&format!(
+            r#"NEIGHBORS "ng" {n1}"#,
+        )).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::StringList(results) => {
+                assert_eq!(results.len(), 2, "n1 should have 2 neighbors");
+                for r in &results {
+                    let parts: Vec<&str> = r.split(':').collect();
+                    assert_eq!(parts.len(), 4, "format should be nid:eid:DIR:label, got {}", r);
+                }
+            }
+            _ => panic!("expected StringList"),
+        }
+    }
+
+    #[test]
+    fn test_neighbors_with_direction() {
+        let engine = make_engine();
+        create_test_graph(&engine, "nd");
+
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "nd" LABEL "x" PROPERTIES {"v": "1"}"#,
+        ).unwrap();
+        let n1 = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "nd" LABEL "x" PROPERTIES {"v": "2"}"#,
+        ).unwrap();
+        let n2 = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Edge from n1 -> n2
+        let cmd = parser::parse_command(&format!(
+            r#"EDGE ADD TO "nd" FROM {n1} TO {n2} LABEL "link""#,
+        )).unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        // DIRECTION OUT from n1: should see n2
+        let cmd = parser::parse_command(&format!(
+            r#"NEIGHBORS "nd" {n1} DIRECTION OUT"#,
+        )).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::StringList(results) => {
+                assert_eq!(results.len(), 1);
+                assert!(results[0].contains("OUT"), "direction should be OUT");
+            }
+            _ => panic!("expected StringList"),
+        }
+
+        // DIRECTION OUT from n2: should be empty
+        let cmd = parser::parse_command(&format!(
+            r#"NEIGHBORS "nd" {n2} DIRECTION OUT"#,
+        )).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::StringList(results) => {
+                assert_eq!(results.len(), 0, "n2 has no outgoing edges");
+            }
+            _ => panic!("expected StringList"),
+        }
+    }
+
+    #[test]
+    fn test_graph_default_ttl_edge() {
+        let engine = make_engine();
+
+        // Create graph with default TTL of 1ms
+        let mut gc = weav_core::config::GraphConfig::default();
+        gc.default_ttl_ms = Some(1);
+        let cmd = Command::GraphCreate(parser::GraphCreateCmd {
+            name: "ttl_edge_g".to_string(),
+            config: Some(gc),
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        // Add two nodes
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "ttl_edge_g".to_string(),
+            label: "a".to_string(),
+            properties: vec![("x".to_string(), Value::Int(1))],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        let n1 = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "ttl_edge_g".to_string(),
+            label: "b".to_string(),
+            properties: vec![("x".to_string(), Value::Int(2))],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        let n2 = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Add edge WITHOUT explicit TTL — should inherit graph default (1ms)
+        let cmd = Command::EdgeAdd(parser::EdgeAddCmd {
+            graph: "ttl_edge_g".to_string(),
+            source: n1,
+            target: n2,
+            label: "ephemeral".to_string(),
+            weight: 1.0,
+            properties: vec![],
+            ttl_ms: None,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        // Edge should inherit the 1ms TTL via valid_until
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let expired = engine.sweep_ttl();
+        // Both nodes and the edge should expire (graph default applies to all)
+        assert!(expired >= 1, "edge with inherited TTL should be expired, got {}", expired);
+    }
+
+    #[test]
+    fn test_search_no_results() {
+        let engine = make_engine();
+        create_test_graph(&engine, "empty_s");
+
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "empty_s" LABEL "item" PROPERTIES {"color": "red"}"#,
+        ).unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        // Search for a value that doesn't match
+        let cmd = parser::parse_command(
+            r#"SEARCH "empty_s" WHERE color = "blue""#,
+        ).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::StringList(results) => {
+                assert!(results.is_empty(), "no nodes should match color=blue");
+            }
+            _ => panic!("expected StringList"),
+        }
+    }
+
+    #[test]
+    fn test_graph_info_enhanced_fields() {
+        let engine = make_engine();
+        create_test_graph(&engine, "enh_info");
+
+        // Add nodes with distinct labels
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "enh_info" LABEL "person" PROPERTIES {"name": "X"}"#,
+        ).unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "enh_info" LABEL "company" PROPERTIES {"name": "Y"}"#,
+        ).unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = Command::GraphInfo("enh_info".to_string());
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::GraphInfo(info) => {
+                assert_eq!(info.node_count, 2);
+                assert_eq!(info.vector_count, 0);
+                assert!(info.label_count >= 2,
+                    "should have at least 2 labels, got {}", info.label_count);
+            }
+            _ => panic!("expected GraphInfo"),
+        }
+    }
+
+    #[test]
+    fn test_replaying_flag_suppresses_wal() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "weav_replay_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+
+        let mut config = WeavConfig::default();
+        config.persistence.enabled = true;
+        config.persistence.data_dir = tmp_dir.clone();
+        let engine = Engine::new(config);
+
+        // Normal operation: create a graph (writes to WAL)
+        create_test_graph(&engine, "pre_replay");
+
+        let seq_before = engine.wal.as_ref()
+            .expect("WAL should be present").lock().sequence_number();
+        assert!(seq_before > 0, "should have WAL entries from graph create");
+
+        // Set replaying flag
+        engine.replaying.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Create another graph — this should NOT write to WAL
+        let cmd = parser::parse_command("GRAPH CREATE \"during_replay\"").unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        let seq_after = engine.wal.as_ref()
+            .expect("WAL should still be present").lock().sequence_number();
+        assert_eq!(seq_before, seq_after,
+            "WAL should not grow while replaying flag is set");
+
+        // Clear replaying flag
+        engine.replaying.store(false, std::sync::atomic::Ordering::Relaxed);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
 }
