@@ -99,6 +99,13 @@ pub struct SearchParams {
     pub limit: Option<u32>,
 }
 
+#[derive(Deserialize)]
+pub struct TemporalQueryRequest {
+    pub timestamp: u64,
+    pub node_ids: Option<Vec<u64>>,
+    pub include_edges: Option<bool>,
+}
+
 #[derive(Serialize)]
 pub struct ApiResponse<T: Serialize> {
     pub success: bool,
@@ -248,6 +255,11 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route(
             "/v1/graphs/{graph}/algorithms/{algorithm}",
             post(run_algorithm),
+        )
+        // Temporal query.
+        .route(
+            "/v1/graphs/{graph}/temporal",
+            post(temporal_query),
         )
         // Prometheus metrics.
         .route("/metrics", get(metrics_handler))
@@ -565,6 +577,136 @@ async fn import_graph(
     }
 
     (StatusCode::OK, Json(ApiResponse::ok(response))).into_response()
+}
+
+/// Temporal query: return graph state at a specific point in time.
+/// POST /v1/graphs/{graph}/temporal
+async fn temporal_query(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+    Json(body): Json<TemporalQueryRequest>,
+) -> impl IntoResponse {
+    let _identity = extract_identity(&engine, &headers);
+    let graph_arc = match engine.get_graph(&graph) {
+        Ok(g) => g,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
+    let gs = graph_arc.read();
+
+    let timestamp = body.timestamp;
+    let include_edges = body.include_edges.unwrap_or(true);
+
+    // Determine which nodes to inspect
+    let node_ids: Vec<u64> = match body.node_ids {
+        Some(ids) => ids,
+        None => gs.adjacency.all_node_ids(),
+    };
+
+    // Filter nodes valid at the given timestamp
+    let mut result_nodes: Vec<serde_json::Value> = Vec::new();
+    let mut result_edges: Vec<serde_json::Value> = Vec::new();
+    let mut seen_edges = std::collections::HashSet::new();
+
+    for &nid in &node_ids {
+        if !gs.adjacency.has_node(nid) {
+            continue;
+        }
+
+        // Check node temporal validity via _tx_from and _ttl_expires_at properties
+        let created_at = gs
+            .properties
+            .get_node_property(nid, "_tx_from")
+            .and_then(|v| match v {
+                Value::Int(ts) => Some(*ts as u64),
+                Value::Timestamp(ts) => Some(*ts),
+                _ => None,
+            });
+        let expires_at = gs
+            .properties
+            .get_node_property(nid, "_ttl_expires_at")
+            .and_then(|v| match v {
+                Value::Timestamp(ts) => Some(*ts),
+                Value::Int(ts) => Some(*ts as u64),
+                _ => None,
+            });
+
+        // Node is valid at timestamp if created before/at timestamp and not expired
+        if let Some(created) = created_at {
+            if timestamp < created {
+                continue;
+            }
+        }
+        if let Some(expires) = expires_at {
+            if timestamp >= expires {
+                continue;
+            }
+        }
+
+        // Build node JSON
+        let label = gs
+            .properties
+            .get_node_property(nid, "_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let props = gs.properties.get_all_node_properties(nid);
+        let mut props_map = serde_json::Map::new();
+        for (k, v) in props {
+            if !k.starts_with('_') {
+                props_map.insert(k.to_string(), value_to_json(v));
+            }
+        }
+
+        result_nodes.push(serde_json::json!({
+            "node_id": nid,
+            "label": label,
+            "properties": props_map,
+        }));
+
+        // Collect edges valid at this timestamp
+        if include_edges {
+            let temporal_neighbors = gs.adjacency.neighbors_at(nid, timestamp, None);
+            for (neighbor_id, edge_id) in temporal_neighbors {
+                if seen_edges.insert(edge_id) {
+                    if let Some(meta) = gs.adjacency.get_edge(edge_id) {
+                        let edge_label = gs
+                            .interner
+                            .resolve_label(meta.label)
+                            .unwrap_or("unknown")
+                            .to_string();
+                        result_edges.push(serde_json::json!({
+                            "edge_id": edge_id,
+                            "source": meta.source,
+                            "target": meta.target,
+                            "label": edge_label,
+                            "weight": meta.weight,
+                            "neighbor": neighbor_id,
+                            "valid_from": meta.temporal.valid_from,
+                            "valid_until": if meta.temporal.valid_until == u64::MAX {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::json!(meta.temporal.valid_until)
+                            },
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::ok(serde_json::json!({
+            "graph": graph,
+            "timestamp": timestamp,
+            "node_count": result_nodes.len(),
+            "edge_count": result_edges.len(),
+            "nodes": result_nodes,
+            "edges": result_edges,
+        }))),
+    )
+        .into_response()
 }
 
 async fn metrics_handler() -> impl IntoResponse {

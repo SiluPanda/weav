@@ -383,7 +383,13 @@ impl Engine {
                         );
                     }
                     if !ns.properties_json.is_empty() && ns.properties_json != "{}" {
-                        if let Ok(props_val) = serde_json::from_str::<serde_json::Value>(&ns.properties_json) {
+                        // Try tagged Value deserialization first (full fidelity),
+                        // fall back to json_val_to_value for legacy snapshots.
+                        if let Ok(props) = serde_json::from_str::<std::collections::HashMap<String, Value>>(&ns.properties_json) {
+                            for (k, v) in props {
+                                state.properties.set_node_property(ns.node_id, &k, v);
+                            }
+                        } else if let Ok(props_val) = serde_json::from_str::<serde_json::Value>(&ns.properties_json) {
                             if let Some(obj) = props_val.as_object() {
                                 for (k, v) in obj {
                                     state.properties.set_node_property(
@@ -496,7 +502,12 @@ impl Engine {
                     if let Some(name) = graph_name {
                         let mut props = Vec::new();
                         if !properties_json.is_empty() && properties_json != "{}" {
-                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(properties_json) {
+                            // Try tagged Value deserialization first (full fidelity)
+                            if let Ok(tagged) = serde_json::from_str::<std::collections::HashMap<String, Value>>(properties_json) {
+                                for (k, v) in tagged {
+                                    props.push((k, v));
+                                }
+                            } else if let Ok(val) = serde_json::from_str::<serde_json::Value>(properties_json) {
                                 if let Some(obj) = val.as_object() {
                                     for (k, v) in obj {
                                         props.push((k.clone(), crate::http::json_val_to_value(v)));
@@ -532,7 +543,12 @@ impl Engine {
                         let mut gs = graph_arc.write();
                         if gs.adjacency.has_node(*node_id) {
                             if !properties_json.is_empty() && properties_json != "{}" {
-                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(properties_json) {
+                                // Try tagged Value deserialization first (full fidelity)
+                                if let Ok(props) = serde_json::from_str::<std::collections::HashMap<String, Value>>(properties_json) {
+                                    for (k, v) in props {
+                                        gs.properties.set_node_property(*node_id, &k, v);
+                                    }
+                                } else if let Ok(val) = serde_json::from_str::<serde_json::Value>(properties_json) {
                                     if let Some(obj) = val.as_object() {
                                         for (k, v) in obj {
                                             gs.properties.set_node_property(
@@ -4406,5 +4422,93 @@ mod tests {
         // Release without acquire should not underflow (saturating_sub)
         engine.release_connection();
         assert_eq!(engine.active_connection_count(), 0);
+    }
+
+    #[test]
+    fn test_value_types_survive_snapshot_roundtrip() {
+        use weav_persist::recovery::RecoveryResult;
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "weav_value_types_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let mut config = WeavConfig::default();
+        config.persistence.enabled = true;
+        config.persistence.data_dir = tmp_dir.clone();
+
+        let engine = Engine::new(config.clone());
+        create_test_graph(&engine, "vt_graph");
+
+        // Add node with Timestamp and various Value types
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "vt_graph".to_string(),
+            label: "entity".to_string(),
+            properties: vec![
+                ("name".to_string(), Value::String(CompactString::from("test"))),
+                ("count".to_string(), Value::Int(42)),
+                ("score".to_string(), Value::Float(3.14)),
+                ("active".to_string(), Value::Bool(true)),
+                ("created".to_string(), Value::Timestamp(1700000000000)),
+            ],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        // Take snapshot
+        let cmd = parser::parse_command("SNAPSHOT").unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        // Recover into new engine
+        let engine2 = Engine::new(config.clone());
+        let snap_engine = weav_persist::snapshot::SnapshotEngine::new(tmp_dir.clone());
+        let latest = snap_engine.latest_snapshot().unwrap().expect("snapshot should exist");
+        let snapshot = snap_engine.load_snapshot(&latest).unwrap();
+
+        let recovery = RecoveryResult {
+            snapshots_loaded: 1,
+            wal_entries_replayed: 0,
+            graphs_recovered: 1,
+            errors: vec![],
+            snapshot: Some(snapshot),
+            wal_entries: vec![],
+        };
+        engine2.recover(recovery).unwrap();
+
+        // Verify all value types survived
+        let graph_arc = engine2.get_graph("vt_graph").unwrap();
+        let gs = graph_arc.read();
+        let node_ids = gs.adjacency.all_node_ids();
+        assert!(!node_ids.is_empty());
+        let nid = node_ids[0];
+
+        // String
+        let name = gs.properties.get_node_property(nid, "name");
+        assert_eq!(name.unwrap().as_str(), Some("test"), "String should survive");
+
+        // Int
+        let count = gs.properties.get_node_property(nid, "count");
+        assert_eq!(count.unwrap().as_int(), Some(42), "Int should survive");
+
+        // Float
+        let score = gs.properties.get_node_property(nid, "score");
+        assert!(score.is_some(), "Float should survive");
+
+        // Bool
+        let active = gs.properties.get_node_property(nid, "active");
+        assert_eq!(active.unwrap().as_bool(), Some(true), "Bool should survive");
+
+        // Timestamp — this was the bug! Previously lost during recovery
+        let created = gs.properties.get_node_property(nid, "created");
+        assert!(created.is_some(), "Timestamp should survive snapshot roundtrip");
+        match created.unwrap() {
+            Value::Timestamp(ts) => assert_eq!(*ts, 1700000000000),
+            other => panic!("expected Timestamp, got {:?}", other),
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
