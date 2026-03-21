@@ -34,20 +34,20 @@ async fn main() {
     }
 
     // Spawn background WAL sync task if configured for EverySecond mode.
-    if config.persistence.enabled {
-        if matches!(config.persistence.wal_sync_mode, WalSyncMode::EverySecond) {
-            let engine_wal = engine.clone();
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-                loop {
-                    interval.tick().await;
-                    if let Err(e) = engine_wal.sync_wal() {
-                        tracing::error!("WAL sync failed: {e}");
-                    }
+    if config.persistence.enabled
+        && matches!(config.persistence.wal_sync_mode, WalSyncMode::EverySecond)
+    {
+        let engine_wal = engine.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                if let Err(e) = engine_wal.sync_wal() {
+                    tracing::error!("WAL sync failed: {e}");
                 }
-            });
-            tracing::info!("WAL EverySecond sync task started");
-        }
+            }
+        });
+        tracing::info!("WAL EverySecond sync task started");
     }
 
     // Spawn background TTL sweep task (every 10 seconds)
