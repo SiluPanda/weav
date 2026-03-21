@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use weav_core::config::{WalSyncMode, WeavConfig};
-use weav_server::{engine::Engine, grpc_server::WeavGrpcService, http, resp3_server};
+use weav_server::{engine::Engine, grpc_server::WeavGrpcService, http, resp3_server, tls};
 use weav_proto::grpc::weav_service_server::WeavServiceServer;
 
 #[tokio::main]
@@ -120,8 +120,27 @@ async fn main() {
         config.server.port
     );
 
-    tracing::info!("Weav HTTP server listening on {}", http_addr);
-    tracing::info!("Weav RESP3 server listening on {}", resp3_addr);
+    // Load TLS config if enabled.
+    let tls_config = if config.server.tls_enabled {
+        let cert_path = config.server.tls_cert_path.as_deref().unwrap();
+        let key_path = config.server.tls_key_path.as_deref().unwrap();
+        match tls::load_tls_config(cert_path, key_path) {
+            Ok(tls_cfg) => {
+                tracing::info!("TLS enabled: cert={}, key={}", cert_path, key_path);
+                Some(tls_cfg)
+            }
+            Err(e) => {
+                tracing::error!("Failed to load TLS config: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    let tls_scheme = if tls_config.is_some() { "s" } else { "" };
+    tracing::info!("Weav HTTP{} server listening on {}", tls_scheme, http_addr);
+    tracing::info!("Weav RESP3{} server listening on {}", if tls_config.is_some() { "+TLS" } else { "" }, resp3_addr);
 
     let grpc_addr = format!(
         "{}:{}",
@@ -149,8 +168,25 @@ async fn main() {
     tracing::info!("Weav gRPC server listening on {}", grpc_addr);
     let grpc_addr_parsed: std::net::SocketAddr = grpc_addr.parse().unwrap();
     let grpc_shutdown_token = shutdown_token.clone();
+    let grpc_tls_config = tls_config.clone();
     let grpc_handle = tokio::spawn(async move {
-        tonic::transport::Server::builder()
+        let mut builder = tonic::transport::Server::builder();
+        if let Some(ref _tls_cfg) = grpc_tls_config
+            && let (Some(cert_path), Some(key_path)) = (
+                config.server.tls_cert_path.as_deref(),
+                config.server.tls_key_path.as_deref(),
+            )
+            && let (Ok(cert), Ok(key)) = (
+                std::fs::read_to_string(cert_path),
+                std::fs::read_to_string(key_path),
+            )
+        {
+            let tls = tonic::transport::ServerTlsConfig::new()
+                .identity(tonic::transport::Identity::from_pem(cert, key));
+            builder = builder.tls_config(tls).expect("invalid gRPC TLS config");
+            tracing::info!("gRPC TLS enabled");
+        }
+        builder
             .add_service(WeavServiceServer::new(grpc_service))
             .serve_with_shutdown(grpc_addr_parsed, async move {
                 grpc_shutdown_token.cancelled().await;

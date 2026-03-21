@@ -38,6 +38,9 @@ base64 = { workspace = true }
 tokio-stream = "0.1"
 uuid = { version = "1", features = ["v4"] }
 csv = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }

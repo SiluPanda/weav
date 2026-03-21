@@ -80,6 +80,9 @@ impl WeavConfig {
         env_override_opt_parse!("WEAV_SERVER_HTTP_PORT", self.server.http_port);
         env_override_opt_parse!("WEAV_SERVER_GRPC_PORT", self.server.grpc_port);
         env_override_str!("WEAV_SERVER_BIND_ADDRESS", self.server.bind_address);
+        env_override!("WEAV_TLS_ENABLED", self.server.tls_enabled);
+        env_override_opt!("WEAV_TLS_CERT", self.server.tls_cert_path);
+        env_override_opt!("WEAV_TLS_KEY", self.server.tls_key_path);
         env_override_opt_parse!("WEAV_ENGINE_NUM_SHARDS", self.engine.num_shards);
         env_override!("WEAV_PERSISTENCE_ENABLED", self.persistence.enabled);
         env_override_str!("WEAV_PERSISTENCE_DATA_DIR", self.persistence.data_dir);
@@ -119,6 +122,13 @@ impl WeavConfig {
                 "engine.num_shards must be > 0".into(),
             ));
         }
+        if self.server.tls_enabled
+            && (self.server.tls_cert_path.is_none() || self.server.tls_key_path.is_none())
+        {
+            return Err(crate::error::WeavError::InvalidConfig(
+                "TLS enabled but tls_cert_path and tls_key_path must be set".into(),
+            ));
+        }
         if self.engine.default_vector_dimensions == 0 {
             return Err(crate::error::WeavError::InvalidConfig(
                 "engine.default_vector_dimensions must be > 0".into(),
@@ -143,6 +153,12 @@ pub struct ServerConfig {
     pub max_connections: u32,
     pub tcp_keepalive_secs: u32,
     pub read_timeout_ms: u64,
+    /// Enable TLS encryption for all protocols. Requires cert_path and key_path.
+    pub tls_enabled: bool,
+    /// Path to PEM-encoded TLS certificate file.
+    pub tls_cert_path: Option<String>,
+    /// Path to PEM-encoded TLS private key file.
+    pub tls_key_path: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -155,6 +171,9 @@ impl Default for ServerConfig {
             max_connections: 10_000,
             tcp_keepalive_secs: 300,
             read_timeout_ms: 30_000,
+            tls_enabled: false,
+            tls_cert_path: None,
+            tls_key_path: None,
         }
     }
 }

@@ -62,8 +62,11 @@ bytes = "1"
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["timeout", "limit"] }
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls"] }
 prost = "0.13"
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
 
 # Token counting
 tiktoken-rs = "0.6"
