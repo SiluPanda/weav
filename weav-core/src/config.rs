@@ -1,5 +1,6 @@
 //! Configuration system for Weav.
 
+use crate::schema::GraphSchema;
 use crate::types::ConflictPolicy;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -386,6 +387,8 @@ pub struct GraphConfig {
     /// Default TTL in milliseconds for nodes/edges created in this graph.
     /// If set, new nodes/edges without an explicit TTL will inherit this value.
     pub default_ttl_ms: Option<u64>,
+    /// Schema constraints for property validation on nodes and edges.
+    pub schema: GraphSchema,
 }
 
 impl Default for GraphConfig {
@@ -400,6 +403,7 @@ impl Default for GraphConfig {
             vector_dimensions: 1536,
             auto_dedup_threshold: None,
             default_ttl_ms: None,
+            schema: GraphSchema::new(),
         }
     }
 }

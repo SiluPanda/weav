@@ -80,6 +80,10 @@ pub enum Command {
     Search(SearchCmd),
     /// Get neighbors of a node.
     Neighbors(NeighborsCmd),
+    /// Set a schema constraint on a label.
+    SchemaSet(SchemaSetCmd),
+    /// Get the schema for a graph.
+    SchemaGet(SchemaGetCmd),
 }
 
 impl Command {
@@ -118,6 +122,8 @@ impl Command {
             Command::Ingest(_) => "ingest",
             Command::Search(_) => "search",
             Command::Neighbors(_) => "neighbors",
+            Command::SchemaSet(_) => "schema_set",
+            Command::SchemaGet(_) => "schema_get",
         }
     }
 }
@@ -278,6 +284,26 @@ pub struct NeighborsCmd {
     pub node_id: u64,
     pub label: Option<String>,
     pub direction: Direction,
+}
+
+/// Set a schema constraint on a node or edge label.
+#[derive(Debug, Clone)]
+pub struct SchemaSetCmd {
+    pub graph: String,
+    /// "node" or "edge"
+    pub target: String,
+    pub label: String,
+    /// "type", "required", or "unique"
+    pub constraint_type: String,
+    pub property: String,
+    /// For "type" constraint: "string", "int", "float", "bool", "bytes", "vector", "list", "map", "timestamp"
+    pub value_type: Option<String>,
+}
+
+/// Get the full schema for a graph.
+#[derive(Debug, Clone)]
+pub struct SchemaGetCmd {
+    pub graph: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -498,6 +524,7 @@ pub fn parse_command(input: &str) -> Result<Command, WeavError> {
         "INGEST" => parse_ingest_command(&tokens),
         "SEARCH" => parse_search_command(&tokens),
         "NEIGHBORS" => parse_neighbors_command(&tokens),
+        "SCHEMA" => parse_schema_command(&tokens),
         _ => Err(parse_err(format!("unknown command: {}", &tokens[0]))),
     }
 }
@@ -1569,6 +1596,76 @@ fn parse_neighbors_command(tokens: &[String]) -> Result<Command, WeavError> {
     }))
 }
 
+// ─── SCHEMA commands ─────────────────────────────────────────────────────────
+
+/// Parse: SCHEMA SET "graph" node|edge "label" type|required|unique "property" ["value_type"]
+///        SCHEMA GET "graph"
+fn parse_schema_command(tokens: &[String]) -> Result<Command, WeavError> {
+    if tokens.len() < 2 {
+        return Err(parse_err("SCHEMA requires a subcommand (SET, GET)"));
+    }
+    let sub = tokens[1].to_uppercase();
+    match sub.as_str() {
+        "SET" => parse_schema_set(tokens),
+        "GET" => {
+            if tokens.len() < 3 {
+                return Err(parse_err("SCHEMA GET requires a graph name"));
+            }
+            let graph = unquote(&tokens[2]).to_string();
+            Ok(Command::SchemaGet(SchemaGetCmd { graph }))
+        }
+        _ => Err(parse_err(format!(
+            "unknown SCHEMA subcommand: {}",
+            &tokens[1]
+        ))),
+    }
+}
+
+/// Parse: SCHEMA SET "graph" node|edge "label" type|required|unique "property" ["value_type"]
+fn parse_schema_set(tokens: &[String]) -> Result<Command, WeavError> {
+    // SCHEMA SET graph target label constraint_type property [value_type]
+    if tokens.len() < 7 {
+        return Err(parse_err(
+            "SCHEMA SET requires: SCHEMA SET \"graph\" node|edge \"label\" type|required|unique \"property\" [\"value_type\"]",
+        ));
+    }
+    let graph = unquote(&tokens[2]).to_string();
+    let target = tokens[3].to_lowercase();
+    if target != "node" && target != "edge" {
+        return Err(parse_err(
+            "SCHEMA SET target must be 'node' or 'edge'",
+        ));
+    }
+    let label = unquote(&tokens[4]).to_string();
+    let constraint_type = tokens[5].to_lowercase();
+    if constraint_type != "type" && constraint_type != "required" && constraint_type != "unique" {
+        return Err(parse_err(
+            "SCHEMA SET constraint must be 'type', 'required', or 'unique'",
+        ));
+    }
+    let property = unquote(&tokens[6]).to_string();
+
+    let value_type = if constraint_type == "type" {
+        if tokens.len() < 8 {
+            return Err(parse_err(
+                "SCHEMA SET type constraint requires a value_type (string, int, float, bool, bytes, vector, list, map, timestamp)",
+            ));
+        }
+        Some(tokens[7].to_lowercase())
+    } else {
+        None
+    };
+
+    Ok(Command::SchemaSet(SchemaSetCmd {
+        graph,
+        target,
+        label,
+        constraint_type,
+        property,
+        value_type,
+    }))
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2532,5 +2629,125 @@ mod tests {
     fn test_parse_neighbors_invalid_id() {
         let result = parse_command(r#"NEIGHBORS "g" abc"#);
         assert!(result.is_err(), "non-numeric node_id should fail parsing");
+    }
+
+    // ── SCHEMA command parsing tests ────────────────────────────────────
+
+    #[test]
+    fn test_parse_schema_set_type() {
+        let cmd = parse_command(
+            r#"SCHEMA SET "mygraph" node "Person" type "age" int"#,
+        ).unwrap();
+        match cmd {
+            Command::SchemaSet(c) => {
+                assert_eq!(c.graph, "mygraph");
+                assert_eq!(c.target, "node");
+                assert_eq!(c.label, "Person");
+                assert_eq!(c.constraint_type, "type");
+                assert_eq!(c.property, "age");
+                assert_eq!(c.value_type, Some("int".to_string()));
+            }
+            _ => panic!("expected SchemaSet"),
+        }
+    }
+
+    #[test]
+    fn test_parse_schema_set_required() {
+        let cmd = parse_command(
+            r#"SCHEMA SET "mygraph" node "Person" required "name""#,
+        ).unwrap();
+        match cmd {
+            Command::SchemaSet(c) => {
+                assert_eq!(c.graph, "mygraph");
+                assert_eq!(c.target, "node");
+                assert_eq!(c.label, "Person");
+                assert_eq!(c.constraint_type, "required");
+                assert_eq!(c.property, "name");
+                assert_eq!(c.value_type, None);
+            }
+            _ => panic!("expected SchemaSet"),
+        }
+    }
+
+    #[test]
+    fn test_parse_schema_set_unique() {
+        let cmd = parse_command(
+            r#"SCHEMA SET "mygraph" edge "KNOWS" unique "id""#,
+        ).unwrap();
+        match cmd {
+            Command::SchemaSet(c) => {
+                assert_eq!(c.graph, "mygraph");
+                assert_eq!(c.target, "edge");
+                assert_eq!(c.label, "KNOWS");
+                assert_eq!(c.constraint_type, "unique");
+                assert_eq!(c.property, "id");
+                assert_eq!(c.value_type, None);
+            }
+            _ => panic!("expected SchemaSet"),
+        }
+    }
+
+    #[test]
+    fn test_parse_schema_get() {
+        let cmd = parse_command(r#"SCHEMA GET "mygraph""#).unwrap();
+        match cmd {
+            Command::SchemaGet(c) => {
+                assert_eq!(c.graph, "mygraph");
+            }
+            _ => panic!("expected SchemaGet"),
+        }
+    }
+
+    #[test]
+    fn test_parse_schema_set_invalid_target() {
+        let result = parse_command(
+            r#"SCHEMA SET "g" table "Person" type "age" int"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_schema_set_invalid_constraint() {
+        let result = parse_command(
+            r#"SCHEMA SET "g" node "Person" check "age" int"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_schema_set_type_missing_value_type() {
+        let result = parse_command(
+            r#"SCHEMA SET "g" node "Person" type "age""#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_schema_set_too_few_tokens() {
+        let result = parse_command(r#"SCHEMA SET "g""#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_schema_invalid_subcommand() {
+        let result = parse_command(r#"SCHEMA DROP "g""#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_schema_get_missing_graph() {
+        let result = parse_command("SCHEMA GET");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_schema_set_type_name() {
+        let cmd = parse_command(
+            r#"SCHEMA SET "g" node "L" required "p""#,
+        ).unwrap();
+        assert_eq!(cmd.type_name(), "schema_set");
+
+        let cmd = parse_command(r#"SCHEMA GET "g""#).unwrap();
+        assert_eq!(cmd.type_name(), "schema_get");
     }
 }

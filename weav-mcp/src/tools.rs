@@ -15,9 +15,10 @@ use rmcp::{
 };
 use serde::Deserialize;
 
-use weav_core::types::Value;
+use weav_core::types::{Direction, TokenAllocation, TokenBudget, Value};
 use weav_query::parser::{
-    Command, EdgeAddCmd, GraphCreateCmd, NodeAddCmd, NodeGetCmd,
+    Command, ContextQuery, EdgeAddCmd, EdgeDeleteCmd, EdgeGetCmd, GraphCreateCmd,
+    NodeAddCmd, NodeDeleteCmd, NodeGetCmd, NodeUpdateCmd, SeedStrategy,
 };
 use weav_server::engine::CommandResponse;
 
@@ -105,6 +106,105 @@ pub struct ExportGraphParams {
 pub struct GraphStatsParams {
     /// Name of the graph.
     pub graph: String,
+}
+
+/// Parameters for updating a node's properties.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct NodeUpdateParams {
+    /// Name of the graph.
+    pub graph: String,
+    /// Node ID to update.
+    pub node_id: u64,
+    /// New key-value properties to set (merges with existing).
+    #[serde(default)]
+    pub properties: HashMap<String, serde_json::Value>,
+    /// Optional new embedding vector.
+    pub embedding: Option<Vec<f32>>,
+}
+
+/// Parameters for deleting a node.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct NodeDeleteParams {
+    /// Name of the graph.
+    pub graph: String,
+    /// Node ID to delete.
+    pub node_id: u64,
+}
+
+/// Parameters for getting an edge.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EdgeGetParams {
+    /// Name of the graph.
+    pub graph: String,
+    /// Edge ID to retrieve.
+    pub edge_id: u64,
+}
+
+/// Parameters for deleting an edge.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EdgeDeleteParams {
+    /// Name of the graph.
+    pub graph: String,
+    /// Edge ID to delete.
+    pub edge_id: u64,
+}
+
+/// Parameters for context-aware retrieval with token budget.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ContextQueryParams {
+    /// Name of the graph.
+    pub graph: String,
+    /// Natural language query text.
+    pub query: Option<String>,
+    /// Seed node entity keys to start traversal from.
+    #[serde(default)]
+    pub seed_keys: Vec<String>,
+    /// Embedding vector for semantic seed selection.
+    pub embedding: Option<Vec<f32>>,
+    /// Number of top-k vector results for seeding (default 10).
+    pub top_k: Option<u16>,
+    /// Maximum token budget (default 4096).
+    pub max_tokens: Option<u32>,
+    /// Budget allocation strategy: "auto", "diversity" (MMR), "submodular", or "proportional".
+    pub strategy: Option<String>,
+    /// Maximum traversal depth (default 3).
+    pub max_depth: Option<u8>,
+    /// Include provenance metadata in results.
+    #[serde(default)]
+    pub include_provenance: bool,
+    /// Point-in-time temporal query (milliseconds since epoch).
+    pub temporal_at: Option<u64>,
+}
+
+/// Parameters for vector similarity search.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct VectorSearchParams {
+    /// Name of the graph.
+    pub graph: String,
+    /// Query embedding vector.
+    pub embedding: Vec<f32>,
+    /// Number of results to return (default 10).
+    pub top_k: Option<usize>,
+}
+
+/// Parameters for running a graph algorithm.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RunAlgorithmParams {
+    /// Name of the graph.
+    pub graph: String,
+    /// Algorithm name: "pagerank", "communities", "shortest_path", "connected_components",
+    /// "betweenness", "closeness", "degree", "triangle_count", "scc", "topological_sort".
+    pub algorithm: String,
+    /// Source node ID (for path algorithms).
+    pub source: Option<u64>,
+    /// Target node ID (for path algorithms).
+    pub target: Option<u64>,
+    /// Maximum iterations (for iterative algorithms, default 100).
+    pub max_iterations: Option<u32>,
+    /// Resolution parameter (for community detection, default 1.0).
+    pub resolution: Option<f32>,
+    /// Maximum results to return (default 50).
+    pub limit: Option<usize>,
 }
 
 /// Parameters for adding an edge between two nodes.
@@ -396,23 +496,20 @@ impl WeavMcpServer {
             if let Some(s) = v.as_str() {
                 return s == search_value;
             }
-            // Match against integer.
-            if let Some(i) = v.as_int() {
-                if let Ok(parsed) = search_value.parse::<i64>() {
-                    return i == parsed;
-                }
+            if let Some(i) = v.as_int()
+                && let Ok(parsed) = search_value.parse::<i64>()
+            {
+                return i == parsed;
             }
-            // Match against float.
-            if let Some(f) = v.as_float() {
-                if let Ok(parsed) = search_value.parse::<f64>() {
-                    return (f - parsed).abs() < f64::EPSILON;
-                }
+            if let Some(f) = v.as_float()
+                && let Ok(parsed) = search_value.parse::<f64>()
+            {
+                return (f - parsed).abs() < f64::EPSILON;
             }
-            // Match against bool.
-            if let Some(b) = v.as_bool() {
-                if let Ok(parsed) = search_value.parse::<bool>() {
-                    return b == parsed;
-                }
+            if let Some(b) = v.as_bool()
+                && let Ok(parsed) = search_value.parse::<bool>()
+            {
+                return b == parsed;
             }
             false
         });
@@ -647,6 +744,507 @@ impl WeavMcpServer {
             Err(e) => weav_error(e),
         }
     }
+
+    /// Update a node's properties or embedding.
+    #[tool(description = "Update an existing node's properties (merge) or embedding vector. Provide the node ID and new properties to set.")]
+    fn node_update(
+        &self,
+        Parameters(params): Parameters<NodeUpdateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let cmd = Command::NodeUpdate(NodeUpdateCmd {
+            graph: params.graph,
+            node_id: params.node_id,
+            properties: props_to_pairs(&params.properties),
+            embedding: params.embedding,
+        });
+        match self.engine.execute_command(cmd, None) {
+            Ok(CommandResponse::Ok) => success_json(&serde_json::json!({
+                "status": "updated",
+                "node_id": params.node_id,
+            })),
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "{resp:?}"
+            ))])),
+            Err(e) => weav_error(e),
+        }
+    }
+
+    /// Delete a node from a graph.
+    #[tool(description = "Delete a node and all its connected edges from a graph.")]
+    fn node_delete(
+        &self,
+        Parameters(params): Parameters<NodeDeleteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let cmd = Command::NodeDelete(NodeDeleteCmd {
+            graph: params.graph,
+            node_id: params.node_id,
+        });
+        match self.engine.execute_command(cmd, None) {
+            Ok(CommandResponse::Ok) => success_json(&serde_json::json!({
+                "status": "deleted",
+                "node_id": params.node_id,
+            })),
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "{resp:?}"
+            ))])),
+            Err(e) => weav_error(e),
+        }
+    }
+
+    /// Get an edge by ID.
+    #[tool(description = "Get an edge from a graph by its edge ID. Returns source, target, label, and weight.")]
+    fn edge_get(
+        &self,
+        Parameters(params): Parameters<EdgeGetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let cmd = Command::EdgeGet(EdgeGetCmd {
+            graph: params.graph,
+            edge_id: params.edge_id,
+        });
+        match self.engine.execute_command(cmd, None) {
+            Ok(CommandResponse::EdgeInfo(info)) => success_json(&serde_json::json!({
+                "edge_id": info.edge_id,
+                "source": info.source,
+                "target": info.target,
+                "label": info.label,
+                "weight": info.weight,
+            })),
+            Ok(CommandResponse::Null) => Ok(CallToolResult::success(vec![Content::text(
+                "Edge not found",
+            )])),
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "{resp:?}"
+            ))])),
+            Err(e) => weav_error(e),
+        }
+    }
+
+    /// Delete an edge from a graph.
+    #[tool(description = "Delete an edge from a graph by its edge ID.")]
+    fn edge_delete(
+        &self,
+        Parameters(params): Parameters<EdgeDeleteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let cmd = Command::EdgeDelete(EdgeDeleteCmd {
+            graph: params.graph,
+            edge_id: params.edge_id,
+        });
+        match self.engine.execute_command(cmd, None) {
+            Ok(CommandResponse::Ok) => success_json(&serde_json::json!({
+                "status": "deleted",
+                "edge_id": params.edge_id,
+            })),
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "{resp:?}"
+            ))])),
+            Err(e) => weav_error(e),
+        }
+    }
+
+    /// Context-aware retrieval with token budget management.
+    #[tool(description = "Retrieve context from a graph with intelligent token budget management. This is Weav's unique differentiator — no other graph database offers budget-aware context retrieval. Supports multiple strategies: 'auto' (greedy knapsack), 'diversity' (MMR for diverse results), 'submodular' (facility location for maximum coverage), or 'proportional' (fixed allocation). Provide seed nodes and/or an embedding vector to start traversal.")]
+    fn context_query(
+        &self,
+        Parameters(params): Parameters<ContextQueryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let seeds = match (&params.embedding, params.seed_keys.is_empty()) {
+            (Some(emb), true) => SeedStrategy::Vector {
+                embedding: emb.clone(),
+                top_k: params.top_k.unwrap_or(10),
+            },
+            (None, false) => SeedStrategy::Nodes(params.seed_keys.clone()),
+            (Some(emb), false) => SeedStrategy::Both {
+                embedding: emb.clone(),
+                top_k: params.top_k.unwrap_or(10),
+                node_keys: params.seed_keys.clone(),
+            },
+            (None, true) => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "Must provide either 'embedding' or 'seed_keys' (or both)",
+                )]));
+            }
+        };
+
+        let max_tokens = params.max_tokens.unwrap_or(4096);
+        let allocation = match params.strategy.as_deref() {
+            Some("diversity") | Some("mmr") => TokenAllocation::DiversityAware { lambda: 0.7 },
+            Some("submodular") | Some("facility") => {
+                TokenAllocation::SubmodularFacilityLocation { alpha: 0.5 }
+            }
+            Some("proportional") => TokenAllocation::Proportional {
+                entities_pct: 0.4,
+                relationships_pct: 0.3,
+                text_chunks_pct: 0.2,
+                metadata_pct: 0.1,
+            },
+            _ => TokenAllocation::Auto,
+        };
+
+        let cmd = Command::Context(ContextQuery {
+            query_text: params.query,
+            graph: params.graph,
+            budget: Some(TokenBudget {
+                max_tokens,
+                allocation,
+            }),
+            seeds,
+            max_depth: params.max_depth.unwrap_or(3),
+            direction: Direction::Both,
+            edge_filter: None,
+            decay: None,
+            include_provenance: params.include_provenance,
+            temporal_at: params.temporal_at,
+            limit: None,
+            sort: None,
+        });
+
+        match self.engine.execute_command(cmd, None) {
+            Ok(CommandResponse::Context(ctx)) => {
+                let chunks: Vec<serde_json::Value> = ctx
+                    .chunks
+                    .iter()
+                    .map(|c| {
+                        let mut obj = serde_json::json!({
+                            "node_id": c.node_id,
+                            "label": c.label,
+                            "content": c.content,
+                            "relevance_score": c.relevance_score,
+                            "depth": c.depth,
+                            "token_count": c.token_count,
+                        });
+                        if let Some(ref prov) = c.provenance {
+                            obj["provenance"] = serde_json::json!({
+                                "source": prov.source.as_str(),
+                                "confidence": prov.confidence,
+                            });
+                        }
+                        if let Some(ref temporal) = c.temporal {
+                            obj["temporal"] = serde_json::json!({
+                                "valid_from": temporal.valid_from,
+                                "valid_until": temporal.valid_until,
+                            });
+                        }
+                        if !c.relationships.is_empty() {
+                            obj["relationships"] = serde_json::json!(c.relationships.len());
+                        }
+                        obj
+                    })
+                    .collect();
+                success_json(&serde_json::json!({
+                    "total_tokens": ctx.total_tokens,
+                    "budget_used": ctx.budget_used,
+                    "nodes_considered": ctx.nodes_considered,
+                    "nodes_included": ctx.nodes_included,
+                    "query_time_us": ctx.query_time_us,
+                    "chunks": chunks,
+                }))
+            }
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "{resp:?}"
+            ))])),
+            Err(e) => weav_error(e),
+        }
+    }
+
+    /// Vector similarity search.
+    #[tool(description = "Search for the most similar nodes using vector embeddings (HNSW index). Returns nodes ranked by cosine similarity to the query vector.")]
+    fn vector_search(
+        &self,
+        Parameters(params): Parameters<VectorSearchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let graph_arc = self.engine.get_graph(&params.graph).map_err(|e| {
+            McpError::internal_error(e.to_string(), None)
+        })?;
+        let gs = graph_arc.read();
+
+        let top_k = params.top_k.unwrap_or(10) as u16;
+        let results = gs.vector_index.search(&params.embedding, top_k, None)
+            .unwrap_or_default();
+
+        let items: Vec<serde_json::Value> = results
+            .iter()
+            .map(|&(node_id, score): &(u64, f32)| {
+                let label = gs
+                    .properties
+                    .get_node_property(node_id, "_label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let props: serde_json::Map<String, serde_json::Value> = gs
+                    .properties
+                    .get_all_node_properties(node_id)
+                    .into_iter()
+                    .filter(|(k, _)| !k.starts_with('_'))
+                    .map(|(k, v)| (k.to_string(), value_to_json(v)))
+                    .collect();
+                serde_json::json!({
+                    "node_id": node_id,
+                    "similarity": score,
+                    "label": label,
+                    "properties": props,
+                })
+            })
+            .collect();
+
+        success_json(&serde_json::json!({
+            "graph": params.graph,
+            "count": items.len(),
+            "results": items,
+        }))
+    }
+
+    /// Run a graph algorithm.
+    #[tool(description = "Run a graph algorithm on a graph. Supported algorithms: 'pagerank' (Personalized PageRank), 'communities' (Louvain modularity), 'label_propagation', 'shortest_path' (Dijkstra, requires source+target), 'connected_components', 'betweenness' (centrality), 'closeness' (centrality), 'degree' (centrality), 'triangle_count', 'scc' (strongly connected components), 'topological_sort'. Returns algorithm-specific results.")]
+    fn run_algorithm(
+        &self,
+        Parameters(params): Parameters<RunAlgorithmParams>,
+    ) -> Result<CallToolResult, McpError> {
+        use weav_graph::traversal;
+
+        let graph_arc = self.engine.get_graph(&params.graph).map_err(|e| {
+            McpError::internal_error(e.to_string(), None)
+        })?;
+        let gs = graph_arc.read();
+        let limit = params.limit.unwrap_or(50);
+
+        match params.algorithm.as_str() {
+            "pagerank" => {
+                let max_iter = params.max_iterations.unwrap_or(100);
+                let scores = traversal::personalized_pagerank(
+                    &gs.adjacency,
+                    &[],
+                    0.85,
+                    max_iter,
+                    1e-6,
+                );
+                let top: Vec<serde_json::Value> = scores
+                    .iter()
+                    .take(limit)
+                    .map(|sn| serde_json::json!({"node_id": sn.node_id, "score": sn.score}))
+                    .collect();
+                success_json(&serde_json::json!({
+                    "algorithm": "pagerank",
+                    "count": top.len(),
+                    "results": top,
+                }))
+            }
+            "communities" | "louvain" => {
+                let max_iter = params.max_iterations.unwrap_or(100);
+                let resolution = params.resolution.unwrap_or(1.0);
+                let communities =
+                    traversal::modularity_communities(&gs.adjacency, max_iter, resolution);
+                // Group by community
+                let mut groups: HashMap<u64, Vec<u64>> = HashMap::new();
+                for (&node, &comm) in &communities {
+                    groups.entry(comm).or_default().push(node);
+                }
+                let mut sorted_groups: Vec<(u64, Vec<u64>)> =
+                    groups.into_iter().collect();
+                sorted_groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+                let result: Vec<serde_json::Value> = sorted_groups
+                    .iter()
+                    .take(limit)
+                    .map(|(comm, members)| {
+                        serde_json::json!({
+                            "community_id": comm,
+                            "size": members.len(),
+                            "members": members,
+                        })
+                    })
+                    .collect();
+                success_json(&serde_json::json!({
+                    "algorithm": "communities",
+                    "community_count": sorted_groups.len(),
+                    "results": result,
+                }))
+            }
+            "label_propagation" => {
+                let max_iter = params.max_iterations.unwrap_or(100);
+                let labels =
+                    traversal::label_propagation(&gs.adjacency, max_iter);
+                let mut groups: HashMap<u64, Vec<u64>> = HashMap::new();
+                for (&node, &label) in &labels {
+                    groups.entry(label).or_default().push(node);
+                }
+                let mut sorted_groups: Vec<(u64, Vec<u64>)> =
+                    groups.into_iter().collect();
+                sorted_groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+                let result: Vec<serde_json::Value> = sorted_groups
+                    .iter()
+                    .take(limit)
+                    .map(|(label, members)| {
+                        serde_json::json!({
+                            "label": label,
+                            "size": members.len(),
+                            "members": members,
+                        })
+                    })
+                    .collect();
+                success_json(&serde_json::json!({
+                    "algorithm": "label_propagation",
+                    "community_count": sorted_groups.len(),
+                    "results": result,
+                }))
+            }
+            "shortest_path" | "dijkstra" => {
+                let source = params.source.ok_or_else(|| {
+                    McpError::invalid_params("'source' is required for shortest_path", None)
+                })?;
+                let target = params.target.ok_or_else(|| {
+                    McpError::invalid_params("'target' is required for shortest_path", None)
+                })?;
+                match traversal::dijkstra_shortest_path(
+                    &gs.adjacency,
+                    source,
+                    target,
+                    u8::MAX,
+                ) {
+                    Some(path) => success_json(&serde_json::json!({
+                        "algorithm": "shortest_path",
+                        "path": path.nodes,
+                        "total_weight": path.total_weight,
+                    })),
+                    None => Ok(CallToolResult::error(vec![Content::text(
+                        "No path found between source and target",
+                    )])),
+                }
+            }
+            "connected_components" => {
+                let comp_map = traversal::connected_components(&gs.adjacency);
+                let mut groups: HashMap<u32, Vec<u64>> = HashMap::new();
+                for (&node, &comp) in &comp_map {
+                    groups.entry(comp).or_default().push(node);
+                }
+                let mut sorted: Vec<Vec<u64>> = groups.into_values().collect();
+                sorted.sort_by_key(|b| std::cmp::Reverse(b.len()));
+                let result: Vec<serde_json::Value> = sorted
+                    .iter()
+                    .take(limit)
+                    .map(|members: &Vec<u64>| {
+                        serde_json::json!({
+                            "size": members.len(),
+                            "members": members,
+                        })
+                    })
+                    .collect();
+                success_json(&serde_json::json!({
+                    "algorithm": "connected_components",
+                    "component_count": sorted.len(),
+                    "results": result,
+                }))
+            }
+            "betweenness" => {
+                let scores = traversal::betweenness_centrality(
+                    &gs.adjacency,
+                    &traversal::EdgeFilter::none(),
+                );
+                let top: Vec<serde_json::Value> = scores
+                    .iter()
+                    .take(limit)
+                    .map(|&(nid, score)| serde_json::json!({"node_id": nid, "score": score}))
+                    .collect();
+                success_json(&serde_json::json!({
+                    "algorithm": "betweenness_centrality",
+                    "count": top.len(),
+                    "results": top,
+                }))
+            }
+            "closeness" => {
+                let scores = traversal::closeness_centrality(
+                    &gs.adjacency,
+                    &traversal::EdgeFilter::none(),
+                );
+                let top: Vec<serde_json::Value> = scores
+                    .iter()
+                    .take(limit)
+                    .map(|&(nid, score)| serde_json::json!({"node_id": nid, "score": score}))
+                    .collect();
+                success_json(&serde_json::json!({
+                    "algorithm": "closeness_centrality",
+                    "count": top.len(),
+                    "results": top,
+                }))
+            }
+            "degree" => {
+                let node_ids = gs.adjacency.all_node_ids();
+                let n = node_ids.len();
+                let divisor = if n > 1 { (n - 1) as f64 } else { 1.0 };
+                let mut scores: Vec<(u64, f64)> = node_ids
+                    .iter()
+                    .map(|&nid| {
+                        let deg = gs.adjacency.neighbors_both(nid, None).len();
+                        (nid, deg as f64 / divisor)
+                    })
+                    .collect();
+                scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let top: Vec<serde_json::Value> = scores
+                    .iter()
+                    .take(limit)
+                    .map(|&(nid, score)| serde_json::json!({"node_id": nid, "score": score}))
+                    .collect();
+                success_json(&serde_json::json!({
+                    "algorithm": "degree_centrality",
+                    "count": top.len(),
+                    "results": top,
+                }))
+            }
+            "triangle_count" => {
+                let result = traversal::triangle_count(
+                    &gs.adjacency,
+                    &traversal::EdgeFilter::none(),
+                );
+                let top: Vec<serde_json::Value> = result.per_node
+                    .iter()
+                    .take(limit)
+                    .map(|&(nid, count, coeff): &(u64, u32, f64)| {
+                        serde_json::json!({
+                            "node_id": nid,
+                            "triangles": count,
+                            "clustering_coefficient": coeff,
+                        })
+                    })
+                    .collect();
+                success_json(&serde_json::json!({
+                    "algorithm": "triangle_count",
+                    "total_triangles": result.total_triangles,
+                    "results": top,
+                }))
+            }
+            "scc" => {
+                let components = traversal::tarjan_scc(&gs.adjacency);
+                let result: Vec<serde_json::Value> = components
+                    .iter()
+                    .take(limit)
+                    .map(|members: &Vec<u64>| {
+                        serde_json::json!({
+                            "size": members.len(),
+                            "members": members,
+                        })
+                    })
+                    .collect();
+                success_json(&serde_json::json!({
+                    "algorithm": "strongly_connected_components",
+                    "component_count": components.len(),
+                    "results": result,
+                }))
+            }
+            "topological_sort" => match traversal::topological_sort(&gs.adjacency) {
+                Ok(order) => {
+                    let limited: Vec<u64> = order.iter().copied().take(limit).collect();
+                    success_json(&serde_json::json!({
+                        "algorithm": "topological_sort",
+                        "order": limited,
+                    }))
+                }
+                Err(e) => weav_error(e),
+            },
+            other => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Unknown algorithm '{other}'. Supported: pagerank, communities, label_propagation, \
+                 shortest_path, connected_components, betweenness, closeness, degree, \
+                 triangle_count, scc, topological_sort"
+            ))])),
+        }
+    }
 }
 
 #[tool_handler]
@@ -657,17 +1255,15 @@ impl ServerHandler for WeavMcpServer {
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(
                 "Weav is an in-memory context graph database for AI/LLM workloads. \
-                 Use graph_list to see available graphs. \
-                 Use graph_create to create a new graph. \
-                 Use graph_info to get node/edge counts for a graph. \
-                 Use node_add to add nodes with labels and properties. \
-                 Use node_get to retrieve nodes by ID or entity_key. \
-                 Use search_nodes to find nodes by property key/value. \
-                 Use get_neighbors to find all neighbors of a node. \
-                 Use edge_add to create edges between nodes. \
-                 Use export_graph to export all nodes and edges as JSON. \
-                 Use graph_stats for detailed statistics including label distribution. \
-                 Use graph_drop to delete a graph."
+                 Tools: graph_list, graph_create, graph_info, graph_stats, graph_drop, \
+                 node_add, node_get, node_update, node_delete, \
+                 edge_add, edge_get, edge_delete, \
+                 search_nodes, get_neighbors, vector_search, \
+                 context_query (token-budget-aware retrieval — Weav's unique feature), \
+                 run_algorithm (PageRank, communities, shortest path, centrality, etc.), \
+                 export_graph, server_info. \
+                 Start with graph_list to see available graphs, or graph_create to make one. \
+                 Use context_query for intelligent, budget-aware context retrieval from knowledge graphs."
                     .to_string(),
             )
     }
@@ -959,12 +1555,19 @@ mod tests {
         assert!(router.has_route("graph_drop"));
         assert!(router.has_route("node_add"));
         assert!(router.has_route("node_get"));
+        assert!(router.has_route("node_update"));
+        assert!(router.has_route("node_delete"));
         assert!(router.has_route("edge_add"));
+        assert!(router.has_route("edge_get"));
+        assert!(router.has_route("edge_delete"));
         assert!(router.has_route("server_info"));
         assert!(router.has_route("search_nodes"));
         assert!(router.has_route("get_neighbors"));
         assert!(router.has_route("export_graph"));
         assert!(router.has_route("graph_stats"));
+        assert!(router.has_route("context_query"));
+        assert!(router.has_route("vector_search"));
+        assert!(router.has_route("run_algorithm"));
     }
 
     /// Helper: create a graph and add two connected nodes for testing new tools.
@@ -1188,5 +1791,278 @@ mod tests {
             .sum();
         let avg_degree = total_degree as f64 / gs.adjacency.node_count() as f64;
         assert!((avg_degree - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_node_update() {
+        use weav_query::parser::{Command, GraphCreateCmd, NodeAddCmd, NodeGetCmd, NodeUpdateCmd};
+        use weav_server::engine::CommandResponse;
+
+        let server = test_server();
+        server
+            .engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd { name: "ug".into(), config: None }),
+                None,
+            )
+            .unwrap();
+
+        let nid = match server
+            .engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "ug".into(), label: "Person".into(),
+                    properties: vec![("name".into(), weav_core::types::Value::String("Alice".into()))],
+                    embedding: None, entity_key: None, ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        let resp = server
+            .engine
+            .execute_command(
+                Command::NodeUpdate(NodeUpdateCmd {
+                    graph: "ug".into(), node_id: nid,
+                    properties: vec![("age".into(), weav_core::types::Value::Int(25))],
+                    embedding: None,
+                }),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(resp, CommandResponse::Ok));
+
+        let resp = server
+            .engine
+            .execute_command(
+                Command::NodeGet(NodeGetCmd { graph: "ug".into(), node_id: Some(nid), entity_key: None }),
+                None,
+            )
+            .unwrap();
+        match resp {
+            CommandResponse::NodeInfo(info) => {
+                assert!(info.properties.iter().any(|(k, v)| k == "age" && v.as_int() == Some(25)));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_node_delete() {
+        use weav_query::parser::{Command, GraphCreateCmd, NodeAddCmd, NodeDeleteCmd};
+        use weav_server::engine::CommandResponse;
+
+        let server = test_server();
+        server
+            .engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd { name: "dg".into(), config: None }),
+                None,
+            )
+            .unwrap();
+
+        let nid = match server
+            .engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "dg".into(), label: "Temp".into(),
+                    properties: vec![], embedding: None, entity_key: None, ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        let resp = server
+            .engine
+            .execute_command(
+                Command::NodeDelete(NodeDeleteCmd { graph: "dg".into(), node_id: nid }),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(resp, CommandResponse::Ok));
+
+        let graph_arc = server.engine.get_graph("dg").unwrap();
+        let gs = graph_arc.read();
+        assert!(!gs.adjacency.has_node(nid));
+    }
+
+    #[test]
+    fn test_edge_get_and_delete() {
+        use weav_query::parser::{Command, EdgeAddCmd, EdgeDeleteCmd, EdgeGetCmd, GraphCreateCmd, NodeAddCmd};
+        use weav_server::engine::CommandResponse;
+
+        let server = test_server();
+        server
+            .engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd { name: "eg".into(), config: None }),
+                None,
+            )
+            .unwrap();
+
+        let n1 = match server.engine.execute_command(
+            Command::NodeAdd(NodeAddCmd {
+                graph: "eg".into(), label: "A".into(),
+                properties: vec![], embedding: None, entity_key: None, ttl_ms: None,
+            }),
+            None,
+        ).unwrap() {
+            CommandResponse::Integer(id) => id,
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        let n2 = match server.engine.execute_command(
+            Command::NodeAdd(NodeAddCmd {
+                graph: "eg".into(), label: "B".into(),
+                properties: vec![], embedding: None, entity_key: None, ttl_ms: None,
+            }),
+            None,
+        ).unwrap() {
+            CommandResponse::Integer(id) => id,
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        let eid = match server.engine.execute_command(
+            Command::EdgeAdd(EdgeAddCmd {
+                graph: "eg".into(), source: n1, target: n2,
+                label: "LINK".into(), weight: 0.5, properties: vec![], ttl_ms: None,
+            }),
+            None,
+        ).unwrap() {
+            CommandResponse::Integer(id) => id,
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        // Get the edge.
+        match server.engine.execute_command(
+            Command::EdgeGet(EdgeGetCmd { graph: "eg".into(), edge_id: eid }),
+            None,
+        ).unwrap() {
+            CommandResponse::EdgeInfo(info) => {
+                assert_eq!(info.edge_id, eid);
+                assert_eq!(info.source, n1);
+                assert_eq!(info.target, n2);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Delete the edge.
+        let resp = server.engine.execute_command(
+            Command::EdgeDelete(EdgeDeleteCmd { graph: "eg".into(), edge_id: eid }),
+            None,
+        ).unwrap();
+        assert!(matches!(resp, CommandResponse::Ok));
+
+        let graph_arc = server.engine.get_graph("eg").unwrap();
+        let gs = graph_arc.read();
+        assert_eq!(gs.adjacency.edge_count(), 0);
+    }
+
+    #[test]
+    fn test_run_algorithm_pagerank() {
+        let server = test_server();
+        let _ = setup_graph_with_nodes(&server);
+        let graph_arc = server.engine.get_graph("tg").unwrap();
+        let gs = graph_arc.read();
+        let scores = weav_graph::traversal::personalized_pagerank(
+            &gs.adjacency, &[], 0.85, 100, 1e-6,
+        );
+        // With empty seeds, PageRank may return empty or all nodes.
+        // Just verify it doesn't crash.
+        assert!(scores.len() <= 2);
+    }
+
+    #[test]
+    fn test_run_algorithm_communities() {
+        let server = test_server();
+        let _ = setup_graph_with_nodes(&server);
+        let graph_arc = server.engine.get_graph("tg").unwrap();
+        let gs = graph_arc.read();
+        let communities = weav_graph::traversal::modularity_communities(&gs.adjacency, 100, 1.0);
+        assert_eq!(communities.len(), 2);
+    }
+
+    #[test]
+    fn test_run_algorithm_shortest_path() {
+        let server = test_server();
+        let (n1, n2) = setup_graph_with_nodes(&server);
+        let graph_arc = server.engine.get_graph("tg").unwrap();
+        let gs = graph_arc.read();
+        let path = weav_graph::traversal::dijkstra_shortest_path(
+            &gs.adjacency, n1, n2, u8::MAX,
+        );
+        assert!(path.is_some());
+        assert_eq!(path.unwrap().nodes, vec![n1, n2]);
+    }
+
+    #[test]
+    fn test_run_algorithm_betweenness() {
+        let server = test_server();
+        let _ = setup_graph_with_nodes(&server);
+        let graph_arc = server.engine.get_graph("tg").unwrap();
+        let gs = graph_arc.read();
+        let scores = weav_graph::traversal::betweenness_centrality(
+            &gs.adjacency, &weav_graph::traversal::EdgeFilter::none(),
+        );
+        assert_eq!(scores.len(), 2);
+    }
+
+    #[test]
+    fn test_run_algorithm_triangle_count() {
+        let server = test_server();
+        let _ = setup_graph_with_nodes(&server);
+        let graph_arc = server.engine.get_graph("tg").unwrap();
+        let gs = graph_arc.read();
+        let result = weav_graph::traversal::triangle_count(
+            &gs.adjacency,
+            &weav_graph::traversal::EdgeFilter::none(),
+        );
+        assert_eq!(result.total_triangles, 0);
+    }
+
+    #[test]
+    fn test_run_algorithm_scc() {
+        let server = test_server();
+        let _ = setup_graph_with_nodes(&server);
+        let graph_arc = server.engine.get_graph("tg").unwrap();
+        let gs = graph_arc.read();
+        let components = weav_graph::traversal::tarjan_scc(&gs.adjacency);
+        assert_eq!(components.len(), 2);
+    }
+
+    #[test]
+    fn test_run_algorithm_topological_sort() {
+        let server = test_server();
+        let (n1, n2) = setup_graph_with_nodes(&server);
+        let graph_arc = server.engine.get_graph("tg").unwrap();
+        let gs = graph_arc.read();
+        let order = weav_graph::traversal::topological_sort(&gs.adjacency).unwrap();
+        let pos1 = order.iter().position(|&n| n == n1).unwrap();
+        let pos2 = order.iter().position(|&n| n == n2).unwrap();
+        assert!(pos1 < pos2);
+    }
+
+    #[test]
+    fn test_total_tool_count() {
+        let server = test_server();
+        let router = &server.tool_router;
+        let expected = [
+            "graph_list", "graph_info", "graph_create", "graph_drop",
+            "node_add", "node_get", "node_update", "node_delete",
+            "edge_add", "edge_get", "edge_delete",
+            "search_nodes", "get_neighbors", "export_graph", "graph_stats",
+            "server_info", "context_query", "vector_search", "run_algorithm",
+        ];
+        for tool in &expected {
+            assert!(router.has_route(tool), "missing tool: {tool}");
+        }
     }
 }

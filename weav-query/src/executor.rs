@@ -312,7 +312,7 @@ pub fn execute_context_query(
         }
 
         // Within each group, compare property values
-        for (_label, indices) in &label_groups {
+        for indices in label_groups.values() {
             if indices.len() < 2 {
                 continue;
             }

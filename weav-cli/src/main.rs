@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if, clippy::collapsible_else_if, clippy::unnecessary_unwrap)]
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use rustyline::error::ReadlineError;

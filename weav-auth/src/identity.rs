@@ -188,7 +188,7 @@ pub enum GraphPermission {
 }
 
 impl GraphPermission {
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "read" | "r" => GraphPermission::Read,
             "readwrite" | "rw" | "write" => GraphPermission::ReadWrite,
@@ -324,14 +324,14 @@ mod tests {
 
     #[test]
     fn test_graph_permission_from_str() {
-        assert_eq!(GraphPermission::from_str("read"), GraphPermission::Read);
-        assert_eq!(GraphPermission::from_str("r"), GraphPermission::Read);
-        assert_eq!(GraphPermission::from_str("readwrite"), GraphPermission::ReadWrite);
-        assert_eq!(GraphPermission::from_str("rw"), GraphPermission::ReadWrite);
-        assert_eq!(GraphPermission::from_str("write"), GraphPermission::ReadWrite);
-        assert_eq!(GraphPermission::from_str("admin"), GraphPermission::Admin);
-        assert_eq!(GraphPermission::from_str("all"), GraphPermission::Admin);
-        assert_eq!(GraphPermission::from_str("bogus"), GraphPermission::None);
+        assert_eq!(GraphPermission::parse("read"), GraphPermission::Read);
+        assert_eq!(GraphPermission::parse("r"), GraphPermission::Read);
+        assert_eq!(GraphPermission::parse("readwrite"), GraphPermission::ReadWrite);
+        assert_eq!(GraphPermission::parse("rw"), GraphPermission::ReadWrite);
+        assert_eq!(GraphPermission::parse("write"), GraphPermission::ReadWrite);
+        assert_eq!(GraphPermission::parse("admin"), GraphPermission::Admin);
+        assert_eq!(GraphPermission::parse("all"), GraphPermission::Admin);
+        assert_eq!(GraphPermission::parse("bogus"), GraphPermission::None);
     }
 
     #[test]

@@ -241,7 +241,7 @@ fn acl_user_from_config(config: &UserConfig) -> WeavResult<AclUser> {
         .iter()
         .map(|gp| GraphAcl {
             pattern: gp.pattern.clone(),
-            permission: GraphPermission::from_str(&gp.permission),
+            permission: GraphPermission::parse(&gp.permission),
         })
         .collect();
 
@@ -295,7 +295,7 @@ fn parse_acl_line(line: &str) -> Option<AclUser> {
                 if let Some((pat, perm)) = inner.rsplit_once(':') {
                     graph_acl.push(GraphAcl {
                         pattern: pat.to_string(),
-                        permission: GraphPermission::from_str(perm),
+                        permission: GraphPermission::parse(perm),
                     });
                 }
             }

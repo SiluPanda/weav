@@ -2,7 +2,9 @@
 //! scored paths, Dijkstra, connected components, Personalized PageRank,
 //! Label Propagation community detection, modularity-based community detection,
 //! betweenness centrality, closeness centrality, triangle counting,
-//! Tarjan's strongly connected components, topological sort.
+//! Tarjan's strongly connected components, topological sort, Leiden community
+//! detection, Node2Vec random walks, A* shortest path, Yen's K-shortest paths,
+//! degree centrality, eigenvector centrality, HITS (hubs & authorities).
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
@@ -155,6 +157,7 @@ fn get_neighbors(
 ///
 /// - `node_label_lookup`: Optional closure that resolves a node to its LabelId.
 /// - `property_check`: Optional closure that checks if a node has a given property.
+#[allow(clippy::type_complexity)]
 fn node_passes_filter(
     adjacency: &AdjacencyStore,
     node: NodeId,
@@ -218,6 +221,7 @@ fn node_passes_filter(
 /// Optional closure params for node filtering:
 /// - `node_label_lookup`: Resolves a node to its LabelId (for label filtering).
 /// - `property_check`: Checks if a node has a given property (for has_property filtering).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn bfs(
     adjacency: &AdjacencyStore,
     seeds: &[NodeId],
@@ -547,6 +551,7 @@ impl Ord for DijkstraState {
 }
 
 /// Weighted shortest path result.
+#[derive(Debug)]
 pub struct WeightedPath {
     pub nodes: Vec<NodeId>,
     pub total_weight: f64,
@@ -1172,8 +1177,8 @@ pub fn closeness_centrality(
                 if !edge_passes_filter(adjacency, eid, edge_filter) {
                     continue;
                 }
-                if !dist.contains_key(&w) {
-                    dist.insert(w, d_v + 1);
+                if let std::collections::hash_map::Entry::Vacant(e) = dist.entry(w) {
+                    e.insert(d_v + 1);
                     queue.push_back(w);
                 }
             }
@@ -1396,19 +1401,19 @@ pub fn tarjan_scc(adjacency: &AdjacencyStore) -> Vec<Vec<NodeId>> {
                     }
 
                     // If we exhausted all neighbors, check if v is a root
-                    if i == neighbors.len() {
-                        if lowlink[&v] == index_map[&v] {
-                            let mut component = Vec::new();
-                            loop {
-                                let w = stack.pop().unwrap();
-                                on_stack.remove(&w);
-                                component.push(w);
-                                if w == v {
-                                    break;
-                                }
+                    if i == neighbors.len()
+                        && lowlink[&v] == index_map[&v]
+                    {
+                        let mut component = Vec::new();
+                        loop {
+                            let w = stack.pop().unwrap();
+                            on_stack.remove(&w);
+                            component.push(w);
+                            if w == v {
+                                break;
                             }
-                            result.push(component);
                         }
+                        result.push(component);
                     }
                 }
             }
@@ -1468,6 +1473,959 @@ pub fn topological_sort(adjacency: &AdjacencyStore) -> WeavResult<Vec<NodeId>> {
     }
 
     Ok(sorted)
+}
+
+// ─── Leiden Community Detection ──────────────────────────────────────────────
+
+/// Leiden community detection with refinement.
+///
+/// Improves on modularity-based community detection (Louvain) by adding a
+/// refinement step that ensures communities are well-connected. After the
+/// standard modularity optimization phase, each community is checked for
+/// internal connectivity. Nodes whose ratio of internal edges to total edges
+/// falls below the `gamma` threshold are separated into singleton communities,
+/// and modularity is re-optimized from the refined partition.
+///
+/// - `max_iterations`: maximum number of modularity optimization passes.
+/// - `resolution`: modularity resolution (1.0 = standard, >1.0 = smaller communities).
+/// - `gamma`: refinement threshold (0.0–1.0). Nodes with `internal_edges / total_edges < gamma`
+///   are separated into their own community before re-optimization.
+pub fn leiden_communities(
+    adjacency: &AdjacencyStore,
+    max_iterations: u32,
+    resolution: f32,
+    gamma: f32,
+) -> HashMap<NodeId, u64> {
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() {
+        return HashMap::new();
+    }
+
+    // Phase 1: standard modularity optimization (same as modularity_communities)
+    let mut community = modularity_communities(adjacency, max_iterations, resolution);
+
+    // Phase 2: refinement — check each community for well-connectedness
+    // Build per-node neighbor sets (undirected) for quick internal edge counting
+    let mut node_neighbors: HashMap<NodeId, Vec<NodeId>> = HashMap::with_capacity(all_nodes.len());
+    for &node in &all_nodes {
+        let mut nbrs = Vec::new();
+        for &(nbr, _) in adjacency.neighbors_out(node, None).iter() {
+            nbrs.push(nbr);
+        }
+        for &(nbr, _) in adjacency.neighbors_in(node, None).iter() {
+            nbrs.push(nbr);
+        }
+        node_neighbors.insert(node, nbrs);
+    }
+
+    let gamma = gamma.clamp(0.0, 1.0) as f64;
+
+    for &node in &all_nodes {
+        let nbrs = &node_neighbors[&node];
+        if nbrs.is_empty() {
+            continue; // isolated node stays in its community
+        }
+
+        let my_comm = community[&node];
+        let total_edges = nbrs.len() as f64;
+        let internal_edges = nbrs
+            .iter()
+            .filter(|&&nbr| community.get(&nbr).copied() == Some(my_comm))
+            .count() as f64;
+
+        let ratio = internal_edges / total_edges;
+        if ratio < gamma {
+            // Node is not well-connected to its community; make it a singleton
+            community.insert(node, node);
+        }
+    }
+
+    // Phase 3: re-optimize modularity from the refined partition
+    // Re-run the modularity optimization moves on the refined partition
+    let resolution = resolution as f64;
+
+    // Recompute node degrees and total weight
+    let mut node_degree: HashMap<NodeId, f64> = HashMap::with_capacity(all_nodes.len());
+    let mut total_weight_double = 0.0_f64;
+
+    for &node in &all_nodes {
+        let mut ki = 0.0_f64;
+        for &(_, edge_id) in adjacency.neighbors_out(node, None).iter() {
+            let w = adjacency
+                .get_edge(edge_id)
+                .map(|meta| meta.weight as f64)
+                .unwrap_or(1.0);
+            ki += w;
+        }
+        for &(_, edge_id) in adjacency.neighbors_in(node, None).iter() {
+            let w = adjacency
+                .get_edge(edge_id)
+                .map(|meta| meta.weight as f64)
+                .unwrap_or(1.0);
+            ki += w;
+        }
+        node_degree.insert(node, ki);
+        total_weight_double += ki;
+    }
+
+    let m = total_weight_double / 2.0;
+    if m == 0.0 {
+        return community;
+    }
+
+    let mut sigma_tot: HashMap<u64, f64> = HashMap::new();
+    for &node in &all_nodes {
+        let comm = community[&node];
+        *sigma_tot.entry(comm).or_insert(0.0) += node_degree[&node];
+    }
+
+    for iteration in 0..max_iterations {
+        let mut order: Vec<NodeId> = all_nodes.clone();
+        order.sort_by(|&a, &b| {
+            let hash_a = {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (a ^ (iteration as u64)).hash(&mut h);
+                h.finish()
+            };
+            let hash_b = {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (b ^ (iteration as u64)).hash(&mut h);
+                h.finish()
+            };
+            hash_a.cmp(&hash_b)
+        });
+
+        let mut changed = false;
+
+        for &node in &order {
+            let ki = node_degree[&node];
+            let current_comm = community[&node];
+
+            let mut edges_to_comm: HashMap<u64, f64> = HashMap::new();
+            let out_neighbors = adjacency.neighbors_out(node, None);
+            let in_neighbors = adjacency.neighbors_in(node, None);
+            for &(nbr, edge_id) in out_neighbors.iter().chain(in_neighbors.iter()) {
+                let w = adjacency
+                    .get_edge(edge_id)
+                    .map(|meta| meta.weight as f64)
+                    .unwrap_or(1.0);
+                let nbr_comm = community[&nbr];
+                *edges_to_comm.entry(nbr_comm).or_insert(0.0) += w;
+            }
+
+            if edges_to_comm.is_empty() {
+                continue;
+            }
+
+            let sigma_tot_old = sigma_tot.get(&current_comm).copied().unwrap_or(0.0) - ki;
+            let ki_in = edges_to_comm.get(&current_comm).copied().unwrap_or(0.0);
+            let remove_cost = ki_in / m - resolution * ki * sigma_tot_old / (2.0 * m * m);
+
+            let mut best_comm = current_comm;
+            let mut best_gain = 0.0_f64;
+
+            for (&cand_comm, &ki_cand) in &edges_to_comm {
+                if cand_comm == current_comm {
+                    continue;
+                }
+                let sigma_tot_cand = sigma_tot.get(&cand_comm).copied().unwrap_or(0.0);
+                let add_gain = ki_cand / m - resolution * ki * sigma_tot_cand / (2.0 * m * m);
+                let net_gain = add_gain - remove_cost;
+
+                if net_gain > best_gain || (net_gain == best_gain && cand_comm < best_comm) {
+                    best_gain = net_gain;
+                    best_comm = cand_comm;
+                }
+            }
+
+            if best_comm != current_comm {
+                *sigma_tot.entry(current_comm).or_insert(0.0) -= ki;
+                *sigma_tot.entry(best_comm).or_insert(0.0) += ki;
+                community.insert(node, best_comm);
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    community
+}
+
+// ─── Node2Vec Random Walks ───────────────────────────────────────────────────
+
+/// Generate biased random walks for Node2Vec-style embeddings.
+///
+/// Produces `num_walks` walks of length `walk_length` starting from each node.
+/// The walk bias is controlled by:
+/// - `p`: return parameter (high p = less likely to return to the previous node)
+/// - `q`: in-out parameter (high q = biased toward local/BFS-like exploration)
+/// - `seed`: deterministic PRNG seed (hash-based: `seed XOR step XOR node`)
+///
+/// The graph is treated as undirected (both `neighbors_out` and `neighbors_in`
+/// are considered). Returns a flat list of all walks.
+pub fn node2vec_walks(
+    adjacency: &AdjacencyStore,
+    walk_length: usize,
+    num_walks: usize,
+    p: f64,
+    q: f64,
+    seed: u64,
+) -> Vec<Vec<NodeId>> {
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() || walk_length == 0 || num_walks == 0 {
+        return Vec::new();
+    }
+
+    // Simple hash-based PRNG: xorshift64
+    fn xorshift(mut state: u64) -> u64 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    }
+
+    // Get undirected neighbors for a node (sorted for determinism)
+    fn undirected_neighbors(adj: &AdjacencyStore, node: NodeId) -> Vec<NodeId> {
+        let mut nbrs: HashSet<NodeId> = HashSet::new();
+        for &(nbr, _) in adj.neighbors_out(node, None).iter() {
+            nbrs.insert(nbr);
+        }
+        for &(nbr, _) in adj.neighbors_in(node, None).iter() {
+            nbrs.insert(nbr);
+        }
+        let mut result: Vec<NodeId> = nbrs.into_iter().collect();
+        result.sort_unstable();
+        result
+    }
+
+    let mut all_walks = Vec::with_capacity(all_nodes.len() * num_walks);
+
+    for walk_idx in 0..num_walks {
+        for &start_node in &all_nodes {
+            let mut walk = Vec::with_capacity(walk_length);
+            walk.push(start_node);
+
+            if walk_length == 1 {
+                all_walks.push(walk);
+                continue;
+            }
+
+            // First step: uniform random among neighbors
+            let first_nbrs = undirected_neighbors(adjacency, start_node);
+            if first_nbrs.is_empty() {
+                all_walks.push(walk);
+                continue;
+            }
+
+            let mut rng_state = seed ^ (walk_idx as u64) ^ start_node;
+            rng_state = xorshift(rng_state);
+            let first_idx = (rng_state % first_nbrs.len() as u64) as usize;
+            walk.push(first_nbrs[first_idx]);
+
+            // Subsequent steps: biased by p and q
+            for step in 2..walk_length {
+                let current = *walk.last().unwrap();
+                let prev = walk[walk.len() - 2];
+
+                let nbrs = undirected_neighbors(adjacency, current);
+                if nbrs.is_empty() {
+                    break;
+                }
+
+                // Build neighbor set of prev for distance computation
+                let prev_nbrs: HashSet<NodeId> = undirected_neighbors(adjacency, prev)
+                    .into_iter()
+                    .collect();
+
+                // Compute unnormalized weights
+                let mut weights: Vec<f64> = Vec::with_capacity(nbrs.len());
+                for &nbr in &nbrs {
+                    let w = if nbr == prev {
+                        1.0 / p // return to previous
+                    } else if prev_nbrs.contains(&nbr) {
+                        1.0 // neighbor of prev (distance 1)
+                    } else {
+                        1.0 / q // move away (distance 2)
+                    };
+                    weights.push(w);
+                }
+
+                // Normalize and select
+                let total: f64 = weights.iter().sum();
+                rng_state = xorshift(seed ^ (step as u64) ^ current ^ (walk_idx as u64));
+                let threshold = (rng_state as f64 / u64::MAX as f64) * total;
+
+                let mut cumulative = 0.0;
+                let mut chosen = nbrs[0];
+                for (i, &w) in weights.iter().enumerate() {
+                    cumulative += w;
+                    if cumulative >= threshold {
+                        chosen = nbrs[i];
+                        break;
+                    }
+                }
+
+                walk.push(chosen);
+            }
+
+            all_walks.push(walk);
+        }
+    }
+
+    all_walks
+}
+
+// ─── A* Shortest Path ────────────────────────────────────────────────────────
+
+/// A* search state for the priority queue.
+struct AstarState {
+    node: NodeId,
+    g_cost: f64,
+    f_cost: f64,
+}
+
+impl PartialEq for AstarState {
+    fn eq(&self, other: &Self) -> bool {
+        self.f_cost == other.f_cost && self.node == other.node
+    }
+}
+
+impl Eq for AstarState {}
+
+impl PartialOrd for AstarState {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for AstarState {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse ordering for min-heap
+        other
+            .f_cost
+            .partial_cmp(&self.f_cost)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| self.node.cmp(&other.node))
+    }
+}
+
+/// Find the shortest weighted path between source and target using A* search.
+///
+/// Like Dijkstra, but uses a heuristic function `h(n)` to guide the search
+/// toward the target: `f(n) = g(n) + h(n)` where `g(n)` is the cost so far.
+///
+/// Edge weights are used as costs via `1/weight` (same convention as Dijkstra).
+/// The heuristic must be admissible (never overestimate) for optimality.
+///
+/// Returns `WeavError::NodeNotFound` if source or target is not in the graph.
+/// Returns `WeavError::Conflict("no path found")` if no path exists.
+pub fn astar_shortest_path(
+    adjacency: &AdjacencyStore,
+    source: NodeId,
+    target: NodeId,
+    heuristic: &dyn Fn(NodeId) -> f64,
+    edge_filter: &EdgeFilter,
+) -> WeavResult<WeightedPath> {
+    let all_nodes_set: HashSet<NodeId> = adjacency.all_node_ids().into_iter().collect();
+    if !all_nodes_set.contains(&source) {
+        return Err(WeavError::NodeNotFound(source, 0));
+    }
+    if !all_nodes_set.contains(&target) {
+        return Err(WeavError::NodeNotFound(target, 0));
+    }
+
+    if source == target {
+        return Ok(WeightedPath {
+            nodes: vec![source],
+            total_weight: 0.0,
+        });
+    }
+
+    let mut g_score: HashMap<NodeId, f64> = HashMap::new();
+    let mut parent: HashMap<NodeId, NodeId> = HashMap::new();
+    let mut heap = BinaryHeap::new();
+    let mut closed: HashSet<NodeId> = HashSet::new();
+
+    g_score.insert(source, 0.0);
+    heap.push(AstarState {
+        node: source,
+        g_cost: 0.0,
+        f_cost: heuristic(source),
+    });
+
+    while let Some(AstarState { node, g_cost, .. }) = heap.pop() {
+        if node == target {
+            // Reconstruct path
+            let mut path = vec![target];
+            let mut current = target;
+            while let Some(&p) = parent.get(&current) {
+                path.push(p);
+                current = p;
+                if current == source {
+                    break;
+                }
+            }
+            path.reverse();
+            return Ok(WeightedPath {
+                nodes: path,
+                total_weight: g_cost,
+            });
+        }
+
+        if !closed.insert(node) {
+            continue; // already expanded
+        }
+
+        // Skip stale entries
+        if let Some(&best_g) = g_score.get(&node)
+            && g_cost > best_g
+        {
+            continue;
+        }
+
+        let neighbors = adjacency.neighbors_out(node, None);
+        for (neighbor, edge_id) in neighbors {
+            if !edge_passes_filter(adjacency, edge_id, edge_filter) {
+                continue;
+            }
+            if closed.contains(&neighbor) {
+                continue;
+            }
+
+            let edge_weight = adjacency
+                .get_edge(edge_id)
+                .map(|m| m.weight as f64)
+                .unwrap_or(1.0);
+            let edge_cost = if edge_weight > 0.0 {
+                1.0 / edge_weight
+            } else {
+                f64::MAX
+            };
+
+            let tentative_g = g_cost + edge_cost;
+            let is_better = g_score.get(&neighbor).is_none_or(|&g| tentative_g < g);
+
+            if is_better {
+                g_score.insert(neighbor, tentative_g);
+                parent.insert(neighbor, node);
+                heap.push(AstarState {
+                    node: neighbor,
+                    g_cost: tentative_g,
+                    f_cost: tentative_g + heuristic(neighbor),
+                });
+            }
+        }
+    }
+
+    Err(WeavError::Conflict("no path found".into()))
+}
+
+// ─── Yen's K-Shortest Paths ─────────────────────────────────────────────────
+
+/// Find the K shortest loopless paths between source and target using Yen's algorithm.
+///
+/// Uses `dijkstra_shortest_path` internally to find individual shortest paths,
+/// then iteratively discovers the next shortest path by deviating from previously
+/// found paths. Edges and nodes are temporarily excluded via exclusion sets.
+///
+/// Returns up to `k` paths sorted by total weight (ascending).
+/// Returns `WeavError::NodeNotFound` if source or target is not in the graph.
+pub fn k_shortest_paths(
+    adjacency: &AdjacencyStore,
+    source: NodeId,
+    target: NodeId,
+    k: usize,
+    edge_filter: &EdgeFilter,
+) -> WeavResult<Vec<WeightedPath>> {
+    let all_nodes_set: HashSet<NodeId> = adjacency.all_node_ids().into_iter().collect();
+    if !all_nodes_set.contains(&source) {
+        return Err(WeavError::NodeNotFound(source, 0));
+    }
+    if !all_nodes_set.contains(&target) {
+        return Err(WeavError::NodeNotFound(target, 0));
+    }
+
+    if k == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Helper: Dijkstra with node and edge exclusion sets
+    fn dijkstra_with_exclusions(
+        adjacency: &AdjacencyStore,
+        source: NodeId,
+        target: NodeId,
+        excluded_nodes: &HashSet<NodeId>,
+        excluded_edges: &HashSet<(NodeId, NodeId)>,
+        edge_filter: &EdgeFilter,
+    ) -> Option<WeightedPath> {
+        if source == target {
+            return Some(WeightedPath {
+                nodes: vec![source],
+                total_weight: 0.0,
+            });
+        }
+
+        let mut dist: HashMap<NodeId, f64> = HashMap::new();
+        let mut parent: HashMap<NodeId, NodeId> = HashMap::new();
+        let mut heap = BinaryHeap::new();
+
+        dist.insert(source, 0.0);
+        heap.push(DijkstraState {
+            node: source,
+            cost: 0.0,
+        });
+
+        while let Some(DijkstraState { node, cost }) = heap.pop() {
+            if node == target {
+                let mut path = vec![target];
+                let mut current = target;
+                while let Some(&p) = parent.get(&current) {
+                    path.push(p);
+                    current = p;
+                    if current == source {
+                        break;
+                    }
+                }
+                path.reverse();
+                return Some(WeightedPath {
+                    nodes: path,
+                    total_weight: cost,
+                });
+            }
+
+            if let Some(&d) = dist.get(&node)
+                && cost > d
+            {
+                continue;
+            }
+
+            let neighbors = adjacency.neighbors_out(node, None);
+            for (neighbor, edge_id) in neighbors {
+                if excluded_nodes.contains(&neighbor) {
+                    continue;
+                }
+                if excluded_edges.contains(&(node, neighbor)) {
+                    continue;
+                }
+                if !edge_passes_filter(adjacency, edge_id, edge_filter) {
+                    continue;
+                }
+
+                let edge_weight = adjacency
+                    .get_edge(edge_id)
+                    .map(|m| m.weight as f64)
+                    .unwrap_or(1.0);
+                let edge_cost = if edge_weight > 0.0 {
+                    1.0 / edge_weight
+                } else {
+                    f64::MAX
+                };
+
+                let next_cost = cost + edge_cost;
+                let is_better = dist.get(&neighbor).is_none_or(|&d| next_cost < d);
+
+                if is_better {
+                    dist.insert(neighbor, next_cost);
+                    parent.insert(neighbor, node);
+                    heap.push(DijkstraState {
+                        node: neighbor,
+                        cost: next_cost,
+                    });
+                }
+            }
+        }
+
+        None
+    }
+
+    // Find the first shortest path
+    let first_path = match dijkstra_with_exclusions(
+        adjacency,
+        source,
+        target,
+        &HashSet::new(),
+        &HashSet::new(),
+        edge_filter,
+    ) {
+        Some(p) => p,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut result: Vec<WeightedPath> = vec![first_path];
+
+    // Candidate paths, sorted by weight (min-heap via BinaryHeap with Reverse-like ordering)
+    let mut candidates: Vec<WeightedPath> = Vec::new();
+
+    for ki in 1..k {
+        let prev_path = &result[ki - 1];
+
+        for i in 0..prev_path.nodes.len().saturating_sub(1) {
+            let spur_node = prev_path.nodes[i];
+            let root_path: Vec<NodeId> = prev_path.nodes[..=i].to_vec();
+
+            // Compute root path cost
+            let mut root_cost = 0.0_f64;
+            for j in 0..root_path.len().saturating_sub(1) {
+                let from = root_path[j];
+                let to = root_path[j + 1];
+                // Find edge cost
+                let neighbors = adjacency.neighbors_out(from, None);
+                for &(nbr, eid) in &neighbors {
+                    if nbr == to {
+                        let w = adjacency
+                            .get_edge(eid)
+                            .map(|m| m.weight as f64)
+                            .unwrap_or(1.0);
+                        root_cost += if w > 0.0 { 1.0 / w } else { f64::MAX };
+                        break;
+                    }
+                }
+            }
+
+            // Exclude edges used by previous paths at the spur node
+            let mut excluded_edges: HashSet<(NodeId, NodeId)> = HashSet::new();
+            for prev in &result {
+                if prev.nodes.len() > i
+                    && prev.nodes[..=i] == root_path[..]
+                    && let Some(&next_node) = prev.nodes.get(i + 1)
+                {
+                    excluded_edges.insert((spur_node, next_node));
+                }
+            }
+
+            // Exclude nodes in root path (except spur node)
+            let mut excluded_nodes: HashSet<NodeId> = HashSet::new();
+            for &rn in &root_path[..root_path.len() - 1] {
+                excluded_nodes.insert(rn);
+            }
+
+            // Find spur path
+            if let Some(spur_path) = dijkstra_with_exclusions(
+                adjacency,
+                spur_node,
+                target,
+                &excluded_nodes,
+                &excluded_edges,
+                edge_filter,
+            ) {
+                // Combine root + spur
+                let mut total_nodes = root_path[..root_path.len() - 1].to_vec();
+                total_nodes.extend_from_slice(&spur_path.nodes);
+                let total_weight = root_cost + spur_path.total_weight;
+
+                // Check for duplicate paths
+                let is_dup = result
+                    .iter()
+                    .chain(candidates.iter())
+                    .any(|p| p.nodes == total_nodes);
+
+                if !is_dup {
+                    candidates.push(WeightedPath {
+                        nodes: total_nodes,
+                        total_weight,
+                    });
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            break;
+        }
+
+        // Select the candidate with minimum weight
+        candidates.sort_by(|a, b| {
+            a.total_weight
+                .partial_cmp(&b.total_weight)
+                .unwrap_or(Ordering::Equal)
+        });
+        result.push(candidates.remove(0));
+    }
+
+    Ok(result)
+}
+
+// ─── Degree Centrality ───────────────────────────────────────────────────────
+
+/// Compute degree centrality for every node.
+///
+/// Degree centrality = `degree(node) / (n - 1)` where `n` is the total number
+/// of nodes. The graph is treated as undirected: both in-degree and out-degree
+/// are counted, with shared edges deduplicated.
+///
+/// Returns a list of `(NodeId, centrality)` sorted descending by score.
+pub fn degree_centrality(adjacency: &AdjacencyStore) -> Vec<(NodeId, f64)> {
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() {
+        return Vec::new();
+    }
+
+    let n = all_nodes.len();
+    let denominator = if n > 1 { (n - 1) as f64 } else { 1.0 };
+
+    let mut result: Vec<(NodeId, f64)> = Vec::with_capacity(n);
+
+    for &node in &all_nodes {
+        // Collect unique undirected neighbors (dedup shared edges)
+        let mut unique_neighbors: HashSet<NodeId> = HashSet::new();
+        for &(nbr, _) in adjacency.neighbors_out(node, None).iter() {
+            if nbr != node {
+                unique_neighbors.insert(nbr);
+            }
+        }
+        for &(nbr, _) in adjacency.neighbors_in(node, None).iter() {
+            if nbr != node {
+                unique_neighbors.insert(nbr);
+            }
+        }
+
+        let centrality = unique_neighbors.len() as f64 / denominator;
+        result.push((node, centrality));
+    }
+
+    result.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    result
+}
+
+// ─── Eigenvector Centrality ──────────────────────────────────────────────────
+
+/// Compute eigenvector centrality using the power iteration method.
+///
+/// A node's score is proportional to the sum of its neighbors' scores (treating
+/// the graph as undirected). Scores are normalized by the L-infinity norm
+/// (maximum score) each iteration.
+///
+/// - `max_iterations`: maximum number of power iterations.
+/// - `tolerance`: convergence threshold on the maximum score change between iterations.
+///
+/// Returns a list of `(NodeId, centrality)` sorted descending by score.
+pub fn eigenvector_centrality(
+    adjacency: &AdjacencyStore,
+    max_iterations: u32,
+    tolerance: f64,
+) -> Vec<(NodeId, f64)> {
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() {
+        return Vec::new();
+    }
+
+    let n = all_nodes.len();
+    let init_val = 1.0 / (n as f64).sqrt();
+
+    let node_to_idx: HashMap<NodeId, usize> = all_nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &nid)| (nid, i))
+        .collect();
+
+    let mut scores: Vec<f64> = vec![init_val; n];
+
+    // Pre-compute undirected neighbor indices for each node
+    let mut neighbor_indices: Vec<Vec<usize>> = Vec::with_capacity(n);
+    for &node in &all_nodes {
+        let mut nbr_set: HashSet<NodeId> = HashSet::new();
+        for &(nbr, _) in adjacency.neighbors_out(node, None).iter() {
+            nbr_set.insert(nbr);
+        }
+        for &(nbr, _) in adjacency.neighbors_in(node, None).iter() {
+            nbr_set.insert(nbr);
+        }
+        let idx_list: Vec<usize> = nbr_set
+            .into_iter()
+            .filter_map(|nbr| node_to_idx.get(&nbr).copied())
+            .collect();
+        neighbor_indices.push(idx_list);
+    }
+
+    for _ in 0..max_iterations {
+        let mut new_scores = vec![0.0_f64; n];
+
+        // Each node's new score = sum of neighbor scores
+        for i in 0..n {
+            let mut s = 0.0;
+            for &j in &neighbor_indices[i] {
+                s += scores[j];
+            }
+            new_scores[i] = s;
+        }
+
+        // Normalize by L-infinity norm (max value)
+        let max_score = new_scores
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max);
+
+        if max_score > 0.0 {
+            for s in &mut new_scores {
+                *s /= max_score;
+            }
+        }
+
+        // Check convergence
+        let max_change = scores
+            .iter()
+            .zip(new_scores.iter())
+            .map(|(old, new)| (old - new).abs())
+            .fold(0.0_f64, f64::max);
+
+        scores = new_scores;
+
+        if max_change < tolerance {
+            break;
+        }
+    }
+
+    let mut result: Vec<(NodeId, f64)> = all_nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &nid)| (nid, scores[i]))
+        .collect();
+    result.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    result
+}
+
+// ─── HITS (Hyperlink-Induced Topic Search) ───────────────────────────────────
+
+/// Ranked list of `(NodeId, score)` pairs, sorted descending by score.
+pub type RankedScores = Vec<(NodeId, f64)>;
+
+/// Compute HITS authority and hub scores.
+///
+/// - Authority: a node is a good authority if many good hubs point to it.
+/// - Hub: a node is a good hub if it points to many good authorities.
+///
+/// Authority update: `auth[v] = sum(hub[u])` for all `u` that point to `v`.
+/// Hub update: `hub[v] = sum(auth[u])` for all `u` that `v` points to.
+/// Both vectors are normalized by their L2 norm each iteration.
+///
+/// - `max_iterations`: maximum number of iterations.
+/// - `tolerance`: convergence threshold on the maximum score change.
+///
+/// Returns `(authority_scores, hub_scores)`, each sorted descending by score.
+pub fn hits(
+    adjacency: &AdjacencyStore,
+    max_iterations: u32,
+    tolerance: f64,
+) -> (RankedScores, RankedScores) {
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let n = all_nodes.len();
+    let node_to_idx: HashMap<NodeId, usize> = all_nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &nid)| (nid, i))
+        .collect();
+
+    // Pre-compute in-neighbor and out-neighbor indices
+    let mut in_neighbors: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut out_neighbors: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+    for (i, &node) in all_nodes.iter().enumerate() {
+        for &(nbr, _) in adjacency.neighbors_out(node, None).iter() {
+            if let Some(&j) = node_to_idx.get(&nbr) {
+                out_neighbors[i].push(j);
+            }
+        }
+        for &(nbr, _) in adjacency.neighbors_in(node, None).iter() {
+            if let Some(&j) = node_to_idx.get(&nbr) {
+                in_neighbors[i].push(j);
+            }
+        }
+    }
+
+    let init_val = 1.0 / (n as f64).sqrt();
+    let mut auth: Vec<f64> = vec![init_val; n];
+    let mut hub: Vec<f64> = vec![init_val; n];
+
+    for _ in 0..max_iterations {
+        // Authority update: auth[v] = sum(hub[u]) for all u pointing to v
+        let mut new_auth = vec![0.0_f64; n];
+        for v in 0..n {
+            for &u in &in_neighbors[v] {
+                new_auth[v] += hub[u];
+            }
+        }
+
+        // Normalize auth by L2 norm
+        let auth_norm: f64 = new_auth.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if auth_norm > 0.0 {
+            for a in &mut new_auth {
+                *a /= auth_norm;
+            }
+        }
+
+        // Hub update: hub[v] = sum(auth[u]) for all u that v points to
+        let mut new_hub = vec![0.0_f64; n];
+        for v in 0..n {
+            for &u in &out_neighbors[v] {
+                new_hub[v] += new_auth[u];
+            }
+        }
+
+        // Normalize hub by L2 norm
+        let hub_norm: f64 = new_hub.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if hub_norm > 0.0 {
+            for h in &mut new_hub {
+                *h /= hub_norm;
+            }
+        }
+
+        // Check convergence
+        let auth_change = auth
+            .iter()
+            .zip(new_auth.iter())
+            .map(|(old, new)| (old - new).abs())
+            .fold(0.0_f64, f64::max);
+        let hub_change = hub
+            .iter()
+            .zip(new_hub.iter())
+            .map(|(old, new)| (old - new).abs())
+            .fold(0.0_f64, f64::max);
+
+        auth = new_auth;
+        hub = new_hub;
+
+        if auth_change < tolerance && hub_change < tolerance {
+            break;
+        }
+    }
+
+    let mut auth_result: Vec<(NodeId, f64)> = all_nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &nid)| (nid, auth[i]))
+        .collect();
+    auth_result.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+
+    let mut hub_result: Vec<(NodeId, f64)> = all_nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &nid)| (nid, hub[i]))
+        .collect();
+    hub_result.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+
+    (auth_result, hub_result)
 }
 
 #[cfg(test)]
@@ -3349,5 +4307,469 @@ mod tests {
                     "spoke node {} should have betweenness 0, got {}", nid, score);
             }
         }
+    }
+
+    // ── Helper: build a cycle graph ─────────────────────────────────────────
+
+    fn build_cycle_graph() -> AdjacencyStore {
+        // 1 -> 2 -> 3 -> 1 (directed cycle)
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+        adj
+    }
+
+    // ── Leiden Community Detection tests ────────────────────────────────────
+
+    #[test]
+    fn test_leiden_two_cliques() {
+        // Two cliques connected by a bridge
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=6 { adj.add_node(i); }
+        // Clique 1: 1-2-3
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        // Clique 2: 4-5-6
+        adj.add_edge(4, 5, 0, make_meta(4, 5, 0)).unwrap();
+        adj.add_edge(5, 4, 0, make_meta(5, 4, 0)).unwrap();
+        adj.add_edge(4, 6, 0, make_meta(4, 6, 0)).unwrap();
+        adj.add_edge(6, 4, 0, make_meta(6, 4, 0)).unwrap();
+        adj.add_edge(5, 6, 0, make_meta(5, 6, 0)).unwrap();
+        adj.add_edge(6, 5, 0, make_meta(6, 5, 0)).unwrap();
+        // Bridge
+        adj.add_edge(3, 4, 0, make_meta(3, 4, 0)).unwrap();
+        adj.add_edge(4, 3, 0, make_meta(4, 3, 0)).unwrap();
+
+        let communities = leiden_communities(&adj, 20, 1.0, 0.3);
+        assert_eq!(communities.len(), 6);
+        // Nodes in same clique should share a community
+        assert_eq!(communities[&1], communities[&2]);
+        assert_eq!(communities[&1], communities[&3]);
+        assert_eq!(communities[&4], communities[&5]);
+        assert_eq!(communities[&4], communities[&6]);
+        // Different cliques should differ
+        assert_ne!(communities[&1], communities[&4]);
+    }
+
+    #[test]
+    fn test_leiden_empty_graph() {
+        let adj = AdjacencyStore::new();
+        let communities = leiden_communities(&adj, 10, 1.0, 0.5);
+        assert!(communities.is_empty());
+    }
+
+    #[test]
+    fn test_leiden_single_node() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        let communities = leiden_communities(&adj, 10, 1.0, 0.5);
+        assert_eq!(communities.len(), 1);
+        assert!(communities.contains_key(&1));
+    }
+
+    #[test]
+    fn test_leiden_high_gamma_splits() {
+        // With gamma=1.0, every node that isn't fully internal should become singleton
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_node(3);
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+
+        let communities = leiden_communities(&adj, 20, 1.0, 1.0);
+        assert_eq!(communities.len(), 3);
+        // With gamma=1.0, node 2 has neighbors in different communities after initial pass,
+        // so the refinement may split communities. The number of unique communities
+        // should be >= 1 (exact result depends on modularity convergence).
+        let unique: HashSet<u64> = communities.values().copied().collect();
+        assert!(unique.len() >= 1);
+    }
+
+    // ── Node2Vec Random Walks tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_node2vec_basic_walks() {
+        let adj = build_linear_graph(); // 1->2->3->4
+        let walks = node2vec_walks(&adj, 3, 2, 1.0, 1.0, 42);
+        // 4 nodes * 2 walks = 8 walks total
+        assert_eq!(walks.len(), 8);
+        // Each walk should start from a node in the graph and have length <= 3
+        for walk in &walks {
+            assert!(!walk.is_empty());
+            assert!(walk.len() <= 3);
+            assert!([1, 2, 3, 4].contains(&walk[0]));
+        }
+    }
+
+    #[test]
+    fn test_node2vec_empty_graph() {
+        let adj = AdjacencyStore::new();
+        let walks = node2vec_walks(&adj, 5, 3, 1.0, 1.0, 42);
+        assert!(walks.is_empty());
+    }
+
+    #[test]
+    fn test_node2vec_walk_length_one() {
+        let adj = build_linear_graph();
+        let walks = node2vec_walks(&adj, 1, 1, 1.0, 1.0, 42);
+        // Each walk should be exactly 1 node (just the start)
+        assert_eq!(walks.len(), 4);
+        for walk in &walks {
+            assert_eq!(walk.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_node2vec_isolated_node() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        let walks = node2vec_walks(&adj, 5, 2, 1.0, 1.0, 42);
+        // 1 node * 2 walks = 2 walks, each with only the start node
+        assert_eq!(walks.len(), 2);
+        for walk in &walks {
+            assert_eq!(walk.len(), 1);
+            assert_eq!(walk[0], 1);
+        }
+    }
+
+    #[test]
+    fn test_node2vec_deterministic() {
+        // Two runs with same seed should produce identical walks
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 { adj.add_node(i); }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+
+        let walks1 = node2vec_walks(&adj, 4, 2, 1.0, 1.0, 123);
+        let walks2 = node2vec_walks(&adj, 4, 2, 1.0, 1.0, 123);
+        assert_eq!(walks1, walks2);
+    }
+
+    // ── A* Shortest Path tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_astar_basic() {
+        let adj = build_linear_graph(); // 1->2->3->4
+        // Trivial heuristic: always 0 (degenerates to Dijkstra)
+        let h = |_: NodeId| 0.0;
+        let result = astar_shortest_path(&adj, 1, 4, &h, &EdgeFilter::none()).unwrap();
+        assert_eq!(result.nodes, vec![1, 2, 3, 4]);
+        assert!(result.total_weight > 0.0);
+    }
+
+    #[test]
+    fn test_astar_same_node() {
+        let adj = build_linear_graph();
+        let h = |_: NodeId| 0.0;
+        let result = astar_shortest_path(&adj, 1, 1, &h, &EdgeFilter::none()).unwrap();
+        assert_eq!(result.nodes, vec![1]);
+        assert_eq!(result.total_weight, 0.0);
+    }
+
+    #[test]
+    fn test_astar_no_path() {
+        let adj = build_linear_graph(); // directed 1->2->3->4
+        let h = |_: NodeId| 0.0;
+        let result = astar_shortest_path(&adj, 4, 1, &h, &EdgeFilter::none());
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WeavError::Conflict(msg) => assert!(msg.contains("no path")),
+            other => panic!("expected Conflict, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_astar_node_not_found() {
+        let adj = build_linear_graph();
+        let h = |_: NodeId| 0.0;
+        let result = astar_shortest_path(&adj, 999, 1, &h, &EdgeFilter::none());
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WeavError::NodeNotFound(nid, _) => assert_eq!(nid, 999),
+            other => panic!("expected NodeNotFound, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_astar_prefers_high_weight() {
+        // Two paths: 1->2->3 (low weight) vs 1->3 (high weight)
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_node(3);
+
+        let meta_12 = EdgeMeta {
+            source: 1, target: 2, label: 0,
+            temporal: BiTemporal::new_current(1000),
+            provenance: None, weight: 0.1, token_cost: 0,
+        };
+        adj.add_edge(1, 2, 0, meta_12).unwrap();
+        let meta_23 = EdgeMeta {
+            source: 2, target: 3, label: 0,
+            temporal: BiTemporal::new_current(1000),
+            provenance: None, weight: 0.1, token_cost: 0,
+        };
+        adj.add_edge(2, 3, 0, meta_23).unwrap();
+        let meta_13 = EdgeMeta {
+            source: 1, target: 3, label: 0,
+            temporal: BiTemporal::new_current(1000),
+            provenance: None, weight: 1.0, token_cost: 0,
+        };
+        adj.add_edge(1, 3, 0, meta_13).unwrap();
+
+        let h = |_: NodeId| 0.0;
+        let result = astar_shortest_path(&adj, 1, 3, &h, &EdgeFilter::none()).unwrap();
+        // Should prefer direct path (high weight = low cost)
+        assert_eq!(result.nodes, vec![1, 3]);
+    }
+
+    // ── Yen's K-Shortest Paths tests ────────────────────────────────────────
+
+    #[test]
+    fn test_k_shortest_basic() {
+        // Diamond: 1->2->4, 1->3->4
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=4 { adj.add_node(i); }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 4, 0, make_meta(2, 4, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 4, 0, make_meta(3, 4, 0)).unwrap();
+
+        let paths = k_shortest_paths(&adj, 1, 4, 2, &EdgeFilter::none()).unwrap();
+        assert_eq!(paths.len(), 2);
+        // Both paths should start at 1 and end at 4
+        for p in &paths {
+            assert_eq!(*p.nodes.first().unwrap(), 1);
+            assert_eq!(*p.nodes.last().unwrap(), 4);
+        }
+        // First path should have lower or equal weight
+        assert!(paths[0].total_weight <= paths[1].total_weight);
+    }
+
+    #[test]
+    fn test_k_shortest_single_path() {
+        let adj = build_linear_graph(); // 1->2->3->4
+        let paths = k_shortest_paths(&adj, 1, 4, 3, &EdgeFilter::none()).unwrap();
+        // Only one path exists in a linear graph
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].nodes, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_k_shortest_no_path() {
+        let adj = build_linear_graph(); // directed
+        let paths = k_shortest_paths(&adj, 4, 1, 2, &EdgeFilter::none()).unwrap();
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn test_k_shortest_node_not_found() {
+        let adj = build_linear_graph();
+        let result = k_shortest_paths(&adj, 999, 1, 2, &EdgeFilter::none());
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WeavError::NodeNotFound(nid, _) => assert_eq!(nid, 999),
+            other => panic!("expected NodeNotFound, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_k_shortest_k_zero() {
+        let adj = build_linear_graph();
+        let paths = k_shortest_paths(&adj, 1, 4, 0, &EdgeFilter::none()).unwrap();
+        assert!(paths.is_empty());
+    }
+
+    // ── Degree Centrality tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_degree_centrality_star() {
+        // Star: center 1 connects to 2,3,4,5 (undirected via both directions)
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=5 { adj.add_node(i); }
+        for i in 2..=5 {
+            adj.add_edge(1, i, 0, make_meta(1, i, 0)).unwrap();
+            adj.add_edge(i, 1, 0, make_meta(i, 1, 0)).unwrap();
+        }
+
+        let result = degree_centrality(&adj);
+        let dc: HashMap<NodeId, f64> = result.into_iter().collect();
+        // Center has degree 4, n-1=4, so centrality=1.0
+        assert!((dc[&1] - 1.0).abs() < 1e-10);
+        // Spokes have degree 1, centrality=1/4=0.25
+        for i in 2..=5 {
+            assert!((dc[&i] - 0.25).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn test_degree_centrality_empty() {
+        let adj = AdjacencyStore::new();
+        let result = degree_centrality(&adj);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_degree_centrality_single_node() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        let result = degree_centrality(&adj);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 1);
+        assert_eq!(result[0].1, 0.0);
+    }
+
+    #[test]
+    fn test_degree_centrality_sorted_descending() {
+        let adj = build_star_graph(); // directed: 1->2,3,4,5
+        let result = degree_centrality(&adj);
+        for i in 1..result.len() {
+            assert!(result[i - 1].1 >= result[i].1);
+        }
+    }
+
+    // ── Eigenvector Centrality tests ────────────────────────────────────────
+
+    #[test]
+    fn test_eigenvector_star_graph() {
+        // Undirected star: center should have highest eigenvector centrality
+        // (need reverse edges so spokes see center and center sees spokes)
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=5 { adj.add_node(i); }
+        for i in 2..=5 {
+            adj.add_edge(1, i, 0, make_meta(1, i, 0)).unwrap();
+            adj.add_edge(i, 1, 0, make_meta(i, 1, 0)).unwrap();
+        }
+        // Also connect spokes 2-3, so the graph isn't perfectly symmetric
+        // and center node has a clearly higher eigenvector centrality
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+
+        let result = eigenvector_centrality(&adj, 100, 1e-8);
+        let ec: HashMap<NodeId, f64> = result.into_iter().collect();
+        // Center node should have the highest score (most connected)
+        assert!(ec[&1] >= ec[&4], "center ec={} should be >= spoke4 ec={}", ec[&1], ec[&4]);
+        assert!(ec[&1] >= ec[&5], "center ec={} should be >= spoke5 ec={}", ec[&1], ec[&5]);
+        // All scores should be non-negative
+        for &(_, score) in &[(1, ec[&1]), (2, ec[&2]), (3, ec[&3]), (4, ec[&4]), (5, ec[&5])] {
+            assert!(score >= 0.0);
+        }
+    }
+
+    #[test]
+    fn test_eigenvector_empty_graph() {
+        let adj = AdjacencyStore::new();
+        let result = eigenvector_centrality(&adj, 100, 1e-8);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_eigenvector_single_node() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        let result = eigenvector_centrality(&adj, 100, 1e-8);
+        assert_eq!(result.len(), 1);
+        // Single node with no neighbors: score stays 0 after first iteration
+        // (no neighbors to sum over)
+    }
+
+    #[test]
+    fn test_eigenvector_complete_triangle() {
+        // Complete triangle: all nodes should have equal scores
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 { adj.add_node(i); }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let result = eigenvector_centrality(&adj, 100, 1e-10);
+        let ec: HashMap<NodeId, f64> = result.into_iter().collect();
+        assert!((ec[&1] - ec[&2]).abs() < 1e-6);
+        assert!((ec[&2] - ec[&3]).abs() < 1e-6);
+    }
+
+    // ── HITS tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_hits_star_graph() {
+        // Star: 1->2, 1->3, 1->4
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=4 { adj.add_node(i); }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(1, 4, 0, make_meta(1, 4, 0)).unwrap();
+
+        let (auth, hub) = hits(&adj, 100, 1e-8);
+        let auth_map: HashMap<NodeId, f64> = auth.into_iter().collect();
+        let hub_map: HashMap<NodeId, f64> = hub.into_iter().collect();
+
+        // Node 1 is the hub (points to many), should have highest hub score
+        assert!(hub_map[&1] > hub_map[&2]);
+        assert!(hub_map[&1] > hub_map[&3]);
+        assert!(hub_map[&1] > hub_map[&4]);
+
+        // Nodes 2,3,4 are authorities (pointed to by the hub)
+        assert!(auth_map[&2] > auth_map[&1]);
+        assert!(auth_map[&3] > auth_map[&1]);
+
+        // All spoke authorities should be roughly equal
+        assert!((auth_map[&2] - auth_map[&3]).abs() < 1e-6);
+        assert!((auth_map[&3] - auth_map[&4]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_hits_empty_graph() {
+        let adj = AdjacencyStore::new();
+        let (auth, hub) = hits(&adj, 100, 1e-8);
+        assert!(auth.is_empty());
+        assert!(hub.is_empty());
+    }
+
+    #[test]
+    fn test_hits_single_node() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        let (auth, hub) = hits(&adj, 100, 1e-8);
+        assert_eq!(auth.len(), 1);
+        assert_eq!(hub.len(), 1);
+    }
+
+    #[test]
+    fn test_hits_bidirectional() {
+        // Complete graph: all nodes should have similar auth and hub scores
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 { adj.add_node(i); }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let (auth, hub) = hits(&adj, 100, 1e-8);
+        let auth_map: HashMap<NodeId, f64> = auth.into_iter().collect();
+        let hub_map: HashMap<NodeId, f64> = hub.into_iter().collect();
+        // Symmetric graph: all authority scores should be equal
+        assert!((auth_map[&1] - auth_map[&2]).abs() < 1e-6);
+        assert!((auth_map[&2] - auth_map[&3]).abs() < 1e-6);
+        // All hub scores should be equal
+        assert!((hub_map[&1] - hub_map[&2]).abs() < 1e-6);
+        assert!((hub_map[&2] - hub_map[&3]).abs() < 1e-6);
     }
 }

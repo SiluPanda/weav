@@ -123,6 +123,22 @@ pub struct Engine {
     replaying: std::sync::atomic::AtomicBool,
 }
 
+/// Extract graph name and operation type from a WAL operation for metric labels.
+fn wal_op_labels(op: &WalOperation) -> (&str, &str) {
+    match op {
+        WalOperation::GraphCreate { name, .. } => (name.as_str(), "GraphCreate"),
+        WalOperation::GraphDrop { name, .. } => (name.as_str(), "GraphDrop"),
+        WalOperation::NodeAdd { .. } => ("_", "NodeAdd"),
+        WalOperation::NodeUpdate { .. } => ("_", "NodeUpdate"),
+        WalOperation::NodeDelete { .. } => ("_", "NodeDelete"),
+        WalOperation::EdgeAdd { .. } => ("_", "EdgeAdd"),
+        WalOperation::EdgeInvalidate { .. } => ("_", "EdgeInvalidate"),
+        WalOperation::EdgeDelete { .. } => ("_", "EdgeDelete"),
+        WalOperation::VectorUpdate { .. } => ("_", "VectorUpdate"),
+        WalOperation::Ingest { graph_name, .. } => (graph_name.as_str(), "Ingest"),
+    }
+}
+
 impl Engine {
     /// Create a new engine with the given configuration.
     pub fn new(config: WeavConfig) -> Self {
@@ -185,9 +201,19 @@ impl Engine {
             return Ok(());
         }
         if let Some(ref wal_mutex) = self.wal {
+            // Extract labels and size before moving `op` into append.
+            let (graph_label, op_label) = wal_op_labels(&op);
+            let graph_label = graph_label.to_string();
+            let op_label = op_label.to_string();
+            let estimated_bytes = bincode::serialized_size(&op).unwrap_or(0);
             let mut wal = wal_mutex.lock();
             wal.append(0, op)
                 .map_err(|e| WeavError::PersistenceError(format!("WAL write failed: {e}")))?;
+            crate::metrics::WAL_WRITES_TOTAL
+                .with_label_values(&[&graph_label, &op_label])
+                .inc();
+            crate::metrics::WAL_BYTES_WRITTEN
+                .inc_by(4 + estimated_bytes);
         }
         Ok(())
     }
@@ -195,9 +221,11 @@ impl Engine {
     /// Force-sync the WAL file to disk. Called periodically for EverySecond mode.
     pub fn sync_wal(&self) -> WeavResult<()> {
         if let Some(ref wal_mutex) = self.wal {
+            let start = std::time::Instant::now();
             let mut wal = wal_mutex.lock();
             wal.sync()
                 .map_err(|e| WeavError::PersistenceError(format!("WAL sync failed: {e}")))?;
+            crate::metrics::WAL_SYNC_DURATION.observe(start.elapsed().as_secs_f64());
         }
         Ok(())
     }
@@ -301,6 +329,16 @@ impl Engine {
                 crate::metrics::EDGES_TOTAL
                     .with_label_values(&[graph_name])
                     .set(gs.adjacency.edge_count() as i64);
+            }
+            if !expired_nodes.is_empty() {
+                crate::metrics::TTL_EXPIRED_TOTAL
+                    .with_label_values(&[graph_name, "node"])
+                    .inc_by(expired_nodes.len() as u64);
+            }
+            if !expired_edges.is_empty() {
+                crate::metrics::TTL_EXPIRED_TOTAL
+                    .with_label_values(&[graph_name, "edge"])
+                    .inc_by(expired_edges.len() as u64);
             }
         }
 
@@ -842,6 +880,8 @@ impl Engine {
             )),
             Command::Search(cmd) => self.handle_search(cmd),
             Command::Neighbors(cmd) => self.handle_neighbors(cmd),
+            Command::SchemaSet(cmd) => self.handle_schema_set(cmd),
+            Command::SchemaGet(cmd) => self.handle_schema_get(cmd),
         }
     }
 
@@ -899,7 +939,8 @@ impl Engine {
             Command::NodeGet(_) | Command::EdgeGet(_) | Command::GraphInfo(_)
             | Command::GraphList | Command::Stats(_) | Command::Context(_)
             | Command::ConfigGet(_) | Command::AclWhoAmI
-            | Command::Search(_) | Command::Neighbors(_) => CommandCategory::Read,
+            | Command::Search(_) | Command::Neighbors(_)
+            | Command::SchemaGet(_) => CommandCategory::Read,
             Command::NodeAdd(_) | Command::NodeUpdate(_) | Command::NodeDelete(_)
             | Command::EdgeAdd(_) | Command::EdgeDelete(_) | Command::EdgeInvalidate(_)
             | Command::BulkInsertNodes(_) | Command::BulkInsertEdges(_)
@@ -907,7 +948,7 @@ impl Engine {
             Command::GraphCreate(_) | Command::GraphDrop(_) | Command::Snapshot
             | Command::ConfigSet(_, _) | Command::AclSetUser(_) | Command::AclDelUser(_)
             | Command::AclList | Command::AclGetUser(_) | Command::AclSave
-            | Command::AclLoad => CommandCategory::Admin,
+            | Command::AclLoad | Command::SchemaSet(_) => CommandCategory::Admin,
         };
 
         // Check category permission.
@@ -1023,6 +1064,8 @@ impl Engine {
             Command::Neighbors(c) => Some(c.graph.clone()),
             Command::GraphCreate(c) => Some(c.name.clone()),
             Command::GraphDrop(name) | Command::GraphInfo(name) => Some(name.clone()),
+            Command::SchemaSet(c) => Some(c.graph.clone()),
+            Command::SchemaGet(c) => Some(c.graph.clone()),
             Command::Stats(opt) => opt.clone(),
             _ => None,
         }
@@ -1385,6 +1428,7 @@ impl Engine {
             config_json,
         })?;
         graphs.insert(cmd.name, Arc::new(RwLock::new(graph_state)));
+        crate::metrics::GRAPHS_TOTAL.set(graphs.len() as i64);
         Ok(CommandResponse::Ok)
     }
 
@@ -1398,6 +1442,7 @@ impl Engine {
         // Write-ahead: WAL entry before in-memory mutation
         self.append_wal(WalOperation::GraphDrop { name: name.to_string() })?;
         graphs.remove(name);
+        crate::metrics::GRAPHS_TOTAL.set(graphs.len() as i64);
         Ok(CommandResponse::Ok)
     }
 
@@ -1537,6 +1582,39 @@ impl Engine {
                 return Err(WeavError::CapacityExceeded(format!(
                     "graph '{}' reached max_nodes limit ({})", cmd.graph, max
                 )));
+            }
+        }
+
+        // ── Schema validation ────────────────────────────────────────────
+        gs.config.schema.validate_node_properties(&cmd.label, &cmd.properties)?;
+
+        // Uniqueness constraint enforcement
+        for constraint in gs.config.schema.node_schemas
+            .get(cmd.label.as_str())
+            .map(|s| s.constraints.as_slice())
+            .unwrap_or_default()
+        {
+            if let weav_core::schema::SchemaConstraint::PropertyUnique { property } = constraint {
+                if let Some((_, prop_val)) = cmd.properties.iter().find(|(k, _)| k == property.as_str()) {
+                    if *prop_val != Value::Null {
+                        let search_val = prop_val.clone();
+                        let existing = gs.properties.nodes_where(property.as_str(), &|v| *v == search_val);
+                        // Filter to only nodes with the same label
+                        let duplicates: Vec<_> = existing.into_iter().filter(|&nid| {
+                            gs.properties
+                                .get_node_property(nid, "_label")
+                                .and_then(|v| v.as_str())
+                                .map(|l| l == cmd.label)
+                                .unwrap_or(false)
+                        }).collect();
+                        if !duplicates.is_empty() {
+                            return Err(WeavError::InvalidConfig(format!(
+                                "uniqueness constraint violated: property '{}' value already exists on node(s) {:?}",
+                                property, duplicates
+                            )));
+                        }
+                    }
+                }
             }
         }
 
@@ -1868,6 +1946,9 @@ impl Engine {
             }
         }
 
+        // ── Schema validation ────────────────────────────────────────────
+        gs.config.schema.validate_edge_properties(&cmd.label, &cmd.properties)?;
+
         // Pre-allocate edge ID for write-ahead logging
         let edge_id = gs.adjacency.allocate_edge_id();
         let graph_id = gs.graph_id;
@@ -2019,9 +2100,93 @@ impl Engine {
         }
     }
 
+    // ── Schema ───────────────────────────────────────────────────────────
+
+    fn handle_schema_set(
+        &self,
+        cmd: weav_query::parser::SchemaSetCmd,
+    ) -> WeavResult<CommandResponse> {
+        use compact_str::CompactString;
+        use weav_core::schema::SchemaConstraint;
+        use weav_core::types::ValueType;
+
+        let graph_arc = self.get_graph(&cmd.graph)?;
+        let mut gs = graph_arc.write();
+
+        let constraint = match cmd.constraint_type.as_str() {
+            "type" => {
+                let vt = match cmd.value_type.as_deref() {
+                    Some("string") => ValueType::String,
+                    Some("int") => ValueType::Int,
+                    Some("float") => ValueType::Float,
+                    Some("bool") => ValueType::Bool,
+                    Some("bytes") => ValueType::Bytes,
+                    Some("vector") => ValueType::Vector,
+                    Some("list") => ValueType::List,
+                    Some("map") => ValueType::Map,
+                    Some("timestamp") => ValueType::Timestamp,
+                    Some("null") => ValueType::Null,
+                    Some(other) => {
+                        return Err(WeavError::InvalidConfig(format!(
+                            "unknown value type: '{}'",
+                            other
+                        )));
+                    }
+                    None => {
+                        return Err(WeavError::InvalidConfig(
+                            "type constraint requires a value_type".into(),
+                        ));
+                    }
+                };
+                SchemaConstraint::PropertyType {
+                    property: CompactString::new(&cmd.property),
+                    expected_type: vt,
+                }
+            }
+            "required" => SchemaConstraint::PropertyRequired {
+                property: CompactString::new(&cmd.property),
+            },
+            "unique" => SchemaConstraint::PropertyUnique {
+                property: CompactString::new(&cmd.property),
+            },
+            other => {
+                return Err(WeavError::InvalidConfig(format!(
+                    "unknown constraint type: '{}'",
+                    other
+                )));
+            }
+        };
+
+        match cmd.target.as_str() {
+            "node" => gs.config.schema.add_node_constraint(&cmd.label, constraint),
+            "edge" => gs.config.schema.add_edge_constraint(&cmd.label, constraint),
+            other => {
+                return Err(WeavError::InvalidConfig(format!(
+                    "schema target must be 'node' or 'edge', got '{}'",
+                    other
+                )));
+            }
+        }
+
+        Ok(CommandResponse::Ok)
+    }
+
+    fn handle_schema_get(
+        &self,
+        cmd: weav_query::parser::SchemaGetCmd,
+    ) -> WeavResult<CommandResponse> {
+        let graph_arc = self.get_graph(&cmd.graph)?;
+        let gs = graph_arc.read();
+
+        let schema_json = serde_json::to_string_pretty(&gs.config.schema)
+            .unwrap_or_else(|_| "{}".to_string());
+        Ok(CommandResponse::Text(schema_json))
+    }
+
     // ── Snapshot ──────────────────────────────────────────────────────────
 
     fn handle_snapshot(&self) -> WeavResult<CommandResponse> {
+        let snap_start = std::time::Instant::now();
         let snapshot_engine = match &self.snapshot_engine {
             Some(se) => se,
             None => return Ok(CommandResponse::Ok), // Persistence not enabled
@@ -2134,8 +2299,13 @@ impl Engine {
             graphs: graph_snapshots,
         };
 
-        snapshot_engine.save_snapshot(&full_snapshot)
+        let saved_path = snapshot_engine.save_snapshot(&full_snapshot)
             .map_err(|e| WeavError::Internal(format!("snapshot save failed: {e}")))?;
+
+        crate::metrics::SNAPSHOT_DURATION.observe(snap_start.elapsed().as_secs_f64());
+        if let Ok(meta) = std::fs::metadata(&saved_path) {
+            crate::metrics::SNAPSHOT_SIZE_BYTES.set(meta.len() as i64);
+        }
 
         Ok(CommandResponse::Ok)
     }
@@ -2146,9 +2316,11 @@ impl Engine {
         &self,
         query: weav_query::parser::ContextQuery,
     ) -> WeavResult<CommandResponse> {
-        let graph_arc = self.get_graph(&query.graph)?;
+        let graph_name = query.graph.clone();
+        let graph_arc = self.get_graph(&graph_name)?;
         let gs = graph_arc.read();
 
+        let ctx_start = std::time::Instant::now();
         let result = executor::execute_context_query(
             &query,
             &gs.adjacency,
@@ -2157,6 +2329,33 @@ impl Engine {
             &self.token_counter,
             &gs.interner,
         )?;
+
+        // Vector search timing (context query always involves vector or graph traversal).
+        crate::metrics::VECTOR_SEARCH_DURATION
+            .with_label_values(&[&graph_name])
+            .observe(ctx_start.elapsed().as_secs_f64());
+        crate::metrics::VECTOR_INDEX_SIZE
+            .with_label_values(&[&graph_name])
+            .set(gs.vector_index.len() as i64);
+
+        // Token budget metrics.
+        let strategy = query.budget.as_ref().map_or("auto", |b| {
+            match &b.allocation {
+                weav_core::types::TokenAllocation::Auto => "auto",
+                weav_core::types::TokenAllocation::Proportional { .. } => "proportional",
+                weav_core::types::TokenAllocation::Priority(_) => "priority",
+                weav_core::types::TokenAllocation::DiversityAware { .. } => "mmr",
+                weav_core::types::TokenAllocation::SubmodularFacilityLocation { .. } => "submodular",
+            }
+        });
+        crate::metrics::TOKEN_BUDGET_USAGE
+            .with_label_values(&[&graph_name, strategy])
+            .observe(result.budget_used as f64);
+        if result.budget_used >= 1.0 {
+            crate::metrics::TOKEN_BUDGET_OVERFLOW
+                .with_label_values(&[&graph_name])
+                .inc();
+        }
 
         Ok(CommandResponse::Context(result))
     }
@@ -2167,6 +2366,7 @@ impl Engine {
         &self,
         cmd: weav_query::parser::IngestCmd,
     ) -> WeavResult<CommandResponse> {
+        let ingest_start = std::time::Instant::now();
         if !self.config.extract.enabled {
             return Err(WeavError::ExtractionNotEnabled);
         }
@@ -2182,6 +2382,8 @@ impl Engine {
         } else {
             weav_extract::types::DocumentFormat::PlainText
         };
+
+        let format_label = format!("{:?}", format);
 
         // Build input document.
         let document_id = cmd
@@ -2221,6 +2423,13 @@ impl Engine {
 
         // Apply results to graph.
         let response = self.apply_extraction_result(&cmd.graph, &result)?;
+
+        crate::metrics::INGEST_DURATION
+            .with_label_values(&[&cmd.graph, &format_label])
+            .observe(ingest_start.elapsed().as_secs_f64());
+        crate::metrics::INGEST_DOCUMENTS_TOTAL
+            .with_label_values(&[&cmd.graph])
+            .inc();
 
         Ok(response)
     }
@@ -2419,14 +2628,25 @@ impl Engine {
     ) -> WeavResult<CommandResponse> {
         let store = self.acl_store()?;
 
-        let identity = match username {
-            Some(ref u) => store.authenticate(u, &password)?,
-            None => store.authenticate_default(&password)?,
+        let result = match username {
+            Some(ref u) => store.authenticate(u, &password),
+            None => store.authenticate_default(&password),
         };
 
-        // Return OK with the username. The protocol layer uses the identity
-        // from authenticate() directly; this response is for the client.
-        Ok(CommandResponse::Text(format!("OK (user: {})", identity.username)))
+        match result {
+            Ok(identity) => {
+                crate::metrics::AUTH_ATTEMPTS_TOTAL
+                    .with_label_values(&["success"])
+                    .inc();
+                Ok(CommandResponse::Text(format!("OK (user: {})", identity.username)))
+            }
+            Err(e) => {
+                crate::metrics::AUTH_ATTEMPTS_TOTAL
+                    .with_label_values(&["failure"])
+                    .inc();
+                Err(e)
+            }
+        }
     }
 
     fn handle_acl_set_user(
@@ -2466,7 +2686,7 @@ impl Engine {
                 .iter()
                 .map(|(pat, perm)| weav_auth::identity::GraphAcl {
                     pattern: pat.clone(),
-                    permission: weav_auth::identity::GraphPermission::from_str(perm),
+                    permission: weav_auth::identity::GraphPermission::parse(perm),
                 })
                 .collect();
         }
@@ -2545,6 +2765,7 @@ impl Engine {
             Err(WeavError::InvalidConfig("no ACL file configured".into()))
         }
     }
+
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -5090,5 +5311,362 @@ mod tests {
         engine.replaying.store(false, std::sync::atomic::Ordering::Relaxed);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // ── Schema enforcement tests ────────────────────────────────────────
+
+    #[test]
+    fn test_schema_set_and_get() {
+        let engine = make_engine();
+        create_test_graph(&engine, "sg");
+
+        let cmd = parser::parse_command(
+            r#"SCHEMA SET "sg" node "Person" type "age" int"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        assert!(matches!(resp, CommandResponse::Ok));
+
+        let cmd = parser::parse_command(r#"SCHEMA GET "sg""#).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json) => {
+                assert!(json.contains("Person"));
+                assert!(json.contains("age"));
+                assert!(json.contains("Int"));
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_schema_blocks_invalid_node_type() {
+        let engine = make_engine();
+        create_test_graph(&engine, "sbi");
+
+        let cmd = parser::parse_command(
+            r#"SCHEMA SET "sbi" node "Person" type "age" int"#,
+        )
+        .unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "sbi".into(),
+            label: "Person".into(),
+            properties: vec![
+                ("name".into(), Value::String(CompactString::new("Alice"))),
+                ("age".into(), Value::String(CompactString::new("thirty"))),
+            ],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        let result = engine.execute_command(cmd, None);
+        assert!(result.is_err(), "should reject wrong type");
+    }
+
+    #[test]
+    fn test_schema_allows_valid_node() {
+        let engine = make_engine();
+        create_test_graph(&engine, "sav");
+
+        let cmd = parser::parse_command(
+            r#"SCHEMA SET "sav" node "Person" type "age" int"#,
+        )
+        .unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "sav".into(),
+            label: "Person".into(),
+            properties: vec![
+                ("name".into(), Value::String(CompactString::new("Alice"))),
+                ("age".into(), Value::Int(30)),
+            ],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        let result = engine.execute_command(cmd, None);
+        assert!(result.is_ok(), "should accept correct type");
+    }
+
+    #[test]
+    fn test_schema_required_blocks_missing() {
+        let engine = make_engine();
+        create_test_graph(&engine, "srm");
+
+        let cmd = parser::parse_command(
+            r#"SCHEMA SET "srm" node "Person" required "name""#,
+        )
+        .unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "srm".into(),
+            label: "Person".into(),
+            properties: vec![("age".into(), Value::Int(30))],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        let result = engine.execute_command(cmd, None);
+        assert!(result.is_err(), "should reject missing required property");
+    }
+
+    #[test]
+    fn test_schema_uniqueness_constraint() {
+        let engine = make_engine();
+        create_test_graph(&engine, "su");
+
+        let cmd = parser::parse_command(
+            r#"SCHEMA SET "su" node "Person" unique "email""#,
+        )
+        .unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "su".into(),
+            label: "Person".into(),
+            properties: vec![(
+                "email".into(),
+                Value::String(CompactString::new("alice@example.com")),
+            )],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        assert!(engine.execute_command(cmd, None).is_ok());
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "su".into(),
+            label: "Person".into(),
+            properties: vec![(
+                "email".into(),
+                Value::String(CompactString::new("alice@example.com")),
+            )],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        let result = engine.execute_command(cmd, None);
+        assert!(result.is_err(), "should reject duplicate unique value");
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "su".into(),
+            label: "Person".into(),
+            properties: vec![(
+                "email".into(),
+                Value::String(CompactString::new("bob@example.com")),
+            )],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        assert!(engine.execute_command(cmd, None).is_ok());
+    }
+
+    #[test]
+    fn test_schema_edge_type_enforcement() {
+        let engine = make_engine();
+        create_test_graph(&engine, "ste");
+
+        let cmd = parser::parse_command(
+            r#"SCHEMA SET "ste" edge "KNOWS" type "strength" float"#,
+        )
+        .unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "ste".into(),
+            label: "Person".into(),
+            properties: vec![(
+                "name".into(),
+                Value::String(CompactString::new("Alice")),
+            )],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        let n1 = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "ste".into(),
+            label: "Person".into(),
+            properties: vec![(
+                "name".into(),
+                Value::String(CompactString::new("Bob")),
+            )],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        let n2 = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let cmd = Command::EdgeAdd(parser::EdgeAddCmd {
+            graph: "ste".into(),
+            source: n1,
+            target: n2,
+            label: "KNOWS".into(),
+            weight: 1.0,
+            properties: vec![("strength".into(), Value::Float(0.95))],
+            ttl_ms: None,
+        });
+        assert!(engine.execute_command(cmd, None).is_ok());
+
+        let cmd = Command::EdgeAdd(parser::EdgeAddCmd {
+            graph: "ste".into(),
+            source: n1,
+            target: n2,
+            label: "KNOWS".into(),
+            weight: 1.0,
+            properties: vec![("strength".into(), Value::Int(1))],
+            ttl_ms: None,
+        });
+        assert!(engine.execute_command(cmd, None).is_err());
+    }
+
+    #[test]
+    fn test_schema_no_constraints_allows_all() {
+        let engine = make_engine();
+        create_test_graph(&engine, "snc");
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "snc".into(),
+            label: "Anything".into(),
+            properties: vec![
+                ("random".into(), Value::Bool(true)),
+                ("data".into(), Value::Float(3.14)),
+            ],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        assert!(engine.execute_command(cmd, None).is_ok());
+    }
+
+    #[test]
+    fn test_schema_set_nonexistent_graph() {
+        let engine = make_engine();
+        let cmd = parser::parse_command(
+            r#"SCHEMA SET "nonexistent" node "Person" type "age" int"#,
+        )
+        .unwrap();
+        let result = engine.execute_command(cmd, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_schema_set_invalid_value_type() {
+        let engine = make_engine();
+        create_test_graph(&engine, "sivt");
+
+        let cmd = Command::SchemaSet(parser::SchemaSetCmd {
+            graph: "sivt".into(),
+            target: "node".into(),
+            label: "Person".into(),
+            constraint_type: "type".into(),
+            property: "age".into(),
+            value_type: Some("unknown_type".into()),
+        });
+        let result = engine.execute_command(cmd, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_schema_uniqueness_different_labels() {
+        let engine = make_engine();
+        create_test_graph(&engine, "sudl");
+
+        let cmd = parser::parse_command(
+            r#"SCHEMA SET "sudl" node "Person" unique "email""#,
+        )
+        .unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "sudl".into(),
+            label: "Person".into(),
+            properties: vec![(
+                "email".into(),
+                Value::String(CompactString::new("shared@example.com")),
+            )],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        assert!(engine.execute_command(cmd, None).is_ok());
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "sudl".into(),
+            label: "Company".into(),
+            properties: vec![(
+                "email".into(),
+                Value::String(CompactString::new("shared@example.com")),
+            )],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        assert!(engine.execute_command(cmd, None).is_ok());
+    }
+
+    #[test]
+    fn test_schema_multiple_constraints_combined() {
+        let engine = make_engine();
+        create_test_graph(&engine, "smc");
+
+        let cmd = parser::parse_command(
+            r#"SCHEMA SET "smc" node "Person" required "name""#,
+        )
+        .unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = parser::parse_command(
+            r#"SCHEMA SET "smc" node "Person" type "age" int"#,
+        )
+        .unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "smc".into(),
+            label: "Person".into(),
+            properties: vec![
+                ("name".into(), Value::String(CompactString::new("Alice"))),
+                ("age".into(), Value::Int(30)),
+            ],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        assert!(engine.execute_command(cmd, None).is_ok());
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "smc".into(),
+            label: "Person".into(),
+            properties: vec![("age".into(), Value::Int(25))],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        assert!(engine.execute_command(cmd, None).is_err());
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "smc".into(),
+            label: "Person".into(),
+            properties: vec![
+                ("name".into(), Value::String(CompactString::new("Bob"))),
+                ("age".into(), Value::String(CompactString::new("old"))),
+            ],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        assert!(engine.execute_command(cmd, None).is_err());
     }
 }

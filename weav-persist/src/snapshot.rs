@@ -21,6 +21,7 @@ pub enum SnapshotFormat {
     // Rkyv support planned for future versions
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for SnapshotFormat {
     fn default() -> Self {
         SnapshotFormat::Bincode
@@ -186,21 +187,20 @@ impl SnapshotEngine {
 
             // Try sidecar metadata first (fast path), fall back to full deserialization
             let meta_path = path.with_extension("meta.json");
-            if meta_path.exists() {
-                if let Ok(json_str) = fs::read_to_string(&meta_path) {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                        snapshots.push(SnapshotMeta {
-                            path: path.clone(),
-                            created_at: val["created_at"].as_u64().unwrap_or(0),
-                            size_bytes: val["size_bytes"].as_u64().unwrap_or(entry.metadata()?.len()),
-                            node_count: val["node_count"].as_u64().unwrap_or(0),
-                            edge_count: val["edge_count"].as_u64().unwrap_or(0),
-                            graph_count: val["graph_count"].as_u64().unwrap_or(0) as u32,
-                            wal_sequence: val["wal_sequence"].as_u64().unwrap_or(0),
-                        });
-                        continue;
-                    }
-                }
+            if meta_path.exists()
+                && let Ok(json_str) = fs::read_to_string(&meta_path)
+                && let Ok(val) = serde_json::from_str::<serde_json::Value>(&json_str)
+            {
+                snapshots.push(SnapshotMeta {
+                    path: path.clone(),
+                    created_at: val["created_at"].as_u64().unwrap_or(0),
+                    size_bytes: val["size_bytes"].as_u64().unwrap_or(entry.metadata()?.len()),
+                    node_count: val["node_count"].as_u64().unwrap_or(0),
+                    edge_count: val["edge_count"].as_u64().unwrap_or(0),
+                    graph_count: val["graph_count"].as_u64().unwrap_or(0) as u32,
+                    wal_sequence: val["wal_sequence"].as_u64().unwrap_or(0),
+                });
+                continue;
             }
 
             // Fallback: load full snapshot to extract metadata (slow path)

@@ -41,7 +41,7 @@ impl TokenCounter {
 
 /// Ceiling division of byte length by 4.
 fn char_div_4(text: &str) -> u32 {
-    (text.len() as u32 + 3) / 4
+    (text.len() as u32).div_ceil(4)
 }
 
 #[cfg(test)]
