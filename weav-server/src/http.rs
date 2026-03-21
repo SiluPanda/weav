@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -235,6 +235,38 @@ fn weav_error_to_response(err: weav_core::error::WeavError) -> impl IntoResponse
     (status, Json(ApiResponse::<()>::err(err.to_string())))
 }
 
+// ─── Auth extraction ────────────────────────────────────────────────────────
+
+/// Extract session identity from the Authorization header.
+///
+/// Supports two schemes:
+///   - `Authorization: Bearer <api_key>` → API key auth
+///   - `Authorization: Basic <base64(user:pass)>` → username/password auth
+///
+/// Returns `None` when auth is disabled or no header is present.
+fn extract_identity(
+    engine: &Engine,
+    headers: &HeaderMap,
+) -> Option<weav_auth::identity::SessionIdentity> {
+    if !engine.is_auth_enabled() {
+        return None;
+    }
+    let auth_header = headers.get("authorization")?.to_str().ok()?;
+
+    if let Some(token) = auth_header.strip_prefix("Bearer ") {
+        engine.authenticate_api_key(token.trim()).ok()
+    } else if let Some(basic) = auth_header.strip_prefix("Basic ") {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(basic.trim())
+            .ok()?;
+        let creds = String::from_utf8(decoded).ok()?;
+        let (user, pass) = creds.split_once(':')?;
+        engine.authenticate(user, pass).ok()
+    } else {
+        None
+    }
+}
+
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
 async fn health() -> impl IntoResponse {
@@ -253,26 +285,27 @@ async fn metrics_handler() -> impl IntoResponse {
 
 async fn create_graph(
     State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
     Json(body): Json<CreateGraphRequest>,
 ) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
     let cmd = Command::GraphCreate(GraphCreateCmd {
         name: body.name,
         config: None,
     });
-    match engine.execute_command(cmd, None) {
+    match engine.execute_command(cmd, identity.as_ref()) {
         Ok(_) => (
             StatusCode::CREATED,
-            Json(ApiResponse::<()>::ok_empty()).into_response(),
-        ),
-        Err(e) => (
-            StatusCode::CONFLICT,
-            weav_error_to_response(e).into_response(),
-        ),
+            Json(ApiResponse::<()>::ok_empty()),
+        )
+            .into_response(),
+        Err(e) => weav_error_to_response(e).into_response(),
     }
 }
 
-async fn list_graphs(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
-    match engine.execute_command(Command::GraphList, None) {
+async fn list_graphs(State(engine): State<Arc<Engine>>, headers: HeaderMap) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
+    match engine.execute_command(Command::GraphList, identity.as_ref()) {
         Ok(CommandResponse::StringList(names)) => {
             (StatusCode::OK, Json(ApiResponse::ok(names))).into_response()
         }
@@ -287,10 +320,12 @@ async fn list_graphs(State(engine): State<Arc<Engine>>) -> impl IntoResponse {
 
 async fn get_graph_info(
     State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
     let cmd = Command::GraphInfo(name);
-    match engine.execute_command(cmd, None) {
+    match engine.execute_command(cmd, identity.as_ref()) {
         Ok(CommandResponse::GraphInfo(info)) => (
             StatusCode::OK,
             Json(ApiResponse::ok(GraphInfoJson {
@@ -311,10 +346,12 @@ async fn get_graph_info(
 
 async fn drop_graph(
     State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
     let cmd = Command::GraphDrop(name);
-    match engine.execute_command(cmd, None) {
+    match engine.execute_command(cmd, identity.as_ref()) {
         Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
     }
@@ -322,9 +359,11 @@ async fn drop_graph(
 
 async fn add_node(
     State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
     Path(graph): Path<String>,
     Json(body): Json<AddNodeRequest>,
 ) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
     let properties = if let Some(ref val) = body.properties {
         json_to_props(val)
     } else {
@@ -339,7 +378,7 @@ async fn add_node(
         entity_key: body.entity_key,
     });
 
-    match engine.execute_command(cmd, None) {
+    match engine.execute_command(cmd, identity.as_ref()) {
         Ok(CommandResponse::Integer(id)) => (
             StatusCode::CREATED,
             Json(ApiResponse::ok(NodeIdResponse { node_id: id })),
@@ -356,15 +395,17 @@ async fn add_node(
 
 async fn get_node(
     State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
     Path((graph, id)): Path<(String, u64)>,
 ) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
     let cmd = Command::NodeGet(NodeGetCmd {
         graph,
         node_id: Some(id),
         entity_key: None,
     });
 
-    match engine.execute_command(cmd, None) {
+    match engine.execute_command(cmd, identity.as_ref()) {
         Ok(CommandResponse::NodeInfo(info)) => {
             let props_json = props_to_json(&info.properties);
             (
@@ -388,14 +429,16 @@ async fn get_node(
 
 async fn delete_node(
     State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
     Path((graph, id)): Path<(String, u64)>,
 ) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
     let cmd = Command::NodeDelete(NodeDeleteCmd {
         graph,
         node_id: id,
     });
 
-    match engine.execute_command(cmd, None) {
+    match engine.execute_command(cmd, identity.as_ref()) {
         Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
     }
@@ -403,9 +446,11 @@ async fn delete_node(
 
 async fn add_edge(
     State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
     Path(graph): Path<String>,
     Json(body): Json<AddEdgeRequest>,
 ) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
     let properties = if let Some(ref val) = body.properties {
         json_to_props(val)
     } else {
@@ -421,7 +466,7 @@ async fn add_edge(
         properties,
     });
 
-    match engine.execute_command(cmd, None) {
+    match engine.execute_command(cmd, identity.as_ref()) {
         Ok(CommandResponse::Integer(id)) => (
             StatusCode::CREATED,
             Json(ApiResponse::ok(EdgeIdResponse { edge_id: id })),
@@ -438,14 +483,16 @@ async fn add_edge(
 
 async fn invalidate_edge(
     State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
     Path((graph, id)): Path<(String, u64)>,
 ) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
     let cmd = Command::EdgeInvalidate(EdgeInvalidateCmd {
         graph,
         edge_id: id,
     });
 
-    match engine.execute_command(cmd, None) {
+    match engine.execute_command(cmd, identity.as_ref()) {
         Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
     }
@@ -453,14 +500,16 @@ async fn invalidate_edge(
 
 async fn get_edge(
     State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
     Path((graph, id)): Path<(String, u64)>,
 ) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
     let cmd = Command::EdgeGet(EdgeGetCmd {
         graph,
         edge_id: id,
     });
 
-    match engine.execute_command(cmd, None) {
+    match engine.execute_command(cmd, identity.as_ref()) {
         Ok(CommandResponse::EdgeInfo(info)) => (
             StatusCode::OK,
             Json(ApiResponse::ok(EdgeInfoJson {
@@ -483,14 +532,16 @@ async fn get_edge(
 
 async fn delete_edge(
     State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
     Path((graph, id)): Path<(String, u64)>,
 ) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
     let cmd = Command::EdgeDelete(EdgeDeleteCmd {
         graph,
         edge_id: id,
     });
 
-    match engine.execute_command(cmd, None) {
+    match engine.execute_command(cmd, identity.as_ref()) {
         Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
     }
@@ -498,8 +549,10 @@ async fn delete_edge(
 
 async fn snapshot(
     State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    match engine.execute_command(Command::Snapshot, None) {
+    let identity = extract_identity(&engine, &headers);
+    match engine.execute_command(Command::Snapshot, identity.as_ref()) {
         Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
     }
@@ -507,8 +560,10 @@ async fn snapshot(
 
 async fn server_info(
     State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    match engine.execute_command(Command::Info, None) {
+    let identity = extract_identity(&engine, &headers);
+    match engine.execute_command(Command::Info, identity.as_ref()) {
         Ok(CommandResponse::Text(text)) => {
             (StatusCode::OK, Json(ApiResponse::ok(text))).into_response()
         }
@@ -523,9 +578,11 @@ async fn server_info(
 
 async fn update_node(
     State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
     Path((graph, id)): Path<(String, u64)>,
     Json(body): Json<UpdateNodeRequest>,
 ) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
     let properties = if let Some(ref val) = body.properties {
         json_to_props(val)
     } else {
@@ -539,7 +596,7 @@ async fn update_node(
         embedding: body.embedding,
     });
 
-    match engine.execute_command(cmd, None) {
+    match engine.execute_command(cmd, identity.as_ref()) {
         Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
     }
@@ -547,9 +604,11 @@ async fn update_node(
 
 async fn bulk_add_nodes(
     State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
     Path(graph): Path<String>,
     Json(body): Json<BulkAddNodesRequest>,
 ) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
     let nodes: Vec<NodeAddCmd> = body
         .nodes
         .into_iter()
@@ -574,7 +633,7 @@ async fn bulk_add_nodes(
         nodes,
     });
 
-    match engine.execute_command(cmd, None) {
+    match engine.execute_command(cmd, identity.as_ref()) {
         Ok(CommandResponse::IntegerList(ids)) => {
             (StatusCode::CREATED, Json(ApiResponse::ok(BulkNodeIdsResponse { node_ids: ids }))).into_response()
         }
@@ -589,9 +648,11 @@ async fn bulk_add_nodes(
 
 async fn bulk_add_edges(
     State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
     Path(graph): Path<String>,
     Json(body): Json<BulkAddEdgesRequest>,
 ) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
     let edges: Vec<EdgeAddCmd> = body
         .edges
         .into_iter()
@@ -617,7 +678,7 @@ async fn bulk_add_edges(
         edges,
     });
 
-    match engine.execute_command(cmd, None) {
+    match engine.execute_command(cmd, identity.as_ref()) {
         Ok(CommandResponse::IntegerList(ids)) => {
             (StatusCode::CREATED, Json(ApiResponse::ok(BulkEdgeIdsResponse { edge_ids: ids }))).into_response()
         }
@@ -632,8 +693,10 @@ async fn bulk_add_edges(
 
 async fn context_query(
     State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
     Json(body): Json<ContextRequest>,
 ) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
     // Build the seed strategy.
     let seeds = match (&body.embedding, &body.seed_nodes) {
         (Some(emb), Some(nodes)) if !nodes.is_empty() => SeedStrategy::Both {
@@ -707,7 +770,7 @@ async fn context_query(
     };
 
     let cmd = Command::Context(query);
-    match engine.execute_command(cmd, None) {
+    match engine.execute_command(cmd, identity.as_ref()) {
         Ok(CommandResponse::Context(result)) => {
             (StatusCode::OK, Json(ApiResponse::ok(result))).into_response()
         }
@@ -748,9 +811,11 @@ struct IngestResultJson {
 
 async fn ingest(
     State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
     Path(graph): Path<String>,
     Json(body): Json<IngestRequest>,
 ) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
     // Resolve content from either text or base64.
     let content = if let Some(ref text) = body.content {
         text.clone()
@@ -801,7 +866,7 @@ async fn ingest(
         entity_types: body.entity_types,
     });
 
-    match engine.execute_command_async(cmd, None).await {
+    match engine.execute_command_async(cmd, identity.as_ref()).await {
         Ok(CommandResponse::IngestResult(info)) => (
             StatusCode::OK,
             Json(ApiResponse::ok(IngestResultJson {
@@ -1535,5 +1600,147 @@ mod tests {
         let json = body_to_json(resp.into_body()).await;
         assert_eq!(json["success"], true);
         assert!(json["data"]["nodes_included"].as_u64().is_some());
+    }
+
+    // ─── Auth tests ─────────────────────────────────────────────────────────
+
+    fn make_authed_app() -> (Router, Arc<Engine>) {
+        use weav_core::config::{AuthConfig, UserConfig, GraphPatternConfig};
+        let mut config = WeavConfig::default();
+        config.auth = AuthConfig {
+            enabled: true,
+            require_auth: true,
+            acl_file: None,
+            default_password: None,
+            users: vec![
+                UserConfig {
+                    username: "admin".to_string(),
+                    password: Some("secret".to_string()),
+                    categories: vec!["+@all".to_string()],
+                    graph_patterns: vec![GraphPatternConfig {
+                        pattern: "*".to_string(),
+                        permission: "admin".to_string(),
+                    }],
+                    api_keys: vec!["wk_test_key_123".to_string()],
+                    enabled: true,
+                },
+                UserConfig {
+                    username: "reader".to_string(),
+                    password: Some("readonly".to_string()),
+                    categories: vec!["+@read".to_string(), "+@connection".to_string()],
+                    graph_patterns: vec![GraphPatternConfig {
+                        pattern: "*".to_string(),
+                        permission: "read".to_string(),
+                    }],
+                    api_keys: vec![],
+                    enabled: true,
+                },
+            ],
+        };
+        let engine = Arc::new(Engine::new(config));
+        let app = build_router(engine.clone());
+        (app, engine)
+    }
+
+    #[tokio::test]
+    async fn test_http_auth_bearer_token() {
+        let (app, _engine) = make_authed_app();
+
+        // Request with valid Bearer token should succeed.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer wk_test_key_123")
+            .body(Body::from(r#"{"name": "auth_test"}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_http_auth_basic() {
+        let (app, _engine) = make_authed_app();
+
+        // Request with valid Basic auth should succeed.
+        let creds = base64::engine::general_purpose::STANDARD.encode("admin:secret");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Basic {creds}"))
+            .body(Body::from(r#"{"name": "basic_test"}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_http_auth_rejected_no_creds() {
+        let (app, _engine) = make_authed_app();
+
+        // Request with no auth header should be rejected (auth required).
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name": "no_auth"}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_http_auth_rejected_bad_token() {
+        let (app, _engine) = make_authed_app();
+
+        // Request with invalid Bearer token should be rejected.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer wk_wrong_key")
+            .body(Body::from(r#"{"name": "bad_auth"}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_http_auth_permission_denied() {
+        let (app, engine) = make_authed_app();
+
+        // Admin creates a graph first — authenticate to get identity.
+        let admin_id = engine.authenticate("admin", "secret").unwrap();
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "perm_test".to_string(),
+                    config: None,
+                }),
+                Some(&admin_id),
+            )
+            .unwrap();
+
+        // Reader should be able to list graphs (read op).
+        let reader_creds = base64::engine::general_purpose::STANDARD.encode("reader:readonly");
+        let req = Request::builder()
+            .uri("/v1/graphs")
+            .header("authorization", format!("Basic {reader_creds}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Reader should NOT be able to create graphs (admin op).
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Basic {reader_creds}"))
+            .body(Body::from(r#"{"name": "reader_graph"}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }

@@ -2,40 +2,14 @@
 <p align="center">
 
 ```
-                         ╭──────────────────────────────────────────╮
-                         │                                          │
-                         │            ·  ·  · W E A V ·  ·  ·      │
-                         │                                          │
-                         ╰──────────────────────────────────────────╯
+                            ,_,
+                           (O,O)
+                           (   )
+                            " "
 
-                                        ╱╲      ╱╲
-                                       ╱  ╲    ╱  ╲
-                              ╱╲      ╱    ╲  ╱    ╲      ╱╲
-                             ╱  ╲    ╱      ╲╱      ╲    ╱  ╲
-                            ╱    ╲  ╱   ◆────────◆   ╲  ╱    ╲
-                           ╱      ╲╱   ╱ ╲      ╱ ╲   ╲╱      ╲
-                          ╱   ◆───────◆   ╲    ╱   ◆───────◆   ╲
-                         ╱   ╱│╲  ╱  ╱ ╲   ╲  ╱   ╱ ╲  ╱  ╱│╲   ╲
-                        ╱   ╱ │ ╲╱  ╱   ╲   ╲╱   ╱   ╲╱  ╱ │ ╲   ╲
-                            ╱ │  ╲ ╱     ╲   ╱╲  ╱     ╲ ╱  │ ╲
-                           ◆──┼───◆       ◆─╱──╲─◆       ◆──┼──◆
-                            ╲ │  ╱ ╲     ╱ ╱    ╲ ╲     ╱ ╲ │ ╱
-                             ╲│ ╱   ╲   ╱ ╱      ╲ ╲   ╱   ╲│╱
-                              ◆       ◆  ╱ ╲    ╱ ╲  ◆       ◆
-                               ╲     ╱  ◆───────────◆  ╲     ╱
-                                ╲   ╱    ╲   ╱  ╲   ╱    ╲   ╱
-                                 ╲ ╱      ◆──────◆╱       ╲ ╱
-                                  ╲      ╱        ╲        ╲
-                                   ╲    ╱          ╲        ╲
-                                    ╲  ╱            ╲
-                                     ╲╱              ╲
+                   · · · W E A V · · ·
 
-                      ◆ = context node    ─── = semantic edge
-                    ╱╲╱╲ = vector space     ◆───◆ = knowledge link
-
-          ┌──────────────────────────────────────────────────────────────┐
-          │  "Weaving context graphs for minds that think in vectors."  │
-          └──────────────────────────────────────────────────────────────┘
+            Weaving context graphs for AI.
 ```
 
 </p>
@@ -59,8 +33,8 @@
 <p align="center">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue.svg">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.85%2B-orange.svg">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-812%20passing-brightgreen.svg">
-  <img alt="Crates" src="https://img.shields.io/badge/crates-10-purple.svg">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-909%20passing-brightgreen.svg">
+  <img alt="Crates" src="https://img.shields.io/badge/crates-11-purple.svg">
 </p>
 
 ---
@@ -85,6 +59,7 @@ Weav is a **Redis-like, in-memory context graph database** purpose-built for AI 
 | **Entity Dedup** | Exact key, fuzzy name (Jaro-Winkler), and vector similarity deduplication |
 | **Provenance** | Track source, confidence, and extraction method for every piece of knowledge |
 | **Decay Functions** | Linear, exponential, and gaussian relevance decay over time |
+| **MCP Server** | Model Context Protocol integration — connect directly from Claude, Cursor, etc. |
 | **Multi-Protocol** | HTTP REST, RESP3 (Redis protocol), and gRPC — all on one server |
 | **Auth & ACL** | Redis-ACL-inspired auth with command categories, graph-level permissions, API keys |
 | **Persistence** | WAL with CRC32 checksums + periodic snapshots with full recovery |
@@ -256,12 +231,14 @@ const prompt = contextToPrompt(result);
 | Crate | Purpose |
 |---|---|
 | `weav-core` | Foundation types, config, errors, shard infrastructure, message bus |
-| `weav-graph` | Adjacency store, property store, traversal (BFS, flow scoring), entity dedup |
+| `weav-graph` | Adjacency store, property store, traversal (BFS, flow scoring, Dijkstra, PPR), entity dedup |
 | `weav-vector` | HNSW vector index (usearch), token counting (tiktoken-rs) |
+| `weav-extract` | Ingestion pipeline: document parsing (PDF/DOCX/CSV/text), chunking, LLM extraction |
 | `weav-query` | Query parser (30 commands), planner, executor, token budget enforcement |
 | `weav-auth` | Authentication (Argon2id), API keys (SHA-256), ACL store, command classification |
 | `weav-persist` | Write-ahead log, snapshot engine, crash recovery |
 | `weav-proto` | RESP3 codec, gRPC protobuf definitions, command mapping |
+| `weav-mcp` | Model Context Protocol server (8 tools, stdio + HTTP transports) |
 | `weav-server` | Engine coordinator, HTTP/RESP3/gRPC servers (axum, tonic) |
 | `weav-cli` | Interactive REPL client with history (rustyline) |
 | `benchmarks` | Criterion benchmarks at 100K scale |
@@ -776,18 +753,20 @@ cd sdk/python && pip install -e ".[dev]" && pytest
 cd sdk/node && npm test
 ```
 
-**812 Rust tests** across all crates, **886 total** including SDKs — all passing.
+**909 Rust tests** across all crates, **983 total** including SDKs — all passing.
 
 | Crate | Tests |
 |---|---|
-| weav-core | 108 |
-| weav-graph | 138 |
-| weav-vector | 53 |
-| weav-query | 132 |
-| weav-auth | 64 |
-| weav-persist | 44 |
+| weav-core | 109 |
+| weav-graph | 174 |
+| weav-vector | 31 |
+| weav-extract | 43 |
+| weav-query | 155 |
+| weav-auth | 47 |
+| weav-persist | 43 |
 | weav-proto | 61 |
-| weav-server | 173 (77 unit + 28 integration + 68 E2E) |
+| weav-mcp | 8 |
+| weav-server | 199 (103 unit + 28 integration + 68 E2E) |
 | weav-cli | 39 |
 | Python SDK | 49 |
 | Node SDK | 25 |
@@ -801,10 +780,12 @@ weav/
 ├── weav-core/          Core types, config, errors, shard, message bus
 ├── weav-graph/         Adjacency store, property store, traversal, dedup
 ├── weav-vector/        HNSW vector index, token counter
+├── weav-extract/       Ingestion: document parsing, chunking, LLM extraction
 ├── weav-query/         Parser (30 commands), planner, executor, budget enforcer
 ├── weav-auth/          Authentication (Argon2id), API keys, ACL store
 ├── weav-persist/       WAL, snapshots, recovery manager
 ├── weav-proto/         RESP3 codec, gRPC proto, command mapping
+├── weav-mcp/           MCP server (Model Context Protocol for LLM tools)
 ├── weav-server/        Engine, HTTP/RESP3/gRPC servers, binary
 ├── weav-cli/           Interactive REPL client
 ├── benchmarks/         Criterion benchmarks (100K scale)

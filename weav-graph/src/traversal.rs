@@ -316,6 +316,12 @@ pub fn flow_score(
         if work_count > max_work {
             break;
         }
+        // Skip stale queue entries — a better score was found since this was enqueued
+        if let Some(&(current_score, _)) = scores.get(&node) {
+            if score < current_score {
+                continue;
+            }
+        }
         if depth >= max_depth {
             continue;
         }
@@ -323,7 +329,7 @@ pub fn flow_score(
         let neighbors = adjacency.neighbors_out(node, None);
         for (neighbor, _edge_id) in neighbors {
             let propagated = score * alpha;
-            if propagated < theta {
+            if !propagated.is_finite() || propagated < theta {
                 continue;
             }
 
@@ -2374,5 +2380,103 @@ mod tests {
             assert!(s.score >= 0.0);
             assert!(!s.score.is_nan());
         }
+    }
+
+    // ── Flow score cycle / convergence tests ────────────────────────────────
+
+    #[test]
+    fn test_flow_score_cycle() {
+        // Cycle: 1 -> 2 -> 3 -> 1
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_node(3);
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let result = flow_score(&adj, &[(1, 1.0)], 0.85, 0.01, 10);
+        // Must terminate and produce scores for all 3 nodes
+        assert_eq!(result.len(), 3);
+        let score_map: HashMap<NodeId, f32> =
+            result.iter().map(|s| (s.node_id, s.score)).collect();
+        // Seed has highest score
+        assert_eq!(score_map[&1], 1.0);
+        // Scores decrease along the cycle
+        assert!(score_map[&2] < score_map[&1]);
+        assert!(score_map[&3] < score_map[&2]);
+    }
+
+    #[test]
+    fn test_flow_score_convergent_paths() {
+        // Diamond: 1 -> 2, 1 -> 3, 2 -> 4, 3 -> 4
+        // Node 4 is reachable via two paths
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_node(3);
+        adj.add_node(4);
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(2, 4, 0, make_meta(2, 4, 0)).unwrap();
+        adj.add_edge(3, 4, 0, make_meta(3, 4, 0)).unwrap();
+
+        let result = flow_score(&adj, &[(1, 1.0)], 0.8, 0.01, 5);
+        let score_map: HashMap<NodeId, f32> =
+            result.iter().map(|s| (s.node_id, s.score)).collect();
+        // Node 4: best path gives 1.0 * 0.8 * 0.8 = 0.64
+        assert!((score_map[&4] - 0.64).abs() < 0.001);
+        // Node 2 and 3 should have equal scores (symmetric)
+        assert!((score_map[&2] - score_map[&3]).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_flow_score_nan_seed() {
+        let adj = build_linear_graph();
+        let result = flow_score(&adj, &[(1, f32::NAN)], 0.5, 0.01, 3);
+        // NaN propagation: NaN * alpha = NaN, NaN < theta is false,
+        // but NaN > existing is also false, so it shouldn't propagate
+        // Seed itself is inserted with NaN score
+        assert!(result.len() >= 1);
+        // No non-seed node should have a score (NaN doesn't propagate)
+        let non_seed: Vec<&ScoredNode> = result.iter().filter(|s| s.node_id != 1).collect();
+        for s in &non_seed {
+            // NaN comparisons: NaN > existing returns false, so no propagation
+            assert!(!s.score.is_nan(), "NaN should not propagate to node {}", s.node_id);
+        }
+    }
+
+    #[test]
+    fn test_flow_score_multiple_seeds_different_scores() {
+        // Seeds at both ends of a chain: 1(1.0) -> 2 -> 3 <- 5(0.5) <- 4
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=5 { adj.add_node(i); }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(4, 5, 0, make_meta(4, 5, 0)).unwrap();
+        adj.add_edge(5, 3, 0, make_meta(5, 3, 0)).unwrap();
+
+        let result = flow_score(&adj, &[(1, 1.0), (4, 0.5)], 0.8, 0.01, 5);
+        let score_map: HashMap<NodeId, f32> =
+            result.iter().map(|s| (s.node_id, s.score)).collect();
+        // Node 3 reachable from both seeds:
+        //   via 1 -> 2 -> 3: 1.0 * 0.8 * 0.8 = 0.64
+        //   via 4 -> 5 -> 3: 0.5 * 0.8 * 0.8 = 0.32
+        // Best score should win: 0.64
+        assert!((score_map[&3] - 0.64).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_flow_score_self_loop() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_edge(1, 1, 0, make_meta(1, 1, 0)).unwrap();
+
+        let result = flow_score(&adj, &[(1, 1.0)], 0.9, 0.01, 5);
+        // Self-loop: propagated = 1.0 * 0.9 = 0.9 < 1.0, no update
+        // Should terminate with only the seed
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].node_id, 1);
+        assert_eq!(result[0].score, 1.0);
     }
 }
