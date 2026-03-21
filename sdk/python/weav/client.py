@@ -397,6 +397,79 @@ class WeavClient:
             pipeline_duration_ms=data["pipeline_duration_ms"],
         )
 
+    # -- Search ------------------------------------------------------------
+
+    def search_text(self, graph: str, query: str, limit: int = 20) -> dict:
+        """Full-text BM25 search across node content."""
+        resp = self._client.get(
+            f"/v1/graphs/{graph}/search/text",
+            params={"q": query, "limit": limit},
+        )
+        return _check_response(resp)
+
+    # -- Node merge --------------------------------------------------------
+
+    def merge_nodes(
+        self,
+        graph: str,
+        source_id: int,
+        target_id: int,
+        conflict_policy: str = "keep_target",
+    ) -> dict:
+        """Merge two nodes, re-linking edges from source to target."""
+        resp = self._client.post(
+            f"/v1/graphs/{graph}/nodes/merge",
+            json={
+                "source_id": source_id,
+                "target_id": target_id,
+                "conflict_policy": conflict_policy,
+            },
+        )
+        return _check_response(resp)
+
+    # -- Algorithms --------------------------------------------------------
+
+    def run_algorithm(self, graph: str, algorithm: str, **kwargs: Any) -> dict:
+        """Run a graph algorithm.
+
+        Supported: pagerank, communities, shortest_path, betweenness,
+        closeness, degree, triangle_count, scc, topological_sort,
+        label_propagation, leiden, eigenvector, hits.
+        """
+        resp = self._client.post(
+            f"/v1/graphs/{graph}/algorithms/{algorithm}",
+            json=kwargs,
+        )
+        return _check_response(resp)
+
+    # -- CSV import/export -------------------------------------------------
+
+    def import_csv(self, graph: str, csv_content: str) -> dict:
+        """Import nodes from CSV. First row is headers (use _label for node label)."""
+        resp = self._client.post(
+            f"/v1/graphs/{graph}/import/csv",
+            content=csv_content,
+            headers={"Content-Type": "text/csv"},
+        )
+        return _check_response(resp)
+
+    def export_csv(self, graph: str) -> str:
+        """Export all nodes as CSV."""
+        resp = self._client.get(f"/v1/graphs/{graph}/export/csv")
+        resp.raise_for_status()
+        return resp.text
+
+    # -- CDC events --------------------------------------------------------
+
+    def subscribe_events(self):
+        """Subscribe to CDC events via SSE. Returns an iterator of GraphEvent dicts."""
+        import json
+
+        with httpx.stream("GET", f"{self.base_url}/v1/events") as response:
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    yield json.loads(line[6:])
+
     # -- Health ------------------------------------------------------------
 
     def health(self) -> bool:
@@ -679,6 +752,80 @@ class AsyncWeavClient:
             relationships_created=data["relationships_created"],
             pipeline_duration_ms=data["pipeline_duration_ms"],
         )
+
+    # -- Search ------------------------------------------------------------
+
+    async def search_text(self, graph: str, query: str, limit: int = 20) -> dict:
+        """Full-text BM25 search across node content."""
+        resp = await self._client.get(
+            f"/v1/graphs/{graph}/search/text",
+            params={"q": query, "limit": limit},
+        )
+        return _check_response(resp)
+
+    # -- Node merge --------------------------------------------------------
+
+    async def merge_nodes(
+        self,
+        graph: str,
+        source_id: int,
+        target_id: int,
+        conflict_policy: str = "keep_target",
+    ) -> dict:
+        """Merge two nodes, re-linking edges from source to target."""
+        resp = await self._client.post(
+            f"/v1/graphs/{graph}/nodes/merge",
+            json={
+                "source_id": source_id,
+                "target_id": target_id,
+                "conflict_policy": conflict_policy,
+            },
+        )
+        return _check_response(resp)
+
+    # -- Algorithms --------------------------------------------------------
+
+    async def run_algorithm(self, graph: str, algorithm: str, **kwargs: Any) -> dict:
+        """Run a graph algorithm.
+
+        Supported: pagerank, communities, shortest_path, betweenness,
+        closeness, degree, triangle_count, scc, topological_sort,
+        label_propagation, leiden, eigenvector, hits.
+        """
+        resp = await self._client.post(
+            f"/v1/graphs/{graph}/algorithms/{algorithm}",
+            json=kwargs,
+        )
+        return _check_response(resp)
+
+    # -- CSV import/export -------------------------------------------------
+
+    async def import_csv(self, graph: str, csv_content: str) -> dict:
+        """Import nodes from CSV. First row is headers (use _label for node label)."""
+        resp = await self._client.post(
+            f"/v1/graphs/{graph}/import/csv",
+            content=csv_content,
+            headers={"Content-Type": "text/csv"},
+        )
+        return _check_response(resp)
+
+    async def export_csv(self, graph: str) -> str:
+        """Export all nodes as CSV."""
+        resp = await self._client.get(f"/v1/graphs/{graph}/export/csv")
+        resp.raise_for_status()
+        return resp.text
+
+    # -- CDC events --------------------------------------------------------
+
+    async def subscribe_events(self):
+        """Subscribe to CDC events via SSE. Yields GraphEvent dicts."""
+        import json
+
+        async with httpx.AsyncClient() as client:
+            async with client.stream("GET", f"{self.base_url}/v1/events") as response:
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        yield json.loads(line[6:])
 
     # -- Health ------------------------------------------------------------
 

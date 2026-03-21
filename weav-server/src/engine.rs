@@ -522,6 +522,17 @@ impl Engine {
                             }
                         }
                     }
+                    // Re-index text content for full-text search during restore
+                    let all_props = state.properties.get_all_node_properties(ns.node_id);
+                    let text_content: String = all_props.iter()
+                        .filter(|(k, _)| !k.starts_with('_'))
+                        .filter_map(|(_, v)| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if !text_content.is_empty() {
+                        state.text_index.index_node(ns.node_id, &text_content);
+                    }
+
                     if let Some(ref emb) = ns.embedding {
                         let _ = state.vector_index.insert(ns.node_id, emb);
                     }
@@ -2116,6 +2127,23 @@ impl Engine {
             .with_label_values(&[&cmd.graph])
             .set(gs.adjacency.edge_count() as i64);
 
+        // Emit CDC events: source was deleted, target was updated with merged properties
+        let target_props: Vec<(CompactString, Value)> = gs
+            .properties
+            .get_all_node_properties(cmd.target_id)
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with('_'))
+            .map(|(k, v)| (CompactString::from(k), v.clone()))
+            .collect();
+
+        self.emit_event(&cmd.graph, EventKind::NodeDeleted {
+            node_id: cmd.source_id,
+        });
+        self.emit_event(&cmd.graph, EventKind::NodeUpdated {
+            node_id: cmd.target_id,
+            properties: target_props,
+        });
+
         Ok(CommandResponse::Integer(cmd.target_id))
     }
 
@@ -2230,6 +2258,14 @@ impl Engine {
                 gs.vector_index.insert(node_id, embedding)?;
             }
 
+            self.emit_event(&cmd.graph, EventKind::NodeCreated {
+                node_id,
+                label: CompactString::from(&node_cmd.label),
+                properties: node_cmd.properties.iter()
+                    .map(|(k, v)| (CompactString::from(k.as_str()), v.clone()))
+                    .collect(),
+            });
+
             ids.push(node_id);
         }
 
@@ -2285,6 +2321,14 @@ impl Engine {
             for (k, v) in &edge_cmd.properties {
                 gs.properties.set_edge_property(edge_id, k, v.clone());
             }
+
+            self.emit_event(&cmd.graph, EventKind::EdgeCreated {
+                edge_id,
+                source: edge_cmd.source,
+                target: edge_cmd.target,
+                label: CompactString::from(&edge_cmd.label),
+                weight: edge_cmd.weight,
+            });
 
             ids.push(edge_id);
         }

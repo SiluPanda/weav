@@ -100,6 +100,13 @@ pub struct SearchParams {
 }
 
 #[derive(Deserialize)]
+pub struct TextSearchParams {
+    #[serde(alias = "q")]
+    pub query: String,
+    pub limit: Option<u32>,
+}
+
+#[derive(Deserialize)]
 pub struct TemporalQueryRequest {
     pub timestamp: u64,
     pub node_ids: Option<Vec<u64>>,
@@ -254,12 +261,14 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/graphs/{graph}/schema", get(get_graph_schema))
         // Node search by property.
         .route("/v1/graphs/{graph}/search", get(search_nodes))
+        // Full-text search with BM25 scoring.
+        .route("/v1/graphs/{graph}/search/text", get(search_text))
         // Graph export/import.
         .route("/v1/graphs/{graph}/export", get(export_graph))
         .route("/v1/graphs/{graph}/import", post(import_graph))
-        // CSV import/export (handlers not yet implemented).
-        // .route("/v1/graphs/{graph}/import/csv", post(import_csv))
-        // .route("/v1/graphs/{graph}/export/csv", get(export_csv))
+        // CSV import/export.
+        .route("/v1/graphs/{graph}/import/csv", post(import_csv))
+        .route("/v1/graphs/{graph}/export/csv", get(export_csv))
         // Graph algorithms.
         .route(
             "/v1/graphs/{graph}/algorithms/{algorithm}",
@@ -482,6 +491,55 @@ async fn search_nodes(
     ).into_response()
 }
 
+/// Full-text search using BM25 scoring.
+/// GET /v1/graphs/{graph}/search/text?query=...&limit=20
+async fn search_text(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+    Query(params): Query<TextSearchParams>,
+) -> impl IntoResponse {
+    let _identity = extract_identity(&engine, &headers);
+    let graph_arc = match engine.get_graph(&graph) {
+        Ok(g) => g,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
+    let gs = graph_arc.read();
+
+    let limit = params.limit.unwrap_or(20) as usize;
+    let results = gs.text_index.search(&params.query, limit);
+
+    let matches: Vec<serde_json::Value> = results.iter().map(|&(nid, score)| {
+        let label = gs.properties
+            .get_node_property(nid, "_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let props = gs.properties.get_all_node_properties(nid);
+        let mut props_map = serde_json::Map::new();
+        for (k, v) in props {
+            if !k.starts_with('_') {
+                props_map.insert(k.to_string(), value_to_json(v));
+            }
+        }
+        serde_json::json!({
+            "node_id": nid,
+            "label": label,
+            "score": score,
+            "properties": props_map,
+        })
+    }).collect();
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::ok(serde_json::json!({
+            "matches": matches,
+            "total": results.len(),
+            "limit": limit,
+        }))),
+    ).into_response()
+}
+
 /// Export an entire graph as JSON.
 /// GET /v1/graphs/{graph}/export
 async fn export_graph(
@@ -672,6 +730,203 @@ async fn import_graph(
     }
 
     (StatusCode::OK, Json(ApiResponse::ok(response))).into_response()
+}
+
+/// Import nodes from a CSV body.
+/// POST /v1/graphs/{graph}/import/csv
+///
+/// The CSV must have a header row. Required column: `_label` (node label).
+/// Optional column: `_id` (ignored). All other columns become node properties.
+async fn import_csv(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+    body: String,
+) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
+
+    // Ensure graph exists (create if not)
+    let create_cmd = Command::GraphCreate(GraphCreateCmd {
+        name: graph.clone(),
+        config: None,
+    });
+    let _ = engine.execute_command(create_cmd, identity.as_ref());
+
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .from_reader(body.as_bytes());
+
+    let csv_headers = match reader.headers() {
+        Ok(h) => h.clone(),
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<()>::err(format!("invalid CSV headers: {e}"))),
+            )
+                .into_response();
+        }
+    };
+
+    // Find the _label column index
+    let label_idx = match csv_headers.iter().position(|h| h == "_label") {
+        Some(idx) => idx,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<()>::err(
+                    "CSV must contain a '_label' column".to_string(),
+                )),
+            )
+                .into_response();
+        }
+    };
+
+    let mut nodes_created: u64 = 0;
+    let mut errors: Vec<String> = Vec::new();
+
+    for (row_idx, result) in reader.records().enumerate() {
+        let record = match result {
+            Ok(r) => r,
+            Err(e) => {
+                errors.push(format!("row {}: {e}", row_idx + 2));
+                continue;
+            }
+        };
+
+        let label = record.get(label_idx).unwrap_or("unknown").to_string();
+
+        let mut properties: Vec<(String, Value)> = Vec::new();
+        for (col_idx, header) in csv_headers.iter().enumerate() {
+            if header == "_label" || header == "_id" {
+                continue;
+            }
+            if let Some(val) = record.get(col_idx) {
+                if !val.is_empty() {
+                    // Try to parse as number, then bool, else string
+                    let value = if let Ok(i) = val.parse::<i64>() {
+                        Value::Int(i)
+                    } else if let Ok(f) = val.parse::<f64>() {
+                        Value::Float(f)
+                    } else if val.eq_ignore_ascii_case("true") {
+                        Value::Bool(true)
+                    } else if val.eq_ignore_ascii_case("false") {
+                        Value::Bool(false)
+                    } else {
+                        Value::String(compact_str::CompactString::from(val))
+                    };
+                    properties.push((header.to_string(), value));
+                }
+            }
+        }
+
+        let cmd = Command::NodeAdd(NodeAddCmd {
+            graph: graph.clone(),
+            label,
+            properties,
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+
+        match engine.execute_command(cmd, identity.as_ref()) {
+            Ok(CommandResponse::Integer(_)) => nodes_created += 1,
+            Err(e) => errors.push(format!("row {}: {e}", row_idx + 2)),
+            _ => {}
+        }
+    }
+
+    let mut response = serde_json::json!({ "nodes_created": nodes_created });
+    if !errors.is_empty() {
+        response["errors"] = serde_json::json!(errors);
+    }
+
+    (StatusCode::OK, Json(ApiResponse::ok(response))).into_response()
+}
+
+/// Export all nodes as CSV.
+/// GET /v1/graphs/{graph}/export/csv
+async fn export_csv(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+) -> impl IntoResponse {
+    let _identity = extract_identity(&engine, &headers);
+    let graph_arc = match engine.get_graph(&graph) {
+        Ok(g) => g,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
+    let gs = graph_arc.read();
+
+    let node_ids = gs.adjacency.all_node_ids();
+    if node_ids.is_empty() {
+        return (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/csv")],
+            String::new(),
+        )
+            .into_response();
+    }
+
+    // Collect all unique property keys across all nodes (excluding internal keys).
+    let mut all_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for &nid in &node_ids {
+        for (k, _) in gs.properties.get_all_node_properties(nid) {
+            if !k.starts_with('_') && k != "entity_key" {
+                all_keys.insert(k.to_string());
+            }
+        }
+    }
+
+    let mut wtr = csv::Writer::from_writer(Vec::new());
+
+    // Write header: _label, then sorted property keys
+    let mut header_row: Vec<String> = vec!["_label".to_string()];
+    header_row.extend(all_keys.iter().cloned());
+    wtr.write_record(&header_row).unwrap();
+
+    // Write data rows
+    for &nid in &node_ids {
+        let label = gs
+            .properties
+            .get_node_property(nid, "_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let mut row: Vec<String> = vec![label];
+        for key in &all_keys {
+            let val = gs
+                .properties
+                .get_node_property(nid, key)
+                .map(value_to_csv_string)
+                .unwrap_or_default();
+            row.push(val);
+        }
+        wtr.write_record(&row).unwrap();
+    }
+
+    let csv_bytes = wtr.into_inner().unwrap();
+    let csv_string = String::from_utf8(csv_bytes).unwrap_or_default();
+
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/csv")],
+        csv_string,
+    )
+        .into_response()
+}
+
+/// Convert a Value to a CSV-friendly string.
+fn value_to_csv_string(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::String(s) => s.to_string(),
+        Value::Timestamp(ts) => ts.to_string(),
+        other => serde_json::to_string(&value_to_json(other)).unwrap_or_default(),
+    }
 }
 
 /// Temporal query: return graph state at a specific point in time.
@@ -1645,6 +1900,30 @@ struct ComponentsResponse {
     count: usize,
 }
 
+#[derive(Serialize)]
+struct TriangleCountResponse {
+    total_triangles: u64,
+    per_node: Vec<TriangleNodeInfo>,
+}
+
+#[derive(Serialize)]
+struct TriangleNodeInfo {
+    node_id: u64,
+    triangles: u32,
+    clustering_coefficient: f64,
+}
+
+#[derive(Serialize)]
+struct TopologicalSortResponse {
+    order: Vec<u64>,
+}
+
+#[derive(Serialize)]
+struct HitsResponse {
+    authorities: Vec<AlgoNodeScore>,
+    hubs: Vec<AlgoNodeScore>,
+}
+
 // ─── Algorithm handler ──────────────────────────────────────────────────────
 
 async fn run_algorithm(
@@ -1821,10 +2100,114 @@ async fn run_algorithm(
                 .into_response()
         }
 
+        "closeness" => {
+            let filter = weav_graph::traversal::EdgeFilter::none();
+            let mut result = weav_graph::traversal::closeness_centrality(&gs.adjacency, &filter);
+            result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let scores: Vec<AlgoNodeScore> = result
+                .into_iter()
+                .map(|(node_id, score)| AlgoNodeScore { node_id, score })
+                .collect();
+            (StatusCode::OK, Json(ApiResponse::ok(BetweennessResponse { scores }))).into_response()
+        }
+
+        "label_propagation" => {
+            let iterations = body.get("iterations").and_then(|v| v.as_u64()).unwrap_or(100) as u32;
+            let label_map = weav_graph::traversal::label_propagation(&gs.adjacency, iterations);
+            let mut groups: std::collections::HashMap<u64, Vec<u64>> = std::collections::HashMap::new();
+            for (&node_id, &label) in &label_map {
+                groups.entry(label).or_default().push(node_id);
+            }
+            let mut communities: Vec<Vec<u64>> = groups.into_values().collect();
+            for c in &mut communities { c.sort(); }
+            communities.sort_by_key(|c| std::cmp::Reverse(c.len()));
+            let modularity = compute_modularity(&gs.adjacency, &label_map);
+            (StatusCode::OK, Json(ApiResponse::ok(CommunitiesResponse { communities, modularity }))).into_response()
+        }
+
+        "leiden" => {
+            let resolution = body.get("resolution").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            let gamma = body.get("gamma").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;
+            let community_map = weav_graph::traversal::leiden_communities(&gs.adjacency, 100, resolution, gamma);
+            let mut groups: std::collections::HashMap<u64, Vec<u64>> = std::collections::HashMap::new();
+            for (&node_id, &comm_id) in &community_map {
+                groups.entry(comm_id).or_default().push(node_id);
+            }
+            let mut communities: Vec<Vec<u64>> = groups.into_values().collect();
+            for c in &mut communities { c.sort(); }
+            communities.sort_by_key(|c| std::cmp::Reverse(c.len()));
+            let modularity = compute_modularity(&gs.adjacency, &community_map);
+            (StatusCode::OK, Json(ApiResponse::ok(CommunitiesResponse { communities, modularity }))).into_response()
+        }
+
+        "triangle_count" => {
+            let filter = weav_graph::traversal::EdgeFilter::none();
+            let result = weav_graph::traversal::triangle_count(&gs.adjacency, &filter);
+            let per_node: Vec<TriangleNodeInfo> = result.per_node.iter()
+                .map(|&(node_id, triangles, clustering_coefficient)| TriangleNodeInfo { node_id, triangles, clustering_coefficient })
+                .collect();
+            (StatusCode::OK, Json(ApiResponse::ok(TriangleCountResponse { total_triangles: result.total_triangles, per_node }))).into_response()
+        }
+
+        "scc" => {
+            let sccs = weav_graph::traversal::tarjan_scc(&gs.adjacency);
+            let mut components: Vec<Vec<u64>> = sccs;
+            for c in &mut components { c.sort(); }
+            components.sort_by_key(|c| std::cmp::Reverse(c.len()));
+            let count = components.len();
+            (StatusCode::OK, Json(ApiResponse::ok(ComponentsResponse { components, count }))).into_response()
+        }
+
+        "topological_sort" => {
+            match weav_graph::traversal::topological_sort(&gs.adjacency) {
+                Ok(order) => (StatusCode::OK, Json(ApiResponse::ok(TopologicalSortResponse { order }))).into_response(),
+                Err(e) => weav_error_to_response(e).into_response(),
+            }
+        }
+
+        "degree" => {
+            let all_nodes = gs.adjacency.all_node_ids();
+            let n = all_nodes.len();
+            let divisor = if n > 1 { (n - 1) as f64 } else { 1.0 };
+            let mut scores: Vec<AlgoNodeScore> = all_nodes.iter()
+                .map(|&nid| {
+                    let deg = gs.adjacency.neighbors_both(nid, None).len();
+                    AlgoNodeScore { node_id: nid, score: deg as f64 / divisor }
+                })
+                .collect();
+            scores.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            (StatusCode::OK, Json(ApiResponse::ok(PageRankResponse { scores }))).into_response()
+        }
+
+        "eigenvector" => {
+            let max_iter = body.get("iterations").and_then(|v| v.as_u64()).unwrap_or(100) as u32;
+            let tolerance = body.get("tolerance").and_then(|v| v.as_f64()).unwrap_or(1e-6);
+            let result = weav_graph::traversal::eigenvector_centrality(&gs.adjacency, max_iter, tolerance);
+            let scores: Vec<AlgoNodeScore> = result.into_iter()
+                .map(|(node_id, score)| AlgoNodeScore { node_id, score })
+                .collect();
+            (StatusCode::OK, Json(ApiResponse::ok(PageRankResponse { scores }))).into_response()
+        }
+
+        "hits" => {
+            let max_iter = body.get("iterations").and_then(|v| v.as_u64()).unwrap_or(100) as u32;
+            let tolerance = body.get("tolerance").and_then(|v| v.as_f64()).unwrap_or(1e-6);
+            let (auth_scores, hub_scores) = weav_graph::traversal::hits(&gs.adjacency, max_iter, tolerance);
+            let authorities: Vec<AlgoNodeScore> = auth_scores.into_iter()
+                .map(|(node_id, score)| AlgoNodeScore { node_id, score })
+                .collect();
+            let hubs: Vec<AlgoNodeScore> = hub_scores.into_iter()
+                .map(|(node_id, score)| AlgoNodeScore { node_id, score })
+                .collect();
+            (StatusCode::OK, Json(ApiResponse::ok(HitsResponse { authorities, hubs }))).into_response()
+        }
+
         _ => (
             StatusCode::BAD_REQUEST,
             Json(ApiResponse::<()>::err(format!(
-                "unknown algorithm: {algorithm}. Supported: pagerank, betweenness, communities, shortest_path, components"
+                "unknown algorithm: {algorithm}. Supported: pagerank, betweenness, closeness, \
+                 communities, label_propagation, leiden, shortest_path, components, scc, \
+                 topological_sort, triangle_count, degree, eigenvector, hits"
             ))),
         )
             .into_response(),
@@ -3500,5 +3883,168 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── CSV import/export tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_csv_import_creates_nodes() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "csv_test".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let csv_body = "_label,name,age\nPerson,Alice,30\nPerson,Bob,25\nCompany,Acme,50\n";
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/csv_test/import/csv")
+            .body(Body::from(csv_body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["nodes_created"], 3);
+
+        let graph_arc = engine.get_graph("csv_test").unwrap();
+        let gs = graph_arc.read();
+        assert_eq!(gs.adjacency.node_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_csv_import_missing_label_returns_error() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "csv_nolabel".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let csv_body = "name,age\nAlice,30\nBob,25\n";
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/csv_nolabel/import/csv")
+            .body(Body::from(csv_body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], false);
+        assert!(json["error"].as_str().unwrap().contains("_label"));
+    }
+
+    #[tokio::test]
+    async fn test_csv_export_roundtrip() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "csv_rt".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "csv_rt".to_string(),
+                    label: "Person".to_string(),
+                    properties: vec![
+                        (
+                            "name".to_string(),
+                            Value::String(compact_str::CompactString::from("Alice")),
+                        ),
+                        ("age".to_string(), Value::Int(30)),
+                    ],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "csv_rt".to_string(),
+                    label: "Company".to_string(),
+                    properties: vec![(
+                        "name".to_string(),
+                        Value::String(compact_str::CompactString::from("Acme")),
+                    )],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let req = Request::builder()
+            .uri("/v1/graphs/csv_rt/export/csv")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let csv_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let csv_string = String::from_utf8(csv_bytes.to_vec()).unwrap();
+
+        assert!(csv_string.contains("_label"));
+        assert!(csv_string.contains("name"));
+        assert!(csv_string.contains("Person"));
+        assert!(csv_string.contains("Company"));
+        assert!(csv_string.contains("Alice"));
+        assert!(csv_string.contains("Acme"));
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "csv_rt2".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/csv_rt2/import/csv")
+            .body(Body::from(csv_string))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["data"]["nodes_created"], 2);
+
+        let graph_arc = engine.get_graph("csv_rt2").unwrap();
+        let gs = graph_arc.read();
+        assert_eq!(gs.adjacency.node_count(), 2);
     }
 }

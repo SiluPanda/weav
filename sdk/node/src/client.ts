@@ -255,6 +255,89 @@ export class WeavClient {
     return this.parseContextResult(raw);
   }
 
+  // ── Search ───────────────────────────────────────────────────────────
+
+  async searchText(
+    graph: string,
+    query: string,
+    limit: number = 20,
+  ): Promise<Record<string, unknown>> {
+    const params = new URLSearchParams({ q: query, limit: String(limit) });
+    return this.request<Record<string, unknown>>(
+      'GET',
+      `/v1/graphs/${encodeURIComponent(graph)}/search/text?${params}`,
+    );
+  }
+
+  // ── Node merge ──────────────────────────────────────────────────────
+
+  async mergeNodes(
+    graph: string,
+    sourceId: number,
+    targetId: number,
+    conflictPolicy: string = 'keep_target',
+  ): Promise<Record<string, unknown>> {
+    return this.request<Record<string, unknown>>(
+      'POST',
+      `/v1/graphs/${encodeURIComponent(graph)}/nodes/merge`,
+      {
+        source_id: sourceId,
+        target_id: targetId,
+        conflict_policy: conflictPolicy,
+      },
+    );
+  }
+
+  // ── Algorithms ──────────────────────────────────────────────────────
+
+  async runAlgorithm(
+    graph: string,
+    algorithm: string,
+    params?: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    return this.request<Record<string, unknown>>(
+      'POST',
+      `/v1/graphs/${encodeURIComponent(graph)}/algorithms/${encodeURIComponent(algorithm)}`,
+      params ?? {},
+    );
+  }
+
+  // ── CSV import/export ───────────────────────────────────────────────
+
+  async importCsv(
+    graph: string,
+    csvContent: string,
+  ): Promise<Record<string, unknown>> {
+    const url = `${this.baseUrl}/v1/graphs/${encodeURIComponent(graph)}/import/csv`;
+    const headers: Record<string, string> = { 'Content-Type': 'text/csv' };
+    if (this.authHeader) {
+      headers['Authorization'] = this.authHeader;
+    }
+    const response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: csvContent,
+    });
+    const json = (await response.json()) as ApiResponse<Record<string, unknown>>;
+    if (!json.success) {
+      throw new WeavError(json.error ?? 'Unknown error', response.status);
+    }
+    return json.data as Record<string, unknown>;
+  }
+
+  async exportCsv(graph: string): Promise<string> {
+    const url = `${this.baseUrl}/v1/graphs/${encodeURIComponent(graph)}/export/csv`;
+    const headers: Record<string, string> = {};
+    if (this.authHeader) {
+      headers['Authorization'] = this.authHeader;
+    }
+    const response = await fetch(url, { method: 'GET', headers });
+    if (!response.ok) {
+      throw new WeavError(`Export failed: ${response.statusText}`, response.status);
+    }
+    return response.text();
+  }
+
   // ── Ingest (extraction pipeline) ─────────────────────────────────────
 
   async ingest(graph: string, params: IngestParams): Promise<IngestResult> {
