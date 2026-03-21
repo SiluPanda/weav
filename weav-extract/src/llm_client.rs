@@ -174,15 +174,13 @@ fn build_extraction_prompt(
 /// Strip markdown code fences from LLM response.
 fn strip_code_fences(text: &str) -> String {
     let trimmed = text.trim();
-    if trimmed.starts_with("```json") {
-        let rest = trimmed.strip_prefix("```json").unwrap_or(trimmed);
+    if let Some(rest) = trimmed.strip_prefix("```json") {
         if let Some(stripped) = rest.strip_suffix("```") {
             return stripped.trim().to_string();
         }
         return rest.trim().to_string();
     }
-    if trimmed.starts_with("```") {
-        let rest = trimmed.strip_prefix("```").unwrap_or(trimmed);
+    if let Some(rest) = trimmed.strip_prefix("```") {
         if let Some(stripped) = rest.strip_suffix("```") {
             return stripped.trim().to_string();
         }
@@ -271,5 +269,51 @@ mod tests {
         let config = ExtractConfig::default();
         let client = LlmClient::new(&config);
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_malformed_json_does_not_panic() {
+        // Various forms of malformed input that an LLM might return
+        let malformed_inputs = vec![
+            "",
+            "not json at all",
+            "{",
+            "{\"entities\": [}",
+            "null",
+            "42",
+            "\"just a string\"",
+            "[\"array\", \"not\", \"object\"]",
+            "{\"entities\": \"not_an_array\"}",
+            "{\"wrong_field\": []}",
+            "```json\nnot actually json\n```",
+            "{\"entities\": [{\"name\": 123}], \"relationships\": []}",
+        ];
+
+        for input in &malformed_inputs {
+            let cleaned = strip_code_fences(input);
+            let result = parse_extraction_response(&cleaned);
+            // Must return Err, never panic
+            assert!(
+                result.is_err(),
+                "expected Err for malformed input: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_strip_code_fences_empty_input() {
+        assert_eq!(strip_code_fences(""), "");
+    }
+
+    #[test]
+    fn test_strip_code_fences_only_backticks() {
+        assert_eq!(strip_code_fences("``````"), "");
+    }
+
+    #[test]
+    fn test_strip_code_fences_nested_backticks() {
+        let input = "```json\n{\"key\": \"value with ``` inside\"}\n```";
+        let result = strip_code_fences(input);
+        assert!(result.contains("key"));
     }
 }

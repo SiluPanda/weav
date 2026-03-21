@@ -54,6 +54,7 @@ pub struct NodeFilter {
 }
 
 impl NodeFilter {
+    /// Create a permissive node filter that matches all nodes.
     pub fn none() -> Self {
         Self {
             labels: None,
@@ -226,11 +227,27 @@ fn node_passes_filter(
     true
 }
 
-/// Breadth-first search from seed nodes.
+/// Breadth-first search from one or more seed nodes.
 ///
-/// Optional closure params for node filtering:
-/// - `node_label_lookup`: Resolves a node to its LabelId (for label filtering).
-/// - `property_check`: Checks if a node has a given property (for has_property filtering).
+/// Explores the graph level-by-level from the given seeds, respecting
+/// edge direction, edge filters, and node filters. Traversal stops when
+/// `max_depth` hops are reached or `max_nodes` have been visited.
+///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `seeds`: starting node(s) for the traversal.
+/// - `max_depth`: maximum number of hops from any seed.
+/// - `max_nodes`: maximum number of nodes to visit before stopping.
+/// - `edge_filter`: criteria to restrict which edges are traversed.
+/// - `node_filter`: criteria to restrict which nodes are visited.
+/// - `direction`: edge direction to follow (`Outgoing`, `Incoming`, or `Both`).
+/// - `node_label_lookup`: optional closure that resolves a node to its `LabelId` (for label filtering).
+/// - `property_check`: optional closure that checks if a node has a given property name.
+///
+/// Returns a `TraversalResult` containing visited nodes, visited edges,
+/// a depth map, and a parent map for path reconstruction.
+///
+/// Complexity: O(V + E) bounded by `max_depth` and `max_nodes`.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn bfs(
     adjacency: &AdjacencyStore,
@@ -309,8 +326,26 @@ pub fn bfs(
     }
 }
 
-/// Propagate scores from seed nodes, decaying by alpha per hop.
-/// Stops when score falls below theta or max_depth is reached.
+/// Network flow-based relevance scoring from seed nodes.
+///
+/// Propagates scores outward from seed nodes via a BFS-like expansion,
+/// decaying each score by the factor `alpha` at every hop. Traversal
+/// stops when a propagated score drops below `theta` or `max_depth` is
+/// reached. This is useful for ranking nodes by proximity and
+/// connectivity strength relative to a set of anchor nodes.
+///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `seeds_with_scores`: starting nodes and their initial relevance scores.
+/// - `alpha`: decay factor applied per hop (0.0–1.0; lower = faster decay).
+/// - `theta`: minimum score threshold; propagation stops below this value.
+/// - `max_depth`: maximum number of hops from any seed.
+///
+/// Returns a list of `ScoredNode` entries for every node reached, sorted
+/// descending by score.
+///
+/// Complexity: O(V + E) in the worst case, bounded by `seeds.len() * 10 000`
+/// work units to prevent runaway expansion on dense graphs.
 pub fn flow_score(
     adjacency: &AdjacencyStore,
     seeds_with_scores: &[(NodeId, f32)],
@@ -380,7 +415,22 @@ pub fn flow_score(
     result
 }
 
-/// Extract the ego network around a center node up to the given radius.
+/// Extract the k-hop ego network (neighborhood subgraph) around a center node.
+///
+/// Performs a BFS from `center` up to `radius` hops in both directions,
+/// collecting every reachable node and traversed edge. The result is a
+/// `SubGraph` suitable for local analysis, visualization, or context
+/// extraction around an entity of interest.
+///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `center`: the focal node whose neighborhood is extracted.
+/// - `radius`: maximum number of hops from `center` (e.g., 1 = direct neighbors only).
+///
+/// Returns a `SubGraph` containing all reachable nodes and edges within the radius.
+///
+/// Complexity: O(V + E) where V and E are the nodes and edges within the
+/// `radius`-hop neighborhood.
 pub fn ego_network(
     adjacency: &AdjacencyStore,
     center: NodeId,
@@ -403,8 +453,22 @@ pub fn ego_network(
     }
 }
 
-/// Find the shortest path between source and target using BFS.
-/// Returns the path as a list of node ids including source and target.
+/// Find the shortest unweighted path between two nodes using BFS.
+///
+/// Explores outgoing edges level-by-level from `source` until `target` is
+/// found or `max_depth` hops are exhausted. Because edges are unweighted,
+/// the first path found is guaranteed to have the fewest hops.
+///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `source`: starting node.
+/// - `target`: destination node.
+/// - `max_depth`: maximum number of hops to search.
+///
+/// Returns `Some(path)` as an ordered list of node IDs from `source` to
+/// `target` (inclusive), or `None` if no path exists within the depth limit.
+///
+/// Complexity: O(V + E) bounded by the `max_depth`-hop frontier.
 pub fn shortest_path(
     adjacency: &AdjacencyStore,
     source: NodeId,
@@ -456,11 +520,26 @@ pub fn shortest_path(
     None
 }
 
-/// Find scored paths between anchor nodes (spec 4.3).
+/// Find and score multiple paths between anchor nodes for context assembly.
 ///
-/// For each pair of anchor nodes, find paths up to `max_path_length` using BFS.
-/// Score each path by averaging the anchor scores of nodes on the path.
-/// Returns up to `max_paths` paths sorted by reliability score descending.
+/// For each pair of anchor nodes, discovers paths up to `max_path_length`
+/// hops via BFS. Each path is scored by averaging the relevance scores of
+/// the anchor nodes it passes through, producing a reliability metric that
+/// indicates how well-supported the connection is. This is used by the
+/// context assembly pipeline (spec 4.3) to select the most informative
+/// subgraph structure for LLM consumption.
+///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `anchors`: anchor nodes paired with their relevance scores.
+/// - `max_paths`: maximum number of paths to return.
+/// - `max_path_length`: maximum hop count for any individual path.
+///
+/// Returns up to `max_paths` `ScoredPath` entries sorted by reliability
+/// score descending.
+///
+/// Complexity: O(A^2 * (V + E)) where A is the number of anchor nodes and
+/// V, E are bounded by the `max_path_length`-hop frontier.
 pub fn scored_paths(
     adjacency: &AdjacencyStore,
     anchors: &[(NodeId, f32)],
@@ -567,10 +646,23 @@ pub struct WeightedPath {
     pub total_weight: f64,
 }
 
-/// Find the shortest weighted path between source and target using Dijkstra's algorithm.
+/// Find the shortest weighted path between two nodes using Dijkstra's algorithm.
 ///
-/// Edge weights are used as costs (lower weight = cheaper path).
-/// Returns the path and its total weight, or None if no path exists within max_depth hops.
+/// Uses a min-heap priority queue to explore edges in order of cumulative
+/// cost. Edge weights are inverted (`1/weight`) so that higher-weight edges
+/// are cheaper to traverse. Stops when the target is reached or `max_depth`
+/// hops are exhausted.
+///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `source`: starting node.
+/// - `target`: destination node.
+/// - `max_depth`: maximum number of hops allowed in the path.
+///
+/// Returns `Some(WeightedPath)` containing the node sequence and total cost,
+/// or `None` if no path exists within the depth limit.
+///
+/// Complexity: O((V + E) log V) using a binary heap, bounded by `max_depth`.
 pub fn dijkstra_shortest_path(
     adjacency: &AdjacencyStore,
     source: NodeId,
@@ -664,7 +756,18 @@ pub fn dijkstra_shortest_path(
 
 /// Find all connected components in the graph (treating edges as undirected).
 ///
-/// Returns a map from NodeId to component ID (0-indexed).
+/// Uses iterative BFS to assign each node a component ID. All nodes
+/// reachable from each other (ignoring edge direction) share the same
+/// component. Useful for detecting disconnected subgraphs.
+///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+///
+/// Returns a map from `NodeId` to component ID (0-indexed, assigned in
+/// discovery order).
+///
+/// Complexity: O(V + E) where V is the number of nodes and E is the
+/// number of edges.
 pub fn connected_components(adjacency: &AdjacencyStore) -> HashMap<NodeId, u32> {
     let all_nodes = adjacency.all_node_ids();
     let mut component_map: HashMap<NodeId, u32> = HashMap::new();
@@ -703,10 +806,24 @@ pub fn connected_components(adjacency: &AdjacencyStore) -> HashMap<NodeId, u32> 
 
 /// Compute Personalized PageRank scores relative to a set of seed nodes.
 ///
-/// - `seeds`: seed nodes and their teleport weights (will be normalized)
-/// - `alpha`: teleport probability (typically 0.15); higher = more biased toward seeds
-/// - `max_iterations`: maximum number of power iterations
-/// - `tolerance`: convergence threshold (L1 norm of score changes)
+/// Runs power iteration on the graph's transition matrix with a teleport
+/// vector biased toward the seed nodes. At each step, every node
+/// distributes its score equally among its outgoing neighbors, and a
+/// fraction `alpha` of the total score teleports back to the seeds.
+/// Converges when the L1 norm of score changes falls below `tolerance`.
+///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `seeds`: seed nodes and their teleport weights (will be normalized to sum to 1.0).
+/// - `alpha`: teleport probability (typically 0.15); higher = more biased toward seeds.
+/// - `max_iterations`: maximum number of power iterations before stopping.
+/// - `tolerance`: convergence threshold (L1 norm of score changes between iterations).
+///
+/// Returns a list of `ScoredNode` entries for all nodes, sorted descending
+/// by PageRank score.
+///
+/// Complexity: O(I * (V + E)) where I is the number of iterations until
+/// convergence.
 pub fn personalized_pagerank(
     adjacency: &AdjacencyStore,
     seeds: &[(NodeId, f32)],
@@ -814,11 +931,23 @@ pub fn personalized_pagerank(
 
 /// Label Propagation community detection.
 ///
-/// Each node starts with its own label. Iteratively, each node adopts the most
-/// frequent label among its neighbors (weighted by edge weight). Converges when
-/// no labels change. Treats edges as undirected.
+/// Each node starts with a unique label. On every iteration, nodes are
+/// visited in a deterministic order and each adopts the most frequent
+/// label among its neighbors (weighted by edge weight, ties broken by
+/// smallest label). The algorithm converges when no labels change.
+/// Edges are treated as undirected.
 ///
-/// Returns a map from NodeId to community label (u64).
+/// This is a fast, near-linear community detection method well-suited
+/// for large graphs where Louvain/Leiden overhead is unnecessary.
+///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `max_iterations`: maximum number of full passes over all nodes.
+///
+/// Returns a map from `NodeId` to community label (`u64`).
+///
+/// Complexity: O(I * (V + E)) where I is the number of iterations until
+/// convergence.
 pub fn label_propagation(
     adjacency: &AdjacencyStore,
     max_iterations: u32,
@@ -896,19 +1025,28 @@ pub fn label_propagation(
     labels
 }
 
-/// Leiden/Louvain community detection using modularity optimization.
+/// Louvain-style community detection using modularity optimization.
 ///
-/// Iteratively moves nodes between communities to maximize modularity Q.
-/// Then aggregates communities into super-nodes and repeats.
-/// Returns a map from NodeId to community label (u64).
-///
-/// Unlike label_propagation, this produces higher-quality communities
-/// by optimizing a global quality function (modularity).
+/// Iteratively moves nodes between communities to maximize the
+/// modularity Q function. After convergence, communities are aggregated
+/// into super-nodes and the process repeats on the coarsened graph.
+/// This produces higher-quality communities than label propagation by
+/// optimizing a global quality function.
 ///
 /// The `resolution` parameter controls community granularity:
 /// - 1.0 = standard modularity
 /// - \> 1.0 = smaller, more numerous communities
 /// - \< 1.0 = larger, fewer communities
+///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `max_iterations`: maximum number of modularity optimization passes.
+/// - `resolution`: modularity resolution parameter (see above).
+///
+/// Returns a map from `NodeId` to community label (`u64`).
+///
+/// Complexity: O(I * (V + E)) per level of the hierarchy, where I is the
+/// number of iterations per level. Typically converges in a few passes.
 pub fn modularity_communities(
     adjacency: &AdjacencyStore,
     max_iterations: u32,
@@ -1066,10 +1204,15 @@ pub fn modularity_communities(
 ///
 /// Betweenness centrality measures how often a node lies on shortest paths
 /// between other node pairs. Edges are treated as undirected and unweighted.
+/// Nodes that act as bridges or bottlenecks receive high scores.
 ///
-/// An optional `edge_filter` restricts which edges are traversed.
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `edge_filter`: criteria to restrict which edges are traversed.
 ///
 /// Returns a list of `(NodeId, centrality)` sorted descending by score.
+///
+/// Complexity: O(V * E) — one BFS per node, accumulating path counts.
 pub fn betweenness_centrality(
     adjacency: &AdjacencyStore,
     edge_filter: &EdgeFilter,
@@ -1152,15 +1295,20 @@ pub fn betweenness_centrality(
 
 /// Compute closeness centrality for every node.
 ///
-/// For each node, closeness = (number of reachable nodes - 1) / (sum of shortest
-/// path distances to all reachable nodes). If a node cannot reach any other node,
-/// its closeness is 0. This uses the Wasserman-Faust normalization so that nodes
-/// in smaller components still receive meaningful scores.
+/// For each node, closeness = (reachable - 1) / (sum of shortest-path
+/// distances to all reachable nodes). Uses the Wasserman-Faust
+/// normalization so that nodes in smaller components still receive
+/// meaningful scores. Nodes that cannot reach any other node score 0.
 ///
-/// Edges are treated as undirected and unweighted. An optional `edge_filter`
-/// restricts which edges are traversed.
+/// Edges are treated as undirected and unweighted.
+///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `edge_filter`: criteria to restrict which edges are traversed.
 ///
 /// Returns a list of `(NodeId, closeness)` sorted descending by score.
+///
+/// Complexity: O(V * (V + E)) — one BFS per node to compute distances.
 pub fn closeness_centrality(
     adjacency: &AdjacencyStore,
     edge_filter: &EdgeFilter,
@@ -1220,10 +1368,18 @@ pub struct TriangleResult {
 /// Count triangles and compute local clustering coefficients.
 ///
 /// Edges are treated as undirected. A triangle is a set of three mutually
-/// connected nodes. The local clustering coefficient for a node with degree k
-/// and t triangles is `2t / (k * (k - 1))`.
+/// connected nodes. The local clustering coefficient for a node with degree
+/// k and t triangles is `2t / (k * (k - 1))`.
 ///
-/// An optional `edge_filter` restricts which edges are considered.
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `edge_filter`: criteria to restrict which edges are considered.
+///
+/// Returns a `TriangleResult` containing the global triangle count and
+/// per-node `(node_id, triangle_count, clustering_coefficient)` tuples.
+///
+/// Complexity: O(V * d^2) where d is the maximum node degree (intersection
+/// of neighbor sets for each edge).
 pub fn triangle_count(
     adjacency: &AdjacencyStore,
     edge_filter: &EdgeFilter,
@@ -1308,12 +1464,19 @@ pub fn triangle_count(
 
 /// Find all strongly connected components using Tarjan's algorithm.
 ///
-/// Unlike `connected_components` which treats edges as undirected, this respects
-/// edge direction. A strongly connected component is a maximal set of nodes
-/// where every node is reachable from every other node following directed edges.
+/// Unlike `connected_components` which treats edges as undirected, this
+/// respects edge direction. A strongly connected component (SCC) is a
+/// maximal set of nodes where every node is reachable from every other
+/// node following directed edges. Uses an iterative (stack-safe)
+/// implementation to avoid stack overflow on deep graphs.
 ///
-/// Returns a list of components, each being a `Vec<NodeId>`. Components are
-/// returned in reverse topological order of the condensation DAG.
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+///
+/// Returns a list of components, each being a `Vec<NodeId>`. Components
+/// are returned in reverse topological order of the condensation DAG.
+///
+/// Complexity: O(V + E).
 pub fn tarjan_scc(adjacency: &AdjacencyStore) -> Vec<Vec<NodeId>> {
     let all_nodes = adjacency.all_node_ids();
     if all_nodes.is_empty() {
@@ -1437,8 +1600,17 @@ pub fn tarjan_scc(adjacency: &AdjacencyStore) -> Vec<Vec<NodeId>> {
 
 /// Compute a topological ordering of the graph using Kahn's algorithm.
 ///
-/// Returns an error if the graph contains a cycle (i.e., is not a DAG).
-/// Nodes with no dependencies appear first in the result.
+/// Processes nodes with zero in-degree first, repeatedly removing them
+/// and decrementing the in-degree of their successors. Nodes with no
+/// dependencies (sources) appear first in the result.
+///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+///
+/// Returns an ordered `Vec<NodeId>` where every node appears before its
+/// dependents, or `WeavError::Conflict` if the graph contains a cycle.
+///
+/// Complexity: O(V + E).
 pub fn topological_sort(adjacency: &AdjacencyStore) -> WeavResult<Vec<NodeId>> {
     let all_nodes = adjacency.all_node_ids();
     if all_nodes.is_empty() {
@@ -1492,14 +1664,22 @@ pub fn topological_sort(adjacency: &AdjacencyStore) -> WeavResult<Vec<NodeId>> {
 /// Improves on modularity-based community detection (Louvain) by adding a
 /// refinement step that ensures communities are well-connected. After the
 /// standard modularity optimization phase, each community is checked for
-/// internal connectivity. Nodes whose ratio of internal edges to total edges
-/// falls below the `gamma` threshold are separated into singleton communities,
-/// and modularity is re-optimized from the refined partition.
+/// internal connectivity. Nodes whose ratio of internal edges to total
+/// edges falls below the `gamma` threshold are separated into singleton
+/// communities, and modularity is re-optimized from the refined partition.
 ///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
 /// - `max_iterations`: maximum number of modularity optimization passes.
 /// - `resolution`: modularity resolution (1.0 = standard, >1.0 = smaller communities).
-/// - `gamma`: refinement threshold (0.0–1.0). Nodes with `internal_edges / total_edges < gamma`
-///   are separated into their own community before re-optimization.
+/// - `gamma`: refinement threshold (0.0--1.0). Nodes with
+///   `internal_edges / total_edges < gamma` are separated into their own
+///   community before re-optimization.
+///
+/// Returns a map from `NodeId` to community label (`u64`).
+///
+/// Complexity: O(I * (V + E)) per refinement round, similar to Louvain
+/// with an additional linear-time refinement pass.
 pub fn leiden_communities(
     adjacency: &AdjacencyStore,
     max_iterations: u32,
@@ -1668,14 +1848,24 @@ pub fn leiden_communities(
 
 /// Generate biased random walks for Node2Vec-style embeddings.
 ///
-/// Produces `num_walks` walks of length `walk_length` starting from each node.
-/// The walk bias is controlled by:
-/// - `p`: return parameter (high p = less likely to return to the previous node)
-/// - `q`: in-out parameter (high q = biased toward local/BFS-like exploration)
-/// - `seed`: deterministic PRNG seed (hash-based: `seed XOR step XOR node`)
+/// Produces `num_walks` walks of length `walk_length` starting from each
+/// node. The walk bias is controlled by two parameters that interpolate
+/// between BFS-like and DFS-like exploration strategies, enabling
+/// downstream embedding algorithms (e.g., Word2Vec) to capture both
+/// structural equivalence and community structure.
 ///
-/// The graph is treated as undirected (both `neighbors_out` and `neighbors_in`
-/// are considered). Returns a flat list of all walks.
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `walk_length`: number of steps per walk.
+/// - `num_walks`: number of walks to generate per node.
+/// - `p`: return parameter (high p = less likely to return to the previous node).
+/// - `q`: in-out parameter (high q = biased toward local/BFS-like exploration).
+/// - `seed`: deterministic PRNG seed (hash-based: `seed XOR step XOR node`).
+///
+/// Returns a flat list of all walks. The graph is treated as undirected.
+///
+/// Complexity: O(num_walks * V * walk_length * d) where d is the average
+/// node degree.
 pub fn node2vec_walks(
     adjacency: &AdjacencyStore,
     walk_length: usize,
@@ -1822,16 +2012,29 @@ impl Ord for AstarState {
     }
 }
 
-/// Find the shortest weighted path between source and target using A* search.
+/// Find the shortest weighted path between two nodes using A* search.
 ///
-/// Like Dijkstra, but uses a heuristic function `h(n)` to guide the search
-/// toward the target: `f(n) = g(n) + h(n)` where `g(n)` is the cost so far.
+/// Like Dijkstra, but uses a heuristic function `h(n)` to guide the
+/// search toward the target: `f(n) = g(n) + h(n)` where `g(n)` is the
+/// cost so far. This can dramatically reduce the number of nodes explored
+/// when a good heuristic is available.
 ///
-/// Edge weights are used as costs via `1/weight` (same convention as Dijkstra).
-/// The heuristic must be admissible (never overestimate) for optimality.
+/// Edge weights are used as costs via `1/weight` (same convention as
+/// Dijkstra). The heuristic must be admissible (never overestimate) to
+/// guarantee optimality.
 ///
-/// Returns `WeavError::NodeNotFound` if source or target is not in the graph.
-/// Returns `WeavError::Conflict("no path found")` if no path exists.
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `source`: starting node.
+/// - `target`: destination node.
+/// - `heuristic`: function estimating remaining cost from a node to `target`.
+/// - `edge_filter`: criteria to restrict which edges are traversed.
+///
+/// Returns a `WeightedPath` on success, `WeavError::NodeNotFound` if
+/// source or target is absent, or `WeavError::Conflict` if no path exists.
+///
+/// Complexity: O((V + E) log V) in the worst case, but typically much
+/// faster than Dijkstra when the heuristic is informative.
 pub fn astar_shortest_path(
     adjacency: &AdjacencyStore,
     source: NodeId,
@@ -1935,14 +2138,26 @@ pub fn astar_shortest_path(
 
 // ─── Yen's K-Shortest Paths ─────────────────────────────────────────────────
 
-/// Find the K shortest loopless paths between source and target using Yen's algorithm.
+/// Find the K shortest loopless paths between two nodes using Yen's algorithm.
 ///
-/// Uses `dijkstra_shortest_path` internally to find individual shortest paths,
-/// then iteratively discovers the next shortest path by deviating from previously
-/// found paths. Edges and nodes are temporarily excluded via exclusion sets.
+/// Uses Dijkstra internally to find individual shortest paths, then
+/// iteratively discovers the next shortest path by deviating from
+/// previously found paths at each spur node. Edges and nodes along
+/// earlier paths are temporarily excluded to force alternative routes.
 ///
-/// Returns up to `k` paths sorted by total weight (ascending).
-/// Returns `WeavError::NodeNotFound` if source or target is not in the graph.
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `source`: starting node.
+/// - `target`: destination node.
+/// - `k`: maximum number of paths to return.
+/// - `edge_filter`: criteria to restrict which edges are traversed.
+///
+/// Returns up to `k` `WeightedPath` entries sorted by total weight
+/// (ascending). Returns `WeavError::NodeNotFound` if source or target is
+/// absent.
+///
+/// Complexity: O(K * V * (V + E) log V) — K iterations of a modified
+/// Dijkstra search.
 pub fn k_shortest_paths(
     adjacency: &AdjacencyStore,
     source: NodeId,

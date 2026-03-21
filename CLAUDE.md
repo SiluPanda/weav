@@ -11,7 +11,7 @@ cargo build --workspace
 cargo build --release              # Optimized (thin LTO, codegen-units=1, opt-level=3)
 
 # Test
-cargo test --workspace             # All 896 Rust tests
+cargo test --workspace             # All 1230+ Rust tests
 cargo test -p weav-core            # Single crate
 cargo test -p weav-server          # Unit tests
 cargo test -p weav-server --test integration  # Integration tests
@@ -32,7 +32,7 @@ weav-graph/       Adjacency store, property store, traversal algorithms, entity 
 weav-vector/      HNSW vector index (usearch), token counting (tiktoken-rs)
 weav-auth/        Authentication (Argon2id passwords, API keys), ACL store, command classification
 weav-extract/     Ingestion pipeline: document parsing (PDF/DOCX/CSV/text), chunking, LLM extraction, embeddings
-weav-query/       Query parser (31 commands), planner, executor, budget enforcer
+weav-query/       Query parser (38 commands), planner, executor, budget enforcer
 weav-persist/     WAL (CRC32 checksums), snapshots, recovery manager
 weav-proto/       RESP3 codec (tokio-util), gRPC proto (tonic/prost), command mapping
 weav-server/      Engine coordinator, HTTP (axum), RESP3 TCP, gRPC (tonic), binary
