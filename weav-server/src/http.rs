@@ -17,7 +17,7 @@ use tower_http::timeout::TimeoutLayer;
 
 use weav_core::types::{DecayFunction, Direction, TokenBudget, Value};
 use weav_query::parser::{
-    Command, ContextQuery, EdgeAddCmd, EdgeDeleteCmd, EdgeFilterConfig,
+    Command, ContextQuery, CypherCmd, EdgeAddCmd, EdgeDeleteCmd, EdgeFilterConfig,
     EdgeInvalidateCmd, GraphCreateCmd, NodeAddCmd, NodeDeleteCmd, NodeGetCmd, NodeUpdateCmd,
     BulkInsertNodesCmd, BulkInsertEdgesCmd, SeedStrategy, SortDirection, SortField, SortOrder,
 };
@@ -66,6 +66,11 @@ pub struct BulkAddNodesRequest {
 #[derive(Deserialize)]
 pub struct BulkAddEdgesRequest {
     pub edges: Vec<AddEdgeRequest>,
+}
+
+#[derive(Deserialize)]
+pub struct CypherRequest {
+    pub query: String,
 }
 
 #[derive(Deserialize)]
@@ -330,6 +335,11 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route(
             "/v1/graphs/{graph}/condense",
             post(condense_graph),
+        )
+        // Cypher query.
+        .route(
+            "/v1/graphs/{graph}/cypher",
+            post(cypher_query),
         )
         // Prometheus metrics.
         .route("/metrics", get(metrics_handler))
@@ -1494,6 +1504,41 @@ async fn condense_graph(
                 "graph": graph,
                 "message": msg,
             }))),
+        )
+            .into_response(),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+        )
+            .into_response(),
+        Err(e) => weav_error_to_response(e).into_response(),
+    }
+}
+
+async fn cypher_query(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+    Json(body): Json<CypherRequest>,
+) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
+    let cmd = Command::Cypher(CypherCmd {
+        graph,
+        query: body.query,
+    });
+
+    match engine.execute_command(cmd, identity.as_ref()) {
+        Ok(CommandResponse::Text(json_str)) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(serde_json::json!({
+                "results": serde_json::from_str::<serde_json::Value>(&json_str)
+                    .unwrap_or(serde_json::Value::String(json_str)),
+            }))),
+        )
+            .into_response(),
+        Ok(CommandResponse::Integer(id)) => (
+            StatusCode::CREATED,
+            Json(ApiResponse::ok(serde_json::json!({ "node_id": id }))),
         )
             .into_response(),
         Ok(_) => (
@@ -5275,5 +5320,107 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_to_json(resp.into_body()).await;
         assert_eq!(json["data"]["nodes_created"], 0);
+    }
+
+    // ── Cypher HTTP Tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_http_cypher_match() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        // Create graph.
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "cypher_http".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        // Add a node.
+        engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "cypher_http".to_string(),
+                    label: "Person".to_string(),
+                    properties: vec![(
+                        "name".to_string(),
+                        Value::String(compact_str::CompactString::from("Alice")),
+                    )],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        // Query via Cypher endpoint.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/cypher_http/cypher")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"query": "MATCH (n:Person) RETURN n"}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        let results = &json["data"]["results"];
+        assert!(results.is_array());
+        assert_eq!(results.as_array().unwrap().len(), 1);
+        assert_eq!(results[0]["n"]["labels"][0], "Person");
+    }
+
+    #[tokio::test]
+    async fn test_http_cypher_create() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        // Create graph.
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "cypher_http_c".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        // Create node via Cypher endpoint.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/cypher_http_c/cypher")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"query": "CREATE (n:Person {name: 'Bob', age: 42})"}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        assert!(json["data"]["node_id"].is_number());
+    }
+
+    #[tokio::test]
+    async fn test_http_cypher_graph_not_found() {
+        let app = make_app();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/no_such_graph/cypher")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"query": "MATCH (n) RETURN n"}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

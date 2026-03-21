@@ -1047,6 +1047,7 @@ impl Engine {
             Command::Backup(label) => self.handle_backup(label),
             Command::WalCompact => self.handle_wal_compact(),
             Command::CreateIndex(cmd) => self.handle_create_index(cmd),
+            Command::Cypher(cmd) => self.handle_cypher(cmd),
         }
     }
 
@@ -1110,6 +1111,13 @@ impl Engine {
             | Command::EdgeAdd(_) | Command::EdgeDelete(_) | Command::EdgeInvalidate(_)
             | Command::BulkInsertNodes(_) | Command::BulkInsertEdges(_)
             | Command::Ingest(_) | Command::NodeMerge(_) => CommandCategory::Write,
+            Command::Cypher(c) => {
+                if c.query.trim_start().to_uppercase().starts_with("CREATE") {
+                    CommandCategory::Write
+                } else {
+                    CommandCategory::Read
+                }
+            }
             Command::GraphCreate(_) | Command::GraphDrop(_) | Command::Snapshot
             | Command::ConfigSet(_, _) | Command::AclSetUser(_) | Command::AclDelUser(_)
             | Command::AclList | Command::AclGetUser(_) | Command::AclSave
@@ -1237,6 +1245,7 @@ impl Engine {
             Command::SchemaGet(c) => Some(c.graph.clone()),
             Command::NodeMerge(c) => Some(c.graph.clone()),
             Command::CreateIndex(c) => Some(c.graph.clone()),
+            Command::Cypher(c) => Some(c.graph.clone()),
             Command::Stats(opt) => opt.clone(),
             _ => None,
         }
@@ -3652,6 +3661,450 @@ impl Engine {
         }
     }
 
+    // ── Cypher query handlers ────────────────────────────────────────────
+
+    fn handle_cypher(
+        &self,
+        cmd: weav_query::parser::CypherCmd,
+    ) -> WeavResult<CommandResponse> {
+        let trimmed = cmd.query.trim();
+        let upper = trimmed.to_uppercase();
+
+        if upper.starts_with("MATCH") {
+            self.execute_cypher_match(&cmd.graph, trimmed)
+        } else if upper.starts_with("CREATE") {
+            self.execute_cypher_create(&cmd.graph, trimmed)
+        } else {
+            Err(WeavError::QueryParseError(format!(
+                "unsupported Cypher: {}",
+                &trimmed[..trimmed.len().min(50)]
+            )))
+        }
+    }
+
+    fn execute_cypher_match(
+        &self,
+        graph: &str,
+        query: &str,
+    ) -> WeavResult<CommandResponse> {
+        let upper = query.to_uppercase();
+
+        // Detect relationship traversal: (n)-[r:TYPE]->(m) or (n)-[r]->(m)
+        if upper.contains("]->(") || upper.contains("]->( ") || upper.contains("]->(") {
+            if let Some(rel) = cypher_parse_relationship(query) {
+                return self.execute_cypher_relationship(graph, &rel);
+            }
+        }
+
+        // Parse label from (n:Label) or (:Label)
+        let label = cypher_extract_label(query);
+
+        // Parse WHERE clause
+        let where_clause = cypher_extract_where(query);
+
+        // Check for id(n) = NNN pattern
+        let id_lookup = cypher_extract_id_lookup(query);
+
+        let graph_arc = self.get_graph(graph)?;
+        let gs = graph_arc.read();
+
+        // If id lookup, return single node
+        if let Some(nid) = id_lookup {
+            if !gs.adjacency.has_node(nid) {
+                return Err(WeavError::NodeNotFound(nid, gs.graph_id));
+            }
+            let node_json = cypher_node_to_json(&gs, nid);
+            return Ok(CommandResponse::Text(
+                serde_json::to_string(&vec![serde_json::json!({ "n": node_json })])
+                    .unwrap_or_default(),
+            ));
+        }
+
+        // Scan all nodes with filters
+        let all_nodes = gs.adjacency.all_node_ids();
+        let mut results: Vec<serde_json::Value> = Vec::new();
+
+        for &nid in &all_nodes {
+            if let Some(ref lbl) = label {
+                let node_label = gs
+                    .properties
+                    .get_node_property(nid, "_label")
+                    .and_then(|v| v.as_str());
+                if node_label != Some(lbl.as_str()) {
+                    continue;
+                }
+            }
+
+            if let Some((ref key, ref value)) = where_clause {
+                if !cypher_property_matches(&gs, nid, key, value) {
+                    continue;
+                }
+            }
+
+            results.push(serde_json::json!({ "n": cypher_node_to_json(&gs, nid) }));
+        }
+
+        Ok(CommandResponse::Text(
+            serde_json::to_string(&results).unwrap_or_default(),
+        ))
+    }
+
+    fn execute_cypher_relationship(
+        &self,
+        graph: &str,
+        rel: &CypherRelationship,
+    ) -> WeavResult<CommandResponse> {
+        let graph_arc = self.get_graph(graph)?;
+        let gs = graph_arc.read();
+
+        let all_nodes = gs.adjacency.all_node_ids();
+        let mut results: Vec<serde_json::Value> = Vec::new();
+
+        // Resolve edge label to LabelId if specified
+        let edge_label_id = rel
+            .edge_label
+            .as_ref()
+            .and_then(|lbl| gs.interner.resolve_label_id(lbl));
+
+        for &nid in &all_nodes {
+            // Filter source nodes by label
+            if let Some(ref src_label) = rel.src_label {
+                let node_label = gs
+                    .properties
+                    .get_node_property(nid, "_label")
+                    .and_then(|v| v.as_str());
+                if node_label != Some(src_label.as_str()) {
+                    continue;
+                }
+            }
+
+            // Traverse outgoing edges
+            let neighbors = gs.adjacency.neighbors_out(nid, edge_label_id);
+            for (target_nid, edge_id) in neighbors {
+                // Filter target nodes by label
+                if let Some(ref tgt_label) = rel.tgt_label {
+                    let target_label = gs
+                        .properties
+                        .get_node_property(target_nid, "_label")
+                        .and_then(|v| v.as_str());
+                    if target_label != Some(tgt_label.as_str()) {
+                        continue;
+                    }
+                }
+
+                let edge_info = gs.adjacency.all_edges().find(|(eid, _)| *eid == edge_id);
+                let edge_json = if let Some((eid, meta)) = edge_info {
+                    let label_name = gs.interner.resolve_label(meta.label).unwrap_or("unknown");
+                    serde_json::json!({
+                        "id": eid,
+                        "type": label_name,
+                        "source": meta.source,
+                        "target": meta.target,
+                        "weight": meta.weight,
+                    })
+                } else {
+                    serde_json::json!({ "id": edge_id })
+                };
+
+                results.push(serde_json::json!({
+                    "n": cypher_node_to_json(&gs, nid),
+                    "r": edge_json,
+                    "m": cypher_node_to_json(&gs, target_nid),
+                }));
+            }
+        }
+
+        Ok(CommandResponse::Text(
+            serde_json::to_string(&results).unwrap_or_default(),
+        ))
+    }
+
+    fn execute_cypher_create(
+        &self,
+        graph: &str,
+        query: &str,
+    ) -> WeavResult<CommandResponse> {
+        // Parse: CREATE (n:Label {key: 'value', ...})
+        let label = cypher_extract_label(query)
+            .ok_or_else(|| WeavError::QueryParseError(
+                "CREATE requires a node label: CREATE (n:Label {props})".into(),
+            ))?;
+
+        let properties = cypher_extract_create_properties(query);
+
+        let cmd = weav_query::parser::NodeAddCmd {
+            graph: graph.to_string(),
+            label,
+            properties,
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        };
+
+        self.handle_node_add(cmd)
+    }
+}
+
+// ─── Cypher helpers (module-level, outside impl) ─────────────────────────────
+
+struct CypherRelationship {
+    src_label: Option<String>,
+    edge_label: Option<String>,
+    tgt_label: Option<String>,
+}
+
+/// Extract a node label from a Cypher pattern like (n:Person) or (:Person).
+fn cypher_extract_label(query: &str) -> Option<String> {
+    // Find the first ( ... ) pattern and look for :Label inside it.
+    let open = query.find('(')?;
+    let close = query[open..].find(')')? + open;
+    let inside = &query[open + 1..close];
+
+    // Look for :Label (possibly after a variable name)
+    let colon = inside.find(':')?;
+    let after_colon = &inside[colon + 1..];
+    // Label ends at space, ), {, or end
+    let end = after_colon
+        .find(|c: char| c.is_whitespace() || c == ')' || c == '{' || c == '-')
+        .unwrap_or(after_colon.len());
+    let label = after_colon[..end].trim();
+    if label.is_empty() {
+        None
+    } else {
+        Some(label.to_string())
+    }
+}
+
+/// Extract WHERE clause: WHERE n.prop = 'value' or WHERE n.prop = value
+fn cypher_extract_where(query: &str) -> Option<(String, String)> {
+    let upper = query.to_uppercase();
+    let where_pos = upper.find("WHERE")?;
+    let after_where = query[where_pos + 5..].trim();
+
+    // Check for id(n) = NNN pattern first — handled separately
+    let after_upper = after_where.to_uppercase();
+    if after_upper.starts_with("ID(") {
+        return None;
+    }
+
+    // Parse: n.prop = 'value' or n.prop = value
+    let eq_pos = after_where.find('=')?;
+    let key_part = after_where[..eq_pos].trim();
+    let val_part = after_where[eq_pos + 1..].trim();
+
+    // Strip variable prefix (n. or m.)
+    let key = if let Some(dot) = key_part.find('.') {
+        key_part[dot + 1..].trim()
+    } else {
+        key_part
+    };
+
+    // Strip RETURN and anything after the value
+    let val_str = val_part
+        .split_whitespace()
+        .next()
+        .unwrap_or(val_part);
+
+    // Remove surrounding quotes
+    let value = val_str
+        .trim_matches('\'')
+        .trim_matches('"')
+        .to_string();
+
+    if key.is_empty() || value.is_empty() {
+        None
+    } else {
+        Some((key.to_string(), value))
+    }
+}
+
+/// Extract id(n) = NNN from a WHERE clause.
+fn cypher_extract_id_lookup(query: &str) -> Option<u64> {
+    let upper = query.to_uppercase();
+    let where_pos = upper.find("WHERE")?;
+    let after_where = query[where_pos + 5..].trim();
+    let after_upper = after_where.to_uppercase();
+
+    if !after_upper.starts_with("ID(") {
+        return None;
+    }
+
+    // Find the = sign
+    let eq_pos = after_where.find('=')?;
+    let val_part = after_where[eq_pos + 1..].trim();
+
+    // Parse the numeric ID
+    let id_str = val_part
+        .split_whitespace()
+        .next()
+        .unwrap_or(val_part);
+    id_str.parse::<u64>().ok()
+}
+
+/// Parse a relationship pattern from Cypher.
+/// Supports: (n:Label)-[r:TYPE]->(m:Label) and variations.
+fn cypher_parse_relationship(query: &str) -> Option<CypherRelationship> {
+    // Find the ]->(  pattern
+    let arrow_pos = query.find("]->(")?;
+
+    // Extract source pattern: everything from first ( to the )-[
+    let src_open = query.find('(')?;
+    let dash_bracket = query.find(")-[")?;
+    if src_open >= dash_bracket {
+        return None;
+    }
+    let src_inside = &query[src_open + 1..dash_bracket];
+
+    // Extract edge pattern: between [ and ]
+    let bracket_open = query[dash_bracket..].find('[')? + dash_bracket;
+    let bracket_close = query[bracket_open..].find(']')? + bracket_open;
+    let edge_inside = &query[bracket_open + 1..bracket_close];
+
+    // Extract target pattern: between >( and the next )
+    let tgt_open = arrow_pos + 3; // skip ]->(
+    let tgt_close = query[tgt_open..].find(')')? + tgt_open;
+    let tgt_inside = &query[tgt_open + 1..tgt_close];
+
+    let src_label = extract_label_from_pattern(src_inside);
+    let tgt_label = extract_label_from_pattern(tgt_inside);
+
+    // Edge label: r:TYPE or just :TYPE
+    let edge_label = if let Some(colon) = edge_inside.find(':') {
+        let after = &edge_inside[colon + 1..];
+        let end = after
+            .find(|c: char| c.is_whitespace() || c == ']')
+            .unwrap_or(after.len());
+        let lbl = after[..end].trim();
+        if lbl.is_empty() { None } else { Some(lbl.to_string()) }
+    } else {
+        None
+    };
+
+    Some(CypherRelationship {
+        src_label,
+        edge_label,
+        tgt_label,
+    })
+}
+
+fn extract_label_from_pattern(pattern: &str) -> Option<String> {
+    let colon = pattern.find(':')?;
+    let after = &pattern[colon + 1..];
+    let end = after
+        .find(|c: char| c.is_whitespace() || c == '{' || c == '-')
+        .unwrap_or(after.len());
+    let label = after[..end].trim();
+    if label.is_empty() {
+        None
+    } else {
+        Some(label.to_string())
+    }
+}
+
+/// Check if a node property matches a value (string comparison with type coercion).
+fn cypher_property_matches(gs: &GraphState, nid: u64, key: &str, value: &str) -> bool {
+    let prop = gs.properties.get_node_property(nid, key);
+    match prop {
+        Some(Value::String(s)) => s.as_str() == value,
+        Some(Value::Int(i)) => i.to_string() == value,
+        Some(Value::Float(f)) => f.to_string() == value,
+        Some(Value::Bool(b)) => b.to_string() == value,
+        _ => false,
+    }
+}
+
+/// Build a JSON object for a node (used in Cypher results).
+fn cypher_node_to_json(gs: &GraphState, nid: u64) -> serde_json::Value {
+    let label = gs
+        .properties
+        .get_node_property(nid, "_label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    let props = gs.properties.get_all_node_properties(nid);
+    let mut props_map = serde_json::Map::new();
+    for (k, v) in props {
+        if !k.starts_with('_') && k != "entity_key" {
+            props_map.insert(k.to_string(), cypher_value_to_json(v));
+        }
+    }
+
+    serde_json::json!({
+        "id": nid,
+        "labels": [label],
+        "properties": props_map,
+    })
+}
+
+fn cypher_value_to_json(v: &Value) -> serde_json::Value {
+    match v {
+        Value::Null => serde_json::Value::Null,
+        Value::Bool(b) => serde_json::Value::Bool(*b),
+        Value::Int(i) => serde_json::json!(*i),
+        Value::Float(f) => serde_json::json!(*f),
+        Value::String(s) => serde_json::Value::String(s.to_string()),
+        Value::Bytes(b) => serde_json::json!(b),
+        Value::Vector(v) => serde_json::json!(v),
+        Value::List(items) => {
+            let arr: Vec<serde_json::Value> = items.iter().map(cypher_value_to_json).collect();
+            serde_json::Value::Array(arr)
+        }
+        Value::Map(pairs) => {
+            let mut map = serde_json::Map::new();
+            for (k, val) in pairs {
+                map.insert(k.to_string(), cypher_value_to_json(val));
+            }
+            serde_json::Value::Object(map)
+        }
+        Value::Timestamp(ts) => serde_json::json!(*ts),
+    }
+}
+
+/// Parse properties from CREATE (n:Label {key: 'value', key2: 123}).
+fn cypher_extract_create_properties(query: &str) -> Vec<(String, Value)> {
+    let mut result = Vec::new();
+
+    // Find the { ... } block
+    let open = match query.find('{') {
+        Some(pos) => pos,
+        None => return result,
+    };
+    let close = match query[open..].rfind('}') {
+        Some(pos) => pos + open,
+        None => return result,
+    };
+    let inside = &query[open + 1..close];
+
+    // Split by comma, parse key: value pairs
+    for pair in inside.split(',') {
+        let pair = pair.trim();
+        if let Some(colon) = pair.find(':') {
+            let key = pair[..colon].trim().trim_matches(|c: char| c == '\'' || c == '"');
+            let val_str = pair[colon + 1..].trim();
+
+            let value = if (val_str.starts_with('\'') && val_str.ends_with('\''))
+                || (val_str.starts_with('"') && val_str.ends_with('"'))
+            {
+                Value::String(CompactString::from(&val_str[1..val_str.len() - 1]))
+            } else if let Ok(i) = val_str.parse::<i64>() {
+                Value::Int(i)
+            } else if let Ok(f) = val_str.parse::<f64>() {
+                Value::Float(f)
+            } else if val_str == "true" {
+                Value::Bool(true)
+            } else if val_str == "false" {
+                Value::Bool(false)
+            } else if val_str == "null" {
+                Value::Null
+            } else {
+                Value::String(CompactString::from(val_str))
+            };
+
+            result.push((key.to_string(), value));
+        }
+    }
+
+    result
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -8780,5 +9233,254 @@ mod tests {
         let result = engine.handle_condense("cond_na", 0.5);
         assert!(result.is_ok());
         assert!(node_count_before > 0, "should have added nodes");
+    }
+
+    // ── Cypher Tests ─────────────────────────────────────────────────────
+
+    /// Returns (alice_id, bob_id, charlie_id, london_id).
+    fn setup_cypher_graph(engine: &Engine) -> (u64, u64, u64, u64) {
+        create_test_graph(engine, "cypher_g");
+        // Add Person nodes
+        let mut ids = Vec::new();
+        for (name, age) in &[("Alice", 30), ("Bob", 25), ("Charlie", 35)] {
+            let resp = engine
+                .execute_command(
+                    Command::NodeAdd(parser::NodeAddCmd {
+                        graph: "cypher_g".to_string(),
+                        label: "Person".to_string(),
+                        properties: vec![
+                            ("name".to_string(), Value::String(CompactString::from(*name))),
+                            ("age".to_string(), Value::Int(*age)),
+                        ],
+                        embedding: None,
+                        entity_key: None,
+                        ttl_ms: None,
+                    }),
+                    None,
+                )
+                .unwrap();
+            if let CommandResponse::Integer(nid) = resp {
+                ids.push(nid);
+            }
+        }
+        // Add a City node
+        let resp = engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "cypher_g".to_string(),
+                    label: "City".to_string(),
+                    properties: vec![(
+                        "name".to_string(),
+                        Value::String(CompactString::from("London")),
+                    )],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+        let london_id = if let CommandResponse::Integer(nid) = resp { nid } else { panic!("expected Integer") };
+
+        let (alice, bob, charlie) = (ids[0], ids[1], ids[2]);
+        // Add edges: Alice KNOWS Bob, Bob KNOWS Charlie
+        engine
+            .execute_command(
+                Command::EdgeAdd(parser::EdgeAddCmd {
+                    graph: "cypher_g".to_string(),
+                    source: alice,
+                    target: bob,
+                    label: "KNOWS".to_string(),
+                    weight: 1.0,
+                    properties: vec![],
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+        engine
+            .execute_command(
+                Command::EdgeAdd(parser::EdgeAddCmd {
+                    graph: "cypher_g".to_string(),
+                    source: bob,
+                    target: charlie,
+                    label: "KNOWS".to_string(),
+                    weight: 0.8,
+                    properties: vec![],
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        (alice, bob, charlie, london_id)
+    }
+
+    #[test]
+    fn test_cypher_match_by_label() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        let cmd =
+            parser::parse_command(r#"CYPHER "cypher_g" MATCH (n:Person) RETURN n"#).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 3, "should find 3 Person nodes");
+                // Each result should have labels: ["Person"]
+                for r in &results {
+                    assert_eq!(r["n"]["labels"][0], "Person");
+                }
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_match_with_where() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) WHERE n.name = 'Alice' RETURN n"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 1, "should find 1 Alice");
+                assert_eq!(results[0]["n"]["properties"]["name"], "Alice");
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_match_relationship() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person)-[r:KNOWS]->(m:Person) RETURN n, r, m"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 2, "should find 2 KNOWS edges");
+                for r in &results {
+                    assert!(r["n"].is_object());
+                    assert!(r["r"].is_object());
+                    assert!(r["m"].is_object());
+                    assert_eq!(r["r"]["type"], "KNOWS");
+                }
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_match_by_id() {
+        let engine = make_engine();
+        let (alice_id, _, _, _) = setup_cypher_graph(&engine);
+
+        let cmd = parser::parse_command(
+            &format!(r#"CYPHER "cypher_g" MATCH (n) WHERE id(n) = {} RETURN n"#, alice_id),
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0]["n"]["id"], alice_id);
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_create_node() {
+        let engine = make_engine();
+        create_test_graph(&engine, "cypher_create");
+
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_create" CREATE (n:Person {name: 'Eve', age: 28})"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Integer(nid) => {
+                // Verify the node was created
+                let get_cmd = Command::NodeGet(parser::NodeGetCmd {
+                    graph: "cypher_create".to_string(),
+                    node_id: Some(nid),
+                    entity_key: None,
+                });
+                let get_resp = engine.execute_command(get_cmd, None).unwrap();
+                match get_resp {
+                    CommandResponse::NodeInfo(info) => {
+                        assert_eq!(info.label, "Person");
+                        let name_prop = info.properties.iter().find(|(k, _)| k == "name");
+                        assert!(name_prop.is_some());
+                        assert_eq!(
+                            name_prop.unwrap().1.as_str(),
+                            Some("Eve")
+                        );
+                    }
+                    _ => panic!("expected NodeInfo response"),
+                }
+            }
+            _ => panic!("expected Integer response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_unsupported() {
+        let engine = make_engine();
+        create_test_graph(&engine, "cypher_unsup");
+
+        let cmd = parser::parse_command(r#"CYPHER "cypher_unsup" DELETE n"#);
+        assert!(cmd.is_err(), "DELETE should not be supported");
+    }
+
+    #[test]
+    fn test_cypher_match_no_results() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Robot) RETURN n"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert!(results.is_empty(), "no Robot nodes should exist");
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_match_all_nodes() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        // Match without label filter
+        let cmd =
+            parser::parse_command(r#"CYPHER "cypher_g" MATCH (n) RETURN n"#).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 4, "should find all 4 nodes (3 Person + 1 City)");
+            }
+            _ => panic!("expected Text response"),
+        }
     }
 }

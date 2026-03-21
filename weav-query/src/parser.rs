@@ -96,6 +96,8 @@ pub enum Command {
     WalCompact,
     /// Create a secondary index on a property key for O(1) lookups.
     CreateIndex(CreateIndexCmd),
+    /// Execute a minimal Cypher query subset.
+    Cypher(CypherCmd),
 }
 
 impl Command {
@@ -142,6 +144,7 @@ impl Command {
             Command::Backup(_) => "backup",
             Command::WalCompact => "wal_compact",
             Command::CreateIndex(_) => "create_index",
+            Command::Cypher(_) => "cypher",
         }
     }
 }
@@ -375,6 +378,12 @@ pub struct NodeMergeCmd {
 pub struct CreateIndexCmd {
     pub graph: String,
     pub property_key: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CypherCmd {
+    pub graph: String,
+    pub query: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -615,6 +624,10 @@ pub fn parse_command(input: &str) -> Result<Command, WeavError> {
             }
         }
         "INDEX" => parse_index_command(&tokens),
+        "CYPHER" => parse_cypher_command(input),
+        "MATCH" | "CREATE" if looks_like_cypher(input) => {
+            Err(parse_err("Cypher queries require a graph name: CYPHER \"graph\" MATCH ..."))
+        }
         _ => Err(parse_err(format!("unknown command: {}", &tokens[0]))),
     }
 }
@@ -1868,6 +1881,46 @@ fn parse_schema_set(tokens: &[String]) -> Result<Command, WeavError> {
         property,
         value_type,
     }))
+}
+
+// ─── Cypher parsing ─────────────────────────────────────────────────────────
+
+/// Returns true if input looks like a bare Cypher MATCH or CREATE statement.
+fn looks_like_cypher(input: &str) -> bool {
+    let upper = input.trim_start().to_uppercase();
+    (upper.starts_with("MATCH") || upper.starts_with("CREATE"))
+        && (upper.contains('(') && upper.contains(')'))
+}
+
+/// Parse: CYPHER "graph" <cypher_query>
+fn parse_cypher_command(input: &str) -> Result<Command, WeavError> {
+    // Strip the leading CYPHER keyword (case-insensitive).
+    let rest = input.trim();
+    let after_keyword = &rest[rest.find(char::is_whitespace)
+        .ok_or_else(|| parse_err("CYPHER requires a graph name and query"))?..].trim_start();
+
+    // Extract the quoted graph name.
+    if !after_keyword.starts_with('"') {
+        return Err(parse_err("CYPHER requires a quoted graph name: CYPHER \"graph\" MATCH ..."));
+    }
+    let end_quote = after_keyword[1..].find('"')
+        .ok_or_else(|| parse_err("unterminated graph name in CYPHER command"))?;
+    let graph = after_keyword[1..1 + end_quote].to_string();
+    let query = after_keyword[2 + end_quote..].trim().to_string();
+
+    if query.is_empty() {
+        return Err(parse_err("CYPHER requires a query after the graph name"));
+    }
+
+    let upper = query.to_uppercase();
+    if !upper.starts_with("MATCH") && !upper.starts_with("CREATE") && !upper.starts_with("RETURN") {
+        return Err(parse_err(format!(
+            "unsupported Cypher statement (only MATCH/CREATE supported): {}",
+            &query[..query.len().min(50)]
+        )));
+    }
+
+    Ok(Command::Cypher(CypherCmd { graph, query }))
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -3158,5 +3211,80 @@ mod tests {
         assert_eq!(budget_preset("unknown"), None);
         assert_eq!(budget_preset(""), None);
         assert_eq!(budget_preset("64k"), None);
+    }
+
+    // ── Cypher Parsing Tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_cypher_match_by_label() {
+        let cmd = parse_command(r#"CYPHER "mydb" MATCH (n:Person) RETURN n"#).unwrap();
+        match cmd {
+            Command::Cypher(c) => {
+                assert_eq!(c.graph, "mydb");
+                assert_eq!(c.query, "MATCH (n:Person) RETURN n");
+            }
+            _ => panic!("expected Cypher command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_cypher_match_with_where() {
+        let cmd = parse_command(
+            r#"CYPHER "mydb" MATCH (n:Person) WHERE n.name = 'Alice' RETURN n"#,
+        )
+        .unwrap();
+        match cmd {
+            Command::Cypher(c) => {
+                assert_eq!(c.graph, "mydb");
+                assert!(c.query.contains("WHERE"));
+                assert!(c.query.contains("Alice"));
+            }
+            _ => panic!("expected Cypher command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_cypher_create() {
+        let cmd =
+            parse_command(r#"CYPHER "mydb" CREATE (n:Person {name: 'Alice', age: 30})"#).unwrap();
+        match cmd {
+            Command::Cypher(c) => {
+                assert_eq!(c.graph, "mydb");
+                assert!(c.query.starts_with("CREATE"));
+            }
+            _ => panic!("expected Cypher command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_cypher_missing_graph() {
+        let result = parse_command("CYPHER MATCH (n) RETURN n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_cypher_empty_query() {
+        let result = parse_command(r#"CYPHER "mydb""#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_cypher_unsupported_statement() {
+        let result = parse_command(r#"CYPHER "mydb" DELETE n"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_bare_match_gives_helpful_error() {
+        let result = parse_command("MATCH (n:Person) RETURN n");
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("graph name"), "error should mention graph name: {err_msg}");
+    }
+
+    #[test]
+    fn test_cypher_type_name() {
+        let cmd = parse_command(r#"CYPHER "g" MATCH (n) RETURN n"#).unwrap();
+        assert_eq!(cmd.type_name(), "cypher");
     }
 }
