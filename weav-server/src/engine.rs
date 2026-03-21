@@ -116,6 +116,8 @@ pub struct Engine {
     acl_store: Option<weav_auth::acl::AclStore>,
     /// Active connection counter for enforcing max_connections.
     active_connections: std::sync::atomic::AtomicU64,
+    /// When true, WAL writes are suppressed (during recovery replay).
+    replaying: std::sync::atomic::AtomicBool,
 }
 
 impl Engine {
@@ -155,6 +157,7 @@ impl Engine {
             runtime_config: RwLock::new(HashMap::new()),
             acl_store,
             active_connections: std::sync::atomic::AtomicU64::new(0),
+            replaying: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -174,6 +177,10 @@ impl Engine {
     }
 
     fn append_wal(&self, op: WalOperation) -> WeavResult<()> {
+        // Skip WAL writes during recovery replay to avoid doubling WAL size
+        if self.replaying.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
         if let Some(ref wal_mutex) = self.wal {
             let mut wal = wal_mutex.lock();
             wal.append(0, op)
@@ -437,11 +444,9 @@ impl Engine {
         }
 
         // Step 2: Replay WAL entries.
-        // NOTE: WAL replay currently calls handle_* methods (e.g. handle_graph_create,
-        // handle_node_add) which write NEW WAL entries during recovery. This means
-        // recovery doubles the WAL size. This is a known design issue — the replay is
-        // idempotent and correct, but wastes disk space. A future improvement would be
-        // to add a "replaying" flag that suppresses WAL writes during recovery.
+        // Set replaying flag to suppress WAL writes during recovery —
+        // handle_* methods call append_wal which would otherwise double the WAL size.
+        self.replaying.store(true, std::sync::atomic::Ordering::Relaxed);
         let mut replay_errors: u64 = 0;
         for entry in &result.wal_entries {
             match &entry.operation {
@@ -675,6 +680,9 @@ impl Engine {
                 }
             }
         }
+
+        // Clear replaying flag — normal WAL writes resume
+        self.replaying.store(false, std::sync::atomic::Ordering::Relaxed);
 
         if replay_errors > 0 {
             tracing::warn!(

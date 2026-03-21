@@ -243,6 +243,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/graphs/{graph}/search", get(search_nodes))
         // Graph export/import.
         .route("/v1/graphs/{graph}/export", get(export_graph))
+        .route("/v1/graphs/{graph}/import", post(import_graph))
         // Graph algorithms.
         .route(
             "/v1/graphs/{graph}/algorithms/{algorithm}",
@@ -453,6 +454,117 @@ async fn export_graph(
             "edges": edges,
         }))),
     ).into_response()
+}
+
+/// Import a graph from JSON (same format as export).
+/// POST /v1/graphs/{graph}/import
+/// Creates the graph if it doesn't exist, then adds all nodes and edges.
+async fn import_graph(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
+
+    // Create graph if it doesn't exist
+    let create_cmd = Command::GraphCreate(GraphCreateCmd {
+        name: graph.clone(),
+        config: None,
+    });
+    let _ = engine.execute_command(create_cmd, identity.as_ref());
+
+    let mut nodes_imported: u64 = 0;
+    let mut edges_imported: u64 = 0;
+    let mut errors: Vec<String> = Vec::new();
+
+    // Map from exported node_id to new node_id (in case IDs need remapping)
+    let mut id_map: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+
+    // Import nodes
+    if let Some(nodes) = body.get("nodes").and_then(|v| v.as_array()) {
+        for node_json in nodes {
+            let label = node_json.get("label").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+            let entity_key = node_json.get("entity_key").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let old_id = node_json.get("node_id").and_then(|v| v.as_u64()).unwrap_or(0);
+
+            let properties = if let Some(props) = node_json.get("properties") {
+                json_to_props(props)
+            } else {
+                Vec::new()
+            };
+
+            let embedding = node_json.get("embedding").and_then(|v| {
+                v.as_array().map(|arr| {
+                    arr.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect::<Vec<f32>>()
+                })
+            });
+
+            let cmd = Command::NodeAdd(NodeAddCmd {
+                graph: graph.clone(),
+                label,
+                properties,
+                embedding,
+                entity_key,
+                ttl_ms: None,
+            });
+
+            match engine.execute_command(cmd, identity.as_ref()) {
+                Ok(CommandResponse::Integer(new_id)) => {
+                    id_map.insert(old_id, new_id);
+                    nodes_imported += 1;
+                }
+                Err(e) => errors.push(format!("node {old_id}: {e}")),
+                _ => {}
+            }
+        }
+    }
+
+    // Import edges (remap source/target IDs)
+    if let Some(edges) = body.get("edges").and_then(|v| v.as_array()) {
+        for edge_json in edges {
+            let old_source = edge_json.get("source").and_then(|v| v.as_u64()).unwrap_or(0);
+            let old_target = edge_json.get("target").and_then(|v| v.as_u64()).unwrap_or(0);
+
+            let source = id_map.get(&old_source).copied().unwrap_or(old_source);
+            let target = id_map.get(&old_target).copied().unwrap_or(old_target);
+
+            let label = edge_json.get("label").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+            let weight = edge_json.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+
+            let properties = if let Some(props) = edge_json.get("properties") {
+                json_to_props(props)
+            } else {
+                Vec::new()
+            };
+
+            let cmd = Command::EdgeAdd(EdgeAddCmd {
+                graph: graph.clone(),
+                source,
+                target,
+                label,
+                weight,
+                properties,
+                ttl_ms: None,
+            });
+
+            match engine.execute_command(cmd, identity.as_ref()) {
+                Ok(CommandResponse::Integer(_)) => edges_imported += 1,
+                Err(e) => errors.push(format!("edge {old_source}->{old_target}: {e}")),
+                _ => {}
+            }
+        }
+    }
+
+    let mut response = serde_json::json!({
+        "nodes_imported": nodes_imported,
+        "edges_imported": edges_imported,
+    });
+    if !errors.is_empty() {
+        response["errors"] = serde_json::json!(errors);
+    }
+
+    (StatusCode::OK, Json(ApiResponse::ok(response))).into_response()
 }
 
 async fn metrics_handler() -> impl IntoResponse {
@@ -2639,6 +2751,326 @@ mod tests {
         let req = Request::builder()
             .uri("/v1/graphs/enf/edges/9999")
             .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ─── Algorithm endpoint tests ───────────────────────────────────────
+
+    /// Helper: create a graph with a triangle (3 nodes, 3 edges) for algorithm tests.
+    fn setup_triangle_graph(engine: &Arc<Engine>, name: &str) -> (u64, u64, u64) {
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: name.to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let mut ids = Vec::new();
+        for label in ["a", "b", "c"] {
+            let id = match engine
+                .execute_command(
+                    Command::NodeAdd(NodeAddCmd {
+                        graph: name.to_string(),
+                        label: label.to_string(),
+                        properties: vec![],
+                        embedding: None,
+                        entity_key: None,
+                        ttl_ms: None,
+                    }),
+                    None,
+                )
+                .unwrap()
+            {
+                CommandResponse::Integer(id) => id,
+                _ => panic!("expected Integer"),
+            };
+            ids.push(id);
+        }
+
+        // Edges: a->b, b->c, c->a (triangle)
+        for &(s, t) in &[(ids[0], ids[1]), (ids[1], ids[2]), (ids[2], ids[0])] {
+            engine
+                .execute_command(
+                    Command::EdgeAdd(EdgeAddCmd {
+                        graph: name.to_string(),
+                        source: s,
+                        target: t,
+                        label: "link".to_string(),
+                        weight: 1.0,
+                        properties: vec![],
+                        ttl_ms: None,
+                    }),
+                    None,
+                )
+                .unwrap();
+        }
+
+        (ids[0], ids[1], ids[2])
+    }
+
+    #[tokio::test]
+    async fn test_algorithm_pagerank() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+        let (n1, n2, n3) = setup_triangle_graph(&engine, "pr");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/pr/algorithms/pagerank")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"damping": 0.85, "iterations": 20}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+
+        let scores = json["data"]["scores"].as_array().unwrap();
+        assert_eq!(scores.len(), 3);
+        // In a symmetric triangle, all nodes should have roughly equal PageRank.
+        for s in scores {
+            assert!(s["score"].as_f64().unwrap() > 0.0);
+            let nid = s["node_id"].as_u64().unwrap();
+            assert!(nid == n1 || nid == n2 || nid == n3);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_algorithm_pagerank_defaults() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+        setup_triangle_graph(&engine, "pr_def");
+
+        // Empty body — should use defaults.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/pr_def/algorithms/pagerank")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["scores"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_algorithm_betweenness() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+        setup_triangle_graph(&engine, "bt");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/bt/algorithms/betweenness")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+
+        let scores = json["data"]["scores"].as_array().unwrap();
+        assert_eq!(scores.len(), 3);
+        // Each score must be a valid number.
+        for s in scores {
+            assert!(s["node_id"].as_u64().is_some());
+            assert!(s["score"].as_f64().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_algorithm_communities() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+        setup_triangle_graph(&engine, "cm");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/cm/algorithms/communities")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"resolution": 1.0}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+
+        let communities = json["data"]["communities"].as_array().unwrap();
+        assert!(!communities.is_empty());
+        // Total nodes across all communities should be 3.
+        let total: usize = communities.iter().map(|c| c.as_array().unwrap().len()).sum();
+        assert_eq!(total, 3);
+        // Modularity should be a finite number.
+        assert!(json["data"]["modularity"].as_f64().unwrap().is_finite());
+    }
+
+    #[tokio::test]
+    async fn test_algorithm_shortest_path() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+        let (n1, _n2, n3) = setup_triangle_graph(&engine, "sp");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/sp/algorithms/shortest_path")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"source": n1, "target": n3, "max_depth": 10}).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+
+        let path = json["data"]["path"].as_array().unwrap();
+        assert!(!path.is_empty());
+        assert_eq!(path[0].as_u64().unwrap(), n1);
+        assert_eq!(path.last().unwrap().as_u64().unwrap(), n3);
+        assert!(json["data"]["length"].as_u64().unwrap() >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_algorithm_shortest_path_no_path() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+        // Create graph with isolated nodes (no edges).
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "sp_no".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+        let n1 = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "sp_no".to_string(),
+                    label: "x".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+        let n2 = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "sp_no".to_string(),
+                    label: "y".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/sp_no/algorithms/shortest_path")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"source": n1, "target": n2}).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        assert!(json["data"]["path"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_algorithm_shortest_path_missing_source() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+        setup_triangle_graph(&engine, "sp_ms");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/sp_ms/algorithms/shortest_path")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"target": 1}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_algorithm_components() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+        setup_triangle_graph(&engine, "cc");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/cc/algorithms/components")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+
+        let components = json["data"]["components"].as_array().unwrap();
+        // A triangle is a single connected component.
+        assert_eq!(json["data"]["count"].as_u64().unwrap(), 1);
+        assert_eq!(components.len(), 1);
+        assert_eq!(components[0].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_algorithm_unknown() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+        setup_triangle_graph(&engine, "unk");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/unk/algorithms/foobar")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], false);
+        assert!(json["error"].as_str().unwrap().contains("unknown algorithm"));
+    }
+
+    #[tokio::test]
+    async fn test_algorithm_graph_not_found() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/nonexistent/algorithms/pagerank")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{}"#))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);

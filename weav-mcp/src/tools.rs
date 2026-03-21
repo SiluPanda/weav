@@ -71,6 +71,42 @@ pub struct NodeGetParams {
     pub entity_key: Option<String>,
 }
 
+/// Parameters for searching nodes by property.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchNodesParams {
+    /// Name of the graph.
+    pub graph: String,
+    /// Property key to search on.
+    pub key: String,
+    /// Value to match (compared as string, int, float, or bool).
+    pub value: String,
+    /// Maximum number of results (default 100).
+    pub limit: Option<u32>,
+}
+
+/// Parameters for getting neighbors of a node.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetNeighborsParams {
+    /// Name of the graph.
+    pub graph: String,
+    /// Node ID to get neighbors for.
+    pub node_id: u64,
+}
+
+/// Parameters for exporting a graph.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExportGraphParams {
+    /// Name of the graph to export.
+    pub graph: String,
+}
+
+/// Parameters for getting graph statistics.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GraphStatsParams {
+    /// Name of the graph.
+    pub graph: String,
+}
+
 /// Parameters for adding an edge between two nodes.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EdgeAddParams {
@@ -340,6 +376,261 @@ impl WeavMcpServer {
         }
     }
 
+    /// Search nodes by property key/value.
+    #[tool(description = "Search for nodes in a graph by matching a property key against a value. The value is compared as string, integer, float, or boolean. Returns matching node IDs, labels, and properties.")]
+    fn search_nodes(
+        &self,
+        Parameters(params): Parameters<SearchNodesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let graph_arc = self.engine.get_graph(&params.graph).map_err(|e| {
+            McpError::internal_error(e.to_string(), None)
+        })?;
+        let gs = graph_arc.read();
+
+        let search_value = params.value.clone();
+        let matching_ids = gs.properties.nodes_where(&params.key, &move |v| {
+            // Match against string representation.
+            if let Some(s) = v.as_str() {
+                return s == search_value;
+            }
+            // Match against integer.
+            if let Some(i) = v.as_int() {
+                if let Ok(parsed) = search_value.parse::<i64>() {
+                    return i == parsed;
+                }
+            }
+            // Match against float.
+            if let Some(f) = v.as_float() {
+                if let Ok(parsed) = search_value.parse::<f64>() {
+                    return (f - parsed).abs() < f64::EPSILON;
+                }
+            }
+            // Match against bool.
+            if let Some(b) = v.as_bool() {
+                if let Ok(parsed) = search_value.parse::<bool>() {
+                    return b == parsed;
+                }
+            }
+            false
+        });
+
+        let limit = params.limit.unwrap_or(100) as usize;
+        let results: Vec<serde_json::Value> = matching_ids
+            .iter()
+            .take(limit)
+            .map(|&nid| {
+                let label = gs
+                    .properties
+                    .get_node_property(nid, "_label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let props: serde_json::Map<String, serde_json::Value> = gs
+                    .properties
+                    .get_all_node_properties(nid)
+                    .into_iter()
+                    .filter(|(k, _)| !k.starts_with('_'))
+                    .map(|(k, v)| (k.to_string(), value_to_json(v)))
+                    .collect();
+                serde_json::json!({
+                    "node_id": nid,
+                    "label": label,
+                    "properties": props,
+                })
+            })
+            .collect();
+
+        success_json(&serde_json::json!({
+            "count": results.len(),
+            "nodes": results,
+        }))
+    }
+
+    /// Get all neighbors of a node.
+    #[tool(description = "Get all neighbors (both incoming and outgoing) of a node in a graph. Returns neighbor node IDs, edge IDs, labels, direction, and edge weight.")]
+    fn get_neighbors(
+        &self,
+        Parameters(params): Parameters<GetNeighborsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let graph_arc = self.engine.get_graph(&params.graph).map_err(|e| {
+            McpError::internal_error(e.to_string(), None)
+        })?;
+        let gs = graph_arc.read();
+
+        if !gs.adjacency.has_node(params.node_id) {
+            return weav_error(weav_core::error::WeavError::NodeNotFound(
+                params.node_id,
+                gs.graph_id,
+            ));
+        }
+
+        let neighbors = gs.adjacency.neighbors_both(params.node_id, None);
+        let results: Vec<serde_json::Value> = neighbors
+            .iter()
+            .map(|&(neighbor_id, edge_id, ref direction)| {
+                let label = gs
+                    .properties
+                    .get_node_property(neighbor_id, "_label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let dir_str = match direction {
+                    weav_core::types::Direction::Outgoing => "outgoing",
+                    weav_core::types::Direction::Incoming => "incoming",
+                    weav_core::types::Direction::Both => "both",
+                };
+                let edge_label = gs
+                    .adjacency
+                    .get_edge(edge_id)
+                    .map(|e| {
+                        gs.interner
+                            .resolve_label(e.label)
+                            .unwrap_or("unknown")
+                            .to_string()
+                    })
+                    .unwrap_or_default();
+                let weight = gs
+                    .adjacency
+                    .get_edge(edge_id)
+                    .map(|e| e.weight)
+                    .unwrap_or(1.0);
+                serde_json::json!({
+                    "node_id": neighbor_id,
+                    "edge_id": edge_id,
+                    "label": label,
+                    "edge_label": edge_label,
+                    "direction": dir_str,
+                    "weight": weight,
+                })
+            })
+            .collect();
+
+        success_json(&serde_json::json!({
+            "node_id": params.node_id,
+            "neighbor_count": results.len(),
+            "neighbors": results,
+        }))
+    }
+
+    /// Export entire graph as JSON.
+    #[tool(description = "Export an entire graph as JSON including all nodes with their labels and properties, and all edges with source, target, label, and weight.")]
+    fn export_graph(
+        &self,
+        Parameters(params): Parameters<ExportGraphParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let graph_arc = self.engine.get_graph(&params.graph).map_err(|e| {
+            McpError::internal_error(e.to_string(), None)
+        })?;
+        let gs = graph_arc.read();
+
+        // Export all nodes.
+        let node_ids = gs.adjacency.all_node_ids();
+        let nodes: Vec<serde_json::Value> = node_ids
+            .iter()
+            .map(|&nid| {
+                let label = gs
+                    .properties
+                    .get_node_property(nid, "_label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let props: serde_json::Map<String, serde_json::Value> = gs
+                    .properties
+                    .get_all_node_properties(nid)
+                    .into_iter()
+                    .filter(|(k, _)| !k.starts_with('_'))
+                    .map(|(k, v)| (k.to_string(), value_to_json(v)))
+                    .collect();
+                serde_json::json!({
+                    "node_id": nid,
+                    "label": label,
+                    "properties": props,
+                })
+            })
+            .collect();
+
+        // Export all edges.
+        let edges: Vec<serde_json::Value> = gs
+            .adjacency
+            .all_edges()
+            .map(|(eid, meta)| {
+                let edge_label = gs
+                    .interner
+                    .resolve_label(meta.label)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let props: serde_json::Map<String, serde_json::Value> = gs
+                    .properties
+                    .get_all_edge_properties(eid)
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), value_to_json(v)))
+                    .collect();
+                serde_json::json!({
+                    "edge_id": eid,
+                    "source": meta.source,
+                    "target": meta.target,
+                    "label": edge_label,
+                    "weight": meta.weight,
+                    "properties": props,
+                })
+            })
+            .collect();
+
+        success_json(&serde_json::json!({
+            "graph": params.graph,
+            "node_count": nodes.len(),
+            "edge_count": edges.len(),
+            "nodes": nodes,
+            "edges": edges,
+        }))
+    }
+
+    /// Get detailed graph statistics.
+    #[tool(description = "Get detailed statistics for a graph including node count, edge count, vector count, label distribution, and average node degree.")]
+    fn graph_stats(
+        &self,
+        Parameters(params): Parameters<GraphStatsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let graph_arc = self.engine.get_graph(&params.graph).map_err(|e| {
+            McpError::internal_error(e.to_string(), None)
+        })?;
+        let gs = graph_arc.read();
+
+        let node_count = gs.adjacency.node_count();
+        let edge_count = gs.adjacency.edge_count();
+        let vector_count = gs.vector_index.len();
+
+        // Compute label distribution.
+        let node_ids = gs.adjacency.all_node_ids();
+        let mut label_counts: HashMap<String, u64> = HashMap::new();
+        let mut total_degree: u64 = 0;
+        for &nid in &node_ids {
+            let label = gs
+                .properties
+                .get_node_property(nid, "_label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            *label_counts.entry(label).or_insert(0) += 1;
+            total_degree += gs.adjacency.neighbors_both(nid, None).len() as u64;
+        }
+
+        let avg_degree = if node_count > 0 {
+            total_degree as f64 / node_count as f64
+        } else {
+            0.0
+        };
+
+        success_json(&serde_json::json!({
+            "graph": params.graph,
+            "node_count": node_count,
+            "edge_count": edge_count,
+            "vector_count": vector_count,
+            "label_distribution": label_counts,
+            "avg_degree": avg_degree,
+        }))
+    }
+
     /// Get server info and statistics.
     #[tool(description = "Get Weav server information including version and number of graphs.")]
     fn server_info(&self) -> Result<CallToolResult, McpError> {
@@ -368,7 +659,11 @@ impl ServerHandler for WeavMcpServer {
                  Use graph_info to get node/edge counts for a graph. \
                  Use node_add to add nodes with labels and properties. \
                  Use node_get to retrieve nodes by ID or entity_key. \
+                 Use search_nodes to find nodes by property key/value. \
+                 Use get_neighbors to find all neighbors of a node. \
                  Use edge_add to create edges between nodes. \
+                 Use export_graph to export all nodes and edges as JSON. \
+                 Use graph_stats for detailed statistics including label distribution. \
                  Use graph_drop to delete a graph."
                     .to_string(),
             )
@@ -663,5 +958,9 @@ mod tests {
         assert!(router.has_route("node_get"));
         assert!(router.has_route("edge_add"));
         assert!(router.has_route("server_info"));
+        assert!(router.has_route("search_nodes"));
+        assert!(router.has_route("get_neighbors"));
+        assert!(router.has_route("export_graph"));
+        assert!(router.has_route("graph_stats"));
     }
 }
