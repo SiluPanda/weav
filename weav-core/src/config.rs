@@ -243,7 +243,7 @@ impl Default for MemoryConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub enum EvictionPolicy {
     #[default]
     NoEviction,
@@ -389,6 +389,9 @@ pub struct GraphConfig {
     pub default_ttl_ms: Option<u64>,
     /// Schema constraints for property validation on nodes and edges.
     pub schema: GraphSchema,
+    /// Eviction policy for this graph when at capacity.
+    #[serde(default)]
+    pub eviction_policy: EvictionPolicy,
 }
 
 impl Default for GraphConfig {
@@ -404,6 +407,7 @@ impl Default for GraphConfig {
             auto_dedup_threshold: None,
             default_ttl_ms: None,
             schema: GraphSchema::new(),
+            eviction_policy: EvictionPolicy::NoEviction,
         }
     }
 }

@@ -70,6 +70,9 @@ tiktoken-rs = "0.6"
 # String matching (for dedup)
 strsim = "0.11"
 
+# CSV
+csv = "1.3"
+
 # Configuration
 toml = "0.8"
 

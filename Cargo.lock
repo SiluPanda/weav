@@ -5476,6 +5476,7 @@ dependencies = [
  "bincode",
  "bytes",
  "compact_str",
+ "csv",
  "futures",
  "parking_lot",
  "prometheus",

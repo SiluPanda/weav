@@ -18,7 +18,8 @@ use serde::Deserialize;
 use weav_core::types::{Direction, TokenAllocation, TokenBudget, Value};
 use weav_query::parser::{
     Command, ContextQuery, EdgeAddCmd, EdgeDeleteCmd, EdgeGetCmd, GraphCreateCmd,
-    NodeAddCmd, NodeDeleteCmd, NodeGetCmd, NodeUpdateCmd, SeedStrategy,
+    IngestCmd, NodeAddCmd, NodeDeleteCmd, NodeGetCmd, NodeUpdateCmd, SchemaGetCmd,
+    SchemaSetCmd, SeedStrategy,
 };
 use weav_server::engine::CommandResponse;
 
@@ -224,6 +225,56 @@ pub struct EdgeAddParams {
     #[serde(default)]
     pub properties: HashMap<String, serde_json::Value>,
 }
+
+/// Parameters for ingesting a document.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IngestDocumentParams {
+    /// Name of the graph.
+    pub graph: String,
+    /// Document content (text, markdown, etc.).
+    pub content: String,
+    /// Format hint: "text", "markdown", "csv", "pdf". Defaults to "text".
+    pub format: Option<String>,
+    /// Optional document ID for tracking.
+    pub document_id: Option<String>,
+}
+
+/// Parameters for setting a schema constraint.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SchemaSetParams {
+    /// Name of the graph.
+    pub graph: String,
+    /// Target: "node" or "edge".
+    pub target: String,
+    /// Label to apply the constraint to (e.g. "Person", "KNOWS").
+    pub label: String,
+    /// Constraint type: "type", "required", or "unique".
+    pub constraint_type: String,
+    /// Property name the constraint applies to.
+    pub property: String,
+    /// Value type (for "type" constraint): "string", "int", "float", "bool", "bytes", "vector", "list", "map", "timestamp".
+    pub value_type: Option<String>,
+}
+
+/// Parameters for getting the schema of a graph.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SchemaGetParams {
+    /// Name of the graph.
+    pub graph: String,
+}
+
+/// Parameters for setting a config key.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConfigSetParams {
+    /// Config key to set.
+    pub key: String,
+    /// Value to set.
+    pub value: String,
+}
+
+/// Parameters for triggering a snapshot.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TriggerSnapshotParams {}
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -1245,6 +1296,124 @@ impl WeavMcpServer {
             ))])),
         }
     }
+
+    /// Ingest a document into a graph using the LLM extraction pipeline.
+    #[tool(description = "Ingest a document into a graph. The extraction pipeline chunks the text, extracts entities and relationships using LLM, and builds the knowledge graph automatically. Supports text, markdown, CSV formats.")]
+    fn ingest_document(
+        &self,
+        Parameters(params): Parameters<IngestDocumentParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let cmd = Command::Ingest(IngestCmd {
+            graph: params.graph,
+            content: params.content,
+            format: params.format,
+            document_id: params.document_id,
+            skip_extraction: false,
+            skip_dedup: false,
+            chunk_size: None,
+            entity_types: None,
+        });
+        match self.engine.execute_command(cmd, None) {
+            Ok(CommandResponse::IngestResult(info)) => success_json(&serde_json::json!({
+                "document_id": info.document_id,
+                "chunks_created": info.chunks_created,
+                "entities_created": info.entities_created,
+                "entities_merged": info.entities_merged,
+                "relationships_created": info.relationships_created,
+                "pipeline_duration_ms": info.pipeline_duration_ms,
+            })),
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "{resp:?}"
+            ))])),
+            Err(e) => weav_error(e),
+        }
+    }
+
+    /// Set a schema constraint on a graph.
+    #[tool(description = "Set a schema constraint on node or edge labels. Constraint types: 'type' (enforce property data type), 'required' (property must exist), 'unique' (property value must be unique within the label). Example: set type constraint on Person.age to 'int'.")]
+    fn schema_set(
+        &self,
+        Parameters(params): Parameters<SchemaSetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let cmd = Command::SchemaSet(SchemaSetCmd {
+            graph: params.graph.clone(),
+            target: params.target,
+            label: params.label.clone(),
+            constraint_type: params.constraint_type,
+            property: params.property.clone(),
+            value_type: params.value_type,
+        });
+        match self.engine.execute_command(cmd, None) {
+            Ok(CommandResponse::Ok) => success_json(&serde_json::json!({
+                "status": "constraint_added",
+                "graph": params.graph,
+                "label": params.label,
+                "property": params.property,
+            })),
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "{resp:?}"
+            ))])),
+            Err(e) => weav_error(e),
+        }
+    }
+
+    /// Get the schema for a graph.
+    #[tool(description = "Get all schema constraints defined for a graph, including property type, required, and uniqueness constraints for both node and edge labels.")]
+    fn schema_get(
+        &self,
+        Parameters(params): Parameters<SchemaGetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let cmd = Command::SchemaGet(SchemaGetCmd {
+            graph: params.graph,
+        });
+        match self.engine.execute_command(cmd, None) {
+            Ok(CommandResponse::Text(schema_json)) => {
+                Ok(CallToolResult::success(vec![Content::text(schema_json)]))
+            }
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "{resp:?}"
+            ))])),
+            Err(e) => weav_error(e),
+        }
+    }
+
+    /// Set a runtime configuration value.
+    #[tool(description = "Set a runtime configuration key-value pair on the Weav server.")]
+    fn config_set(
+        &self,
+        Parameters(params): Parameters<ConfigSetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let cmd = Command::ConfigSet(params.key.clone(), params.value.clone());
+        match self.engine.execute_command(cmd, None) {
+            Ok(CommandResponse::Ok) => success_json(&serde_json::json!({
+                "status": "set",
+                "key": params.key,
+                "value": params.value,
+            })),
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "{resp:?}"
+            ))])),
+            Err(e) => weav_error(e),
+        }
+    }
+
+    /// Trigger a persistence snapshot.
+    #[tool(description = "Trigger an immediate persistence snapshot of all graph data to disk. Useful before maintenance or to ensure durability.")]
+    fn trigger_snapshot(
+        &self,
+        #[allow(unused_variables)]
+        Parameters(params): Parameters<TriggerSnapshotParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.engine.execute_command(Command::Snapshot, None) {
+            Ok(CommandResponse::Ok) => success_json(&serde_json::json!({
+                "status": "snapshot_triggered",
+            })),
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "{resp:?}"
+            ))])),
+            Err(e) => weav_error(e),
+        }
+    }
 }
 
 #[tool_handler]
@@ -1255,15 +1424,19 @@ impl ServerHandler for WeavMcpServer {
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(
                 "Weav is an in-memory context graph database for AI/LLM workloads. \
-                 Tools: graph_list, graph_create, graph_info, graph_stats, graph_drop, \
+                 24 tools available: graph_list, graph_create, graph_info, graph_stats, graph_drop, \
                  node_add, node_get, node_update, node_delete, \
                  edge_add, edge_get, edge_delete, \
                  search_nodes, get_neighbors, vector_search, \
                  context_query (token-budget-aware retrieval — Weav's unique feature), \
                  run_algorithm (PageRank, communities, shortest path, centrality, etc.), \
-                 export_graph, server_info. \
-                 Start with graph_list to see available graphs, or graph_create to make one. \
-                 Use context_query for intelligent, budget-aware context retrieval from knowledge graphs."
+                 export_graph, server_info, \
+                 ingest_document (LLM entity extraction pipeline), \
+                 schema_set, schema_get (property type/required/unique constraints), \
+                 config_set, trigger_snapshot. \
+                 Start with graph_list, or graph_create to make a new graph. \
+                 Use context_query for intelligent, budget-aware context retrieval. \
+                 Use ingest_document to automatically build knowledge graphs from text."
                     .to_string(),
             )
     }
@@ -1568,6 +1741,11 @@ mod tests {
         assert!(router.has_route("context_query"));
         assert!(router.has_route("vector_search"));
         assert!(router.has_route("run_algorithm"));
+        assert!(router.has_route("ingest_document"));
+        assert!(router.has_route("schema_set"));
+        assert!(router.has_route("schema_get"));
+        assert!(router.has_route("config_set"));
+        assert!(router.has_route("trigger_snapshot"));
     }
 
     /// Helper: create a graph and add two connected nodes for testing new tools.
@@ -2060,9 +2238,82 @@ mod tests {
             "edge_add", "edge_get", "edge_delete",
             "search_nodes", "get_neighbors", "export_graph", "graph_stats",
             "server_info", "context_query", "vector_search", "run_algorithm",
+            "ingest_document", "schema_set", "schema_get",
+            "config_set", "trigger_snapshot",
         ];
         for tool in &expected {
             assert!(router.has_route(tool), "missing tool: {tool}");
         }
+    }
+
+    #[test]
+    fn test_schema_set_and_get() {
+        use weav_query::parser::{Command, GraphCreateCmd, SchemaSetCmd, SchemaGetCmd};
+        use weav_server::engine::CommandResponse;
+
+        let server = test_server();
+        server.engine.execute_command(
+            Command::GraphCreate(GraphCreateCmd { name: "sg".into(), config: None }),
+            None,
+        ).unwrap();
+
+        // Set a type constraint.
+        let resp = server.engine.execute_command(
+            Command::SchemaSet(SchemaSetCmd {
+                graph: "sg".into(),
+                target: "node".into(),
+                label: "Person".into(),
+                constraint_type: "type".into(),
+                property: "age".into(),
+                value_type: Some("int".into()),
+            }),
+            None,
+        ).unwrap();
+        assert!(matches!(resp, CommandResponse::Ok));
+
+        // Get schema.
+        let resp = server.engine.execute_command(
+            Command::SchemaGet(SchemaGetCmd { graph: "sg".into() }),
+            None,
+        ).unwrap();
+        match resp {
+            CommandResponse::Text(json) => {
+                assert!(json.contains("Person"));
+                assert!(json.contains("age"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_config_set() {
+        use weav_query::parser::Command;
+        use weav_server::engine::CommandResponse;
+
+        let server = test_server();
+        let resp = server.engine.execute_command(
+            Command::ConfigSet("test_key".into(), "test_value".into()),
+            None,
+        ).unwrap();
+        assert!(matches!(resp, CommandResponse::Ok));
+
+        let resp = server.engine.execute_command(
+            Command::ConfigGet("test_key".into()),
+            None,
+        ).unwrap();
+        match resp {
+            CommandResponse::Text(v) => assert_eq!(v, "test_value"),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_trigger_snapshot() {
+        use weav_query::parser::Command;
+        use weav_server::engine::CommandResponse;
+
+        let server = test_server();
+        let resp = server.engine.execute_command(Command::Snapshot, None).unwrap();
+        assert!(matches!(resp, CommandResponse::Ok));
     }
 }

@@ -126,6 +126,23 @@ impl PropertyStore {
         Vec::new()
     }
 
+    /// Find edge IDs where the given property key matches a predicate.
+    pub fn edges_where(&self, key: &str, predicate: &dyn Fn(&Value) -> bool) -> Vec<EdgeId> {
+        let key_id = match self.schema.get(key) {
+            Some(&id) => id,
+            None => return Vec::new(),
+        };
+        self.edge_overflow
+            .iter()
+            .filter(|(_, props)| {
+                props
+                    .iter()
+                    .any(|(k, v)| *k == key_id && predicate(v))
+            })
+            .map(|(&eid, _)| eid)
+            .collect()
+    }
+
     /// Set a property on an edge.
     pub fn set_edge_property(&mut self, edge_id: EdgeId, key: &str, value: Value) {
         let key_id = self.intern_key(key).expect("property key space exhausted");

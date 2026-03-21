@@ -3,6 +3,7 @@
 //! Provides a thread-safe interface for executing commands against graphs.
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -10,12 +11,14 @@ use parking_lot::{Mutex, RwLock};
 
 use compact_str::CompactString;
 
-use weav_core::config::{GraphConfig, WeavConfig};
+use weav_core::config::{EvictionPolicy, GraphConfig, WeavConfig};
 use weav_core::error::{WeavError, WeavResult};
+use weav_core::events::{EventKind, GraphEvent};
 use weav_core::shard::StringInterner;
 use weav_core::types::*;
 use weav_graph::adjacency::{AdjacencyStore, EdgeMeta};
 use weav_graph::properties::PropertyStore;
+use weav_graph::text_index::TextIndex;
 use weav_persist::snapshot::{
     EdgeSnapshot, FullSnapshot, GraphSnapshot, NodeSnapshot, SnapshotEngine, SnapshotMeta,
 };
@@ -99,6 +102,10 @@ pub struct GraphState {
     pub next_node_id: NodeId,
     pub next_edge_id: EdgeId,
     pub dedup_config: Option<weav_graph::dedup::DedupConfig>,
+    /// Full-text inverted index with BM25 scoring.
+    pub text_index: TextIndex,
+    /// Last access time per node for LRU eviction (ms since epoch).
+    pub access_times: HashMap<NodeId, u64>,
 }
 
 // ─── Engine ──────────────────────────────────────────────────────────────────
@@ -121,6 +128,12 @@ pub struct Engine {
     active_connections: std::sync::atomic::AtomicU64,
     /// When true, WAL writes are suppressed (during recovery replay).
     replaying: std::sync::atomic::AtomicBool,
+    /// CDC broadcast channel for streaming mutation events to subscribers.
+    event_tx: tokio::sync::broadcast::Sender<GraphEvent>,
+    /// Monotonically increasing sequence counter for CDC events.
+    event_sequence: AtomicU64,
+    /// Ring buffer of recent events (last 10,000) for polling/testing.
+    event_log: RwLock<Vec<GraphEvent>>,
 }
 
 /// Extract graph name and operation type from a WAL operation for metric labels.
@@ -166,6 +179,8 @@ impl Engine {
             None
         };
 
+        let (event_tx, _) = tokio::sync::broadcast::channel(4096);
+
         Self {
             graphs: RwLock::new(HashMap::new()),
             next_graph_id: RwLock::new(1),
@@ -177,6 +192,9 @@ impl Engine {
             acl_store,
             active_connections: std::sync::atomic::AtomicU64::new(0),
             replaying: std::sync::atomic::AtomicBool::new(false),
+            event_tx,
+            event_sequence: AtomicU64::new(0),
+            event_log: RwLock::new(Vec::new()),
         }
     }
 
@@ -193,6 +211,67 @@ impl Engine {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64
+    }
+
+    /// Record an LRU access time for a node.
+    fn record_access(gs: &mut GraphState, node_id: NodeId) {
+        let now = Self::now_ms();
+        gs.access_times.insert(node_id, now);
+    }
+
+    /// Evict a single node, removing its edges, properties, vector entry, text
+    /// index entry, and access-time tracking.
+    #[allow(dead_code)]
+    fn evict_node(&self, gs: &mut GraphState, victim_id: NodeId, graph_name: &str) {
+        // Remove the node (cascades edges via AdjacencyStore::remove_node).
+        let _ = gs.adjacency.remove_node(victim_id);
+        gs.properties.remove_all_node_properties(victim_id);
+        let _ = gs.vector_index.remove(victim_id);
+        gs.text_index.remove_node(victim_id);
+        gs.access_times.remove(&victim_id);
+
+        // Update metrics after eviction.
+        crate::metrics::NODES_TOTAL
+            .with_label_values(&[graph_name])
+            .set(gs.adjacency.node_count() as i64);
+        crate::metrics::EDGES_TOTAL
+            .with_label_values(&[graph_name])
+            .set(gs.adjacency.edge_count() as i64);
+    }
+
+    // ── CDC event infrastructure ──────────────────────────────────────────
+
+    /// Subscribe to the CDC event stream. Returns a broadcast receiver that
+    /// yields every [`GraphEvent`] emitted by mutation handlers.
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<GraphEvent> {
+        self.event_tx.subscribe()
+    }
+
+    /// Return the most recent CDC events (newest first), up to `limit`.
+    pub fn recent_events(&self, limit: usize) -> Vec<GraphEvent> {
+        let log = self.event_log.read();
+        log.iter().rev().take(limit).cloned().collect()
+    }
+
+    /// Emit a CDC event after a successful mutation.
+    fn emit_event(&self, graph: &str, kind: EventKind) {
+        let seq = self
+            .event_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let event = GraphEvent {
+            sequence: seq,
+            graph: CompactString::from(graph),
+            timestamp: Self::now_ms(),
+            kind,
+        };
+        // Broadcast to live subscribers (ignore error = no active receivers).
+        let _ = self.event_tx.send(event.clone());
+        // Append to ring buffer for polling / testing.
+        let mut log = self.event_log.write();
+        log.push(event);
+        if log.len() > 10_000 {
+            log.drain(..5_000);
+        }
     }
 
     fn append_wal(&self, op: WalOperation) -> WeavResult<()> {
@@ -400,6 +479,8 @@ impl Engine {
                     next_node_id: 1,
                     next_edge_id: 1,
                     dedup_config: None,
+                    text_index: TextIndex::new(),
+                    access_times: HashMap::new(),
                 };
 
                 // Restore nodes.
@@ -879,9 +960,11 @@ impl Engine {
                 "INGEST requires async execution; use execute_command_async".into(),
             )),
             Command::Search(cmd) => self.handle_search(cmd),
+            Command::SearchText(cmd) => self.handle_search_text(cmd),
             Command::Neighbors(cmd) => self.handle_neighbors(cmd),
             Command::SchemaSet(cmd) => self.handle_schema_set(cmd),
             Command::SchemaGet(cmd) => self.handle_schema_get(cmd),
+            Command::NodeMerge(cmd) => self.handle_node_merge_authed(cmd, identity),
         }
     }
 
@@ -939,12 +1022,12 @@ impl Engine {
             Command::NodeGet(_) | Command::EdgeGet(_) | Command::GraphInfo(_)
             | Command::GraphList | Command::Stats(_) | Command::Context(_)
             | Command::ConfigGet(_) | Command::AclWhoAmI
-            | Command::Search(_) | Command::Neighbors(_)
+            | Command::Search(_) | Command::SearchText(_) | Command::Neighbors(_)
             | Command::SchemaGet(_) => CommandCategory::Read,
             Command::NodeAdd(_) | Command::NodeUpdate(_) | Command::NodeDelete(_)
             | Command::EdgeAdd(_) | Command::EdgeDelete(_) | Command::EdgeInvalidate(_)
             | Command::BulkInsertNodes(_) | Command::BulkInsertEdges(_)
-            | Command::Ingest(_) => CommandCategory::Write,
+            | Command::Ingest(_) | Command::NodeMerge(_) => CommandCategory::Write,
             Command::GraphCreate(_) | Command::GraphDrop(_) | Command::Snapshot
             | Command::ConfigSet(_, _) | Command::AclSetUser(_) | Command::AclDelUser(_)
             | Command::AclList | Command::AclGetUser(_) | Command::AclSave
@@ -1061,11 +1144,13 @@ impl Engine {
             Command::Ingest(c) => Some(c.graph.clone()),
             Command::Context(q) => Some(q.graph.clone()),
             Command::Search(c) => Some(c.graph.clone()),
+            Command::SearchText(c) => Some(c.graph.clone()),
             Command::Neighbors(c) => Some(c.graph.clone()),
             Command::GraphCreate(c) => Some(c.name.clone()),
             Command::GraphDrop(name) | Command::GraphInfo(name) => Some(name.clone()),
             Command::SchemaSet(c) => Some(c.graph.clone()),
             Command::SchemaGet(c) => Some(c.graph.clone()),
+            Command::NodeMerge(c) => Some(c.graph.clone()),
             Command::Stats(opt) => opt.clone(),
             _ => None,
         }
@@ -1204,6 +1289,15 @@ impl Engine {
         self.handle_context(query)
     }
 
+    fn handle_node_merge_authed(
+        &self,
+        cmd: weav_query::parser::NodeMergeCmd,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
+        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::ReadWrite)?;
+        self.handle_node_merge(cmd)
+    }
+
     // ── Stats ────────────────────────────────────────────────────────────
 
     fn handle_stats(
@@ -1316,6 +1410,27 @@ impl Engine {
         Ok(CommandResponse::StringList(results))
     }
 
+    fn handle_search_text(
+        &self,
+        cmd: weav_query::parser::SearchTextCmd,
+    ) -> WeavResult<CommandResponse> {
+        let graph_arc = self.get_graph(&cmd.graph)?;
+        let gs = graph_arc.read();
+        let limit = cmd.limit.unwrap_or(20) as usize;
+        let results = gs.text_index.search(&cmd.query, limit);
+
+        // Build result strings: "node_id:label:score"
+        let result_strings: Vec<String> = results.iter().map(|&(nid, score)| {
+            let label = gs.properties
+                .get_node_property(nid, "_label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            format!("{}:{}:{:.4}", nid, label, score)
+        }).collect();
+
+        Ok(CommandResponse::StringList(result_strings))
+    }
+
     fn handle_neighbors(
         &self,
         cmd: weav_query::parser::NeighborsCmd,
@@ -1409,6 +1524,8 @@ impl Engine {
             next_node_id: 1,
             next_edge_id: 1,
             dedup_config: None,
+            text_index: TextIndex::new(),
+            access_times: HashMap::new(),
         };
 
         let mut graphs = self
@@ -1423,12 +1540,18 @@ impl Engine {
         }
 
         // Write-ahead: WAL entry before in-memory mutation
+        let graph_name = cmd.name.clone();
         self.append_wal(WalOperation::GraphCreate {
             name: cmd.name.clone(),
             config_json,
         })?;
         graphs.insert(cmd.name, Arc::new(RwLock::new(graph_state)));
         crate::metrics::GRAPHS_TOTAL.set(graphs.len() as i64);
+
+        self.emit_event(&graph_name, EventKind::GraphCreated {
+            name: CompactString::from(&graph_name),
+        });
+
         Ok(CommandResponse::Ok)
     }
 
@@ -1443,6 +1566,11 @@ impl Engine {
         self.append_wal(WalOperation::GraphDrop { name: name.to_string() })?;
         graphs.remove(name);
         crate::metrics::GRAPHS_TOTAL.set(graphs.len() as i64);
+
+        self.emit_event(name, EventKind::GraphDropped {
+            name: CompactString::from(name),
+        });
+
         Ok(CommandResponse::Ok)
     }
 
@@ -1576,12 +1704,28 @@ impl Engine {
 
         // ── No duplicate found: create new node ─────────────────────────
 
-        // Enforce max_nodes capacity if configured
+        // Enforce max_nodes capacity if configured, with LRU eviction support
         if let Some(max) = gs.config.max_nodes {
             if gs.adjacency.node_count() >= max {
-                return Err(WeavError::CapacityExceeded(format!(
-                    "graph '{}' reached max_nodes limit ({})", cmd.graph, max
-                )));
+                match gs.config.eviction_policy {
+                    EvictionPolicy::LRU => {
+                        // Find least recently used node
+                        let victim_id = gs.access_times
+                            .iter()
+                            .min_by_key(|&(_, ts)| *ts)
+                            .map(|(&id, _)| id)
+                            .or_else(|| gs.adjacency.all_node_ids().first().copied());
+                        if let Some(victim) = victim_id {
+                            let graph_name = cmd.graph.clone();
+                            self.evict_node(&mut gs, victim, &graph_name);
+                        }
+                    }
+                    _ => {
+                        return Err(WeavError::CapacityExceeded(format!(
+                            "graph '{}' reached max_nodes limit ({})", cmd.graph, max
+                        )));
+                    }
+                }
             }
         }
 
@@ -1608,9 +1752,9 @@ impl Engine {
                                 .unwrap_or(false)
                         }).collect();
                         if !duplicates.is_empty() {
-                            return Err(WeavError::InvalidConfig(format!(
-                                "uniqueness constraint violated: property '{}' value already exists on node(s) {:?}",
-                                property, duplicates
+                            return Err(WeavError::Conflict(format!(
+                                "unique constraint violation: property '{}' value already exists on label '{}'",
+                                property, cmd.label
                             )));
                         }
                     }
@@ -1660,6 +1804,15 @@ impl Engine {
             gs.properties.set_node_property(node_id, k, v.clone());
         }
 
+        // Auto-index text content for full-text search
+        let text_content: String = cmd.properties.iter()
+            .filter_map(|(_, v)| v.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !text_content.is_empty() {
+            gs.text_index.index_node(node_id, &text_content);
+        }
+
         if let Some(ref embedding) = cmd.embedding {
             gs.vector_index.insert(node_id, embedding)?;
         }
@@ -1680,6 +1833,17 @@ impl Engine {
             .with_label_values(&[&cmd.graph])
             .set(gs.adjacency.node_count() as i64);
 
+        self.emit_event(&cmd.graph, EventKind::NodeCreated {
+            node_id,
+            label: CompactString::from(&cmd.label),
+            properties: cmd.properties.iter()
+                .map(|(k, v)| (CompactString::from(k.as_str()), v.clone()))
+                .collect(),
+        });
+
+        // Record initial LRU access time for the new node.
+        Self::record_access(&mut gs, node_id);
+
         Ok(CommandResponse::Integer(node_id))
     }
 
@@ -1688,7 +1852,7 @@ impl Engine {
         cmd: weav_query::parser::NodeGetCmd,
     ) -> WeavResult<CommandResponse> {
         let graph_arc = self.get_graph(&cmd.graph)?;
-        let gs = graph_arc.read();
+        let mut gs = graph_arc.write();
 
         let node_id = if let Some(id) = cmd.node_id {
             id
@@ -1710,6 +1874,8 @@ impl Engine {
         if !gs.adjacency.has_node(node_id) {
             return Err(WeavError::NodeNotFound(node_id, gs.graph_id));
         }
+        // Record LRU access time.
+        Self::record_access(&mut gs, node_id);
 
         // Get label.
         let label = gs
@@ -1756,6 +1922,7 @@ impl Engine {
         gs.adjacency.remove_node(cmd.node_id)?;
         gs.properties.remove_all_node_properties(cmd.node_id);
         gs.vector_index.remove(cmd.node_id)?;
+        gs.text_index.remove_node(cmd.node_id);
 
         // Update metrics
         crate::metrics::NODES_TOTAL
@@ -1765,7 +1932,191 @@ impl Engine {
             .with_label_values(&[&cmd.graph])
             .set(gs.adjacency.edge_count() as i64);
 
+        self.emit_event(&cmd.graph, EventKind::NodeDeleted {
+            node_id: cmd.node_id,
+        });
+
         Ok(CommandResponse::Ok)
+    }
+
+    fn handle_node_merge(
+        &self,
+        cmd: weav_query::parser::NodeMergeCmd,
+    ) -> WeavResult<CommandResponse> {
+        let graph_arc = self.get_graph(&cmd.graph)?;
+        let mut gs = graph_arc.write();
+
+        // 1. Verify both nodes exist
+        if !gs.adjacency.has_node(cmd.source_id) {
+            return Err(WeavError::NodeNotFound(cmd.source_id, gs.graph_id));
+        }
+        if !gs.adjacency.has_node(cmd.target_id) {
+            return Err(WeavError::NodeNotFound(cmd.target_id, gs.graph_id));
+        }
+        if cmd.source_id == cmd.target_id {
+            return Err(WeavError::Conflict(
+                "cannot merge a node into itself".into(),
+            ));
+        }
+
+        let graph_id = gs.graph_id;
+
+        // 2. Merge properties based on conflict policy
+        let source_props: Vec<(String, Value)> = gs
+            .properties
+            .get_all_node_properties(cmd.source_id)
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with('_'))
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+
+        for (key, src_val) in &source_props {
+            let target_has = gs
+                .properties
+                .get_node_property(cmd.target_id, key)
+                .cloned();
+            match target_has {
+                None => {
+                    // Target missing this property, always copy
+                    gs.properties
+                        .set_node_property(cmd.target_id, key, src_val.clone());
+                }
+                Some(ref tgt_val) if tgt_val == src_val => {
+                    // Same value, nothing to do
+                }
+                Some(_) => {
+                    // Conflict: decide based on policy
+                    if cmd.conflict_policy == "keep_source" {
+                        gs.properties
+                            .set_node_property(cmd.target_id, key, src_val.clone());
+                    }
+                    // "keep_target" and "merge" both keep target value on conflict
+                }
+            }
+        }
+
+        // 3. Re-link edges from source to target
+        //    Collect edge info before mutating (EdgeMeta is not Clone)
+        struct EdgeInfo {
+            eid: EdgeId,
+            source: NodeId,
+            target: NodeId,
+            label: LabelId,
+            temporal: BiTemporal,
+            provenance: Option<Provenance>,
+            weight: f32,
+            token_cost: u16,
+        }
+        let edge_infos: Vec<EdgeInfo> = gs
+            .adjacency
+            .all_edges()
+            .filter(|(_, meta)| meta.source == cmd.source_id || meta.target == cmd.source_id)
+            .map(|(eid, meta)| EdgeInfo {
+                eid,
+                source: meta.source,
+                target: meta.target,
+                label: meta.label,
+                temporal: meta.temporal,
+                provenance: meta.provenance.clone(),
+                weight: meta.weight,
+                token_cost: meta.token_cost,
+            })
+            .collect();
+
+        for ei in &edge_infos {
+            let new_src = if ei.source == cmd.source_id {
+                cmd.target_id
+            } else {
+                ei.source
+            };
+            let new_tgt = if ei.target == cmd.source_id {
+                cmd.target_id
+            } else {
+                ei.target
+            };
+
+            // Skip self-loops that would result from merge
+            if new_src == new_tgt {
+                continue;
+            }
+
+            // Copy edge properties
+            let edge_props: Vec<(String, Value)> = gs
+                .properties
+                .get_all_edge_properties(ei.eid)
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect();
+
+            // Create new edge with same metadata but updated endpoints
+            let new_edge_id = gs.adjacency.allocate_edge_id();
+            let new_meta = weav_graph::adjacency::EdgeMeta {
+                source: new_src,
+                target: new_tgt,
+                label: ei.label,
+                temporal: ei.temporal,
+                provenance: ei.provenance.clone(),
+                weight: ei.weight,
+                token_cost: ei.token_cost,
+            };
+
+            // WAL entry for the new edge
+            let props_json = serde_json::to_string(
+                &edge_props
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v))
+                    .collect::<std::collections::HashMap<_, _>>(),
+            )
+            .unwrap_or_default();
+            let label_str = gs
+                .interner
+                .resolve_label(ei.label)
+                .unwrap_or("unknown")
+                .to_string();
+            self.append_wal(WalOperation::EdgeAdd {
+                graph_id,
+                edge_id: new_edge_id,
+                source: new_src,
+                target: new_tgt,
+                label: label_str,
+                weight: ei.weight,
+                properties_json: props_json,
+            })?;
+
+            gs.adjacency
+                .add_edge_with_id(new_src, new_tgt, ei.label, new_meta, new_edge_id)?;
+
+            for (k, v) in &edge_props {
+                gs.properties.set_edge_property(new_edge_id, k, v.clone());
+            }
+        }
+
+        // 4. If source has a vector embedding, copy to target if target lacks one
+        if let Some(src_vec) = gs.vector_index.get_vector(cmd.source_id) {
+            let src_vec = src_vec.to_vec();
+            if gs.vector_index.get_vector(cmd.target_id).is_none() {
+                let _ = gs.vector_index.insert(cmd.target_id, &src_vec);
+            }
+        }
+
+        // 5. Delete source node (WAL + in-memory)
+        self.append_wal(WalOperation::NodeDelete {
+            graph_id,
+            node_id: cmd.source_id,
+        })?;
+        gs.adjacency.remove_node(cmd.source_id)?;
+        gs.properties.remove_all_node_properties(cmd.source_id);
+        let _ = gs.vector_index.remove(cmd.source_id);
+
+        // Update metrics
+        crate::metrics::NODES_TOTAL
+            .with_label_values(&[&cmd.graph])
+            .set(gs.adjacency.node_count() as i64);
+        crate::metrics::EDGES_TOTAL
+            .with_label_values(&[&cmd.graph])
+            .set(gs.adjacency.edge_count() as i64);
+
+        Ok(CommandResponse::Integer(cmd.target_id))
     }
 
     fn handle_node_update(
@@ -1795,6 +2146,15 @@ impl Engine {
             gs.properties.set_node_property(cmd.node_id, k, v.clone());
         }
 
+        // Re-index text content for full-text search
+        let text_content: String = cmd.properties.iter()
+            .filter_map(|(_, v)| v.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !text_content.is_empty() {
+            gs.text_index.index_node(cmd.node_id, &text_content);
+        }
+
         if let Some(ref embedding) = cmd.embedding {
             // Write-ahead: persist embedding update to WAL
             self.append_wal(WalOperation::VectorUpdate {
@@ -1805,6 +2165,13 @@ impl Engine {
             let _ = gs.vector_index.remove(cmd.node_id);
             gs.vector_index.insert(cmd.node_id, embedding)?;
         }
+
+        self.emit_event(&cmd.graph, EventKind::NodeUpdated {
+            node_id: cmd.node_id,
+            properties: cmd.properties.iter()
+                .map(|(k, v)| (CompactString::from(k.as_str()), v.clone()))
+                .collect(),
+        });
 
         Ok(CommandResponse::Ok)
     }
@@ -1949,6 +2316,34 @@ impl Engine {
         // ── Schema validation ────────────────────────────────────────────
         gs.config.schema.validate_edge_properties(&cmd.label, &cmd.properties)?;
 
+        // Uniqueness constraint enforcement for edges
+        for constraint in gs.config.schema.edge_schemas
+            .get(cmd.label.as_str())
+            .map(|s| s.constraints.as_slice())
+            .unwrap_or_default()
+        {
+            if let weav_core::schema::SchemaConstraint::PropertyUnique { property } = constraint {
+                if let Some((_, prop_val)) = cmd.properties.iter().find(|(k, _)| k == property.as_str()) {
+                    if *prop_val != Value::Null {
+                        let search_val = prop_val.clone();
+                        let existing = gs.properties.edges_where(property.as_str(), &|v| *v == search_val);
+                        // Filter to only edges with the same label
+                        let duplicates: Vec<_> = existing.into_iter().filter(|&eid| {
+                            gs.adjacency.get_edge(eid)
+                                .map(|meta| meta.label == label_id)
+                                .unwrap_or(false)
+                        }).collect();
+                        if !duplicates.is_empty() {
+                            return Err(WeavError::Conflict(format!(
+                                "unique constraint violation: property '{}' value already exists on edge label '{}'",
+                                property, cmd.label
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
         // Pre-allocate edge ID for write-ahead logging
         let edge_id = gs.adjacency.allocate_edge_id();
         let graph_id = gs.graph_id;
@@ -2002,6 +2397,14 @@ impl Engine {
             .with_label_values(&[&cmd.graph])
             .set(gs.adjacency.edge_count() as i64);
 
+        self.emit_event(&cmd.graph, EventKind::EdgeCreated {
+            edge_id,
+            source: cmd.source,
+            target: cmd.target,
+            label: CompactString::from(&cmd.label),
+            weight: cmd.weight,
+        });
+
         Ok(CommandResponse::Integer(edge_id))
     }
 
@@ -2028,6 +2431,10 @@ impl Engine {
 
         gs.adjacency.invalidate_edge(cmd.edge_id, now)?;
 
+        self.emit_event(&cmd.graph, EventKind::EdgeInvalidated {
+            edge_id: cmd.edge_id,
+        });
+
         Ok(CommandResponse::Ok)
     }
 
@@ -2051,6 +2458,10 @@ impl Engine {
         })?;
 
         gs.adjacency.remove_edge(cmd.edge_id)?;
+
+        self.emit_event(&cmd.graph, EventKind::EdgeDeleted {
+            edge_id: cmd.edge_id,
+        });
 
         Ok(CommandResponse::Ok)
     }
@@ -5668,5 +6079,1315 @@ mod tests {
             ttl_ms: None,
         });
         assert!(engine.execute_command(cmd, None).is_err());
+    }
+
+    // ── LRU eviction tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_lru_eviction_basic() {
+        let engine = make_engine();
+        let mut gc = weav_core::config::GraphConfig::default();
+        gc.max_nodes = Some(3);
+        gc.eviction_policy = weav_core::config::EvictionPolicy::LRU;
+        let cmd = Command::GraphCreate(parser::GraphCreateCmd {
+            name: "lru_basic".to_string(),
+            config: Some(gc),
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        // Add 3 nodes (fills capacity)
+        for i in 0..3 {
+            let cmd = Command::NodeAdd(parser::NodeAddCmd {
+                graph: "lru_basic".to_string(),
+                label: "x".to_string(),
+                properties: vec![("i".to_string(), Value::Int(i))],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            });
+            engine.execute_command(cmd, None).unwrap();
+        }
+
+        // Set deterministic access times: node 1 oldest, node 2 mid, node 3 newest
+        {
+            let graph_arc = engine.get_graph("lru_basic").unwrap();
+            let mut gs = graph_arc.write();
+            gs.access_times.insert(1, 1000);
+            gs.access_times.insert(2, 2000);
+            gs.access_times.insert(3, 3000);
+        }
+
+        // Add a 4th node -- should evict node 1 (oldest access time)
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "lru_basic".to_string(),
+            label: "x".to_string(),
+            properties: vec![("i".to_string(), Value::Int(99))],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        // Verify we still have 3 nodes
+        let graph_arc = engine.get_graph("lru_basic").unwrap();
+        let gs = graph_arc.read();
+        assert_eq!(gs.adjacency.node_count(), 3);
+
+        // Node 1 (oldest access time) should be gone
+        assert!(!gs.adjacency.has_node(1));
+        // Nodes 2, 3, and 4 should still exist
+        assert!(gs.adjacency.has_node(2));
+        assert!(gs.adjacency.has_node(3));
+        assert!(gs.adjacency.has_node(4));
+    }
+
+    #[test]
+    fn test_lru_eviction_access_updates() {
+        let engine = make_engine();
+        let mut gc = weav_core::config::GraphConfig::default();
+        gc.max_nodes = Some(3);
+        gc.eviction_policy = weav_core::config::EvictionPolicy::LRU;
+        let cmd = Command::GraphCreate(parser::GraphCreateCmd {
+            name: "lru_access".to_string(),
+            config: Some(gc),
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        // Add 3 nodes
+        for i in 0..3 {
+            let cmd = Command::NodeAdd(parser::NodeAddCmd {
+                graph: "lru_access".to_string(),
+                label: "x".to_string(),
+                properties: vec![("i".to_string(), Value::Int(i))],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            });
+            engine.execute_command(cmd, None).unwrap();
+        }
+
+        // Set deterministic access times: node 2 is oldest
+        {
+            let graph_arc = engine.get_graph("lru_access").unwrap();
+            let mut gs = graph_arc.write();
+            gs.access_times.insert(1, 1000);
+            gs.access_times.insert(2, 500); // node 2 is the oldest
+            gs.access_times.insert(3, 2000);
+        }
+
+        // Access node 1 via NodeGet to refresh its timestamp (making it recently used)
+        let cmd = Command::NodeGet(parser::NodeGetCmd {
+            graph: "lru_access".to_string(),
+            node_id: Some(1),
+            entity_key: None,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        // Add a 4th node -- should evict node 2 (oldest access time = 500)
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "lru_access".to_string(),
+            label: "x".to_string(),
+            properties: vec![("i".to_string(), Value::Int(99))],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        let graph_arc = engine.get_graph("lru_access").unwrap();
+        let gs = graph_arc.read();
+        assert_eq!(gs.adjacency.node_count(), 3);
+
+        // Node 1 should still exist (was recently accessed via NodeGet)
+        assert!(gs.adjacency.has_node(1));
+        // Node 2 should have been evicted (oldest access time)
+        assert!(!gs.adjacency.has_node(2));
+        // Nodes 3 and 4 should still exist
+        assert!(gs.adjacency.has_node(3));
+        assert!(gs.adjacency.has_node(4));
+    }
+
+    #[test]
+    fn test_no_eviction_returns_error() {
+        let engine = make_engine();
+        let mut gc = weav_core::config::GraphConfig::default();
+        gc.max_nodes = Some(2);
+        // Default eviction_policy is NoEviction
+        assert_eq!(gc.eviction_policy, weav_core::config::EvictionPolicy::NoEviction);
+        let cmd = Command::GraphCreate(parser::GraphCreateCmd {
+            name: "no_evict".to_string(),
+            config: Some(gc),
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        // Fill to capacity
+        for i in 0..2 {
+            let cmd = Command::NodeAdd(parser::NodeAddCmd {
+                graph: "no_evict".to_string(),
+                label: "x".to_string(),
+                properties: vec![("i".to_string(), Value::Int(i))],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            });
+            engine.execute_command(cmd, None).unwrap();
+        }
+
+        // Third should fail with CapacityExceeded
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "no_evict".to_string(),
+            label: "x".to_string(),
+            properties: vec![],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        let result = engine.execute_command(cmd, None);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WeavError::CapacityExceeded(_) => {}
+            other => panic!("expected CapacityExceeded, got: {other}"),
+        }
+    }
+
+    // ── Full-text search (BM25) tests ─────────────────────────────────────
+
+    #[test]
+    fn test_fulltext_search_basic() {
+        let engine = make_engine();
+        create_test_graph(&engine, "ft");
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "ft".to_string(),
+            label: "doc".to_string(),
+            properties: vec![
+                ("content".to_string(), Value::String(CompactString::from(
+                    "Rust programming language systems performance",
+                ))),
+            ],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        let id1 = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "ft".to_string(),
+            label: "doc".to_string(),
+            properties: vec![
+                ("content".to_string(), Value::String(CompactString::from(
+                    "Python scripting language for data science",
+                ))),
+            ],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        let id2 = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "ft".to_string(),
+            label: "doc".to_string(),
+            properties: vec![
+                ("content".to_string(), Value::String(CompactString::from(
+                    "Rust compiler and borrow checker design",
+                ))),
+            ],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        let id3 = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Search for "rust language" - should find nodes 1 and 3
+        let cmd = Command::SearchText(parser::SearchTextCmd {
+            graph: "ft".to_string(),
+            query: "rust language".to_string(),
+            limit: Some(10),
+        });
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::StringList(results) => {
+                assert!(!results.is_empty(), "should find results for 'rust language'");
+                let result_ids: Vec<u64> = results.iter()
+                    .filter_map(|s| s.split(':').next()?.parse::<u64>().ok())
+                    .collect();
+                assert!(result_ids.contains(&id1), "node {} should be in results", id1);
+                assert!(result_ids.contains(&id3), "node {} should be in results", id3);
+                // Node 1 should rank first (has both "rust" and "language")
+                assert_eq!(result_ids[0], id1, "node with both terms should rank first");
+            }
+            _ => panic!("expected StringList response"),
+        }
+
+        // Search for "python" - should find only node 2
+        let cmd = Command::SearchText(parser::SearchTextCmd {
+            graph: "ft".to_string(),
+            query: "python".to_string(),
+            limit: Some(10),
+        });
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::StringList(results) => {
+                assert_eq!(results.len(), 1);
+                let first_id: u64 = results[0].split(':').next().unwrap().parse().unwrap();
+                assert_eq!(first_id, id2);
+            }
+            _ => panic!("expected StringList response"),
+        }
+    }
+
+    #[test]
+    fn test_fulltext_search_node_delete_removes_from_index() {
+        let engine = make_engine();
+        create_test_graph(&engine, "ftdel");
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "ftdel".to_string(),
+            label: "doc".to_string(),
+            properties: vec![
+                ("content".to_string(), Value::String(CompactString::from(
+                    "unique searchable content here",
+                ))),
+            ],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        let node_id = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Verify it's searchable
+        let cmd = Command::SearchText(parser::SearchTextCmd {
+            graph: "ftdel".to_string(),
+            query: "unique searchable".to_string(),
+            limit: Some(10),
+        });
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match &resp {
+            CommandResponse::StringList(results) => assert_eq!(results.len(), 1),
+            _ => panic!("expected StringList response"),
+        }
+
+        // Delete the node
+        let cmd = Command::NodeDelete(parser::NodeDeleteCmd {
+            graph: "ftdel".to_string(),
+            node_id,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        // Search again - should find nothing
+        let cmd = Command::SearchText(parser::SearchTextCmd {
+            graph: "ftdel".to_string(),
+            query: "unique searchable".to_string(),
+            limit: Some(10),
+        });
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::StringList(results) => {
+                assert!(results.is_empty(), "deleted node should not appear in search");
+            }
+            _ => panic!("expected StringList response"),
+        }
+    }
+
+    #[test]
+    fn test_fulltext_search_empty_graph() {
+        let engine = make_engine();
+        create_test_graph(&engine, "ftempty");
+
+        let cmd = Command::SearchText(parser::SearchTextCmd {
+            graph: "ftempty".to_string(),
+            query: "anything".to_string(),
+            limit: Some(10),
+        });
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::StringList(results) => {
+                assert!(results.is_empty(), "empty graph should return no results");
+            }
+            _ => panic!("expected StringList response"),
+        }
+    }
+
+    // ── PropertyUnique enforcement tests ─────────────────────────────────
+
+    #[test]
+    fn test_uniqueness_blocks_duplicate_insert() {
+        let engine = make_engine();
+        create_test_graph(&engine, "uq_dup");
+
+        // Set unique constraint on email for Person
+        let cmd = parser::parse_command(
+            r#"SCHEMA SET "uq_dup" node "Person" unique "email""#,
+        )
+        .unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        // First insert succeeds
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "uq_dup".into(),
+            label: "Person".into(),
+            properties: vec![(
+                "email".into(),
+                Value::String(CompactString::new("alice@example.com")),
+            )],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        assert!(engine.execute_command(cmd, None).is_ok());
+
+        // Duplicate insert fails with Conflict
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "uq_dup".into(),
+            label: "Person".into(),
+            properties: vec![(
+                "email".into(),
+                Value::String(CompactString::new("alice@example.com")),
+            )],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        let result = engine.execute_command(cmd, None);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WeavError::Conflict(msg) => {
+                assert!(msg.contains("email"));
+                assert!(msg.contains("Person"));
+            }
+            other => panic!("expected Conflict, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_uniqueness_allows_different_labels() {
+        let engine = make_engine();
+        create_test_graph(&engine, "uq_labels");
+
+        // Unique constraint only on Person label
+        let cmd = parser::parse_command(
+            r#"SCHEMA SET "uq_labels" node "Person" unique "email""#,
+        )
+        .unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        // Add Person with email
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "uq_labels".into(),
+            label: "Person".into(),
+            properties: vec![(
+                "email".into(),
+                Value::String(CompactString::new("shared@example.com")),
+            )],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        assert!(engine.execute_command(cmd, None).is_ok());
+
+        // Same email on Company label should succeed (different label)
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "uq_labels".into(),
+            label: "Company".into(),
+            properties: vec![(
+                "email".into(),
+                Value::String(CompactString::new("shared@example.com")),
+            )],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        assert!(engine.execute_command(cmd, None).is_ok());
+    }
+
+    #[test]
+    fn test_uniqueness_allows_null_values() {
+        let engine = make_engine();
+        create_test_graph(&engine, "uq_null");
+
+        let cmd = parser::parse_command(
+            r#"SCHEMA SET "uq_null" node "Person" unique "email""#,
+        )
+        .unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        // First node with null email
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "uq_null".into(),
+            label: "Person".into(),
+            properties: vec![("email".into(), Value::Null)],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        assert!(engine.execute_command(cmd, None).is_ok());
+
+        // Second node with null email should also succeed
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "uq_null".into(),
+            label: "Person".into(),
+            properties: vec![("email".into(), Value::Null)],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        assert!(engine.execute_command(cmd, None).is_ok());
+    }
+
+    #[test]
+    fn test_edge_uniqueness_enforcement() {
+        let engine = make_engine();
+        create_test_graph(&engine, "euq");
+
+        // Set unique constraint on edge label KNOWS for property "ref_id"
+        let cmd = Command::SchemaSet(parser::SchemaSetCmd {
+            graph: "euq".into(),
+            target: "edge".into(),
+            label: "KNOWS".into(),
+            constraint_type: "unique".into(),
+            property: "ref_id".into(),
+            value_type: None,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        // Add two nodes
+        let n1 = match engine.execute_command(
+            Command::NodeAdd(parser::NodeAddCmd {
+                graph: "euq".into(),
+                label: "Person".into(),
+                properties: vec![],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            }),
+            None,
+        )
+        .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+        let n2 = match engine.execute_command(
+            Command::NodeAdd(parser::NodeAddCmd {
+                graph: "euq".into(),
+                label: "Person".into(),
+                properties: vec![],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            }),
+            None,
+        )
+        .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // First edge with ref_id succeeds
+        let cmd = Command::EdgeAdd(parser::EdgeAddCmd {
+            graph: "euq".into(),
+            source: n1,
+            target: n2,
+            label: "KNOWS".into(),
+            weight: 1.0,
+            properties: vec![(
+                "ref_id".into(),
+                Value::String(CompactString::new("abc123")),
+            )],
+            ttl_ms: None,
+        });
+        assert!(engine.execute_command(cmd, None).is_ok());
+
+        // Duplicate ref_id on same edge label fails
+        let cmd = Command::EdgeAdd(parser::EdgeAddCmd {
+            graph: "euq".into(),
+            source: n2,
+            target: n1,
+            label: "KNOWS".into(),
+            weight: 1.0,
+            properties: vec![(
+                "ref_id".into(),
+                Value::String(CompactString::new("abc123")),
+            )],
+            ttl_ms: None,
+        });
+        let result = engine.execute_command(cmd, None);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WeavError::Conflict(msg) => {
+                assert!(msg.contains("ref_id"));
+            }
+            other => panic!("expected Conflict, got: {other}"),
+        }
+    }
+
+    // ── NodeMerge tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_node_merge_basic() {
+        let engine = make_engine();
+        create_test_graph(&engine, "nm_basic");
+
+        // Add source node with properties
+        let n1 = match engine.execute_command(
+            Command::NodeAdd(parser::NodeAddCmd {
+                graph: "nm_basic".into(),
+                label: "Person".into(),
+                properties: vec![
+                    (
+                        "name".into(),
+                        Value::String(CompactString::new("Alice")),
+                    ),
+                    ("age".into(), Value::Int(30)),
+                ],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            }),
+            None,
+        )
+        .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Add target node with different properties
+        let n2 = match engine.execute_command(
+            Command::NodeAdd(parser::NodeAddCmd {
+                graph: "nm_basic".into(),
+                label: "Person".into(),
+                properties: vec![(
+                    "city".into(),
+                    Value::String(CompactString::new("NYC")),
+                )],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            }),
+            None,
+        )
+        .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Merge n1 into n2
+        let cmd = Command::NodeMerge(parser::NodeMergeCmd {
+            graph: "nm_basic".into(),
+            source_id: n1,
+            target_id: n2,
+            conflict_policy: "keep_target".into(),
+        });
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Integer(id) => assert_eq!(id, n2),
+            _ => panic!("expected Integer response with target id"),
+        }
+
+        // Source node should be deleted
+        let cmd = Command::NodeGet(parser::NodeGetCmd {
+            graph: "nm_basic".into(),
+            node_id: Some(n1),
+            entity_key: None,
+        });
+        assert!(engine.execute_command(cmd, None).is_err());
+
+        // Target node should have merged properties
+        let cmd = Command::NodeGet(parser::NodeGetCmd {
+            graph: "nm_basic".into(),
+            node_id: Some(n2),
+            entity_key: None,
+        });
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::NodeInfo(info) => {
+                // Should have name, age (from source) and city (from target)
+                assert!(info.properties.iter().any(|(k, _)| k == "name"));
+                assert!(info.properties.iter().any(|(k, _)| k == "age"));
+                assert!(info.properties.iter().any(|(k, _)| k == "city"));
+            }
+            _ => panic!("expected NodeInfo"),
+        }
+    }
+
+    #[test]
+    fn test_node_merge_edge_relinking() {
+        let engine = make_engine();
+        create_test_graph(&engine, "nm_edges");
+
+        // Create three nodes: n1 (source), n2 (target), n3 (neighbor)
+        let n1 = match engine.execute_command(
+            Command::NodeAdd(parser::NodeAddCmd {
+                graph: "nm_edges".into(),
+                label: "Person".into(),
+                properties: vec![(
+                    "name".into(),
+                    Value::String(CompactString::new("Source")),
+                )],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            }),
+            None,
+        )
+        .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let n2 = match engine.execute_command(
+            Command::NodeAdd(parser::NodeAddCmd {
+                graph: "nm_edges".into(),
+                label: "Person".into(),
+                properties: vec![(
+                    "name".into(),
+                    Value::String(CompactString::new("Target")),
+                )],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            }),
+            None,
+        )
+        .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let n3 = match engine.execute_command(
+            Command::NodeAdd(parser::NodeAddCmd {
+                graph: "nm_edges".into(),
+                label: "Person".into(),
+                properties: vec![(
+                    "name".into(),
+                    Value::String(CompactString::new("Neighbor")),
+                )],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            }),
+            None,
+        )
+        .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Create edge from n1 -> n3
+        let cmd = Command::EdgeAdd(parser::EdgeAddCmd {
+            graph: "nm_edges".into(),
+            source: n1,
+            target: n3,
+            label: "KNOWS".into(),
+            weight: 0.9,
+            properties: vec![("strength".into(), Value::Float(0.8))],
+            ttl_ms: None,
+        });
+        assert!(engine.execute_command(cmd, None).is_ok());
+
+        // Merge n1 into n2 -- edge should be re-linked to n2 -> n3
+        let cmd = Command::NodeMerge(parser::NodeMergeCmd {
+            graph: "nm_edges".into(),
+            source_id: n1,
+            target_id: n2,
+            conflict_policy: "keep_target".into(),
+        });
+        assert!(engine.execute_command(cmd, None).is_ok());
+
+        // n2 should now have a neighbor n3
+        let cmd = Command::Neighbors(parser::NeighborsCmd {
+            graph: "nm_edges".into(),
+            node_id: n2,
+            label: None,
+            direction: weav_core::types::Direction::Outgoing,
+        });
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::StringList(list) => {
+                // Should contain an entry referencing n3
+                let has_n3 = list.iter().any(|s| s.starts_with(&format!("{}:", n3)));
+                assert!(has_n3, "expected edge to n3 after merge, got: {:?}", list);
+            }
+            _ => panic!("expected StringList"),
+        }
+    }
+
+    #[test]
+    fn test_node_merge_conflict_keep_source() {
+        let engine = make_engine();
+        create_test_graph(&engine, "nm_ks");
+
+        let n1 = match engine.execute_command(
+            Command::NodeAdd(parser::NodeAddCmd {
+                graph: "nm_ks".into(),
+                label: "Person".into(),
+                properties: vec![(
+                    "name".into(),
+                    Value::String(CompactString::new("SourceName")),
+                )],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            }),
+            None,
+        )
+        .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let n2 = match engine.execute_command(
+            Command::NodeAdd(parser::NodeAddCmd {
+                graph: "nm_ks".into(),
+                label: "Person".into(),
+                properties: vec![(
+                    "name".into(),
+                    Value::String(CompactString::new("TargetName")),
+                )],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            }),
+            None,
+        )
+        .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Merge with keep_source policy -- source value should win on conflict
+        let cmd = Command::NodeMerge(parser::NodeMergeCmd {
+            graph: "nm_ks".into(),
+            source_id: n1,
+            target_id: n2,
+            conflict_policy: "keep_source".into(),
+        });
+        assert!(engine.execute_command(cmd, None).is_ok());
+
+        // Target should have source's name value
+        let cmd = Command::NodeGet(parser::NodeGetCmd {
+            graph: "nm_ks".into(),
+            node_id: Some(n2),
+            entity_key: None,
+        });
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::NodeInfo(info) => {
+                let name = info
+                    .properties
+                    .iter()
+                    .find(|(k, _)| k == "name")
+                    .map(|(_, v)| v.clone());
+                assert_eq!(
+                    name,
+                    Some(Value::String(CompactString::new("SourceName")))
+                );
+            }
+            _ => panic!("expected NodeInfo"),
+        }
+    }
+
+    #[test]
+    fn test_node_merge_conflict_keep_target() {
+        let engine = make_engine();
+        create_test_graph(&engine, "nm_kt");
+
+        let n1 = match engine.execute_command(
+            Command::NodeAdd(parser::NodeAddCmd {
+                graph: "nm_kt".into(),
+                label: "Person".into(),
+                properties: vec![(
+                    "name".into(),
+                    Value::String(CompactString::new("SourceName")),
+                )],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            }),
+            None,
+        )
+        .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let n2 = match engine.execute_command(
+            Command::NodeAdd(parser::NodeAddCmd {
+                graph: "nm_kt".into(),
+                label: "Person".into(),
+                properties: vec![(
+                    "name".into(),
+                    Value::String(CompactString::new("TargetName")),
+                )],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            }),
+            None,
+        )
+        .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Merge with keep_target policy -- target value should win
+        let cmd = Command::NodeMerge(parser::NodeMergeCmd {
+            graph: "nm_kt".into(),
+            source_id: n1,
+            target_id: n2,
+            conflict_policy: "keep_target".into(),
+        });
+        assert!(engine.execute_command(cmd, None).is_ok());
+
+        // Target should keep its own name
+        let cmd = Command::NodeGet(parser::NodeGetCmd {
+            graph: "nm_kt".into(),
+            node_id: Some(n2),
+            entity_key: None,
+        });
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::NodeInfo(info) => {
+                let name = info
+                    .properties
+                    .iter()
+                    .find(|(k, _)| k == "name")
+                    .map(|(_, v)| v.clone());
+                assert_eq!(
+                    name,
+                    Some(Value::String(CompactString::new("TargetName")))
+                );
+            }
+            _ => panic!("expected NodeInfo"),
+        }
+    }
+
+    #[test]
+    fn test_node_merge_nonexistent_source() {
+        let engine = make_engine();
+        create_test_graph(&engine, "nm_ne");
+
+        let n1 = match engine.execute_command(
+            Command::NodeAdd(parser::NodeAddCmd {
+                graph: "nm_ne".into(),
+                label: "Person".into(),
+                properties: vec![],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            }),
+            None,
+        )
+        .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Merge with nonexistent source
+        let cmd = Command::NodeMerge(parser::NodeMergeCmd {
+            graph: "nm_ne".into(),
+            source_id: 99999,
+            target_id: n1,
+            conflict_policy: "keep_target".into(),
+        });
+        assert!(engine.execute_command(cmd, None).is_err());
+    }
+
+    #[test]
+    fn test_node_merge_self_merge_rejected() {
+        let engine = make_engine();
+        create_test_graph(&engine, "nm_self");
+
+        let n1 = match engine.execute_command(
+            Command::NodeAdd(parser::NodeAddCmd {
+                graph: "nm_self".into(),
+                label: "Person".into(),
+                properties: vec![],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            }),
+            None,
+        )
+        .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let cmd = Command::NodeMerge(parser::NodeMergeCmd {
+            graph: "nm_self".into(),
+            source_id: n1,
+            target_id: n1,
+            conflict_policy: "keep_target".into(),
+        });
+        let result = engine.execute_command(cmd, None);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            WeavError::Conflict(msg) => assert!(msg.contains("itself")),
+            other => panic!("expected Conflict, got: {other}"),
+        }
+    }
+
+    // ── CDC event tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_cdc_event_node_created() {
+        let engine = make_engine();
+        create_test_graph(&engine, "cdc_nc");
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "cdc_nc".into(),
+            label: "Person".into(),
+            properties: vec![
+                ("name".into(), Value::String(CompactString::new("Alice"))),
+            ],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        let events = engine.recent_events(10);
+        // Should have at least 2 events: GraphCreated + NodeCreated
+        assert!(events.len() >= 2);
+        let node_event = &events[0]; // newest first
+        match &node_event.kind {
+            weav_core::events::EventKind::NodeCreated { node_id, label, properties } => {
+                assert_eq!(*node_id, 1);
+                assert_eq!(label.as_str(), "Person");
+                assert_eq!(properties.len(), 1);
+            }
+            other => panic!("expected NodeCreated, got {:?}", other),
+        }
+        assert_eq!(node_event.graph.as_str(), "cdc_nc");
+    }
+
+    #[test]
+    fn test_cdc_event_edge_created() {
+        let engine = make_engine();
+        create_test_graph(&engine, "cdc_ec");
+
+        // Add two nodes
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "cdc_ec".into(),
+            label: "Person".into(),
+            properties: vec![],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "cdc_ec".into(),
+            label: "Person".into(),
+            properties: vec![],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        // Add edge
+        let cmd = Command::EdgeAdd(parser::EdgeAddCmd {
+            graph: "cdc_ec".into(),
+            source: 1,
+            target: 2,
+            label: "KNOWS".into(),
+            weight: 0.8,
+            properties: vec![],
+            ttl_ms: None,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        let events = engine.recent_events(10);
+        let edge_event = &events[0]; // newest first
+        match &edge_event.kind {
+            weav_core::events::EventKind::EdgeCreated { edge_id, source, target, label, weight } => {
+                assert!(*edge_id > 0);
+                assert_eq!(*source, 1);
+                assert_eq!(*target, 2);
+                assert_eq!(label.as_str(), "KNOWS");
+                assert!((*weight - 0.8).abs() < f32::EPSILON);
+            }
+            other => panic!("expected EdgeCreated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cdc_event_node_deleted() {
+        let engine = make_engine();
+        create_test_graph(&engine, "cdc_nd");
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "cdc_nd".into(),
+            label: "Temp".into(),
+            properties: vec![],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = Command::NodeDelete(parser::NodeDeleteCmd {
+            graph: "cdc_nd".into(),
+            node_id: 1,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        let events = engine.recent_events(10);
+        let del_event = &events[0];
+        match &del_event.kind {
+            weav_core::events::EventKind::NodeDeleted { node_id } => {
+                assert_eq!(*node_id, 1);
+            }
+            other => panic!("expected NodeDeleted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cdc_event_sequence_monotonic() {
+        let engine = make_engine();
+        create_test_graph(&engine, "cdc_seq");
+
+        // Create several nodes to generate events
+        for i in 0..5 {
+            let cmd = Command::NodeAdd(parser::NodeAddCmd {
+                graph: "cdc_seq".into(),
+                label: format!("Type{}", i),
+                properties: vec![],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            });
+            engine.execute_command(cmd, None).unwrap();
+        }
+
+        let events = engine.recent_events(100);
+        // Events are returned newest-first, so sequences should be decreasing
+        assert!(events.len() >= 6); // 1 GraphCreated + 5 NodeCreated
+        for window in events.windows(2) {
+            assert!(
+                window[0].sequence > window[1].sequence,
+                "sequence numbers should be strictly monotonically increasing (newest first): {} vs {}",
+                window[0].sequence,
+                window[1].sequence
+            );
+        }
+    }
+
+    #[test]
+    fn test_cdc_event_graph_lifecycle() {
+        let engine = make_engine();
+        create_test_graph(&engine, "cdc_gl");
+
+        let cmd = parser::parse_command("GRAPH DROP \"cdc_gl\"").unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        let events = engine.recent_events(10);
+        // Should have GraphDropped as most recent
+        match &events[0].kind {
+            weav_core::events::EventKind::GraphDropped { name } => {
+                assert_eq!(name.as_str(), "cdc_gl");
+            }
+            other => panic!("expected GraphDropped, got {:?}", other),
+        }
+        // And GraphCreated before that
+        match &events[1].kind {
+            weav_core::events::EventKind::GraphCreated { name } => {
+                assert_eq!(name.as_str(), "cdc_gl");
+            }
+            other => panic!("expected GraphCreated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cdc_subscribe_returns_receiver() {
+        let engine = make_engine();
+        let _rx = engine.subscribe_events();
+        // Just verify subscribe doesn't panic and returns a receiver
+    }
+
+    #[test]
+    fn test_cdc_recent_events_limit() {
+        let engine = make_engine();
+        create_test_graph(&engine, "cdc_lim");
+
+        for _ in 0..10 {
+            let cmd = Command::NodeAdd(parser::NodeAddCmd {
+                graph: "cdc_lim".into(),
+                label: "X".into(),
+                properties: vec![],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            });
+            engine.execute_command(cmd, None).unwrap();
+        }
+
+        // Should have 11 events total (1 GraphCreated + 10 NodeCreated)
+        let all = engine.recent_events(100);
+        assert_eq!(all.len(), 11);
+
+        // Limit should work
+        let limited = engine.recent_events(3);
+        assert_eq!(limited.len(), 3);
+    }
+
+    #[test]
+    fn test_cdc_event_node_updated() {
+        let engine = make_engine();
+        create_test_graph(&engine, "cdc_nu");
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "cdc_nu".into(),
+            label: "Person".into(),
+            properties: vec![],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = Command::NodeUpdate(parser::NodeUpdateCmd {
+            graph: "cdc_nu".into(),
+            node_id: 1,
+            properties: vec![
+                ("age".into(), Value::Int(30)),
+            ],
+            embedding: None,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        let events = engine.recent_events(10);
+        match &events[0].kind {
+            weav_core::events::EventKind::NodeUpdated { node_id, properties } => {
+                assert_eq!(*node_id, 1);
+                assert_eq!(properties.len(), 1);
+                assert_eq!(properties[0].0.as_str(), "age");
+            }
+            other => panic!("expected NodeUpdated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cdc_event_edge_invalidated() {
+        let engine = make_engine();
+        create_test_graph(&engine, "cdc_ei");
+
+        // Add two nodes + edge
+        for _ in 0..2 {
+            let cmd = Command::NodeAdd(parser::NodeAddCmd {
+                graph: "cdc_ei".into(),
+                label: "N".into(),
+                properties: vec![],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            });
+            engine.execute_command(cmd, None).unwrap();
+        }
+        let cmd = Command::EdgeAdd(parser::EdgeAddCmd {
+            graph: "cdc_ei".into(),
+            source: 1,
+            target: 2,
+            label: "REL".into(),
+            weight: 1.0,
+            properties: vec![],
+            ttl_ms: None,
+        });
+        let resp = engine.execute_command(cmd, None).unwrap();
+        let edge_id = match resp {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected integer"),
+        };
+
+        // Invalidate the edge
+        let cmd = Command::EdgeInvalidate(parser::EdgeInvalidateCmd {
+            graph: "cdc_ei".into(),
+            edge_id,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        let events = engine.recent_events(10);
+        match &events[0].kind {
+            weav_core::events::EventKind::EdgeInvalidated { edge_id: eid } => {
+                assert_eq!(*eid, edge_id);
+            }
+            other => panic!("expected EdgeInvalidated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cdc_event_edge_deleted() {
+        let engine = make_engine();
+        create_test_graph(&engine, "cdc_ed");
+
+        // Add two nodes + edge
+        for _ in 0..2 {
+            let cmd = Command::NodeAdd(parser::NodeAddCmd {
+                graph: "cdc_ed".into(),
+                label: "N".into(),
+                properties: vec![],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            });
+            engine.execute_command(cmd, None).unwrap();
+        }
+        let cmd = Command::EdgeAdd(parser::EdgeAddCmd {
+            graph: "cdc_ed".into(),
+            source: 1,
+            target: 2,
+            label: "REL".into(),
+            weight: 1.0,
+            properties: vec![],
+            ttl_ms: None,
+        });
+        let resp = engine.execute_command(cmd, None).unwrap();
+        let edge_id = match resp {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected integer"),
+        };
+
+        // Delete the edge
+        let cmd = Command::EdgeDelete(parser::EdgeDeleteCmd {
+            graph: "cdc_ed".into(),
+            edge_id,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        let events = engine.recent_events(10);
+        match &events[0].kind {
+            weav_core::events::EventKind::EdgeDeleted { edge_id: eid } => {
+                assert_eq!(*eid, edge_id);
+            }
+            other => panic!("expected EdgeDeleted, got {:?}", other),
+        }
     }
 }

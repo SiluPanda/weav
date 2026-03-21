@@ -78,12 +78,16 @@ pub enum Command {
     Ingest(IngestCmd),
     /// Search nodes by property key/value.
     Search(SearchCmd),
+    /// Full-text search with BM25 scoring.
+    SearchText(SearchTextCmd),
     /// Get neighbors of a node.
     Neighbors(NeighborsCmd),
     /// Set a schema constraint on a label.
     SchemaSet(SchemaSetCmd),
     /// Get the schema for a graph.
     SchemaGet(SchemaGetCmd),
+    /// Merge two nodes into one.
+    NodeMerge(NodeMergeCmd),
 }
 
 impl Command {
@@ -121,9 +125,11 @@ impl Command {
             Command::AclLoad => "acl_load",
             Command::Ingest(_) => "ingest",
             Command::Search(_) => "search",
+            Command::SearchText(_) => "search_text",
             Command::Neighbors(_) => "neighbors",
             Command::SchemaSet(_) => "schema_set",
             Command::SchemaGet(_) => "schema_get",
+            Command::NodeMerge(_) => "node_merge",
         }
     }
 }
@@ -277,6 +283,14 @@ pub struct SearchCmd {
     pub limit: Option<u32>,
 }
 
+/// Full-text search using BM25 scoring.
+#[derive(Debug, Clone)]
+pub struct SearchTextCmd {
+    pub graph: String,
+    pub query: String,
+    pub limit: Option<u32>,
+}
+
 /// Get neighbors of a node.
 #[derive(Debug, Clone)]
 pub struct NeighborsCmd {
@@ -304,6 +318,15 @@ pub struct SchemaSetCmd {
 #[derive(Debug, Clone)]
 pub struct SchemaGetCmd {
     pub graph: String,
+}
+
+/// Merge two nodes into one, combining properties and re-linking edges.
+#[derive(Debug, Clone)]
+pub struct NodeMergeCmd {
+    pub graph: String,
+    pub source_id: u64,
+    pub target_id: u64,
+    pub conflict_policy: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -570,7 +593,7 @@ fn parse_graph_command(tokens: &[String]) -> Result<Command, WeavError> {
 
 fn parse_node_command(tokens: &[String]) -> Result<Command, WeavError> {
     if tokens.len() < 2 {
-        return Err(parse_err("NODE requires a subcommand (ADD, GET, UPDATE, DELETE)"));
+        return Err(parse_err("NODE requires a subcommand (ADD, GET, UPDATE, DELETE, MERGE)"));
     }
     let sub = tokens[1].to_uppercase();
     match sub.as_str() {
@@ -578,6 +601,7 @@ fn parse_node_command(tokens: &[String]) -> Result<Command, WeavError> {
         "GET" => parse_node_get(tokens),
         "UPDATE" => parse_node_update(tokens),
         "DELETE" => parse_node_delete(tokens),
+        "MERGE" => parse_node_merge(tokens),
         _ => Err(parse_err(format!("unknown NODE subcommand: {}", &tokens[1]))),
     }
 }
@@ -703,6 +727,54 @@ fn parse_node_delete(tokens: &[String]) -> Result<Command, WeavError> {
         .parse()
         .map_err(|_| parse_err(format!("invalid node id: {}", &tokens[3])))?;
     Ok(Command::NodeDelete(NodeDeleteCmd { graph, node_id }))
+}
+
+/// Parse: NODE MERGE "graph" <source_id> INTO <target_id> [POLICY keep_target|keep_source|merge]
+fn parse_node_merge(tokens: &[String]) -> Result<Command, WeavError> {
+    // NODE MERGE "graph" <source_id> INTO <target_id> [POLICY <policy>]
+    if tokens.len() < 6 {
+        return Err(parse_err(
+            "NODE MERGE requires: \"graph\" <source_id> INTO <target_id>",
+        ));
+    }
+    let graph = unquote(&tokens[2]).to_string();
+    let source_id: u64 = tokens[3]
+        .parse()
+        .map_err(|_| parse_err(format!("invalid source node id: {}", &tokens[3])))?;
+
+    let into_pos = find_keyword_after(tokens, "INTO", 4)
+        .ok_or_else(|| parse_err("NODE MERGE requires INTO keyword"))?;
+    if into_pos + 1 >= tokens.len() {
+        return Err(parse_err("INTO requires a target node id"));
+    }
+    let target_id: u64 = tokens[into_pos + 1]
+        .parse()
+        .map_err(|_| parse_err(format!("invalid target node id: {}", &tokens[into_pos + 1])))?;
+
+    let conflict_policy = if let Some(policy_pos) = find_keyword_after(tokens, "POLICY", into_pos + 2) {
+        if policy_pos + 1 >= tokens.len() {
+            return Err(parse_err("POLICY requires a value (keep_target, keep_source, or merge)"));
+        }
+        let p = tokens[policy_pos + 1].to_lowercase();
+        match p.as_str() {
+            "keep_target" | "keep_source" | "merge" => p,
+            _ => {
+                return Err(parse_err(format!(
+                    "invalid conflict policy '{}': must be keep_target, keep_source, or merge",
+                    p
+                )));
+            }
+        }
+    } else {
+        "keep_target".to_string()
+    };
+
+    Ok(Command::NodeMerge(NodeMergeCmd {
+        graph,
+        source_id,
+        target_id,
+        conflict_policy,
+    }))
 }
 
 fn parse_edge_command(tokens: &[String]) -> Result<Command, WeavError> {
@@ -1522,6 +1594,11 @@ fn find_keyword_after(tokens: &[String], keyword: &str, start: usize) -> Option<
 
 /// Parse: SEARCH "graph" WHERE key = "value" [LIMIT n]
 fn parse_search_command(tokens: &[String]) -> Result<Command, WeavError> {
+    // Check for SEARCH TEXT subcommand
+    if tokens.len() >= 2 && tokens[1].to_uppercase() == "TEXT" {
+        return parse_search_text_command(tokens);
+    }
+
     if tokens.len() < 6 {
         return Err(parse_err("SEARCH requires: SEARCH \"graph\" WHERE key = \"value\" [LIMIT n]"));
     }
@@ -1552,6 +1629,36 @@ fn parse_search_command(tokens: &[String]) -> Result<Command, WeavError> {
         graph,
         key,
         value,
+        limit,
+    }))
+}
+
+/// Parse: SEARCH TEXT "graph" "query text" [LIMIT n]
+fn parse_search_text_command(tokens: &[String]) -> Result<Command, WeavError> {
+    // SEARCH TEXT "graph" "query" [LIMIT n]
+    //   0     1     2       3       4    5
+    if tokens.len() < 4 {
+        return Err(parse_err(
+            "SEARCH TEXT requires: SEARCH TEXT \"graph\" \"query text\" [LIMIT n]",
+        ));
+    }
+    let graph = unquote(&tokens[2]).to_string();
+    let query = unquote(&tokens[3]).to_string();
+
+    let limit = if let Some(lim_pos) = find_keyword_after(tokens, "LIMIT", 4) {
+        if lim_pos + 1 >= tokens.len() {
+            return Err(parse_err("LIMIT requires a number"));
+        }
+        Some(tokens[lim_pos + 1].parse::<u32>().map_err(|_| {
+            parse_err("LIMIT value must be a positive integer")
+        })?)
+    } else {
+        None
+    };
+
+    Ok(Command::SearchText(SearchTextCmd {
+        graph,
+        query,
         limit,
     }))
 }
@@ -2749,5 +2856,71 @@ mod tests {
 
         let cmd = parse_command(r#"SCHEMA GET "g""#).unwrap();
         assert_eq!(cmd.type_name(), "schema_get");
+    }
+
+    #[test]
+    fn test_parse_node_merge_basic() {
+        let cmd = parse_command(r#"NODE MERGE "mygraph" 1 INTO 2"#).unwrap();
+        match cmd {
+            Command::NodeMerge(c) => {
+                assert_eq!(c.graph, "mygraph");
+                assert_eq!(c.source_id, 1);
+                assert_eq!(c.target_id, 2);
+                assert_eq!(c.conflict_policy, "keep_target");
+            }
+            _ => panic!("expected NodeMerge"),
+        }
+    }
+
+    #[test]
+    fn test_parse_node_merge_with_policy() {
+        let cmd =
+            parse_command(r#"NODE MERGE "g" 10 INTO 20 POLICY keep_source"#).unwrap();
+        match cmd {
+            Command::NodeMerge(c) => {
+                assert_eq!(c.source_id, 10);
+                assert_eq!(c.target_id, 20);
+                assert_eq!(c.conflict_policy, "keep_source");
+            }
+            _ => panic!("expected NodeMerge"),
+        }
+    }
+
+    #[test]
+    fn test_parse_node_merge_policy_merge() {
+        let cmd =
+            parse_command(r#"NODE MERGE "g" 5 INTO 6 POLICY merge"#).unwrap();
+        match cmd {
+            Command::NodeMerge(c) => {
+                assert_eq!(c.conflict_policy, "merge");
+            }
+            _ => panic!("expected NodeMerge"),
+        }
+    }
+
+    #[test]
+    fn test_parse_node_merge_invalid_policy() {
+        let result =
+            parse_command(r#"NODE MERGE "g" 1 INTO 2 POLICY unknown"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_node_merge_missing_into() {
+        let result = parse_command(r#"NODE MERGE "g" 1 2"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_node_merge_too_few_tokens() {
+        let result = parse_command(r#"NODE MERGE "g""#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_node_merge_type_name() {
+        let cmd =
+            parse_command(r#"NODE MERGE "g" 1 INTO 2"#).unwrap();
+        assert_eq!(cmd.type_name(), "node_merge");
     }
 }

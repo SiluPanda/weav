@@ -257,6 +257,9 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         // Graph export/import.
         .route("/v1/graphs/{graph}/export", get(export_graph))
         .route("/v1/graphs/{graph}/import", post(import_graph))
+        // CSV import/export (handlers not yet implemented).
+        // .route("/v1/graphs/{graph}/import/csv", post(import_csv))
+        // .route("/v1/graphs/{graph}/export/csv", get(export_csv))
         // Graph algorithms.
         .route(
             "/v1/graphs/{graph}/algorithms/{algorithm}",
