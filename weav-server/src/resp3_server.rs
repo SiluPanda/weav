@@ -67,6 +67,14 @@ fn command_response_to_resp3(resp: CommandResponse) -> Resp3Value {
                 Resp3Value::SimpleString("edge_count".to_string()),
                 Resp3Value::Number(info.edge_count as i64),
             ),
+            (
+                Resp3Value::SimpleString("vector_count".to_string()),
+                Resp3Value::Number(info.vector_count as i64),
+            ),
+            (
+                Resp3Value::SimpleString("label_count".to_string()),
+                Resp3Value::Number(info.label_count as i64),
+            ),
         ]),
         CommandResponse::EdgeInfo(info) => Resp3Value::Map(vec![
             (
@@ -187,25 +195,25 @@ pub async fn run_resp3_server(engine: Arc<Engine>, addr: &str) {
                 };
 
                 // Handle AUTH specially: authenticate and store the identity.
-                if let weav_query::parser::Command::Auth { ref username, ref password } = cmd {
-                    if engine.is_auth_enabled() {
-                        let auth_result = match username {
-                            Some(u) => engine.authenticate(u, password),
-                            None => engine.authenticate_default(password),
-                        };
-                        let response = match auth_result {
-                            Ok(id) => {
-                                let resp_text = format!("OK (user: {})", id.username);
-                                identity = Some(id);
-                                command_response_to_resp3(CommandResponse::Text(resp_text))
-                            }
-                            Err(e) => error_to_resp3(&e),
-                        };
-                        if framed.send(response).await.is_err() {
-                            break;
+                if let weav_query::parser::Command::Auth { ref username, ref password } = cmd
+                    && engine.is_auth_enabled()
+                {
+                    let auth_result = match username {
+                        Some(u) => engine.authenticate(u, password),
+                        None => engine.authenticate_default(password),
+                    };
+                    let response = match auth_result {
+                        Ok(id) => {
+                            let resp_text = format!("OK (user: {})", id.username);
+                            identity = Some(id);
+                            command_response_to_resp3(CommandResponse::Text(resp_text))
                         }
-                        continue;
+                        Err(e) => error_to_resp3(&e),
+                    };
+                    if framed.send(response).await.is_err() {
+                        break;
                     }
+                    continue;
                 }
 
                 // Execute command with current identity.

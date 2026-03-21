@@ -160,6 +160,10 @@ struct GraphInfoJson {
     name: String,
     node_count: u64,
     edge_count: u64,
+    vector_count: usize,
+    label_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_ttl_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -766,6 +770,9 @@ async fn get_graph_info(
                 name: info.name,
                 node_count: info.node_count,
                 edge_count: info.edge_count,
+                vector_count: info.vector_count,
+                label_count: info.label_count,
+                default_ttl_ms: info.default_ttl_ms,
             })),
         )
             .into_response(),
@@ -3213,6 +3220,192 @@ mod tests {
             .uri("/v1/graphs/nonexistent/algorithms/pagerank")
             .header("content-type", "application/json")
             .body(Body::from(r#"{}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_temporal_query_basic() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        // Create graph
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "tq".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        // Add two nodes
+        let n1 = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "tq".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![("name".to_string(), Value::String("Alice".into()))],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+        let n2 = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "tq".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![("name".to_string(), Value::String("Bob".into()))],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Add an edge
+        engine
+            .execute_command(
+                Command::EdgeAdd(EdgeAddCmd {
+                    graph: "tq".to_string(),
+                    source: n1,
+                    target: n2,
+                    label: "knows".to_string(),
+                    weight: 1.0,
+                    properties: vec![],
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        // Query at current timestamp (far future) -- should see both nodes and the edge
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/tq/temporal")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "timestamp": now_ms + 1000,
+                    "include_edges": true
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["node_count"].as_u64().unwrap(), 2);
+        assert!(json["data"]["edge_count"].as_u64().unwrap() >= 1);
+        assert_eq!(json["data"]["nodes"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_temporal_query_with_node_ids() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "tq2".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let n1 = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "tq2".to_string(),
+                    label: "x".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+        // Add a second node but don't query it
+        engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "tq2".to_string(),
+                    label: "y".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Query only n1
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/tq2/temporal")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "timestamp": now_ms + 1000,
+                    "node_ids": [n1],
+                    "include_edges": false
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["node_count"].as_u64().unwrap(), 1);
+        assert_eq!(json["data"]["edge_count"].as_u64().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_temporal_query_graph_not_found() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/nonexistent/temporal")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "timestamp": 1700000000000_u64 }).to_string(),
+            ))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);

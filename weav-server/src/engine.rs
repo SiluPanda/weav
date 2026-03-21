@@ -80,6 +80,9 @@ pub struct GraphInfoResponse {
     pub name: String,
     pub node_count: u64,
     pub edge_count: u64,
+    pub vector_count: usize,
+    pub label_count: usize,
+    pub default_ttl_ms: Option<u64>,
 }
 
 // ─── GraphState ──────────────────────────────────────────────────────────────
@@ -1405,6 +1408,9 @@ impl Engine {
             name: gs.name.clone(),
             node_count: gs.adjacency.node_count(),
             edge_count: gs.adjacency.edge_count(),
+            vector_count: gs.vector_index.len(),
+            label_count: gs.interner.label_count(),
+            default_ttl_ms: gs.config.default_ttl_ms,
         }))
     }
 
@@ -1424,86 +1430,57 @@ impl Engine {
         let mut gs = graph_arc.write();
 
         // ── Dedup: entity key (always-on, zero false positives) ─────────
-        if let Some(ref key) = cmd.entity_key {
-            if let Some(existing_id) = weav_graph::dedup::find_duplicate_by_key(
+        if let Some(ref key) = cmd.entity_key
+            && let Some(existing_id) = weav_graph::dedup::find_duplicate_by_key(
                 &gs.properties, "entity_key", key,
-            ) {
-                // Merge properties into existing node
-                weav_graph::dedup::merge_properties(
-                    &mut gs.properties,
-                    existing_id,
-                    &cmd.properties,
-                    &ConflictPolicy::LastWriteWins,
-                );
+            )
+        {
+            // Merge properties into existing node
+            weav_graph::dedup::merge_properties(
+                &mut gs.properties,
+                existing_id,
+                &cmd.properties,
+                &ConflictPolicy::LastWriteWins,
+            );
 
-                // Update embedding if provided
-                if let Some(ref embedding) = cmd.embedding {
-                    let _ = gs.vector_index.remove(existing_id);
-                    gs.vector_index.insert(existing_id, embedding)?;
-                }
-
-                return Ok(CommandResponse::Integer(existing_id));
+            // Update embedding if provided
+            if let Some(ref embedding) = cmd.embedding {
+                let _ = gs.vector_index.remove(existing_id);
+                gs.vector_index.insert(existing_id, embedding)?;
             }
+
+            return Ok(CommandResponse::Integer(existing_id));
         }
 
         // ── Dedup: fuzzy name match (if dedup_config is set) ────────────
-        if let Some(ref dedup_cfg) = gs.dedup_config {
-            if let Some(ref name_field) = dedup_cfg.name_field {
-                // Extract the name value from the incoming properties
-                let name_value = cmd.properties.iter()
-                    .find(|(k, _)| k == name_field)
-                    .and_then(|(_, v)| v.as_str())
-                    .map(|s| s.to_string());
+        if let Some(ref dedup_cfg) = gs.dedup_config
+            && let Some(ref name_field) = dedup_cfg.name_field
+        {
+            // Extract the name value from the incoming properties
+            let name_value = cmd.properties.iter()
+                .find(|(k, _)| k == name_field)
+                .and_then(|(_, v)| v.as_str())
+                .map(|s| s.to_string());
 
-                if let Some(ref name_val) = name_value {
-                    if let Some((existing_id, _score)) = weav_graph::dedup::find_duplicate_by_name(
-                        &gs.properties,
-                        name_field,
-                        name_val,
-                        dedup_cfg.fuzzy_threshold,
-                    ) {
-                        // If require_same_label: check label matches
-                        let label_matches = if dedup_cfg.require_same_label {
-                            gs.properties
-                                .get_node_property(existing_id, "_label")
-                                .and_then(|v| v.as_str())
-                                .map(|l| l == cmd.label)
-                                .unwrap_or(false)
-                        } else {
-                            true
-                        };
+            if let Some(ref name_val) = name_value {
+                if let Some((existing_id, _score)) = weav_graph::dedup::find_duplicate_by_name(
+                    &gs.properties,
+                    name_field,
+                    name_val,
+                    dedup_cfg.fuzzy_threshold,
+                ) {
+                    // If require_same_label: check label matches
+                    let label_matches = if dedup_cfg.require_same_label {
+                        gs.properties
+                            .get_node_property(existing_id, "_label")
+                            .and_then(|v| v.as_str())
+                            .map(|l| l == cmd.label)
+                            .unwrap_or(false)
+                    } else {
+                        true
+                    };
 
-                        if label_matches {
-                            weav_graph::dedup::merge_properties(
-                                &mut gs.properties,
-                                existing_id,
-                                &cmd.properties,
-                                &ConflictPolicy::LastWriteWins,
-                            );
-
-                            if let Some(ref embedding) = cmd.embedding {
-                                let _ = gs.vector_index.remove(existing_id);
-                                gs.vector_index.insert(existing_id, embedding)?;
-                            }
-
-                            return Ok(CommandResponse::Integer(existing_id));
-                        }
-                    }
-                }
-            }
-
-            // ── Dedup: vector similarity (if embedding provided) ────────
-            if let Some(ref embedding) = cmd.embedding {
-                if let Ok(search_results) = gs.vector_index.search(embedding, 5, None) {
-                    let similarities: Vec<(NodeId, f32)> = search_results
-                        .iter()
-                        .map(|&(nid, dist)| (nid, 1.0 / (1.0 + dist)))
-                        .collect();
-
-                    if let Some((existing_id, _sim)) = weav_graph::dedup::find_duplicate_by_vector(
-                        &similarities,
-                        dedup_cfg.vector_threshold,
-                    ) {
+                    if label_matches {
                         weav_graph::dedup::merge_properties(
                             &mut gs.properties,
                             existing_id,
@@ -1511,11 +1488,43 @@ impl Engine {
                             &ConflictPolicy::LastWriteWins,
                         );
 
-                        let _ = gs.vector_index.remove(existing_id);
-                        gs.vector_index.insert(existing_id, embedding)?;
+                        if let Some(ref embedding) = cmd.embedding {
+                            let _ = gs.vector_index.remove(existing_id);
+                            gs.vector_index.insert(existing_id, embedding)?;
+                        }
 
                         return Ok(CommandResponse::Integer(existing_id));
                     }
+                }
+            }
+        }
+
+        // Moved outside of the collapsed if block
+        if let Some(ref dedup_cfg) = gs.dedup_config {
+            // ── Dedup: vector similarity (if embedding provided) ────────
+            if let Some(ref embedding) = cmd.embedding
+                && let Ok(search_results) = gs.vector_index.search(embedding, 5, None)
+            {
+                let similarities: Vec<(NodeId, f32)> = search_results
+                    .iter()
+                    .map(|&(nid, dist)| (nid, 1.0 / (1.0 + dist)))
+                    .collect();
+
+                if let Some((existing_id, _sim)) = weav_graph::dedup::find_duplicate_by_vector(
+                    &similarities,
+                    dedup_cfg.vector_threshold,
+                ) {
+                    weav_graph::dedup::merge_properties(
+                        &mut gs.properties,
+                        existing_id,
+                        &cmd.properties,
+                        &ConflictPolicy::LastWriteWins,
+                    );
+
+                    let _ = gs.vector_index.remove(existing_id);
+                    gs.vector_index.insert(existing_id, embedding)?;
+
+                    return Ok(CommandResponse::Integer(existing_id));
                 }
             }
         }
@@ -1567,8 +1576,9 @@ impl Engine {
             gs.vector_index.insert(node_id, embedding)?;
         }
 
-        // Store TTL expiry timestamp if provided
-        if let Some(ttl_ms) = cmd.ttl_ms {
+        // Store TTL expiry timestamp — explicit TTL overrides graph default
+        let effective_ttl = cmd.ttl_ms.or(gs.config.default_ttl_ms);
+        if let Some(ttl_ms) = effective_ttl {
             let expires_at = Self::now_ms() + ttl_ms;
             gs.properties.set_node_property(
                 node_id,
@@ -1859,8 +1869,9 @@ impl Engine {
             properties_json: props_json,
         })?;
 
-        // Apply in-memory mutation
-        let temporal = if let Some(ttl_ms) = cmd.ttl_ms {
+        // Apply in-memory mutation — explicit TTL overrides graph default
+        let effective_ttl = cmd.ttl_ms.or(gs.config.default_ttl_ms);
+        let temporal = if let Some(ttl_ms) = effective_ttl {
             BiTemporal {
                 valid_from: now,
                 valid_until: now + ttl_ms,
@@ -4599,5 +4610,70 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_graph_level_default_ttl() {
+        let engine = make_engine();
+
+        // Create graph with default TTL of 1ms
+        let mut gc = weav_core::config::GraphConfig::default();
+        gc.default_ttl_ms = Some(1);
+        let cmd = Command::GraphCreate(parser::GraphCreateCmd {
+            name: "ttl_default_g".to_string(),
+            config: Some(gc),
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        // Add node WITHOUT explicit TTL — should inherit graph default
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "ttl_default_g".to_string(),
+            label: "auto_ttl".to_string(),
+            properties: vec![("x".to_string(), Value::Int(1))],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None, // no explicit TTL
+        });
+        let node_id = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Node should have _ttl_expires_at set from graph default
+        let graph_arc = engine.get_graph("ttl_default_g").unwrap();
+        let gs = graph_arc.read();
+        let ttl_prop = gs.properties.get_node_property(node_id, "_ttl_expires_at");
+        assert!(ttl_prop.is_some(), "node should have TTL from graph default");
+
+        // Sweep should remove it (1ms TTL already expired)
+        drop(gs);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let expired = engine.sweep_ttl();
+        assert!(expired >= 1, "node with inherited TTL should be expired");
+    }
+
+    #[test]
+    fn test_graph_info_includes_new_fields() {
+        let engine = make_engine();
+        create_test_graph(&engine, "info_g");
+
+        // Add some data
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "info_g" LABEL "person" PROPERTIES {"name": "Alice"}"#,
+        ).unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = Command::GraphInfo("info_g".to_string());
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::GraphInfo(info) => {
+                assert_eq!(info.name, "info_g");
+                assert!(info.node_count >= 1);
+                assert_eq!(info.vector_count, 0); // no embeddings
+                assert!(info.label_count >= 1); // "person"
+                assert_eq!(info.default_ttl_ms, None);
+            }
+            _ => panic!("expected GraphInfo"),
+        }
     }
 }

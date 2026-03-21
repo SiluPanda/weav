@@ -240,6 +240,9 @@ impl WeavMcpServer {
                 "name": info.name,
                 "node_count": info.node_count,
                 "edge_count": info.edge_count,
+                "vector_count": info.vector_count,
+                "label_count": info.label_count,
+                "default_ttl_ms": info.default_ttl_ms,
             })),
             Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "{resp:?}"

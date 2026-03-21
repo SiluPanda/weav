@@ -383,6 +383,9 @@ pub struct GraphConfig {
     pub enable_provenance: bool,
     pub vector_dimensions: u16,
     pub auto_dedup_threshold: Option<f32>,
+    /// Default TTL in milliseconds for nodes/edges created in this graph.
+    /// If set, new nodes/edges without an explicit TTL will inherit this value.
+    pub default_ttl_ms: Option<u64>,
 }
 
 impl Default for GraphConfig {
@@ -396,6 +399,7 @@ impl Default for GraphConfig {
             enable_provenance: true,
             vector_dimensions: 1536,
             auto_dedup_threshold: None,
+            default_ttl_ms: None,
         }
     }
 }
