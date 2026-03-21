@@ -76,6 +76,10 @@ pub enum Command {
     AclLoad,
     /// Ingest a document (extract entities/relationships and build graph).
     Ingest(IngestCmd),
+    /// Search nodes by property key/value.
+    Search(SearchCmd),
+    /// Get neighbors of a node.
+    Neighbors(NeighborsCmd),
 }
 
 impl Command {
@@ -112,6 +116,8 @@ impl Command {
             Command::AclSave => "acl_save",
             Command::AclLoad => "acl_load",
             Command::Ingest(_) => "ingest",
+            Command::Search(_) => "search",
+            Command::Neighbors(_) => "neighbors",
         }
     }
 }
@@ -254,6 +260,24 @@ pub struct IngestCmd {
     pub skip_dedup: bool,
     pub chunk_size: Option<usize>,
     pub entity_types: Option<Vec<String>>,
+}
+
+/// Search nodes by property key/value.
+#[derive(Debug, Clone)]
+pub struct SearchCmd {
+    pub graph: String,
+    pub key: String,
+    pub value: String,
+    pub limit: Option<u32>,
+}
+
+/// Get neighbors of a node.
+#[derive(Debug, Clone)]
+pub struct NeighborsCmd {
+    pub graph: String,
+    pub node_id: u64,
+    pub label: Option<String>,
+    pub direction: Direction,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -472,6 +496,8 @@ pub fn parse_command(input: &str) -> Result<Command, WeavError> {
         "AUTH" => parse_auth_command(&tokens),
         "ACL" => parse_acl_command(&tokens),
         "INGEST" => parse_ingest_command(&tokens),
+        "SEARCH" => parse_search_command(&tokens),
+        "NEIGHBORS" => parse_neighbors_command(&tokens),
         _ => Err(parse_err(format!("unknown command: {}", &tokens[0]))),
     }
 }
@@ -1467,6 +1493,82 @@ fn find_keyword_after(tokens: &[String], keyword: &str, start: usize) -> Option<
     None
 }
 
+/// Parse: SEARCH "graph" WHERE key = "value" [LIMIT n]
+fn parse_search_command(tokens: &[String]) -> Result<Command, WeavError> {
+    if tokens.len() < 6 {
+        return Err(parse_err("SEARCH requires: SEARCH \"graph\" WHERE key = \"value\" [LIMIT n]"));
+    }
+    let graph = unquote(&tokens[1]).to_string();
+
+    // Find WHERE keyword
+    let where_pos = find_keyword(tokens, "WHERE")
+        .ok_or_else(|| parse_err("SEARCH requires WHERE clause"))?;
+    if where_pos + 3 >= tokens.len() {
+        return Err(parse_err("WHERE requires: key = \"value\""));
+    }
+    let key = tokens[where_pos + 1].clone();
+    // tokens[where_pos + 2] should be "="
+    let value = unquote(&tokens[where_pos + 3]).to_string();
+
+    let limit = if let Some(lim_pos) = find_keyword(tokens, "LIMIT") {
+        if lim_pos + 1 >= tokens.len() {
+            return Err(parse_err("LIMIT requires a number"));
+        }
+        Some(tokens[lim_pos + 1].parse::<u32>().map_err(|_| {
+            parse_err("LIMIT value must be a positive integer")
+        })?)
+    } else {
+        None
+    };
+
+    Ok(Command::Search(SearchCmd {
+        graph,
+        key,
+        value,
+        limit,
+    }))
+}
+
+/// Parse: NEIGHBORS "graph" <node_id> [LABEL "label"] [DIRECTION OUT|IN|BOTH]
+fn parse_neighbors_command(tokens: &[String]) -> Result<Command, WeavError> {
+    if tokens.len() < 3 {
+        return Err(parse_err("NEIGHBORS requires: NEIGHBORS \"graph\" <node_id>"));
+    }
+    let graph = unquote(&tokens[1]).to_string();
+    let node_id: u64 = tokens[2].parse()
+        .map_err(|_| parse_err(format!("invalid node_id: {}", &tokens[2])))?;
+
+    let label = if let Some(lbl_pos) = find_keyword(tokens, "LABEL") {
+        if lbl_pos + 1 >= tokens.len() {
+            return Err(parse_err("LABEL requires a value"));
+        }
+        Some(unquote(&tokens[lbl_pos + 1]).to_string())
+    } else {
+        None
+    };
+
+    let direction = if let Some(dir_pos) = find_keyword(tokens, "DIRECTION") {
+        if dir_pos + 1 >= tokens.len() {
+            return Err(parse_err("DIRECTION requires OUT, IN, or BOTH"));
+        }
+        match tokens[dir_pos + 1].to_uppercase().as_str() {
+            "OUT" => Direction::Outgoing,
+            "IN" => Direction::Incoming,
+            "BOTH" => Direction::Both,
+            _ => return Err(parse_err("DIRECTION must be OUT, IN, or BOTH")),
+        }
+    } else {
+        Direction::Both
+    };
+
+    Ok(Command::Neighbors(NeighborsCmd {
+        graph,
+        node_id,
+        label,
+        direction,
+    }))
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2325,6 +2427,88 @@ mod tests {
         let result = parse_command(
             r#"NODE ADD TO "g" LABEL "x" TTL abc"#,
         );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_search() {
+        let cmd = parse_command(
+            r#"SEARCH "mygraph" WHERE name = "Alice""#,
+        ).unwrap();
+        match cmd {
+            Command::Search(c) => {
+                assert_eq!(c.graph, "mygraph");
+                assert_eq!(c.key, "name");
+                assert_eq!(c.value, "Alice");
+                assert_eq!(c.limit, None);
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn test_parse_search_with_limit() {
+        let cmd = parse_command(
+            r#"SEARCH "g" WHERE age = "30" LIMIT 10"#,
+        ).unwrap();
+        match cmd {
+            Command::Search(c) => {
+                assert_eq!(c.key, "age");
+                assert_eq!(c.value, "30");
+                assert_eq!(c.limit, Some(10));
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn test_parse_neighbors() {
+        let cmd = parse_command(
+            r#"NEIGHBORS "mygraph" 42"#,
+        ).unwrap();
+        match cmd {
+            Command::Neighbors(c) => {
+                assert_eq!(c.graph, "mygraph");
+                assert_eq!(c.node_id, 42);
+                assert!(c.label.is_none());
+                assert_eq!(c.direction, Direction::Both);
+            }
+            _ => panic!("expected Neighbors"),
+        }
+    }
+
+    #[test]
+    fn test_parse_neighbors_with_direction() {
+        let cmd = parse_command(
+            r#"NEIGHBORS "g" 1 DIRECTION OUT"#,
+        ).unwrap();
+        match cmd {
+            Command::Neighbors(c) => {
+                assert_eq!(c.node_id, 1);
+                assert_eq!(c.direction, Direction::Outgoing);
+            }
+            _ => panic!("expected Neighbors"),
+        }
+    }
+
+    #[test]
+    fn test_parse_neighbors_with_label() {
+        let cmd = parse_command(
+            r#"NEIGHBORS "g" 5 LABEL "KNOWS" DIRECTION IN"#,
+        ).unwrap();
+        match cmd {
+            Command::Neighbors(c) => {
+                assert_eq!(c.node_id, 5);
+                assert_eq!(c.label, Some("KNOWS".to_string()));
+                assert_eq!(c.direction, Direction::Incoming);
+            }
+            _ => panic!("expected Neighbors"),
+        }
+    }
+
+    #[test]
+    fn test_parse_search_missing_where() {
+        let result = parse_command(r#"SEARCH "g""#);
         assert!(result.is_err());
     }
 }

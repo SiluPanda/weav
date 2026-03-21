@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Top-level Weav configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct WeavConfig {
     pub server: ServerConfig,
@@ -14,19 +14,6 @@ pub struct WeavConfig {
     pub memory: MemoryConfig,
     pub auth: AuthConfig,
     pub extract: ExtractConfig,
-}
-
-impl Default for WeavConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            engine: EngineConfig::default(),
-            persistence: PersistenceConfig::default(),
-            memory: MemoryConfig::default(),
-            auth: AuthConfig::default(),
-            extract: ExtractConfig::default(),
-        }
-    }
 }
 
 impl WeavConfig {
@@ -124,12 +111,12 @@ impl WeavConfig {
                 "server.port must be > 0".into(),
             ));
         }
-        if let Some(n) = self.engine.num_shards {
-            if n == 0 {
-                return Err(crate::error::WeavError::InvalidConfig(
-                    "engine.num_shards must be > 0".into(),
-                ));
-            }
+        if let Some(n) = self.engine.num_shards
+            && n == 0
+        {
+            return Err(crate::error::WeavError::InvalidConfig(
+                "engine.num_shards must be > 0".into(),
+            ));
         }
         if self.engine.default_vector_dimensions == 0 {
             return Err(crate::error::WeavError::InvalidConfig(
@@ -229,17 +216,12 @@ impl Default for PersistenceConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub enum WalSyncMode {
     Always,
+    #[default]
     EverySecond,
     Never,
-}
-
-impl Default for WalSyncMode {
-    fn default() -> Self {
-        WalSyncMode::EverySecond
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -260,34 +242,24 @@ impl Default for MemoryConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub enum EvictionPolicy {
+    #[default]
     NoEviction,
     LRU,
     RelevanceDecay,
 }
 
-impl Default for EvictionPolicy {
-    fn default() -> Self {
-        EvictionPolicy::NoEviction
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub enum TokenCounterType {
     #[serde(rename = "tiktoken_cl100k")]
     TiktokenCl100k,
     #[serde(rename = "tiktoken_o200k")]
     TiktokenO200k,
+    #[default]
     #[serde(rename = "char_div_4")]
     CharDiv4,
     Exact(String),
-}
-
-impl Default for TokenCounterType {
-    fn default() -> Self {
-        TokenCounterType::CharDiv4
-    }
 }
 
 /// Extraction pipeline configuration (LLM-powered ingestion).
@@ -352,7 +324,7 @@ impl Default for ExtractConfig {
 }
 
 /// Authentication and authorization configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct AuthConfig {
     /// Enable the auth subsystem. When false, all auth checks are skipped.
@@ -368,17 +340,6 @@ pub struct AuthConfig {
     pub users: Vec<UserConfig>,
 }
 
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            require_auth: false,
-            acl_file: None,
-            default_password: None,
-            users: Vec::new(),
-        }
-    }
-}
 
 /// A user definition in the config file.
 #[derive(Debug, Clone, Deserialize)]

@@ -389,14 +389,14 @@ impl Engine {
                             for (k, v) in props {
                                 state.properties.set_node_property(ns.node_id, &k, v);
                             }
-                        } else if let Ok(props_val) = serde_json::from_str::<serde_json::Value>(&ns.properties_json) {
-                            if let Some(obj) = props_val.as_object() {
-                                for (k, v) in obj {
-                                    state.properties.set_node_property(
-                                        ns.node_id, k,
-                                        crate::http::json_val_to_value(v),
-                                    );
-                                }
+                        } else if let Ok(props_val) = serde_json::from_str::<serde_json::Value>(&ns.properties_json)
+                            && let Some(obj) = props_val.as_object()
+                        {
+                            for (k, v) in obj {
+                                state.properties.set_node_property(
+                                    ns.node_id, k,
+                                    crate::http::json_val_to_value(v),
+                                );
                             }
                         }
                     }
@@ -435,11 +435,11 @@ impl Engine {
                     // Restore edge properties from snapshot.
                     // Properties are serialized as serde-tagged Value enums, so we
                     // deserialize directly into HashMap<String, Value> for fidelity.
-                    if !es.properties_json.is_empty() && es.properties_json != "{}" {
-                        if let Ok(props) = serde_json::from_str::<std::collections::HashMap<String, Value>>(&es.properties_json) {
-                            for (k, v) in props {
-                                state.properties.set_edge_property(es.edge_id, &k, v);
-                            }
+                    if !es.properties_json.is_empty() && es.properties_json != "{}"
+                        && let Ok(props) = serde_json::from_str::<std::collections::HashMap<String, Value>>(&es.properties_json)
+                    {
+                        for (k, v) in props {
+                            state.properties.set_edge_property(es.edge_id, &k, v);
                         }
                     }
                 }
@@ -507,11 +507,11 @@ impl Engine {
                                 for (k, v) in tagged {
                                     props.push((k, v));
                                 }
-                            } else if let Ok(val) = serde_json::from_str::<serde_json::Value>(properties_json) {
-                                if let Some(obj) = val.as_object() {
-                                    for (k, v) in obj {
-                                        props.push((k.clone(), crate::http::json_val_to_value(v)));
-                                    }
+                            } else if let Ok(val) = serde_json::from_str::<serde_json::Value>(properties_json)
+                                && let Some(obj) = val.as_object()
+                            {
+                                for (k, v) in obj {
+                                    props.push((k.clone(), crate::http::json_val_to_value(v)));
                                 }
                             }
                         }
@@ -548,14 +548,14 @@ impl Engine {
                                     for (k, v) in props {
                                         gs.properties.set_node_property(*node_id, &k, v);
                                     }
-                                } else if let Ok(val) = serde_json::from_str::<serde_json::Value>(properties_json) {
-                                    if let Some(obj) = val.as_object() {
-                                        for (k, v) in obj {
-                                            gs.properties.set_node_property(
-                                                *node_id, k,
-                                                crate::http::json_val_to_value(v),
-                                            );
-                                        }
+                                } else if let Ok(val) = serde_json::from_str::<serde_json::Value>(properties_json)
+                                    && let Some(obj) = val.as_object()
+                                {
+                                    for (k, v) in obj {
+                                        gs.properties.set_node_property(
+                                            *node_id, k,
+                                            crate::http::json_val_to_value(v),
+                                        );
                                     }
                                 }
                             }
@@ -626,11 +626,11 @@ impl Engine {
                             // Restore edge properties from WAL.
                             // Properties are serialized as serde-tagged Value enums, so we
                             // deserialize directly into HashMap<String, Value> for fidelity.
-                            if !properties_json.is_empty() && properties_json != "{}" {
-                                if let Ok(props) = serde_json::from_str::<std::collections::HashMap<String, Value>>(properties_json) {
-                                    for (k, v) in props {
-                                        gs.properties.set_edge_property(*edge_id, &k, v);
-                                    }
+                            if !properties_json.is_empty() && properties_json != "{}"
+                                && let Ok(props) = serde_json::from_str::<std::collections::HashMap<String, Value>>(properties_json)
+                            {
+                                for (k, v) in props {
+                                    gs.properties.set_edge_property(*edge_id, &k, v);
                                 }
                             }
                         }
@@ -837,6 +837,8 @@ impl Engine {
             Command::Ingest(_) => Err(WeavError::Internal(
                 "INGEST requires async execution; use execute_command_async".into(),
             )),
+            Command::Search(cmd) => self.handle_search(cmd),
+            Command::Neighbors(cmd) => self.handle_neighbors(cmd),
         }
     }
 
@@ -893,7 +895,8 @@ impl Engine {
             Command::Ping | Command::Info | Command::Auth { .. } => CommandCategory::Connection,
             Command::NodeGet(_) | Command::EdgeGet(_) | Command::GraphInfo(_)
             | Command::GraphList | Command::Stats(_) | Command::Context(_)
-            | Command::ConfigGet(_) | Command::AclWhoAmI => CommandCategory::Read,
+            | Command::ConfigGet(_) | Command::AclWhoAmI
+            | Command::Search(_) | Command::Neighbors(_) => CommandCategory::Read,
             Command::NodeAdd(_) | Command::NodeUpdate(_) | Command::NodeDelete(_)
             | Command::EdgeAdd(_) | Command::EdgeDelete(_) | Command::EdgeInvalidate(_)
             | Command::BulkInsertNodes(_) | Command::BulkInsertEdges(_)
@@ -1013,6 +1016,8 @@ impl Engine {
             Command::BulkInsertEdges(c) => Some(c.graph.clone()),
             Command::Ingest(c) => Some(c.graph.clone()),
             Command::Context(q) => Some(q.graph.clone()),
+            Command::Search(c) => Some(c.graph.clone()),
+            Command::Neighbors(c) => Some(c.graph.clone()),
             Command::GraphCreate(c) => Some(c.name.clone()),
             Command::GraphDrop(name) | Command::GraphInfo(name) => Some(name.clone()),
             Command::Stats(opt) => opt.clone(),
@@ -1228,6 +1233,90 @@ impl Engine {
                 env!("CARGO_PKG_VERSION"),
             )))
         }
+    }
+
+    // ── Search and neighbors commands ─────────────────────────────────────
+
+    fn handle_search(
+        &self,
+        cmd: weav_query::parser::SearchCmd,
+    ) -> WeavResult<CommandResponse> {
+        let graph_arc = self.get_graph(&cmd.graph)?;
+        let gs = graph_arc.read();
+
+        let search_value = cmd.value.clone();
+        let matching = gs.properties.nodes_where(&cmd.key, &move |v| {
+            match v {
+                Value::String(s) => s.as_str() == search_value,
+                Value::Int(i) => i.to_string() == search_value,
+                Value::Float(f) => f.to_string() == search_value,
+                Value::Bool(b) => b.to_string() == search_value,
+                _ => false,
+            }
+        });
+
+        let limit = cmd.limit.unwrap_or(100) as usize;
+        let result_ids: Vec<u64> = matching.into_iter().take(limit).collect();
+
+        // Build result strings: "node_id:label"
+        let results: Vec<String> = result_ids.iter().map(|&nid| {
+            let label = gs.properties
+                .get_node_property(nid, "_label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            format!("{}:{}", nid, label)
+        }).collect();
+
+        Ok(CommandResponse::StringList(results))
+    }
+
+    fn handle_neighbors(
+        &self,
+        cmd: weav_query::parser::NeighborsCmd,
+    ) -> WeavResult<CommandResponse> {
+        use weav_core::types::Direction;
+
+        let graph_arc = self.get_graph(&cmd.graph)?;
+        let gs = graph_arc.read();
+
+        if !gs.adjacency.has_node(cmd.node_id) {
+            return Err(WeavError::NodeNotFound(cmd.node_id, gs.graph_id));
+        }
+
+        let label_id = cmd.label.as_ref()
+            .and_then(|l| gs.interner.resolve_label_id(l));
+
+        let neighbors = match cmd.direction {
+            Direction::Outgoing => {
+                gs.adjacency.neighbors_out(cmd.node_id, label_id)
+                    .into_iter()
+                    .map(|(nid, eid)| (nid, eid, Direction::Outgoing))
+                    .collect::<Vec<_>>()
+            }
+            Direction::Incoming => {
+                gs.adjacency.neighbors_in(cmd.node_id, label_id)
+                    .into_iter()
+                    .map(|(nid, eid)| (nid, eid, Direction::Incoming))
+                    .collect::<Vec<_>>()
+            }
+            Direction::Both => {
+                gs.adjacency.neighbors_both(cmd.node_id, label_id)
+            }
+        };
+
+        let results: Vec<String> = neighbors.iter().map(|&(nid, eid, ref dir)| {
+            let dir_str = match dir {
+                Direction::Outgoing => "OUT",
+                Direction::Incoming => "IN",
+                Direction::Both => "BOTH",
+            };
+            let edge_label = gs.adjacency.get_edge(eid)
+                .and_then(|e| gs.interner.resolve_label(e.label))
+                .unwrap_or("unknown");
+            format!("{}:{}:{}:{}", nid, eid, dir_str, edge_label)
+        }).collect();
+
+        Ok(CommandResponse::StringList(results))
     }
 
     // ── Graph commands ───────────────────────────────────────────────────
@@ -2332,7 +2421,7 @@ impl Engine {
         if let Some(pw) = &cmd.password {
             user.password_hash = Some(
                 weav_auth::password::hash_password(pw)
-                    .map_err(|e| WeavError::Internal(e))?,
+                    .map_err(WeavError::Internal)?,
             );
         }
         if let Some(enabled) = cmd.enabled {

@@ -74,20 +74,20 @@ impl PropertyStore {
     pub fn get_all_node_properties(&self, node: NodeId) -> Vec<(&str, &Value)> {
         let mut result = Vec::new();
         for (key_id, column) in &self.node_columns {
-            if let Some(val) = column.values.get(&node) {
-                if let Some(key_name) = self.schema_reverse.get(key_id) {
-                    result.push((key_name.as_str(), val));
-                }
+            if let Some(val) = column.values.get(&node)
+                && let Some(key_name) = self.schema_reverse.get(key_id)
+            {
+                result.push((key_name.as_str(), val));
             }
         }
         result
     }
 
     pub fn remove_node_property(&mut self, node: NodeId, key: &str) {
-        if let Some(&key_id) = self.schema.get(key) {
-            if let Some(column) = self.node_columns.get_mut(&key_id) {
-                column.values.remove(&node);
-            }
+        if let Some(&key_id) = self.schema.get(key)
+            && let Some(column) = self.node_columns.get_mut(&key_id)
+        {
+            column.values.remove(&node);
         }
     }
 
@@ -104,24 +104,24 @@ impl PropertyStore {
     }
 
     pub fn nodes_with_property(&self, key: &str) -> Vec<NodeId> {
-        if let Some(&key_id) = self.schema.get(key) {
-            if let Some(column) = self.node_columns.get(&key_id) {
-                return column.values.keys().copied().collect();
-            }
+        if let Some(&key_id) = self.schema.get(key)
+            && let Some(column) = self.node_columns.get(&key_id)
+        {
+            return column.values.keys().copied().collect();
         }
         Vec::new()
     }
 
     pub fn nodes_where(&self, key: &str, predicate: &dyn Fn(&Value) -> bool) -> Vec<NodeId> {
-        if let Some(&key_id) = self.schema.get(key) {
-            if let Some(column) = self.node_columns.get(&key_id) {
-                return column
-                    .values
-                    .iter()
-                    .filter(|(_, v)| predicate(v))
-                    .map(|(&nid, _)| nid)
-                    .collect();
-            }
+        if let Some(&key_id) = self.schema.get(key)
+            && let Some(column) = self.node_columns.get(&key_id)
+        {
+            return column
+                .values
+                .iter()
+                .filter(|(_, v)| predicate(v))
+                .map(|(&nid, _)| nid)
+                .collect();
         }
         Vec::new()
     }
@@ -129,7 +129,7 @@ impl PropertyStore {
     /// Set a property on an edge.
     pub fn set_edge_property(&mut self, edge_id: EdgeId, key: &str, value: Value) {
         let key_id = self.intern_key(key).expect("property key space exhausted");
-        let entry = self.edge_overflow.entry(edge_id).or_insert_with(Vec::new);
+        let entry = self.edge_overflow.entry(edge_id).or_default();
         // Update existing key or append
         if let Some(pair) = entry.iter_mut().find(|(k, _)| *k == key_id) {
             pair.1 = value;

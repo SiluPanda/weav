@@ -87,19 +87,19 @@ pub fn find_duplicate_by_name(
     let mut best: Option<(NodeId, f32)> = None;
 
     for node_id in nodes {
-        if let Some(val) = properties.get_node_property(node_id, name_field) {
-            if let Some(existing_name) = val.as_str() {
-                let similarity = strsim::jaro_winkler(name_value, existing_name) as f32;
-                if similarity >= threshold {
-                    match best {
-                        Some((_, best_score)) if similarity > best_score => {
-                            best = Some((node_id, similarity));
-                        }
-                        None => {
-                            best = Some((node_id, similarity));
-                        }
-                        _ => {}
+        if let Some(val) = properties.get_node_property(node_id, name_field)
+            && let Some(existing_name) = val.as_str()
+        {
+            let similarity = strsim::jaro_winkler(name_value, existing_name) as f32;
+            if similarity >= threshold {
+                match best {
+                    Some((_, best_score)) if similarity > best_score => {
+                        best = Some((node_id, similarity));
                     }
+                    None => {
+                        best = Some((node_id, similarity));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -219,14 +219,14 @@ pub fn find_duplicate_by_name_indexed(
         let candidates = index.candidates(name, 1);
         let mut best: Option<(NodeId, f32)> = None;
         for nid in candidates {
-            if let Some(val) = properties.get_node_property(nid, name_field) {
-                if let Some(existing_name) = val.as_str() {
-                    let score = strsim::jaro_winkler(name, existing_name) as f32;
-                    if score >= threshold {
-                        match &best {
-                            Some((_, best_score)) if score <= *best_score => {}
-                            _ => best = Some((nid, score)),
-                        }
+            if let Some(val) = properties.get_node_property(nid, name_field)
+                && let Some(existing_name) = val.as_str()
+            {
+                let score = strsim::jaro_winkler(name, existing_name) as f32;
+                if score >= threshold {
+                    match &best {
+                        Some((_, best_score)) if score <= *best_score => {}
+                        _ => best = Some((nid, score)),
                     }
                 }
             }

@@ -300,9 +300,10 @@ pub enum ContentPriority {
 // ─── Decay Functions ───────────────────────────────────────────────────────
 
 /// Relevance decay function applied to scores based on age.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub enum DecayFunction {
     /// No decay — score is unchanged.
+    #[default]
     None,
     /// Exponential decay: `score * 0.5^(age / half_life)`.
     Exponential { half_life_ms: u64 },
@@ -367,18 +368,14 @@ impl DecayFunction {
     }
 }
 
-impl Default for DecayFunction {
-    fn default() -> Self {
-        DecayFunction::None
-    }
-}
 
 // ─── Conflict Resolution ───────────────────────────────────────────────────
 
 /// Policy for resolving conflicting writes to the same entity/property.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConflictPolicy {
     /// Most recent write wins.
+    #[default]
     LastWriteWins,
     /// Highest confidence provenance wins.
     HighestConfidence,
@@ -390,11 +387,6 @@ pub enum ConflictPolicy {
     Reject,
 }
 
-impl Default for ConflictPolicy {
-    fn default() -> Self {
-        ConflictPolicy::LastWriteWins
-    }
-}
 
 // ─── Node / Edge data (for insertion) ──────────────────────────────────────
 

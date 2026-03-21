@@ -100,6 +100,11 @@ impl StringInterner {
         self.label_to_id.len()
     }
 
+    /// Look up the LabelId for a label string (without interning).
+    pub fn resolve_label_id(&self, label: &str) -> Option<LabelId> {
+        self.label_to_id.get(label).copied()
+    }
+
     /// Intern a property key string, returning its compact ID.
     ///
     /// Returns `Err(WeavError::CapacityExceeded)` if the maximum number

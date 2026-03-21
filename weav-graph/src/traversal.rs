@@ -84,22 +84,22 @@ fn edge_passes_filter(adj: &AdjacencyStore, edge_id: EdgeId, filter: &EdgeFilter
         None => return false,
     };
 
-    if let Some(ref labels) = filter.labels {
-        if !labels.contains(&meta.label) {
-            return false;
-        }
+    if let Some(ref labels) = filter.labels
+        && !labels.contains(&meta.label)
+    {
+        return false;
     }
 
-    if let Some(min_w) = filter.min_weight {
-        if meta.weight < min_w {
-            return false;
-        }
+    if let Some(min_w) = filter.min_weight
+        && meta.weight < min_w
+    {
+        return false;
     }
 
-    if let Some(ts) = filter.valid_at {
-        if !meta.temporal.is_valid_at(ts) {
-            return false;
-        }
+    if let Some(ts) = filter.valid_at
+        && !meta.temporal.is_valid_at(ts)
+    {
+        return false;
     }
 
     if let Some(max_age) = filter.max_age_ms {
@@ -184,27 +184,27 @@ fn node_passes_filter(
     }
 
     // Label filtering: check if the node's label is in the allowed set.
-    if let Some(ref allowed_labels) = node_filter.labels {
-        if let Some(ref lookup) = node_label_lookup {
-            match lookup(node) {
-                Some(label_id) => {
-                    if !allowed_labels.contains(&label_id) {
-                        return false;
-                    }
+    if let Some(ref allowed_labels) = node_filter.labels
+        && let Some(ref lookup) = node_label_lookup
+    {
+        match lookup(node) {
+            Some(label_id) => {
+                if !allowed_labels.contains(&label_id) {
+                    return false;
                 }
-                None => return false, // No label found, filter out
             }
+            None => return false, // No label found, filter out
         }
         // If no lookup provided, skip label filtering (can't check)
     }
 
     // Property filtering: check if the node has all required properties.
-    if let Some(ref required_props) = node_filter.has_property {
-        if let Some(ref checker) = property_check {
-            for prop_name in required_props {
-                if !checker(node, prop_name) {
-                    return false;
-                }
+    if let Some(ref required_props) = node_filter.has_property
+        && let Some(ref checker) = property_check
+    {
+        for prop_name in required_props {
+            if !checker(node, prop_name) {
+                return false;
             }
         }
         // If no checker provided, skip property filtering (can't check)
@@ -320,10 +320,10 @@ pub fn flow_score(
             break;
         }
         // Skip stale queue entries — a better score was found since this was enqueued
-        if let Some(&(current_score, _)) = scores.get(&node) {
-            if score < current_score {
-                continue;
-            }
+        if let Some(&(current_score, _)) = scores.get(&node)
+            && score < current_score
+        {
+            continue;
         }
         if depth >= max_depth {
             continue;
@@ -601,10 +601,10 @@ pub fn dijkstra_shortest_path(
         }
 
         // Skip if we've already found a better path to this node
-        if let Some(&d) = dist.get(&node) {
-            if cost > d {
-                continue;
-            }
+        if let Some(&d) = dist.get(&node)
+            && cost > d
+        {
+            continue;
         }
 
         let node_depth = depth.get(&node).copied().unwrap_or(0);
@@ -628,7 +628,7 @@ pub fn dijkstra_shortest_path(
             };
 
             let next_cost = cost + edge_cost;
-            let is_better = dist.get(&neighbor).map_or(true, |&d| next_cost < d);
+            let is_better = dist.get(&neighbor).is_none_or(|&d| next_cost < d);
 
             if is_better {
                 dist.insert(neighbor, next_cost);

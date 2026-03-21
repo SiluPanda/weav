@@ -337,7 +337,7 @@ async fn search_nodes(
     Path(graph): Path<String>,
     Query(params): Query<SearchParams>,
 ) -> impl IntoResponse {
-    let identity = extract_identity(&engine, &headers);
+    let _identity = extract_identity(&engine, &headers);
     let graph_arc = match engine.get_graph(&graph) {
         Ok(g) => g,
         Err(e) => return weav_error_to_response(e).into_response(),
@@ -394,7 +394,7 @@ async fn export_graph(
     headers: HeaderMap,
     Path(graph): Path<String>,
 ) -> impl IntoResponse {
-    let identity = extract_identity(&engine, &headers);
+    let _identity = extract_identity(&engine, &headers);
     let graph_arc = match engine.get_graph(&graph) {
         Ok(g) => g,
         Err(e) => return weav_error_to_response(e).into_response(),
@@ -632,15 +632,15 @@ async fn temporal_query(
             });
 
         // Node is valid at timestamp if created before/at timestamp and not expired
-        if let Some(created) = created_at {
-            if timestamp < created {
-                continue;
-            }
+        if let Some(created) = created_at
+            && timestamp < created
+        {
+            continue;
         }
-        if let Some(expires) = expires_at {
-            if timestamp >= expires {
-                continue;
-            }
+        if let Some(expires) = expires_at
+            && timestamp >= expires
+        {
+            continue;
         }
 
         // Build node JSON
@@ -668,28 +668,28 @@ async fn temporal_query(
         if include_edges {
             let temporal_neighbors = gs.adjacency.neighbors_at(nid, timestamp, None);
             for (neighbor_id, edge_id) in temporal_neighbors {
-                if seen_edges.insert(edge_id) {
-                    if let Some(meta) = gs.adjacency.get_edge(edge_id) {
-                        let edge_label = gs
-                            .interner
-                            .resolve_label(meta.label)
-                            .unwrap_or("unknown")
-                            .to_string();
-                        result_edges.push(serde_json::json!({
-                            "edge_id": edge_id,
-                            "source": meta.source,
-                            "target": meta.target,
-                            "label": edge_label,
-                            "weight": meta.weight,
-                            "neighbor": neighbor_id,
-                            "valid_from": meta.temporal.valid_from,
-                            "valid_until": if meta.temporal.valid_until == u64::MAX {
-                                serde_json::Value::Null
-                            } else {
-                                serde_json::json!(meta.temporal.valid_until)
-                            },
-                        }));
-                    }
+                if seen_edges.insert(edge_id)
+                    && let Some(meta) = gs.adjacency.get_edge(edge_id)
+                {
+                    let edge_label = gs
+                        .interner
+                        .resolve_label(meta.label)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    result_edges.push(serde_json::json!({
+                        "edge_id": edge_id,
+                        "source": meta.source,
+                        "target": meta.target,
+                        "label": edge_label,
+                        "weight": meta.weight,
+                        "neighbor": neighbor_id,
+                        "valid_from": meta.temporal.valid_from,
+                        "valid_until": if meta.temporal.valid_until == u64::MAX {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::json!(meta.temporal.valid_until)
+                        },
+                    }));
                 }
             }
         }
