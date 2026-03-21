@@ -353,7 +353,7 @@ impl Engine {
                     }
                 }
 
-                // Restore edges.
+                // Restore edges with original edge IDs.
                 for es in &gs.edges {
                     let label_id = state.interner.intern_label(&es.label)?;
                     let meta = EdgeMeta {
@@ -370,9 +370,22 @@ impl Engine {
                         weight: es.weight,
                         token_cost: 0,
                     };
-                    let _ = state.adjacency.add_edge(es.source, es.target, label_id, meta);
+                    // Use add_edge_with_id to preserve the original edge ID from snapshot
+                    let _ = state.adjacency.add_edge_with_id(es.source, es.target, label_id, meta, es.edge_id);
                     if es.edge_id >= state.next_edge_id {
                         state.next_edge_id = es.edge_id + 1;
+                        // Sync the adjacency store's internal edge ID counter
+                        state.adjacency.set_next_edge_id(es.edge_id + 1);
+                    }
+                    // Restore edge properties from snapshot.
+                    // Properties are serialized as serde-tagged Value enums, so we
+                    // deserialize directly into HashMap<String, Value> for fidelity.
+                    if !es.properties_json.is_empty() && es.properties_json != "{}" {
+                        if let Ok(props) = serde_json::from_str::<std::collections::HashMap<String, Value>>(&es.properties_json) {
+                            for (k, v) in props {
+                                state.properties.set_edge_property(es.edge_id, &k, v);
+                            }
+                        }
                     }
                 }
 
@@ -382,6 +395,11 @@ impl Engine {
         }
 
         // Step 2: Replay WAL entries.
+        // NOTE: WAL replay currently calls handle_* methods (e.g. handle_graph_create,
+        // handle_node_add) which write NEW WAL entries during recovery. This means
+        // recovery doubles the WAL size. This is a known design issue — the replay is
+        // idempotent and correct, but wastes disk space. A future improvement would be
+        // to add a "replaying" flag that suppresses WAL writes during recovery.
         for entry in &result.wal_entries {
             match &entry.operation {
                 WalOperation::GraphCreate { name, config_json } => {
@@ -496,6 +514,7 @@ impl Engine {
                     target,
                     label,
                     weight,
+                    properties_json,
                 } => {
                     let registry = self.graphs.read();
                     let graph_arc = registry.values()
@@ -515,9 +534,23 @@ impl Engine {
                                 weight: *weight,
                                 token_cost: 0,
                             };
+                            // Use add_edge_with_id to preserve the original edge ID
                             let _ = gs.adjacency.add_edge_with_id(*source, *target, label_id, meta, *edge_id);
+                            // Ensure next_edge_id stays ahead of all replayed IDs
                             if *edge_id >= gs.next_edge_id {
                                 gs.next_edge_id = *edge_id + 1;
+                                // Sync the adjacency store's internal edge ID counter
+                                gs.adjacency.set_next_edge_id(*edge_id + 1);
+                            }
+                            // Restore edge properties from WAL.
+                            // Properties are serialized as serde-tagged Value enums, so we
+                            // deserialize directly into HashMap<String, Value> for fidelity.
+                            if !properties_json.is_empty() && properties_json != "{}" {
+                                if let Ok(props) = serde_json::from_str::<std::collections::HashMap<String, Value>>(properties_json) {
+                                    for (k, v) in props {
+                                        gs.properties.set_edge_property(*edge_id, &k, v);
+                                    }
+                                }
                             }
                         }
                     }
@@ -1034,18 +1067,65 @@ impl Engine {
         if let Some(name) = graph_name {
             let graph_arc = self.get_graph(&name)?;
             let gs = graph_arc.read();
+
+            // Compute label distribution
+            let all_nodes = gs.adjacency.all_node_ids();
+            let mut label_counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+            for nid in &all_nodes {
+                if let Some(label_val) = gs.properties.get_node_property(*nid, "_label") {
+                    let label = label_val.as_str().unwrap_or("unknown").to_string();
+                    *label_counts.entry(label).or_insert(0) += 1;
+                }
+            }
+
+            // Count TTL nodes
+            let ttl_nodes = gs.properties.nodes_with_property("_ttl_expires_at").len();
+
+            // Compute avg degree
+            let node_count = gs.adjacency.node_count();
+            let edge_count = gs.adjacency.edge_count();
+            let avg_degree = if node_count > 0 {
+                (edge_count as f64 * 2.0) / node_count as f64
+            } else {
+                0.0
+            };
+
+            // Build label distribution string
+            let mut label_parts: Vec<String> = label_counts
+                .iter()
+                .map(|(k, v)| format!("{}:{}", k, v))
+                .collect();
+            label_parts.sort();
+
             Ok(CommandResponse::Text(format!(
-                "graph={} nodes={} edges={} vectors={}",
+                "graph={} nodes={} edges={} vectors={} labels={{{}}} avg_degree={:.2} ttl_nodes={} interned_labels={}",
                 name,
-                gs.adjacency.node_count(),
-                gs.adjacency.edge_count(),
+                node_count,
+                edge_count,
                 gs.vector_index.len(),
+                label_parts.join(","),
+                avg_degree,
+                ttl_nodes,
+                gs.interner.label_count(),
             )))
         } else {
             let registry = self.graphs.read();
+            let mut total_nodes: u64 = 0;
+            let mut total_edges: u64 = 0;
+            let mut total_vectors: usize = 0;
+            for graph_arc in registry.values() {
+                let gs = graph_arc.read();
+                total_nodes += gs.adjacency.node_count();
+                total_edges += gs.adjacency.edge_count();
+                total_vectors += gs.vector_index.len();
+            }
             Ok(CommandResponse::Text(format!(
-                "graphs={} engine=weav-server",
+                "graphs={} total_nodes={} total_edges={} total_vectors={} engine=weav-server v{}",
                 registry.len(),
+                total_nodes,
+                total_edges,
+                total_vectors,
+                env!("CARGO_PKG_VERSION"),
             )))
         }
     }
@@ -1519,6 +1599,11 @@ impl Engine {
             // Pre-allocate edge ID for write-ahead logging
             let edge_id = gs.adjacency.allocate_edge_id();
 
+            // Serialize edge properties for WAL persistence
+            let props_json = serde_json::to_string(
+                &edge_cmd.properties.iter().map(|(k, v)| (k.as_str(), v)).collect::<std::collections::HashMap<_, _>>()
+            ).unwrap_or_default();
+
             // Write-ahead: WAL entry before in-memory mutation
             self.append_wal(WalOperation::EdgeAdd {
                 graph_id,
@@ -1527,6 +1612,7 @@ impl Engine {
                 target: edge_cmd.target,
                 label: edge_cmd.label.clone(),
                 weight: edge_cmd.weight,
+                properties_json: props_json,
             })?;
 
             // Apply in-memory mutation
@@ -1540,6 +1626,12 @@ impl Engine {
                 token_cost: 0,
             };
             gs.adjacency.add_edge_with_id(edge_cmd.source, edge_cmd.target, label_id, meta, edge_id)?;
+
+            // Store edge properties
+            for (k, v) in &edge_cmd.properties {
+                gs.properties.set_edge_property(edge_id, k, v.clone());
+            }
+
             ids.push(edge_id);
         }
 
@@ -1562,6 +1654,11 @@ impl Engine {
         let edge_id = gs.adjacency.allocate_edge_id();
         let graph_id = gs.graph_id;
 
+        // Serialize edge properties for WAL persistence
+        let props_json = serde_json::to_string(
+            &cmd.properties.iter().map(|(k, v)| (k.as_str(), v)).collect::<std::collections::HashMap<_, _>>()
+        ).unwrap_or_default();
+
         // Write-ahead: WAL entry before in-memory mutation
         self.append_wal(WalOperation::EdgeAdd {
             graph_id,
@@ -1570,6 +1667,7 @@ impl Engine {
             target: cmd.target,
             label: cmd.label.clone(),
             weight: cmd.weight,
+            properties_json: props_json,
         })?;
 
         // Apply in-memory mutation
@@ -1593,6 +1691,11 @@ impl Engine {
             token_cost: 0,
         };
         gs.adjacency.add_edge_with_id(cmd.source, cmd.target, label_id, meta, edge_id)?;
+
+        // Store edge properties
+        for (k, v) in &cmd.properties {
+            gs.properties.set_edge_property(edge_id, k, v.clone());
+        }
 
         // Update metrics
         crate::metrics::EDGES_TOTAL
@@ -1763,6 +1866,16 @@ impl Engine {
                     .resolve_label(meta.label)
                     .unwrap_or("unknown")
                     .to_string();
+
+                // Serialize edge properties for snapshot persistence
+                let all_edge_props = gs.properties.get_all_edge_properties(edge_id);
+                let edge_props_json = {
+                    let props_map: std::collections::HashMap<&str, &Value> = all_edge_props
+                        .into_iter()
+                        .collect();
+                    serde_json::to_string(&props_map).unwrap_or_default()
+                };
+
                 edge_snapshots.push(EdgeSnapshot {
                     edge_id,
                     source: meta.source,
@@ -1771,6 +1884,7 @@ impl Engine {
                     weight: meta.weight,
                     valid_from: meta.temporal.valid_from,
                     valid_until: meta.temporal.valid_until,
+                    properties_json: edge_props_json,
                 });
             }
 
@@ -2600,7 +2714,11 @@ mod tests {
         let cmd = parser::parse_command("STATS").unwrap();
         let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
-            CommandResponse::Text(t) => assert!(t.contains("graphs=")),
+            CommandResponse::Text(t) => {
+                assert!(t.contains("graphs="), "stats should contain graphs count: {t}");
+                assert!(t.contains("total_nodes="), "stats should contain total_nodes: {t}");
+                assert!(t.contains("engine=weav-server"), "stats should contain engine name: {t}");
+            }
             _ => panic!("expected Text"),
         }
     }
@@ -2610,12 +2728,21 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "sg");
 
+        // Add a node so we have label distribution
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "sg" LABEL "person" PROPERTIES {"name": "Alice"}"#,
+        ).unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
         let cmd = parser::parse_command("STATS \"sg\"").unwrap();
         let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::Text(t) => {
-                assert!(t.contains("graph=sg"));
-                assert!(t.contains("nodes="));
+                assert!(t.contains("graph=sg"), "should contain graph name: {t}");
+                assert!(t.contains("nodes="), "should contain nodes: {t}");
+                assert!(t.contains("labels={"), "should contain label distribution: {t}");
+                assert!(t.contains("avg_degree="), "should contain avg_degree: {t}");
+                assert!(t.contains("person:"), "should list person label: {t}");
             }
             _ => panic!("expected Text"),
         }
@@ -3921,5 +4048,247 @@ mod tests {
 
         let expired = engine.sweep_ttl();
         assert_eq!(expired, 0);
+    }
+
+    #[test]
+    fn test_edge_properties_survive_snapshot_roundtrip() {
+        use weav_persist::recovery::RecoveryResult;
+
+        // Step 1: Create engine with persistence enabled, add edge with properties.
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "weav_edge_props_snap_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let mut config = WeavConfig::default();
+        config.persistence.enabled = true;
+        config.persistence.data_dir = tmp_dir.clone();
+
+        let engine = Engine::new(config.clone());
+        create_test_graph(&engine, "ep_graph");
+
+        // Add two nodes.
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "ep_graph".to_string(),
+            label: "person".to_string(),
+            properties: vec![("name".to_string(), Value::String(CompactString::from("Alice")))],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        let n1 = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "ep_graph".to_string(),
+            label: "person".to_string(),
+            properties: vec![("name".to_string(), Value::String(CompactString::from("Bob")))],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        let n2 = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Add edge with properties.
+        let cmd = Command::EdgeAdd(parser::EdgeAddCmd {
+            graph: "ep_graph".to_string(),
+            source: n1,
+            target: n2,
+            label: "KNOWS".to_string(),
+            weight: 0.9,
+            properties: vec![
+                ("since".to_string(), Value::String(CompactString::from("2020"))),
+                ("strength".to_string(), Value::Float(0.85)),
+            ],
+            ttl_ms: None,
+        });
+        let edge_id = match engine.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Verify in-memory properties are set.
+        {
+            let graph_arc = engine.get_graph("ep_graph").unwrap();
+            let gs = graph_arc.read();
+            let since = gs.properties.get_edge_property(edge_id, "since");
+            assert!(since.is_some(), "edge property 'since' should be set");
+            assert_eq!(since.unwrap().as_str(), Some("2020"));
+            let strength = gs.properties.get_edge_property(edge_id, "strength");
+            assert!(strength.is_some(), "edge property 'strength' should be set");
+        }
+
+        // Take a snapshot.
+        let cmd = parser::parse_command("SNAPSHOT").unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        // Step 2: Create a new engine and recover from the snapshot.
+        let engine2 = Engine::new(config.clone());
+
+        // Load the snapshot file manually.
+        let snap_engine = weav_persist::snapshot::SnapshotEngine::new(tmp_dir.clone());
+        let latest = snap_engine.latest_snapshot().unwrap().expect("snapshot should exist");
+        let snapshot = snap_engine.load_snapshot(&latest).unwrap();
+
+        let recovery = RecoveryResult {
+            snapshots_loaded: 1,
+            wal_entries_replayed: 0,
+            graphs_recovered: 1,
+            errors: vec![],
+            snapshot: Some(snapshot),
+            wal_entries: vec![],
+        };
+        engine2.recover(recovery).unwrap();
+
+        // Step 3: Verify edge properties survived the roundtrip.
+        let graph_arc = engine2.get_graph("ep_graph").unwrap();
+        let gs = graph_arc.read();
+
+        // Edge should exist with original ID.
+        assert_eq!(gs.adjacency.edge_count(), 1, "edge should be restored");
+        let recovered_edge = gs.adjacency.get_edge(edge_id);
+        assert!(recovered_edge.is_some(), "edge should have same ID after recovery");
+
+        // Edge properties should be restored.
+        let since = gs.properties.get_edge_property(edge_id, "since");
+        assert!(since.is_some(), "edge property 'since' should survive snapshot roundtrip");
+        assert_eq!(since.unwrap().as_str(), Some("2020"));
+
+        let strength = gs.properties.get_edge_property(edge_id, "strength");
+        assert!(strength.is_some(), "edge property 'strength' should survive snapshot roundtrip");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_edge_id_consistency_after_recovery() {
+        use weav_persist::recovery::RecoveryResult;
+
+        // Step 1: Create engine, add nodes + edges, capture edge IDs.
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "weav_edge_id_recovery_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let mut config = WeavConfig::default();
+        config.persistence.enabled = true;
+        config.persistence.data_dir = tmp_dir.clone();
+
+        let engine = Engine::new(config.clone());
+        create_test_graph(&engine, "eid_graph");
+
+        // Add three nodes.
+        let mut node_ids = Vec::new();
+        for name in &["Alice", "Bob", "Charlie"] {
+            let cmd = Command::NodeAdd(parser::NodeAddCmd {
+                graph: "eid_graph".to_string(),
+                label: "person".to_string(),
+                properties: vec![("name".to_string(), Value::String(CompactString::from(*name)))],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            });
+            let nid = match engine.execute_command(cmd, None).unwrap() {
+                CommandResponse::Integer(id) => id,
+                _ => panic!("expected Integer"),
+            };
+            node_ids.push(nid);
+        }
+
+        // Add edges and capture their IDs.
+        let mut original_edge_ids = Vec::new();
+        let edges = vec![
+            (node_ids[0], node_ids[1], "KNOWS"),
+            (node_ids[1], node_ids[2], "WORKS_WITH"),
+            (node_ids[0], node_ids[2], "FRIENDS"),
+        ];
+        for (src, tgt, label) in &edges {
+            let cmd = Command::EdgeAdd(parser::EdgeAddCmd {
+                graph: "eid_graph".to_string(),
+                source: *src,
+                target: *tgt,
+                label: label.to_string(),
+                weight: 1.0,
+                properties: vec![],
+                ttl_ms: None,
+            });
+            let eid = match engine.execute_command(cmd, None).unwrap() {
+                CommandResponse::Integer(id) => id,
+                _ => panic!("expected Integer"),
+            };
+            original_edge_ids.push(eid);
+        }
+
+        // Take a snapshot.
+        let cmd = parser::parse_command("SNAPSHOT").unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        // Step 2: Recover from snapshot into a new engine.
+        let engine2 = Engine::new(config.clone());
+
+        let snap_engine = weav_persist::snapshot::SnapshotEngine::new(tmp_dir.clone());
+        let latest = snap_engine.latest_snapshot().unwrap().expect("snapshot should exist");
+        let snapshot = snap_engine.load_snapshot(&latest).unwrap();
+
+        let recovery = RecoveryResult {
+            snapshots_loaded: 1,
+            wal_entries_replayed: 0,
+            graphs_recovered: 1,
+            errors: vec![],
+            snapshot: Some(snapshot),
+            wal_entries: vec![],
+        };
+        engine2.recover(recovery).unwrap();
+
+        // Step 3: Verify all edge IDs match.
+        let graph_arc = engine2.get_graph("eid_graph").unwrap();
+        let gs = graph_arc.read();
+
+        for eid in &original_edge_ids {
+            let meta = gs.adjacency.get_edge(*eid);
+            assert!(
+                meta.is_some(),
+                "edge ID {} should be preserved after snapshot recovery",
+                eid,
+            );
+        }
+
+        // Step 4: Verify that adding a new edge after recovery gets a non-conflicting ID.
+        drop(gs);
+        drop(graph_arc);
+
+        let cmd = Command::EdgeAdd(parser::EdgeAddCmd {
+            graph: "eid_graph".to_string(),
+            source: node_ids[0],
+            target: node_ids[1],
+            label: "NEW_EDGE".to_string(),
+            weight: 0.5,
+            properties: vec![],
+            ttl_ms: None,
+        });
+        let new_eid = match engine2.execute_command(cmd, None).unwrap() {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // New edge ID should not collide with any recovered edge ID.
+        for eid in &original_edge_ids {
+            assert_ne!(
+                new_eid, *eid,
+                "new edge ID should not collide with recovered edge IDs",
+            );
+        }
+        assert!(
+            new_eid > *original_edge_ids.iter().max().unwrap(),
+            "new edge ID should be greater than all recovered edge IDs",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

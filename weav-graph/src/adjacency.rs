@@ -142,6 +142,12 @@ impl AdjacencyStore {
         id
     }
 
+    /// Set the next edge ID counter. Used during recovery to sync the counter
+    /// with edge IDs restored from snapshots or WAL replay.
+    pub fn set_next_edge_id(&mut self, id: EdgeId) {
+        self.next_edge_id = id;
+    }
+
     pub fn add_edge(
         &mut self,
         src: NodeId,

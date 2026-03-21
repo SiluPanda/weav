@@ -59,6 +59,7 @@ pub enum WalOperation {
         target: NodeId,
         label: String,
         weight: f32,
+        properties_json: String,
     },
     EdgeInvalidate {
         graph_id: GraphId,
@@ -586,6 +587,7 @@ mod tests {
                 target: 2,
                 label: "KNOWS".into(),
                 weight: 0.9,
+                properties_json: "{}".into(),
             },
             WalOperation::EdgeInvalidate {
                 graph_id: 1,
@@ -952,6 +954,7 @@ mod tests {
             target: 2,
             label: "KNOWS".into(),
             weight: 1.0,
+            properties_json: "{}".into(),
         };
         assert_eq!(op.graph_id_hint(), 3);
 

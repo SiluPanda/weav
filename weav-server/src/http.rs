@@ -34,6 +34,8 @@ pub struct AddNodeRequest {
     pub properties: Option<serde_json::Value>,
     pub embedding: Option<Vec<f32>>,
     pub entity_key: Option<String>,
+    /// Time-to-live in milliseconds. Node will be auto-expired after this duration.
+    pub ttl_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -43,6 +45,8 @@ pub struct AddEdgeRequest {
     pub label: String,
     pub weight: Option<f32>,
     pub properties: Option<serde_json::Value>,
+    /// Time-to-live in milliseconds. Edge will be auto-expired after this duration.
+    pub ttl_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -376,7 +380,7 @@ async fn add_node(
         properties,
         embedding: body.embedding,
         entity_key: body.entity_key,
-        ttl_ms: None,
+        ttl_ms: body.ttl_ms,
     });
 
     match engine.execute_command(cmd, identity.as_ref()) {
@@ -465,7 +469,7 @@ async fn add_edge(
         label: body.label,
         weight: body.weight.unwrap_or(1.0),
         properties,
-        ttl_ms: None,
+        ttl_ms: body.ttl_ms,
     });
 
     match engine.execute_command(cmd, identity.as_ref()) {
@@ -626,7 +630,7 @@ async fn bulk_add_nodes(
                 properties,
                 embedding: n.embedding,
                 entity_key: n.entity_key,
-                ttl_ms: None,
+                ttl_ms: n.ttl_ms,
             }
         })
         .collect();
@@ -672,7 +676,7 @@ async fn bulk_add_edges(
                 label: e.label,
                 weight: e.weight.unwrap_or(1.0),
                 properties,
-                ttl_ms: None,
+                ttl_ms: e.ttl_ms,
             }
         })
         .collect();

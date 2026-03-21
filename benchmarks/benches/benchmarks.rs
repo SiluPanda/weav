@@ -470,6 +470,7 @@ fn bench_persistence(c: &mut Criterion) {
                 weight: 0.8,
                 valid_from: 1000,
                 valid_until: u64::MAX,
+                properties_json: "{}".into(),
             })
             .collect();
 

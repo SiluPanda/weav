@@ -577,13 +577,25 @@ fn parse_node_add(tokens: &[String]) -> Result<Command, WeavError> {
         None
     };
 
+    // Find "TTL" keyword (optional) — value in milliseconds
+    let ttl_ms = if let Some(ttl_pos) = find_keyword(tokens, "TTL") {
+        if ttl_pos + 1 >= tokens.len() {
+            return Err(parse_err("TTL requires a value in milliseconds"));
+        }
+        Some(tokens[ttl_pos + 1].parse::<u64>().map_err(|_| {
+            parse_err("TTL value must be a positive integer (milliseconds)")
+        })?)
+    } else {
+        None
+    };
+
     Ok(Command::NodeAdd(NodeAddCmd {
         graph,
         label,
         properties,
         embedding,
         entity_key,
-        ttl_ms: None,
+        ttl_ms,
     }))
 }
 
@@ -714,6 +726,18 @@ fn parse_edge_add(tokens: &[String]) -> Result<Command, WeavError> {
         Vec::new()
     };
 
+    // Find TTL (optional) — value in milliseconds
+    let ttl_ms = if let Some(ttl_pos) = find_keyword(tokens, "TTL") {
+        if ttl_pos + 1 >= tokens.len() {
+            return Err(parse_err("TTL requires a value in milliseconds"));
+        }
+        Some(tokens[ttl_pos + 1].parse::<u64>().map_err(|_| {
+            parse_err("TTL value must be a positive integer (milliseconds)")
+        })?)
+    } else {
+        None
+    };
+
     Ok(Command::EdgeAdd(EdgeAddCmd {
         graph,
         source,
@@ -721,7 +745,7 @@ fn parse_edge_add(tokens: &[String]) -> Result<Command, WeavError> {
         label,
         weight,
         properties,
-        ttl_ms: None,
+        ttl_ms,
     }))
 }
 
@@ -2250,6 +2274,57 @@ mod tests {
         let result = parse_command("INGEST");
         assert!(result.is_err());
         let result = parse_command(r#"INGEST "mygraph""#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_node_add_with_ttl() {
+        let cmd = parse_command(
+            r#"NODE ADD TO "g" LABEL "temp" PROPERTIES {"name": "ephemeral"} TTL 60000"#,
+        ).unwrap();
+        match cmd {
+            Command::NodeAdd(c) => {
+                assert_eq!(c.graph, "g");
+                assert_eq!(c.label, "temp");
+                assert_eq!(c.ttl_ms, Some(60000));
+            }
+            _ => panic!("expected NodeAdd"),
+        }
+    }
+
+    #[test]
+    fn test_parse_node_add_without_ttl() {
+        let cmd = parse_command(
+            r#"NODE ADD TO "g" LABEL "perm" PROPERTIES {"name": "permanent"}"#,
+        ).unwrap();
+        match cmd {
+            Command::NodeAdd(c) => {
+                assert_eq!(c.ttl_ms, None);
+            }
+            _ => panic!("expected NodeAdd"),
+        }
+    }
+
+    #[test]
+    fn test_parse_edge_add_with_ttl() {
+        let cmd = parse_command(
+            r#"EDGE ADD TO "g" FROM 1 TO 2 LABEL "link" TTL 30000"#,
+        ).unwrap();
+        match cmd {
+            Command::EdgeAdd(c) => {
+                assert_eq!(c.source, 1);
+                assert_eq!(c.target, 2);
+                assert_eq!(c.ttl_ms, Some(30000));
+            }
+            _ => panic!("expected EdgeAdd"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ttl_invalid_value() {
+        let result = parse_command(
+            r#"NODE ADD TO "g" LABEL "x" TTL abc"#,
+        );
         assert!(result.is_err());
     }
 }

@@ -95,6 +95,11 @@ impl StringInterner {
         self.id_to_label.get(&id).map(|s| s.as_str())
     }
 
+    /// Return the number of unique interned labels.
+    pub fn label_count(&self) -> usize {
+        self.label_to_id.len()
+    }
+
     /// Intern a property key string, returning its compact ID.
     ///
     /// Returns `Err(WeavError::CapacityExceeded)` if the maximum number

@@ -780,6 +780,7 @@ mod tests {
                     target: 11,
                     label: "REL".into(),
                     weight: 1.0,
+                    properties_json: "{}".into(),
                 },
             )
             .unwrap();

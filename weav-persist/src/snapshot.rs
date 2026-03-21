@@ -71,6 +71,7 @@ pub struct EdgeSnapshot {
     pub weight: f32,
     pub valid_from: Timestamp,
     pub valid_until: Timestamp,
+    pub properties_json: String,
 }
 
 /// Full snapshot containing all graphs.
@@ -320,6 +321,7 @@ mod tests {
                     weight: 1.0,
                     valid_from: 1000,
                     valid_until: u64::MAX,
+                    properties_json: "{}".into(),
                 }],
             }],
         }
@@ -567,6 +569,7 @@ mod tests {
                         weight: 0.5,
                         valid_from: 500,
                         valid_until: u64::MAX,
+                        properties_json: "{}".into(),
                     }],
                 },
                 GraphSnapshot {
@@ -605,6 +608,7 @@ mod tests {
                             weight: 1.0,
                             valid_from: 0,
                             valid_until: u64::MAX,
+                            properties_json: "{}".into(),
                         },
                         EdgeSnapshot {
                             edge_id: 201,
@@ -614,6 +618,7 @@ mod tests {
                             weight: 0.8,
                             valid_from: 0,
                             valid_until: u64::MAX,
+                            properties_json: "{}".into(),
                         },
                     ],
                 },
