@@ -114,6 +114,8 @@ pub struct Engine {
     snapshot_engine: Option<SnapshotEngine>,
     runtime_config: RwLock<HashMap<String, String>>,
     acl_store: Option<weav_auth::acl::AclStore>,
+    /// Active connection counter for enforcing max_connections.
+    active_connections: std::sync::atomic::AtomicU64,
 }
 
 impl Engine {
@@ -152,6 +154,7 @@ impl Engine {
             snapshot_engine,
             runtime_config: RwLock::new(HashMap::new()),
             acl_store,
+            active_connections: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -192,6 +195,45 @@ impl Engine {
     /// Return the configured WAL sync mode.
     pub fn wal_sync_mode(&self) -> &weav_core::config::WalSyncMode {
         &self.config.persistence.wal_sync_mode
+    }
+
+    /// Try to acquire a connection slot. Returns Err if max_connections exceeded.
+    pub fn try_acquire_connection(&self) -> WeavResult<()> {
+        let max = self.config.server.max_connections as u64;
+        let current = self.active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if current >= max {
+            self.active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(WeavError::CapacityExceeded(format!(
+                "max connections ({max}) exceeded"
+            )));
+        }
+        crate::metrics::CONNECTIONS_ACTIVE.set((current + 1) as i64);
+        Ok(())
+    }
+
+    /// Release a connection slot.
+    pub fn release_connection(&self) {
+        // Use compare-and-swap loop to prevent underflow
+        loop {
+            let current = self.active_connections.load(std::sync::atomic::Ordering::Relaxed);
+            if current == 0 {
+                break;
+            }
+            if self.active_connections.compare_exchange(
+                current,
+                current - 1,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ).is_ok() {
+                crate::metrics::CONNECTIONS_ACTIVE.set((current - 1) as i64);
+                break;
+            }
+        }
+    }
+
+    /// Return the current active connection count.
+    pub fn active_connection_count(&self) -> u64 {
+        self.active_connections.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Sweep expired nodes and edges across all graphs.
@@ -261,7 +303,7 @@ impl Engine {
     /// lookup (nanoseconds). Callers then acquire the inner per-graph lock
     /// for the duration of their operation, allowing different graphs to be
     /// read/written concurrently.
-    fn get_graph(&self, name: &str) -> WeavResult<Arc<RwLock<GraphState>>> {
+    pub fn get_graph(&self, name: &str) -> WeavResult<Arc<RwLock<GraphState>>> {
         let registry = self.graphs.read();
         registry
             .get(name)
@@ -400,6 +442,7 @@ impl Engine {
         // recovery doubles the WAL size. This is a known design issue — the replay is
         // idempotent and correct, but wastes disk space. A future improvement would be
         // to add a "replaying" flag that suppresses WAL writes during recovery.
+        let mut replay_errors: u64 = 0;
         for entry in &result.wal_entries {
             match &entry.operation {
                 WalOperation::GraphCreate { name, config_json } => {
@@ -412,10 +455,16 @@ impl Engine {
                         name: name.clone(),
                         config,
                     };
-                    let _ = self.handle_graph_create(cmd);
+                    if let Err(e) = self.handle_graph_create(cmd) {
+                        tracing::warn!("WAL replay GraphCreate '{}' failed: {e}", name);
+                        replay_errors += 1;
+                    }
                 }
                 WalOperation::GraphDrop { name } => {
-                    let _ = self.handle_graph_drop(name);
+                    if let Err(e) = self.handle_graph_drop(name) {
+                        tracing::warn!("WAL replay GraphDrop '{}' failed: {e}", name);
+                        replay_errors += 1;
+                    }
                 }
                 WalOperation::NodeAdd {
                     graph_id: _,
@@ -458,7 +507,10 @@ impl Engine {
                             entity_key: entity_key.clone(),
                             ttl_ms: None,
                         };
-                        let _ = self.handle_node_add(cmd);
+                        if let Err(e) = self.handle_node_add(cmd) {
+                            tracing::warn!("WAL replay NodeAdd failed: {e}");
+                            replay_errors += 1;
+                        }
                     }
                 }
                 WalOperation::NodeUpdate {
@@ -501,9 +553,14 @@ impl Engine {
                     if let Some(graph_arc) = graph_arc {
                         let mut gs = graph_arc.write();
                         if gs.adjacency.has_node(*node_id) {
-                            let _ = gs.adjacency.remove_node(*node_id);
+                            if let Err(e) = gs.adjacency.remove_node(*node_id) {
+                                tracing::warn!("WAL replay NodeDelete({node_id}) failed: {e}");
+                                replay_errors += 1;
+                            }
                             gs.properties.remove_all_node_properties(*node_id);
-                            let _ = gs.vector_index.remove(*node_id);
+                            if let Err(e) = gs.vector_index.remove(*node_id) {
+                                tracing::warn!("WAL replay NodeDelete vector cleanup({node_id}) failed: {e}");
+                            }
                         }
                     }
                 }
@@ -535,7 +592,10 @@ impl Engine {
                                 token_cost: 0,
                             };
                             // Use add_edge_with_id to preserve the original edge ID
-                            let _ = gs.adjacency.add_edge_with_id(*source, *target, label_id, meta, *edge_id);
+                            if let Err(e) = gs.adjacency.add_edge_with_id(*source, *target, label_id, meta, *edge_id) {
+                                tracing::warn!("WAL replay EdgeAdd({source}->{target}, id={edge_id}) failed: {e}");
+                                replay_errors += 1;
+                            }
                             // Ensure next_edge_id stays ahead of all replayed IDs
                             if *edge_id >= gs.next_edge_id {
                                 gs.next_edge_id = *edge_id + 1;
@@ -567,7 +627,10 @@ impl Engine {
                     drop(registry);
                     if let Some(graph_arc) = graph_arc {
                         let mut gs = graph_arc.write();
-                        let _ = gs.adjacency.invalidate_edge(*edge_id, *timestamp);
+                        if let Err(e) = gs.adjacency.invalidate_edge(*edge_id, *timestamp) {
+                            tracing::warn!("WAL replay EdgeInvalidate({edge_id}) failed: {e}");
+                            replay_errors += 1;
+                        }
                     }
                 }
                 WalOperation::EdgeDelete {
@@ -581,7 +644,10 @@ impl Engine {
                     drop(registry);
                     if let Some(graph_arc) = graph_arc {
                         let mut gs = graph_arc.write();
-                        let _ = gs.adjacency.remove_edge(*edge_id);
+                        if let Err(e) = gs.adjacency.remove_edge(*edge_id) {
+                            tracing::warn!("WAL replay EdgeDelete({edge_id}) failed: {e}");
+                            replay_errors += 1;
+                        }
                     }
                 }
                 WalOperation::VectorUpdate {
@@ -596,8 +662,11 @@ impl Engine {
                     drop(registry);
                     if let Some(graph_arc) = graph_arc {
                         let mut gs = graph_arc.write();
-                        let _ = gs.vector_index.remove(*node_id);
-                        let _ = gs.vector_index.insert(*node_id, vector);
+                        // insert already handles remove-then-add internally
+                        if let Err(e) = gs.vector_index.insert(*node_id, vector) {
+                            tracing::warn!("WAL replay VectorUpdate({node_id}) failed: {e}");
+                            replay_errors += 1;
+                        }
                     }
                 }
                 WalOperation::Ingest { .. } => {
@@ -605,6 +674,13 @@ impl Engine {
                     // (NodeAdd, EdgeAdd, etc.) are recorded as separate WAL entries.
                 }
             }
+        }
+
+        if replay_errors > 0 {
+            tracing::warn!(
+                "WAL replay completed with {replay_errors} errors out of {} entries",
+                result.wal_entries.len()
+            );
         }
 
         Ok(())
@@ -859,7 +935,7 @@ impl Engine {
     ///
     /// When auth is active and an identity is present, verifies the user holds
     /// at least `required` permission on `graph_name`.
-    fn check_permission(
+    pub fn check_permission(
         &self,
         identity: Option<&weav_auth::identity::SessionIdentity>,
         graph_name: &str,
@@ -4290,5 +4366,37 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_connection_limit_enforcement() {
+        let mut config = WeavConfig::default();
+        config.server.max_connections = 3;
+        let engine = Engine::new(config);
+
+        // Acquire 3 connections (the limit)
+        engine.try_acquire_connection().unwrap();
+        engine.try_acquire_connection().unwrap();
+        engine.try_acquire_connection().unwrap();
+        assert_eq!(engine.active_connection_count(), 3);
+
+        // 4th should fail
+        let result = engine.try_acquire_connection();
+        assert!(result.is_err(), "should reject when at max_connections");
+        assert_eq!(engine.active_connection_count(), 3); // unchanged
+
+        // Release one, then 4th should succeed
+        engine.release_connection();
+        assert_eq!(engine.active_connection_count(), 2);
+        engine.try_acquire_connection().unwrap();
+        assert_eq!(engine.active_connection_count(), 3);
+    }
+
+    #[test]
+    fn test_connection_release_underflow_safe() {
+        let engine = make_engine();
+        // Release without acquire should not underflow (saturating_sub)
+        engine.release_connection();
+        assert_eq!(engine.active_connection_count(), 0);
     }
 }

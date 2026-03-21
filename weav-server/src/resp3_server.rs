@@ -142,6 +142,12 @@ pub async fn run_resp3_server(engine: Arc<Engine>, addr: &str) {
 
         let engine = engine.clone();
         tokio::spawn(async move {
+            // Enforce connection limit
+            if let Err(e) = engine.try_acquire_connection() {
+                tracing::warn!("RESP3 connection from {} rejected: {e}", peer);
+                return;
+            }
+
             tracing::debug!("RESP3 connection from {}", peer);
             let mut framed = Framed::new(stream, Resp3Codec::new());
 
@@ -213,6 +219,7 @@ pub async fn run_resp3_server(engine: Arc<Engine>, addr: &str) {
                 }
             }
 
+            engine.release_connection();
             tracing::debug!("RESP3 connection closed from {}", peer);
         });
     }

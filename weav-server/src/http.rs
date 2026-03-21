@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use weav_core::types::{DecayFunction, Direction, TokenBudget, Value};
 use weav_query::parser::{
-    Command, ContextQuery, EdgeAddCmd, EdgeDeleteCmd, EdgeFilterConfig, EdgeGetCmd,
+    Command, ContextQuery, EdgeAddCmd, EdgeDeleteCmd, EdgeFilterConfig,
     EdgeInvalidateCmd, GraphCreateCmd, NodeAddCmd, NodeDeleteCmd, NodeGetCmd, NodeUpdateCmd,
     BulkInsertNodesCmd, BulkInsertEdgesCmd, SeedStrategy, SortDirection, SortField, SortOrder,
 };
@@ -159,15 +159,6 @@ struct EdgeIdResponse {
 }
 
 #[derive(Serialize)]
-struct EdgeInfoJson {
-    edge_id: u64,
-    source: u64,
-    target: u64,
-    label: String,
-    weight: f32,
-}
-
-#[derive(Serialize)]
 struct BulkNodeIdsResponse {
     node_ids: Vec<u64>,
 }
@@ -175,6 +166,32 @@ struct BulkNodeIdsResponse {
 #[derive(Serialize)]
 struct BulkEdgeIdsResponse {
     edge_ids: Vec<u64>,
+}
+
+#[derive(Serialize)]
+struct NeighborEntry {
+    node_id: u64,
+    edge_id: u64,
+    direction: String,
+    edge_label: String,
+    edge_weight: f32,
+    node_label: String,
+}
+
+#[derive(Serialize)]
+struct NeighborsResponse {
+    node_id: u64,
+    neighbors: Vec<NeighborEntry>,
+}
+
+#[derive(Serialize)]
+struct EdgeDetailJson {
+    edge_id: u64,
+    source: u64,
+    target: u64,
+    label: String,
+    weight: f32,
+    properties: serde_json::Value,
 }
 
 // ─── Router construction ────────────────────────────────────────────────────
@@ -194,6 +211,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/graphs/{graph}/nodes/{id}", get(get_node))
         .route("/v1/graphs/{graph}/nodes/{id}", put(update_node))
         .route("/v1/graphs/{graph}/nodes/{id}", delete(delete_node))
+        .route(
+            "/v1/graphs/{graph}/nodes/{node_id}/neighbors",
+            get(get_node_neighbors),
+        )
         // Edge routes.
         .route("/v1/graphs/{graph}/edges", post(add_edge))
         .route("/v1/graphs/{graph}/edges/bulk", post(bulk_add_edges))
@@ -449,6 +470,82 @@ async fn delete_node(
     }
 }
 
+async fn get_node_neighbors(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path((graph, node_id)): Path<(String, u64)>,
+) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::Read,
+    ) {
+        return weav_error_to_response(e).into_response();
+    }
+
+    let graph_arc = match engine.get_graph(&graph) {
+        Ok(arc) => arc,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
+    let gs = graph_arc.read();
+
+    if !gs.adjacency.has_node(node_id) {
+        return weav_error_to_response(weav_core::error::WeavError::NodeNotFound(
+            node_id,
+            gs.graph_id,
+        ))
+        .into_response();
+    }
+
+    let both = gs.adjacency.neighbors_both(node_id, None);
+    let mut neighbors = Vec::with_capacity(both.len());
+
+    for (neighbor_id, edge_id, direction) in &both {
+        let dir_str = match direction {
+            Direction::Outgoing => "outgoing",
+            Direction::Incoming => "incoming",
+            Direction::Both => "both",
+        };
+
+        let (edge_label, edge_weight) = if let Some(meta) = gs.adjacency.get_edge(*edge_id) {
+            let label = gs
+                .interner
+                .resolve_label(meta.label)
+                .unwrap_or("unknown")
+                .to_string();
+            (label, meta.weight)
+        } else {
+            ("unknown".to_string(), 1.0)
+        };
+
+        let node_label = gs
+            .properties
+            .get_node_property(*neighbor_id, "_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        neighbors.push(NeighborEntry {
+            node_id: *neighbor_id,
+            edge_id: *edge_id,
+            direction: dir_str.to_string(),
+            edge_label,
+            edge_weight,
+            node_label,
+        });
+    }
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::ok(NeighborsResponse {
+            node_id,
+            neighbors,
+        })),
+    )
+        .into_response()
+}
+
 async fn add_edge(
     State(engine): State<Arc<Engine>>,
     headers: HeaderMap,
@@ -510,30 +607,54 @@ async fn get_edge(
     Path((graph, id)): Path<(String, u64)>,
 ) -> impl IntoResponse {
     let identity = extract_identity(&engine, &headers);
-    let cmd = Command::EdgeGet(EdgeGetCmd {
-        graph,
-        edge_id: id,
-    });
-
-    match engine.execute_command(cmd, identity.as_ref()) {
-        Ok(CommandResponse::EdgeInfo(info)) => (
-            StatusCode::OK,
-            Json(ApiResponse::ok(EdgeInfoJson {
-                edge_id: info.edge_id,
-                source: info.source,
-                target: info.target,
-                label: info.label,
-                weight: info.weight,
-            })),
-        )
-            .into_response(),
-        Ok(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
-        )
-            .into_response(),
-        Err(e) => weav_error_to_response(e).into_response(),
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::Read,
+    ) {
+        return weav_error_to_response(e).into_response();
     }
+
+    let graph_arc = match engine.get_graph(&graph) {
+        Ok(arc) => arc,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
+    let gs = graph_arc.read();
+
+    let meta = match gs.adjacency.get_edge(id) {
+        Some(m) => m,
+        None => {
+            return weav_error_to_response(weav_core::error::WeavError::EdgeNotFound(id))
+                .into_response()
+        }
+    };
+
+    let label = gs
+        .interner
+        .resolve_label(meta.label)
+        .unwrap_or("unknown")
+        .to_string();
+
+    let all_props = gs.properties.get_all_edge_properties(id);
+    let props: Vec<(String, Value)> = all_props
+        .into_iter()
+        .filter(|(k, _)| !k.starts_with('_'))
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
+    let properties = props_to_json(&props);
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::ok(EdgeDetailJson {
+            edge_id: id,
+            source: meta.source,
+            target: meta.target,
+            label,
+            weight: meta.weight,
+            properties,
+        })),
+    )
+        .into_response()
 }
 
 async fn delete_edge(
@@ -1761,5 +1882,325 @@ mod tests {
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_get_node_neighbors() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        // Create graph.
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "nbr".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        // Add three nodes.
+        let n1 = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "nbr".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![("name".to_string(), Value::String("Alice".into()))],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+        let n2 = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "nbr".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![("name".to_string(), Value::String("Bob".into()))],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+        let n3 = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "nbr".to_string(),
+                    label: "org".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Add edges: n1 -> n2 (KNOWS), n3 -> n1 (EMPLOYS).
+        engine
+            .execute_command(
+                Command::EdgeAdd(EdgeAddCmd {
+                    graph: "nbr".to_string(),
+                    source: n1,
+                    target: n2,
+                    label: "KNOWS".to_string(),
+                    weight: 0.9,
+                    properties: vec![],
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+        engine
+            .execute_command(
+                Command::EdgeAdd(EdgeAddCmd {
+                    graph: "nbr".to_string(),
+                    source: n3,
+                    target: n1,
+                    label: "EMPLOYS".to_string(),
+                    weight: 0.5,
+                    properties: vec![],
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        // GET neighbors of n1.
+        let req = Request::builder()
+            .uri(format!("/v1/graphs/nbr/nodes/{n1}/neighbors"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["node_id"], n1);
+
+        let neighbors = json["data"]["neighbors"].as_array().unwrap();
+        assert_eq!(neighbors.len(), 2);
+
+        // Check we have both directions.
+        let outgoing: Vec<&serde_json::Value> = neighbors
+            .iter()
+            .filter(|n| n["direction"] == "outgoing")
+            .collect();
+        let incoming: Vec<&serde_json::Value> = neighbors
+            .iter()
+            .filter(|n| n["direction"] == "incoming")
+            .collect();
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(incoming.len(), 1);
+
+        // Outgoing neighbor should be n2 with KNOWS label.
+        assert_eq!(outgoing[0]["node_id"], n2);
+        assert_eq!(outgoing[0]["edge_label"], "KNOWS");
+        assert_eq!(outgoing[0]["node_label"], "person");
+        assert_eq!(outgoing[0]["edge_weight"], 0.9);
+
+        // Incoming neighbor should be n3 with EMPLOYS label.
+        assert_eq!(incoming[0]["node_id"], n3);
+        assert_eq!(incoming[0]["edge_label"], "EMPLOYS");
+        assert_eq!(incoming[0]["node_label"], "org");
+        assert_eq!(incoming[0]["edge_weight"], 0.5);
+    }
+
+    #[tokio::test]
+    async fn test_get_node_neighbors_not_found() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "nbr_nf".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let req = Request::builder()
+            .uri("/v1/graphs/nbr_nf/nodes/9999/neighbors")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_get_node_neighbors_no_neighbors() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "nbr_empty".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let n1 = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "nbr_empty".to_string(),
+                    label: "solo".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let req = Request::builder()
+            .uri(format!("/v1/graphs/nbr_empty/nodes/{n1}/neighbors"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["node_id"], n1);
+        let neighbors = json["data"]["neighbors"].as_array().unwrap();
+        assert!(neighbors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_edge_with_properties() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "ep".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let n1 = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "ep".to_string(),
+                    label: "a".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+        let n2 = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "ep".to_string(),
+                    label: "b".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let edge_id = match engine
+            .execute_command(
+                Command::EdgeAdd(EdgeAddCmd {
+                    graph: "ep".to_string(),
+                    source: n1,
+                    target: n2,
+                    label: "RELATES".to_string(),
+                    weight: 0.7,
+                    properties: vec![
+                        ("since".to_string(), Value::String("2024".into())),
+                        ("strength".to_string(), Value::Float(0.95)),
+                    ],
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // GET edge with properties.
+        let req = Request::builder()
+            .uri(format!("/v1/graphs/ep/edges/{edge_id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["edge_id"], edge_id);
+        assert_eq!(json["data"]["source"], n1);
+        assert_eq!(json["data"]["target"], n2);
+        assert_eq!(json["data"]["label"], "RELATES");
+        assert_eq!(json["data"]["weight"], 0.7);
+        assert_eq!(json["data"]["properties"]["since"], "2024");
+        assert_eq!(json["data"]["properties"]["strength"], 0.95);
+    }
+
+    #[tokio::test]
+    async fn test_get_edge_not_found() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "enf".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let req = Request::builder()
+            .uri("/v1/graphs/enf/edges/9999")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
