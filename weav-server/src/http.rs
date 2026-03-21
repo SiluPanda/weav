@@ -93,6 +93,8 @@ pub struct ContextRequest {
     pub sort_direction: Option<String>,
     pub edge_labels: Option<Vec<String>>,
     pub direction: Option<String>,
+    /// If true, return the query plan without executing.
+    pub explain: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -235,6 +237,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/graphs", get(list_graphs))
         .route("/v1/graphs/{name}", get(get_graph_info))
         .route("/v1/graphs/{name}", delete(drop_graph))
+        .route("/v1/graphs/{graph}/check", get(check_graph))
         // Node routes.
         .route("/v1/graphs/{graph}/nodes", post(add_node))
         .route("/v1/graphs/{graph}/nodes/bulk", post(bulk_add_nodes))
@@ -264,6 +267,11 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/graphs/{graph}/ingest", post(ingest))
         // Schema introspection.
         .route("/v1/graphs/{graph}/schema", get(get_graph_schema))
+        // Detailed graph statistics.
+        .route(
+            "/v1/graphs/{graph}/stats/detailed",
+            get(get_detailed_stats),
+        )
         // Node search by property.
         .route("/v1/graphs/{graph}/search", get(search_nodes))
         // Full-text search with BM25 scoring.
@@ -349,6 +357,16 @@ fn extract_identity(
     } else {
         None
     }
+}
+
+/// Extract group_id from X-Group-Id header for multi-tenancy.
+/// When set, node operations store it as `_group_id` property,
+/// and search/query operations filter results to the specified group.
+fn extract_group_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-group-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
@@ -1319,6 +1337,62 @@ async fn get_graph_info(
     }
 }
 
+/// GET /v1/graphs/{graph}/check
+async fn check_graph(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
+    let cmd = Command::GraphCheck(graph);
+    match engine.execute_command(cmd, identity.as_ref()) {
+        Ok(CommandResponse::Text(report)) => {
+            (StatusCode::OK, Json(ApiResponse::ok(report))).into_response()
+        }
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+        )
+            .into_response(),
+        Err(e) => weav_error_to_response(e).into_response(),
+    }
+}
+
+async fn get_detailed_stats(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
+    // Permission check: read access on the graph.
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::Read,
+    ) {
+        return weav_error_to_response(e).into_response();
+    }
+    match engine.handle_detailed_stats(&graph) {
+        Ok(CommandResponse::Text(json_str)) => {
+            // Parse the pretty-printed JSON so we can wrap it in the standard envelope.
+            match serde_json::from_str::<serde_json::Value>(&json_str) {
+                Ok(val) => (StatusCode::OK, Json(ApiResponse::ok(val))).into_response(),
+                Err(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiResponse::<()>::err("failed to serialize stats".to_string())),
+                )
+                    .into_response(),
+            }
+        }
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+        )
+            .into_response(),
+        Err(e) => weav_error_to_response(e).into_response(),
+    }
+}
+
 async fn drop_graph(
     State(engine): State<Arc<Engine>>,
     headers: HeaderMap,
@@ -1339,11 +1413,15 @@ async fn add_node(
     Json(body): Json<AddNodeRequest>,
 ) -> impl IntoResponse {
     let identity = extract_identity(&engine, &headers);
-    let properties = if let Some(ref val) = body.properties {
+    let group_id = extract_group_id(&headers);
+    let mut properties = if let Some(ref val) = body.properties {
         json_to_props(val)
     } else {
         Vec::new()
     };
+    if let Some(ref gid) = group_id {
+        properties.push(("_group_id".to_string(), Value::String(compact_str::CompactString::from(gid.as_str()))));
+    }
 
     let cmd = Command::NodeAdd(NodeAddCmd {
         graph,
@@ -1846,6 +1924,7 @@ async fn context_query(
         temporal_at: body.temporal_at,
         limit: body.limit,
         sort,
+        explain: body.explain.unwrap_or(false),
     };
 
     let cmd = Command::Context(query);
@@ -4555,5 +4634,101 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn test_detailed_stats_endpoint() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        // Create a graph and add a node.
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "dstat_g".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+        engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "dstat_g".into(),
+                    label: "Thing".into(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let req = Request::builder()
+            .uri("/v1/graphs/dstat_g/stats/detailed")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = body_to_json(resp.into_body()).await;
+        let data = &json["data"];
+        assert_eq!(data["graph"], "dstat_g");
+        assert_eq!(data["node_count"], 1);
+        assert_eq!(data["edge_count"], 0);
+        assert!(data["degree_distribution"].is_object());
+        assert!(data["memory_estimate"].is_object());
+        assert!(data["label_distribution"].is_object());
+        assert_eq!(data["label_distribution"]["Thing"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_detailed_stats_not_found() {
+        let app = make_app();
+        let req = Request::builder()
+            .uri("/v1/graphs/nonexistent/stats/detailed")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_check_graph() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        // Create graph with nodes and edge.
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "chk_http".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let req = Request::builder()
+            .uri("/v1/graphs/chk_http/check")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        let report = json["data"].as_str().unwrap();
+        assert!(report.contains("OK - no issues found"));
+    }
+
+    #[tokio::test]
+    async fn test_check_graph_not_found() {
+        let app = make_app();
+        let req = Request::builder()
+            .uri("/v1/graphs/nonexistent/check")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

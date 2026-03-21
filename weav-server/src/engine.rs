@@ -976,6 +976,7 @@ impl Engine {
             Command::SchemaSet(cmd) => self.handle_schema_set(cmd),
             Command::SchemaGet(cmd) => self.handle_schema_get(cmd),
             Command::NodeMerge(cmd) => self.handle_node_merge_authed(cmd, identity),
+            Command::GraphCheck(name) => self.handle_graph_check_authed(&name, identity),
         }
     }
 
@@ -1034,7 +1035,7 @@ impl Engine {
             | Command::GraphList | Command::Stats(_) | Command::Context(_)
             | Command::ConfigGet(_) | Command::AclWhoAmI
             | Command::Search(_) | Command::SearchText(_) | Command::Neighbors(_)
-            | Command::SchemaGet(_) => CommandCategory::Read,
+            | Command::SchemaGet(_) | Command::GraphCheck(_) => CommandCategory::Read,
             Command::NodeAdd(_) | Command::NodeUpdate(_) | Command::NodeDelete(_)
             | Command::EdgeAdd(_) | Command::EdgeDelete(_) | Command::EdgeInvalidate(_)
             | Command::BulkInsertNodes(_) | Command::BulkInsertEdges(_)
@@ -1158,7 +1159,8 @@ impl Engine {
             Command::SearchText(c) => Some(c.graph.clone()),
             Command::Neighbors(c) => Some(c.graph.clone()),
             Command::GraphCreate(c) => Some(c.name.clone()),
-            Command::GraphDrop(name) | Command::GraphInfo(name) => Some(name.clone()),
+            Command::GraphDrop(name) | Command::GraphInfo(name)
+            | Command::GraphCheck(name) => Some(name.clone()),
             Command::SchemaSet(c) => Some(c.graph.clone()),
             Command::SchemaGet(c) => Some(c.graph.clone()),
             Command::NodeMerge(c) => Some(c.graph.clone()),
@@ -1199,6 +1201,15 @@ impl Engine {
     ) -> WeavResult<CommandResponse> {
         self.check_permission(identity, name, weav_auth::identity::GraphPermission::Read)?;
         self.handle_graph_info(name)
+    }
+
+    fn handle_graph_check_authed(
+        &self,
+        name: &str,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
+        self.check_permission(identity, name, weav_auth::identity::GraphPermission::Read)?;
+        self.handle_graph_check(name)
     }
 
     fn handle_node_add_authed(
@@ -1384,6 +1395,140 @@ impl Engine {
                 env!("CARGO_PKG_VERSION"),
             )))
         }
+    }
+
+    // ── Detailed stats ─────────────────────────────────────────────────────
+
+    /// Compute detailed statistics for a single graph including degree
+    /// distribution, label / edge-type distribution, memory estimates,
+    /// temporal node count, and config snapshot.
+    pub fn handle_detailed_stats(&self, graph_name: &str) -> WeavResult<CommandResponse> {
+        let graph_arc = self.get_graph(graph_name)?;
+        let gs = graph_arc.read();
+
+        let node_ids = gs.adjacency.all_node_ids();
+        let node_count = node_ids.len();
+        let edge_count = gs.adjacency.edge_count() as usize;
+
+        // ── Degree distribution ─────────────────────────────────────────
+        let mut degrees: Vec<usize> = node_ids
+            .iter()
+            .map(|&nid| gs.adjacency.neighbors_both(nid, None).len())
+            .collect();
+        degrees.sort();
+
+        let min_degree = degrees.first().copied().unwrap_or(0);
+        let max_degree = degrees.last().copied().unwrap_or(0);
+        let avg_degree = if node_count > 0 {
+            degrees.iter().sum::<usize>() as f64 / node_count as f64
+        } else {
+            0.0
+        };
+        let p50 = if !degrees.is_empty() {
+            degrees[degrees.len() / 2]
+        } else {
+            0
+        };
+        let p95 = if !degrees.is_empty() {
+            degrees[((degrees.len() as f64 * 0.95) as usize).min(degrees.len() - 1)]
+        } else {
+            0
+        };
+        let p99 = if !degrees.is_empty() {
+            degrees[((degrees.len() as f64 * 0.99) as usize).min(degrees.len() - 1)]
+        } else {
+            0
+        };
+
+        // ── Label distribution ──────────────────────────────────────────
+        let mut label_counts: HashMap<String, u64> = HashMap::new();
+        for &nid in &node_ids {
+            let label = gs
+                .properties
+                .get_node_property(nid, "_label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            *label_counts.entry(label).or_insert(0) += 1;
+        }
+
+        // ── Edge type distribution ──────────────────────────────────────
+        let mut edge_type_counts: HashMap<String, u64> = HashMap::new();
+        for (_, meta) in gs.adjacency.all_edges() {
+            let label = gs
+                .interner
+                .resolve_label(meta.label)
+                .unwrap_or("unknown")
+                .to_string();
+            *edge_type_counts.entry(label).or_insert(0) += 1;
+        }
+
+        // ── Memory estimate (rough) ─────────────────────────────────────
+        // Node: ~64 B (ID + adjacency list overhead)
+        // Edge: ~96 B (EdgeMeta)
+        // Vector: dimensions * 4 B (f32 per dimension)
+        // Text index: ~128 B per term (rough estimate)
+        let vector_count = gs.vector_index.len();
+        let dims = gs.config.vector_dimensions as usize;
+        let text_index_terms = gs.text_index.term_count();
+
+        let est_nodes_bytes = node_count * 64;
+        let est_edges_bytes = edge_count * 96;
+        let est_vectors_bytes = vector_count * dims * 4;
+        let est_text_index_bytes = text_index_terms * 128;
+        let est_total_bytes =
+            est_nodes_bytes + est_edges_bytes + est_vectors_bytes + est_text_index_bytes;
+
+        // ── Temporal stats ──────────────────────────────────────────────
+        let mut temporal_nodes = 0u64;
+        for &nid in &node_ids {
+            if gs
+                .properties
+                .get_node_property(nid, "_valid_from")
+                .is_some()
+            {
+                temporal_nodes += 1;
+            }
+        }
+
+        let result = serde_json::json!({
+            "graph": graph_name,
+            "node_count": node_count,
+            "edge_count": edge_count,
+            "vector_count": vector_count,
+            "text_indexed_count": gs.text_index.len(),
+            "text_index_terms": text_index_terms,
+            "degree_distribution": {
+                "min": min_degree,
+                "max": max_degree,
+                "avg": avg_degree,
+                "p50": p50,
+                "p95": p95,
+                "p99": p99,
+            },
+            "label_distribution": label_counts,
+            "edge_type_distribution": edge_type_counts,
+            "temporal_nodes": temporal_nodes,
+            "memory_estimate": {
+                "nodes_bytes": est_nodes_bytes,
+                "edges_bytes": est_edges_bytes,
+                "vectors_bytes": est_vectors_bytes,
+                "text_index_bytes": est_text_index_bytes,
+                "total_bytes": est_total_bytes,
+                "total_mb": est_total_bytes as f64 / (1024.0 * 1024.0),
+            },
+            "config": {
+                "vector_dimensions": gs.config.vector_dimensions,
+                "max_nodes": gs.config.max_nodes,
+                "max_edges": gs.config.max_edges,
+                "default_ttl_ms": gs.config.default_ttl_ms,
+                "enable_temporal": gs.config.enable_temporal,
+            },
+        });
+
+        Ok(CommandResponse::Text(
+            serde_json::to_string_pretty(&result).unwrap_or_default(),
+        ))
     }
 
     // ── Search and neighbors commands ─────────────────────────────────────
@@ -1602,6 +1747,66 @@ impl Engine {
         let registry = self.graphs.read();
         let names: Vec<String> = registry.keys().cloned().collect();
         Ok(CommandResponse::StringList(names))
+    }
+
+    fn handle_graph_check(&self, graph_name: &str) -> WeavResult<CommandResponse> {
+        let graph_arc = self.get_graph(graph_name)?;
+        let gs = graph_arc.read();
+
+        let mut issues: Vec<String> = Vec::new();
+
+        // 1. Check edges reference existing nodes.
+        for (edge_id, meta) in gs.adjacency.all_edges() {
+            if !gs.adjacency.has_node(meta.source) {
+                issues.push(format!(
+                    "edge {} references nonexistent source node {}",
+                    edge_id, meta.source
+                ));
+            }
+            if !gs.adjacency.has_node(meta.target) {
+                issues.push(format!(
+                    "edge {} references nonexistent target node {}",
+                    edge_id, meta.target
+                ));
+            }
+        }
+
+        // 2. Check adjacency consistency: neighbor lists reference valid edges.
+        for nid in gs.adjacency.all_node_ids() {
+            for (neighbor, edge_id) in gs.adjacency.neighbors_out(nid, None) {
+                if gs.adjacency.get_edge(edge_id).is_none() {
+                    issues.push(format!(
+                        "node {} references nonexistent edge {} to neighbor {}",
+                        nid, edge_id, neighbor
+                    ));
+                }
+            }
+        }
+
+        // 3. Build summary.
+        let node_count = gs.adjacency.node_count();
+        let edge_count = gs.adjacency.edge_count();
+        let vector_count = gs.vector_index.len();
+        let text_index_count = gs.text_index.len();
+
+        let report = format!(
+            "Graph '{}' integrity check:\n\
+             Nodes: {}, Edges: {}, Vectors: {}, Text indexed: {}\n\
+             Issues found: {}\n{}",
+            graph_name,
+            node_count,
+            edge_count,
+            vector_count,
+            text_index_count,
+            issues.len(),
+            if issues.is_empty() {
+                "OK - no issues found".to_string()
+            } else {
+                issues.join("\n")
+            }
+        );
+
+        Ok(CommandResponse::Text(report))
     }
 
     // ── Node commands ────────────────────────────────────────────────────
@@ -7433,6 +7638,254 @@ mod tests {
                 assert_eq!(*eid, edge_id);
             }
             other => panic!("expected EdgeDeleted, got {:?}", other),
+        }
+    }
+
+    // ── Detailed stats tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_detailed_stats_basic() {
+        let engine = make_engine();
+        create_test_graph(&engine, "ds_basic");
+
+        // Add 3 nodes with different labels.
+        for (label, i) in [("Person", 1u64), ("Person", 2), ("Document", 3)] {
+            let cmd = Command::NodeAdd(parser::NodeAddCmd {
+                graph: "ds_basic".into(),
+                label: label.into(),
+                properties: vec![("name".into(), Value::String(format!("n{i}").into()))],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            });
+            engine.execute_command(cmd, None).unwrap();
+        }
+
+        // Add edges: 1->2, 1->3
+        for target in [2u64, 3] {
+            let cmd = Command::EdgeAdd(parser::EdgeAddCmd {
+                graph: "ds_basic".into(),
+                source: 1,
+                target,
+                label: "KNOWS".into(),
+                weight: 1.0,
+                properties: vec![],
+                ttl_ms: None,
+            });
+            engine.execute_command(cmd, None).unwrap();
+        }
+
+        let resp = engine.handle_detailed_stats("ds_basic").unwrap();
+        let json_str = match resp {
+            CommandResponse::Text(t) => t,
+            other => panic!("expected Text response, got: {:?}", other),
+        };
+        let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(v["graph"], "ds_basic");
+        assert_eq!(v["node_count"], 3);
+        assert_eq!(v["edge_count"], 2);
+
+        // Degree distribution: node 1 has degree 2 (out to 2 and 3),
+        // nodes 2 and 3 each have degree 1 (in from 1). Sorted: [1,1,2]
+        let dd = &v["degree_distribution"];
+        assert_eq!(dd["min"], 1);
+        assert_eq!(dd["max"], 2);
+        // p50 = middle element = 1
+        assert_eq!(dd["p50"], 1);
+
+        // Label distribution
+        assert_eq!(v["label_distribution"]["Person"], 2);
+        assert_eq!(v["label_distribution"]["Document"], 1);
+
+        // Edge type distribution
+        assert_eq!(v["edge_type_distribution"]["KNOWS"], 2);
+    }
+
+    #[test]
+    fn test_detailed_stats_memory_estimate() {
+        let engine = make_engine();
+        create_test_graph(&engine, "ds_mem");
+
+        // Add 5 nodes.
+        for _ in 0..5 {
+            let cmd = Command::NodeAdd(parser::NodeAddCmd {
+                graph: "ds_mem".into(),
+                label: "Item".into(),
+                properties: vec![],
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+            });
+            engine.execute_command(cmd, None).unwrap();
+        }
+
+        // Add 3 edges.
+        for (s, t) in [(1, 2), (2, 3), (3, 4)] {
+            let cmd = Command::EdgeAdd(parser::EdgeAddCmd {
+                graph: "ds_mem".into(),
+                source: s,
+                target: t,
+                label: "LINK".into(),
+                weight: 1.0,
+                properties: vec![],
+                ttl_ms: None,
+            });
+            engine.execute_command(cmd, None).unwrap();
+        }
+
+        let resp = engine.handle_detailed_stats("ds_mem").unwrap();
+        let json_str = match resp {
+            CommandResponse::Text(t) => t,
+            other => panic!("expected Text response, got: {:?}", other),
+        };
+        let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        let mem = &v["memory_estimate"];
+        let nodes_bytes = mem["nodes_bytes"].as_u64().unwrap();
+        let edges_bytes = mem["edges_bytes"].as_u64().unwrap();
+        let total_bytes = mem["total_bytes"].as_u64().unwrap();
+
+        // 5 nodes * 64 = 320, 3 edges * 96 = 288
+        assert_eq!(nodes_bytes, 5 * 64);
+        assert_eq!(edges_bytes, 3 * 96);
+        assert!(total_bytes >= nodes_bytes + edges_bytes);
+        // total_mb should be a small positive number
+        let total_mb = mem["total_mb"].as_f64().unwrap();
+        assert!(total_mb > 0.0);
+        assert!(total_mb < 1.0); // tiny graph, well under 1 MB
+    }
+
+    #[test]
+    fn test_detailed_stats_empty_graph() {
+        let engine = make_engine();
+        create_test_graph(&engine, "ds_empty");
+
+        let resp = engine.handle_detailed_stats("ds_empty").unwrap();
+        let json_str = match resp {
+            CommandResponse::Text(t) => t,
+            other => panic!("expected Text response, got: {:?}", other),
+        };
+        let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(v["graph"], "ds_empty");
+        assert_eq!(v["node_count"], 0);
+        assert_eq!(v["edge_count"], 0);
+        assert_eq!(v["vector_count"], 0);
+        assert_eq!(v["text_indexed_count"], 0);
+        assert_eq!(v["text_index_terms"], 0);
+        assert_eq!(v["temporal_nodes"], 0);
+
+        // Degree distribution should be all zeros.
+        let dd = &v["degree_distribution"];
+        assert_eq!(dd["min"], 0);
+        assert_eq!(dd["max"], 0);
+        assert_eq!(dd["p50"], 0);
+        assert_eq!(dd["p95"], 0);
+        assert_eq!(dd["p99"], 0);
+        let avg = dd["avg"].as_f64().unwrap();
+        assert!((avg - 0.0).abs() < f64::EPSILON);
+
+        // Memory estimate should be all zeros.
+        let mem = &v["memory_estimate"];
+        assert_eq!(mem["total_bytes"], 0);
+        let total_mb = mem["total_mb"].as_f64().unwrap();
+        assert!((total_mb - 0.0).abs() < f64::EPSILON);
+
+        // Label/edge distributions should be empty.
+        assert!(v["label_distribution"].as_object().unwrap().is_empty());
+        assert!(v["edge_type_distribution"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_graph_check_healthy() {
+        let engine = make_engine();
+        create_test_graph(&engine, "chk");
+
+        // Add two nodes and an edge.
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "chk".into(),
+            label: "A".into(),
+            properties: vec![],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = Command::NodeAdd(parser::NodeAddCmd {
+            graph: "chk".into(),
+            label: "B".into(),
+            properties: vec![],
+            embedding: None,
+            entity_key: None,
+            ttl_ms: None,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = Command::EdgeAdd(parser::EdgeAddCmd {
+            graph: "chk".into(),
+            source: 1,
+            target: 2,
+            label: "KNOWS".into(),
+            weight: 1.0,
+            properties: vec![],
+            ttl_ms: None,
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        // Run integrity check.
+        let cmd = Command::GraphCheck("chk".to_string());
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(report) => {
+                assert!(report.contains("Nodes: 2"));
+                assert!(report.contains("Edges: 1"));
+                assert!(report.contains("Issues found: 0"));
+                assert!(report.contains("OK - no issues found"));
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_graph_check_empty_graph() {
+        let engine = make_engine();
+        create_test_graph(&engine, "chk_empty");
+
+        let cmd = Command::GraphCheck("chk_empty".to_string());
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(report) => {
+                assert!(report.contains("Nodes: 0"));
+                assert!(report.contains("Edges: 0"));
+                assert!(report.contains("Issues found: 0"));
+                assert!(report.contains("OK - no issues found"));
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_graph_check_not_found() {
+        let engine = make_engine();
+        let cmd = Command::GraphCheck("nonexistent".to_string());
+        assert!(engine.execute_command(cmd, None).is_err());
+    }
+
+    #[test]
+    fn test_graph_check_via_parser() {
+        let engine = make_engine();
+        create_test_graph(&engine, "chk_parse");
+
+        let cmd = parser::parse_command(r#"GRAPH CHECK "chk_parse""#).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(report) => {
+                assert!(report.contains("chk_parse"));
+                assert!(report.contains("OK - no issues found"));
+            }
+            _ => panic!("expected Text response"),
         }
     }
 }

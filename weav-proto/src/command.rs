@@ -349,6 +349,12 @@ mod tests {
             nodes_included: 1,
             query_time_us: 123,
             conflicts: Vec::new(),
+        seed_time_us: 0,
+        flow_time_us: 0,
+        fusion_time_us: 0,
+        chunk_time_us: 0,
+        budget_time_us: 0,
+        plan: None,
         }
     }
 
@@ -410,6 +416,12 @@ mod tests {
             nodes_included: 0,
             query_time_us: 1,
             conflicts: Vec::new(),
+        seed_time_us: 0,
+        flow_time_us: 0,
+        fusion_time_us: 0,
+        chunk_time_us: 0,
+        budget_time_us: 0,
+        plan: None,
         };
         let val = context_result_to_resp3(&result);
         match &val {
@@ -452,6 +464,12 @@ mod tests {
             nodes_included: 1,
             query_time_us: 50,
             conflicts: Vec::new(),
+        seed_time_us: 0,
+        flow_time_us: 0,
+        fusion_time_us: 0,
+        chunk_time_us: 0,
+        budget_time_us: 0,
+        plan: None,
         };
 
         let val = context_result_to_resp3(&result);
@@ -613,6 +631,12 @@ mod tests {
             nodes_included: 1,
             query_time_us: 42,
             conflicts: Vec::new(),
+        seed_time_us: 0,
+        flow_time_us: 0,
+        fusion_time_us: 0,
+        chunk_time_us: 0,
+        budget_time_us: 0,
+        plan: None,
         };
 
         let val = context_result_to_resp3(&result);
@@ -674,6 +698,12 @@ mod tests {
             nodes_included: 1,
             query_time_us: 10,
             conflicts: Vec::new(),
+        seed_time_us: 0,
+        flow_time_us: 0,
+        fusion_time_us: 0,
+        chunk_time_us: 0,
+        budget_time_us: 0,
+        plan: None,
         };
 
         let val = context_result_to_resp3(&result);

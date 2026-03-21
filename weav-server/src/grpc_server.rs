@@ -388,6 +388,7 @@ impl WeavService for WeavGrpcService {
             temporal_at: None,
             limit: None,
             sort: None,
+            explain: false,
         };
 
         let cmd = Command::Context(query);
@@ -556,6 +557,7 @@ impl WeavService for WeavGrpcService {
             temporal_at: None,
             limit: None,
             sort: None,
+            explain: false,
         };
 
         let cmd = Command::Context(query);

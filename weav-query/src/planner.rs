@@ -63,6 +63,49 @@ pub enum PlanStep {
     },
 }
 
+impl std::fmt::Display for PlanStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PlanStep::VectorSearch { k, .. } => write!(f, "VectorSearch(top_k={k})"),
+            PlanStep::NodeLookup { node_keys } => {
+                write!(f, "NodeLookup(keys=[{}])", node_keys.join(", "))
+            }
+            PlanStep::GraphTraversal {
+                max_depth,
+                direction,
+                ..
+            } => write!(f, "GraphTraversal(depth={max_depth}, dir={direction:?})"),
+            PlanStep::FlowScore {
+                alpha,
+                theta,
+                max_depth,
+            } => write!(
+                f,
+                "FlowScore(alpha={alpha}, theta={theta}, depth={max_depth})"
+            ),
+            PlanStep::TemporalFilter { timestamp } => {
+                write!(f, "TemporalFilter(at={timestamp})")
+            }
+            PlanStep::RelevanceScore { decay } => {
+                write!(f, "RelevanceScore(decay={decay:?})")
+            }
+            PlanStep::TokenBudgetEnforce { budget } => {
+                write!(f, "TokenBudgetEnforce(max={})", budget.max_tokens)
+            }
+            PlanStep::PathExtraction {
+                max_paths,
+                max_length,
+            } => write!(f, "PathExtraction(paths={max_paths}, len={max_length})"),
+            PlanStep::ConflictDetection { policy } => {
+                write!(f, "ConflictDetection(policy={policy:?})")
+            }
+            PlanStep::FormatContext {
+                include_provenance,
+            } => write!(f, "FormatContext(provenance={include_provenance})"),
+        }
+    }
+}
+
 // ─── Planner logic ──────────────────────────────────────────────────────────
 
 /// Convert a `ContextQuery` into an ordered `QueryPlan`.
@@ -196,6 +239,7 @@ mod tests {
             temporal_at: None,
             limit: None,
             sort: None,
+            explain: false,
         }
     }
 
@@ -376,6 +420,7 @@ mod tests {
             temporal_at: Some(5000),
             limit: Some(20),
             sort: None,
+            explain: false,
         };
 
         let plan = plan_context_query(&query);
@@ -539,6 +584,7 @@ mod tests {
                 field: SortField::Recency,
                 direction: SortDirection::Asc,
             }),
+            explain: false,
         };
 
         let plan = plan_context_query(&query);
@@ -617,5 +663,45 @@ mod tests {
             plan4.steps.iter().any(|s| matches!(s, PlanStep::ConflictDetection { .. })),
             "ConflictDetection should be present with budget and temporal"
         );
+    }
+
+    // ── Display impl tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_plan_step_display() {
+        let step = PlanStep::VectorSearch {
+            query_vector: vec![1.0, 0.0],
+            k: 10,
+        };
+        assert_eq!(format!("{step}"), "VectorSearch(top_k=10)");
+
+        let step = PlanStep::NodeLookup {
+            node_keys: vec!["alice".to_string(), "bob".to_string()],
+        };
+        assert_eq!(format!("{step}"), "NodeLookup(keys=[alice, bob])");
+
+        let step = PlanStep::GraphTraversal {
+            max_depth: 3,
+            direction: Direction::Outgoing,
+            edge_filter: None,
+        };
+        assert_eq!(format!("{step}"), "GraphTraversal(depth=3, dir=Outgoing)");
+
+        let step = PlanStep::FlowScore {
+            alpha: 0.5,
+            theta: 0.01,
+            max_depth: 2,
+        };
+        assert_eq!(format!("{step}"), "FlowScore(alpha=0.5, theta=0.01, depth=2)");
+
+        let step = PlanStep::TokenBudgetEnforce {
+            budget: TokenBudget::new(4096),
+        };
+        assert_eq!(format!("{step}"), "TokenBudgetEnforce(max=4096)");
+
+        let step = PlanStep::FormatContext {
+            include_provenance: true,
+        };
+        assert_eq!(format!("{step}"), "FormatContext(provenance=true)");
     }
 }

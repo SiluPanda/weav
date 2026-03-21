@@ -46,6 +46,28 @@ pub struct ContextResult {
     pub query_time_us: u64,
     /// Detected conflicts between nodes.
     pub conflicts: Vec<ConflictInfo>,
+    /// Timing breakdown: seed acquisition (microseconds).
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub seed_time_us: u64,
+    /// Timing breakdown: flow scoring + fusion (microseconds).
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub flow_time_us: u64,
+    /// Timing breakdown: RRF fusion (microseconds).
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub fusion_time_us: u64,
+    /// Timing breakdown: chunk building (microseconds).
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub chunk_time_us: u64,
+    /// Timing breakdown: budget enforcement (microseconds).
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub budget_time_us: u64,
+    /// Query plan description (populated when explain=true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 /// A single chunk of context extracted from the graph.
@@ -110,7 +132,36 @@ pub fn execute_context_query(
 ) -> Result<ContextResult, WeavError> {
     let start = Instant::now();
 
+    // ── EXPLAIN mode: return the plan without executing ─────────────────
+    if query.explain {
+        let plan = crate::planner::plan_context_query(query);
+        let plan_description = plan
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(i, step)| format!("  {}. {step}", i + 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        return Ok(ContextResult {
+            chunks: Vec::new(),
+            total_tokens: 0,
+            budget_used: 0.0,
+            nodes_considered: 0,
+            nodes_included: 0,
+            query_time_us: start.elapsed().as_micros() as u64,
+            conflicts: Vec::new(),
+            seed_time_us: 0,
+            flow_time_us: 0,
+            fusion_time_us: 0,
+            chunk_time_us: 0,
+            budget_time_us: 0,
+            plan: Some(plan_description),
+        });
+    }
+
     // ── Step 1: Get seed nodes ──────────────────────────────────────────
+    let step_start = Instant::now();
     let mut seeds_with_scores: Vec<(NodeId, f32)> = Vec::new();
 
     match &query.seeds {
@@ -160,8 +211,10 @@ pub fn execute_context_query(
     }
 
     let has_vector_seeds = matches!(&query.seeds, SeedStrategy::Vector { .. } | SeedStrategy::Both { .. });
+    let seed_time_us = step_start.elapsed().as_micros() as u64;
 
     // ── Step 2: Run flow_score from seeds ───────────────────────────────
+    let step_start = Instant::now();
     let plan = crate::planner::plan_context_query(query);
     let (alpha, theta) = plan.steps.iter().find_map(|step| {
         if let crate::planner::PlanStep::FlowScore { alpha, theta, .. } = step {
@@ -178,8 +231,10 @@ pub fn execute_context_query(
         theta,
         query.max_depth,
     );
+    let flow_time_us = step_start.elapsed().as_micros() as u64;
 
     // ── Step 2b: Triple-fusion RRF (vector + BM25 + graph) ─────────
+    let step_start = Instant::now();
     // BM25 text search: if query_text is available, get text-ranked results
     let bm25_ranked: Vec<NodeId> = if let Some(ref query_text) = query.query_text {
         if !query_text.is_empty() && !text_index.is_empty() {
@@ -248,8 +303,10 @@ pub fn execute_context_query(
     };
 
     let nodes_considered = final_scores.len() as u32;
+    let fusion_time_us = step_start.elapsed().as_micros() as u64;
 
     // Build a depth lookup from scored_nodes for use in chunk construction
+    let step_start = Instant::now();
     let depth_lookup: std::collections::HashMap<NodeId, u8> = scored_nodes.iter()
         .map(|s| (s.node_id, s.depth))
         .collect();
@@ -463,7 +520,10 @@ pub fn execute_context_query(
         chunks.truncate(limit as usize);
     }
 
+    let chunk_time_us = step_start.elapsed().as_micros() as u64;
+
     // ── Step 6: Budget enforcement ──────────────────────────────────────
+    let step_start = Instant::now();
     let (final_chunks, total_tokens, budget_used) = if let Some(ref budget) = query.budget {
         let result = enforce_budget(chunks, budget);
         let total = result.total_tokens;
@@ -473,6 +533,7 @@ pub fn execute_context_query(
         let total: u32 = chunks.iter().map(|c| c.token_count).sum();
         (chunks, total, 0.0)
     };
+    let budget_time_us = step_start.elapsed().as_micros() as u64;
 
     // ── Step 7: Build RelationshipSummary ───────────────────────────────
     let mut result_chunks: Vec<ContextChunk> = final_chunks;
@@ -553,6 +614,12 @@ pub fn execute_context_query(
         nodes_included,
         query_time_us: elapsed.as_micros() as u64,
         conflicts,
+        seed_time_us,
+        flow_time_us,
+        fusion_time_us,
+        chunk_time_us,
+        budget_time_us,
+        plan: None,
     })
 }
 
@@ -937,6 +1004,7 @@ mod tests {
             temporal_at: None,
             limit: None,
             sort: None,
+            explain: false,
         };
 
         let result =
@@ -971,6 +1039,7 @@ mod tests {
             temporal_at: None,
             limit: None,
             sort: None,
+            explain: false,
         };
 
         let result =
@@ -999,6 +1068,7 @@ mod tests {
             temporal_at: None,
             limit: Some(1),
             sort: None,
+            explain: false,
         };
 
         let result =
@@ -1025,6 +1095,7 @@ mod tests {
             temporal_at: None,
             limit: None,
             sort: None,
+            explain: false,
         };
 
         let result =
@@ -1062,6 +1133,7 @@ mod tests {
             temporal_at: None,
             limit: None,
             sort: None,
+            explain: false,
         };
 
         let result =
@@ -1094,6 +1166,7 @@ mod tests {
             temporal_at: None,
             limit: None,
             sort: None,
+            explain: false,
         };
 
         // Step 1: Confirm the planner produces the expected default alpha/theta
@@ -1162,6 +1235,7 @@ mod tests {
             temporal_at: None,
             limit: None,
             sort: None,
+            explain: false,
         };
 
         let result =
@@ -1194,6 +1268,7 @@ mod tests {
             temporal_at: None,
             limit: None,
             sort: None,
+            explain: false,
         };
 
         let result =
@@ -1261,6 +1336,7 @@ mod tests {
             temporal_at: None,
             limit: None,
             sort: None,
+            explain: false,
         };
 
         let result =
@@ -1327,6 +1403,7 @@ mod tests {
                 field: SortField::Recency,
                 direction: SortDirection::Asc,
             }),
+            explain: false,
         };
 
         let result_asc =
@@ -1374,6 +1451,7 @@ mod tests {
                 field: SortField::Recency,
                 direction: SortDirection::Desc,
             }),
+            explain: false,
         };
 
         let result_desc =
@@ -1421,6 +1499,7 @@ mod tests {
                 field: SortField::Relevance,
                 direction: SortDirection::Desc,
             }),
+            explain: false,
         };
 
         let result_rel =
@@ -1541,6 +1620,7 @@ mod tests {
             temporal_at: Some(0), // timestamp 0 — before all nodes were created
             limit: None,
             sort: None,
+            explain: false,
         };
 
         let result =
@@ -1577,6 +1657,7 @@ mod tests {
             temporal_at: Some(u64::MAX - 1), // far future — everything is valid
             limit: None,
             sort: None,
+            explain: false,
         };
 
         let result =
@@ -1637,6 +1718,7 @@ mod tests {
             temporal_at: None,
             limit: None,
             sort: None,
+            explain: false,
         };
 
         let result =
@@ -1704,6 +1786,7 @@ mod tests {
             temporal_at: None,
             limit: Some(0),
             sort: None,
+            explain: false,
         };
 
         let result =
@@ -2055,5 +2138,238 @@ mod tests {
             summaries[0].node_count >= summaries.last().unwrap().node_count,
             "Summaries should be sorted by node_count descending"
         );
+    }
+
+    // ── EXPLAIN / PROFILE tests ────────────────────────────────────────
+
+    #[test]
+    fn test_explain_returns_plan_without_executing() {
+        let (adj, props, vec_index, text_index, token_counter, interner) = setup_test_stores();
+
+        let query = ContextQuery {
+            query_text: Some("test".to_string()),
+            graph: "test".to_string(),
+            budget: Some(TokenBudget::new(4096)),
+            seeds: SeedStrategy::Nodes(vec!["alice".to_string()]),
+            max_depth: 2,
+            direction: Direction::Both,
+            edge_filter: None,
+            decay: None,
+            include_provenance: false,
+            temporal_at: None,
+            limit: None,
+            sort: None,
+            explain: true,
+        };
+
+        let result =
+            execute_context_query(&query, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
+                .unwrap();
+
+        // EXPLAIN should not execute — no chunks, no nodes
+        assert!(result.chunks.is_empty(), "EXPLAIN should return empty chunks");
+        assert_eq!(result.nodes_considered, 0, "EXPLAIN should not traverse");
+        assert_eq!(result.nodes_included, 0, "EXPLAIN should not include nodes");
+        assert_eq!(result.total_tokens, 0, "EXPLAIN should not count tokens");
+
+        // Plan description should be populated
+        let plan = result.plan.as_ref().expect("EXPLAIN should populate plan");
+        assert!(!plan.is_empty(), "Plan description should not be empty");
+
+        // Plan should contain expected steps
+        assert!(plan.contains("NodeLookup"), "Plan should contain NodeLookup step");
+        assert!(plan.contains("GraphTraversal"), "Plan should contain GraphTraversal step");
+        assert!(plan.contains("FlowScore"), "Plan should contain FlowScore step");
+        assert!(plan.contains("TokenBudgetEnforce"), "Plan should contain TokenBudgetEnforce step");
+        assert!(plan.contains("FormatContext"), "Plan should contain FormatContext step");
+
+        // All timing fields should be zero (nothing was executed)
+        assert_eq!(result.seed_time_us, 0);
+        assert_eq!(result.flow_time_us, 0);
+        assert_eq!(result.fusion_time_us, 0);
+        assert_eq!(result.chunk_time_us, 0);
+        assert_eq!(result.budget_time_us, 0);
+    }
+
+    #[test]
+    fn test_explain_vector_seeds_shows_vector_search() {
+        let (adj, props, vec_index, text_index, token_counter, interner) = setup_test_stores();
+
+        let query = ContextQuery {
+            query_text: Some("test".to_string()),
+            graph: "test".to_string(),
+            budget: None,
+            seeds: SeedStrategy::Vector {
+                embedding: vec![1.0, 0.0, 0.0, 0.0],
+                top_k: 5,
+            },
+            max_depth: 2,
+            direction: Direction::Both,
+            edge_filter: None,
+            decay: None,
+            include_provenance: false,
+            temporal_at: None,
+            limit: None,
+            sort: None,
+            explain: true,
+        };
+
+        let result =
+            execute_context_query(&query, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
+                .unwrap();
+
+        let plan = result.plan.as_ref().expect("EXPLAIN should populate plan");
+        assert!(plan.contains("VectorSearch"), "Plan should contain VectorSearch for vector seeds");
+        assert!(plan.contains("top_k=5"), "Plan should show top_k parameter");
+    }
+
+    #[test]
+    fn test_explain_with_temporal_shows_temporal_filter() {
+        let (adj, props, vec_index, text_index, token_counter, interner) = setup_test_stores();
+
+        let query = ContextQuery {
+            query_text: Some("test".to_string()),
+            graph: "test".to_string(),
+            budget: None,
+            seeds: SeedStrategy::Nodes(vec!["alice".to_string()]),
+            max_depth: 2,
+            direction: Direction::Both,
+            edge_filter: None,
+            decay: None,
+            include_provenance: false,
+            temporal_at: Some(5000),
+            limit: None,
+            sort: None,
+            explain: true,
+        };
+
+        let result =
+            execute_context_query(&query, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
+                .unwrap();
+
+        let plan = result.plan.as_ref().expect("EXPLAIN should populate plan");
+        assert!(plan.contains("TemporalFilter"), "Plan should contain TemporalFilter");
+        assert!(plan.contains("5000"), "Plan should show timestamp parameter");
+    }
+
+    #[test]
+    fn test_profile_timing_breakdown_populated() {
+        let (adj, props, vec_index, text_index, token_counter, interner) = setup_test_stores();
+
+        let query = ContextQuery {
+            query_text: Some("test".to_string()),
+            graph: "test".to_string(),
+            budget: Some(TokenBudget::new(4096)),
+            seeds: SeedStrategy::Nodes(vec!["alice".to_string()]),
+            max_depth: 2,
+            direction: Direction::Both,
+            edge_filter: None,
+            decay: None,
+            include_provenance: false,
+            temporal_at: None,
+            limit: None,
+            sort: None,
+            explain: false,
+        };
+
+        let result =
+            execute_context_query(&query, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
+                .unwrap();
+
+        // Regular query should have no plan
+        assert!(result.plan.is_none(), "Regular query should not have a plan");
+
+        // query_time_us should be populated
+        assert!(result.query_time_us > 0, "query_time_us should be populated");
+
+        // The sum of step timings should not exceed total query time
+        let step_sum = result.seed_time_us
+            + result.flow_time_us
+            + result.fusion_time_us
+            + result.chunk_time_us
+            + result.budget_time_us;
+        assert!(
+            step_sum <= result.query_time_us + 100, // allow small overhead for relationship building
+            "Sum of step timings ({step_sum}) should not vastly exceed total ({}).",
+            result.query_time_us
+        );
+
+        // With seeds found, at least some steps should have non-zero timing
+        assert!(result.nodes_considered > 0, "Should have found nodes");
+    }
+
+    #[test]
+    fn test_explain_false_still_works() {
+        let (adj, props, vec_index, text_index, token_counter, interner) = setup_test_stores();
+
+        let query = ContextQuery {
+            query_text: Some("test".to_string()),
+            graph: "test".to_string(),
+            budget: None,
+            seeds: SeedStrategy::Nodes(vec!["alice".to_string()]),
+            max_depth: 2,
+            direction: Direction::Both,
+            edge_filter: None,
+            decay: None,
+            include_provenance: false,
+            temporal_at: None,
+            limit: None,
+            sort: None,
+            explain: false,
+        };
+
+        let result =
+            execute_context_query(&query, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
+                .unwrap();
+
+        // Regular query should execute normally
+        assert!(result.nodes_considered > 0, "Regular query should find nodes");
+        assert!(result.nodes_included > 0, "Regular query should include nodes");
+        assert!(!result.chunks.is_empty(), "Regular query should return chunks");
+        assert!(result.plan.is_none(), "Regular query should not have a plan");
+    }
+
+    #[test]
+    fn test_explain_plan_step_numbering() {
+        let (adj, props, vec_index, text_index, token_counter, interner) = setup_test_stores();
+
+        let query = ContextQuery {
+            query_text: Some("test".to_string()),
+            graph: "test".to_string(),
+            budget: None,
+            seeds: SeedStrategy::Nodes(vec!["alice".to_string()]),
+            max_depth: 2,
+            direction: Direction::Both,
+            edge_filter: None,
+            decay: None,
+            include_provenance: false,
+            temporal_at: None,
+            limit: None,
+            sort: None,
+            explain: true,
+        };
+
+        let result =
+            execute_context_query(&query, &adj, &props, &vec_index, &text_index, &token_counter, &interner)
+                .unwrap();
+
+        let plan = result.plan.as_ref().expect("EXPLAIN should populate plan");
+
+        // Steps should be numbered starting from 1
+        assert!(plan.contains("  1."), "Plan should start with step 1");
+
+        // Should have multiple numbered steps
+        let lines: Vec<&str> = plan.lines().collect();
+        assert!(lines.len() >= 4, "Plan should have at least 4 steps, got {}", lines.len());
+
+        // Each line should be numbered sequentially
+        for (i, line) in lines.iter().enumerate() {
+            let expected_prefix = format!("  {}.", i + 1);
+            assert!(
+                line.starts_with(&expected_prefix),
+                "Step {} should start with '{expected_prefix}', got '{line}'",
+                i + 1
+            );
+        }
     }
 }

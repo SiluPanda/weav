@@ -175,6 +175,9 @@ pub struct ContextQueryParams {
     pub include_provenance: bool,
     /// Point-in-time temporal query (milliseconds since epoch).
     pub temporal_at: Option<u64>,
+    /// If true, return the query plan without executing.
+    #[serde(default)]
+    pub explain: bool,
 }
 
 /// Parameters for vector similarity search.
@@ -782,6 +785,24 @@ impl WeavMcpServer {
         }))
     }
 
+    /// Get comprehensive graph statistics including degree distribution,
+    /// label/edge-type distribution, memory estimates, and temporal node count.
+    #[tool(description = "Get comprehensive statistics for a graph: degree distribution (min/max/avg/p50/p95/p99), label distribution, edge type distribution, memory estimates, temporal node count, and graph config.")]
+    fn graph_stats_detailed(
+        &self,
+        Parameters(params): Parameters<GraphStatsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.engine.handle_detailed_stats(&params.graph) {
+            Ok(CommandResponse::Text(json_str)) => {
+                Ok(CallToolResult::success(vec![Content::text(json_str)]))
+            }
+            Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "{resp:?}"
+            ))])),
+            Err(e) => weav_error(e),
+        }
+    }
+
     /// Get server info and statistics.
     #[tool(description = "Get Weav server information including version and number of graphs.")]
     fn server_info(&self) -> Result<CallToolResult, McpError> {
@@ -947,6 +968,7 @@ impl WeavMcpServer {
             temporal_at: params.temporal_at,
             limit: None,
             sort: None,
+            explain: params.explain,
         });
 
         match self.engine.execute_command(cmd, None) {
@@ -1439,7 +1461,7 @@ impl ServerHandler for WeavMcpServer {
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(
                 "Weav is an in-memory context graph database for AI/LLM workloads. \
-                 24 tools available: graph_list, graph_create, graph_info, graph_stats, graph_drop, \
+                 25 tools available: graph_list, graph_create, graph_info, graph_stats, graph_stats_detailed, graph_drop, \
                  node_add, node_get, node_update, node_delete, \
                  edge_add, edge_get, edge_delete, \
                  search_nodes, get_neighbors, vector_search, \

@@ -88,6 +88,8 @@ pub enum Command {
     SchemaGet(SchemaGetCmd),
     /// Merge two nodes into one.
     NodeMerge(NodeMergeCmd),
+    /// Check graph integrity (DBCC CHECK equivalent).
+    GraphCheck(String),
 }
 
 impl Command {
@@ -130,6 +132,7 @@ impl Command {
             Command::SchemaSet(_) => "schema_set",
             Command::SchemaGet(_) => "schema_get",
             Command::NodeMerge(_) => "node_merge",
+            Command::GraphCheck(_) => "graph_check",
         }
     }
 }
@@ -161,6 +164,8 @@ pub struct ContextQuery {
     pub temporal_at: Option<Timestamp>,
     pub limit: Option<u32>,
     pub sort: Option<SortOrder>,
+    /// If true, return the query plan without executing.
+    pub explain: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -554,7 +559,7 @@ pub fn parse_command(input: &str) -> Result<Command, WeavError> {
 
 fn parse_graph_command(tokens: &[String]) -> Result<Command, WeavError> {
     if tokens.len() < 2 {
-        return Err(parse_err("GRAPH requires a subcommand (CREATE, DROP, INFO, LIST)"));
+        return Err(parse_err("GRAPH requires a subcommand (CREATE, DROP, INFO, LIST, CHECK)"));
     }
     let sub = tokens[1].to_uppercase();
     match sub.as_str() {
@@ -587,6 +592,12 @@ fn parse_graph_command(tokens: &[String]) -> Result<Command, WeavError> {
             Ok(Command::GraphInfo(unquote(&tokens[2]).to_string()))
         }
         "LIST" => Ok(Command::GraphList),
+        "CHECK" => {
+            if tokens.len() < 3 {
+                return Err(parse_err("GRAPH CHECK requires a name"));
+            }
+            Ok(Command::GraphCheck(unquote(&tokens[2]).to_string()))
+        }
         _ => Err(parse_err(format!("unknown GRAPH subcommand: {}", &tokens[1]))),
     }
 }
@@ -1170,6 +1181,7 @@ fn parse_context_command(tokens: &[String]) -> Result<Command, WeavError> {
         temporal_at,
         limit,
         sort,
+        explain: false,
     }))
 }
 
@@ -2922,5 +2934,26 @@ mod tests {
         let cmd =
             parse_command(r#"NODE MERGE "g" 1 INTO 2"#).unwrap();
         assert_eq!(cmd.type_name(), "node_merge");
+    }
+
+    #[test]
+    fn test_parse_graph_check() {
+        let cmd = parse_command(r#"GRAPH CHECK "mydb""#).unwrap();
+        match cmd {
+            Command::GraphCheck(name) => assert_eq!(name, "mydb"),
+            _ => panic!("expected GraphCheck"),
+        }
+    }
+
+    #[test]
+    fn test_parse_graph_check_missing_name() {
+        let result = parse_command("GRAPH CHECK");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_graph_check_type_name() {
+        let cmd = parse_command(r#"GRAPH CHECK "g""#).unwrap();
+        assert_eq!(cmd.type_name(), "graph_check");
     }
 }
