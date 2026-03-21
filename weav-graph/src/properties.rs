@@ -5,6 +5,104 @@ use std::collections::HashMap;
 use weav_core::error::{WeavError, WeavResult};
 use weav_core::types::{EdgeId, NodeId, PropertyKeyId, Value, ValueType};
 
+// ─── Property Secondary Index ───────────────────────────────────────────────
+
+/// Convert a `Value` to its string representation for indexing.
+fn value_to_index_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => "null".to_string(),
+        Value::Timestamp(t) => t.to_string(),
+        Value::Bytes(b) => format!("{b:?}"),
+        Value::Vector(v) => format!("{v:?}"),
+        Value::List(items) => format!("{items:?}"),
+        Value::Map(pairs) => format!("{pairs:?}"),
+    }
+}
+
+/// Secondary index for fast property lookups.
+/// Maps property_key -> (value_string -> Vec<NodeId>) for O(1) exact-match queries.
+pub struct PropertyIndex {
+    /// property_key -> (value_string -> Vec<NodeId>)
+    index: HashMap<String, HashMap<String, Vec<NodeId>>>,
+}
+
+impl PropertyIndex {
+    pub fn new() -> Self {
+        Self {
+            index: HashMap::new(),
+        }
+    }
+
+    /// Index a property value for a node.
+    pub fn insert(&mut self, node_id: NodeId, key: &str, value: &Value) {
+        if let Some(value_map) = self.index.get_mut(key) {
+            let val_str = value_to_index_string(value);
+            value_map.entry(val_str).or_default().push(node_id);
+        }
+    }
+
+    /// Remove a node from the index for a property.
+    pub fn remove(&mut self, node_id: NodeId, key: &str, value: &Value) {
+        if let Some(value_map) = self.index.get_mut(key) {
+            let val_str = value_to_index_string(value);
+            if let Some(ids) = value_map.get_mut(&val_str) {
+                ids.retain(|&id| id != node_id);
+                if ids.is_empty() {
+                    value_map.remove(&val_str);
+                }
+            }
+        }
+    }
+
+    /// Look up nodes by exact property value. O(1).
+    pub fn lookup(&self, key: &str, value: &str) -> Vec<NodeId> {
+        self.index
+            .get(key)
+            .and_then(|vm| vm.get(value))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Check if a property key has an index.
+    pub fn has_index(&self, key: &str) -> bool {
+        self.index.contains_key(key)
+    }
+
+    /// Create an empty index entry for a key (to be populated by `build_for_key`).
+    fn init_key(&mut self, key: &str) {
+        self.index.entry(key.to_string()).or_default();
+    }
+
+    /// Build the index for a key from existing property data.
+    pub fn build_for_key(
+        &mut self,
+        key: &str,
+        schema: &HashMap<String, PropertyKeyId>,
+        node_columns: &HashMap<PropertyKeyId, PropertyColumn>,
+    ) {
+        self.init_key(key);
+        if let Some(&key_id) = schema.get(key)
+            && let Some(column) = node_columns.get(&key_id)
+        {
+            let value_map = self.index.get_mut(key).unwrap();
+            for (&node_id, value) in &column.values {
+                let val_str = value_to_index_string(value);
+                value_map.entry(val_str).or_default().push(node_id);
+            }
+        }
+    }
+}
+
+impl Default for PropertyIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Column-oriented storage for a single property key across all nodes.
 pub struct PropertyColumn {
     pub key_id: PropertyKeyId,
@@ -19,6 +117,8 @@ pub struct PropertyStore {
     next_key_id: PropertyKeyId,
     node_columns: HashMap<PropertyKeyId, PropertyColumn>,
     edge_overflow: HashMap<EdgeId, Vec<(PropertyKeyId, Value)>>,
+    /// Secondary index for fast property lookups.
+    pub index: PropertyIndex,
 }
 
 impl PropertyStore {
@@ -29,6 +129,7 @@ impl PropertyStore {
             next_key_id: 1,
             node_columns: HashMap::new(),
             edge_overflow: HashMap::new(),
+            index: PropertyIndex::new(),
         }
     }
 
@@ -62,6 +163,11 @@ impl PropertyStore {
                 value_type: None,
                 values: HashMap::new(),
             });
+        // Remove old value from index before overwriting
+        if let Some(old_value) = column.values.get(&node) {
+            self.index.remove(node, key, old_value);
+        }
+        self.index.insert(node, key, &value);
         column.values.insert(node, value);
     }
 
@@ -86,14 +192,19 @@ impl PropertyStore {
     pub fn remove_node_property(&mut self, node: NodeId, key: &str) {
         if let Some(&key_id) = self.schema.get(key)
             && let Some(column) = self.node_columns.get_mut(&key_id)
+            && let Some(old_value) = column.values.remove(&node)
         {
-            column.values.remove(&node);
+            self.index.remove(node, key, &old_value);
         }
     }
 
     pub fn remove_all_node_properties(&mut self, node: NodeId) {
-        for column in self.node_columns.values_mut() {
-            column.values.remove(&node);
+        for (&key_id, column) in self.node_columns.iter_mut() {
+            if let Some(old_value) = column.values.remove(&node)
+                && let Some(key_name) = self.schema_reverse.get(&key_id)
+            {
+                self.index.remove(node, key_name, &old_value);
+            }
         }
     }
 
@@ -101,6 +212,11 @@ impl PropertyStore {
         for (key, value) in props {
             self.set_node_property(node, &key, value);
         }
+    }
+
+    /// Create a secondary index for a property key, building from existing data.
+    pub fn create_index(&mut self, key: &str) {
+        self.index.build_for_key(key, &self.schema, &self.node_columns);
     }
 
     pub fn nodes_with_property(&self, key: &str) -> Vec<NodeId> {
@@ -600,5 +716,155 @@ mod tests {
         // But re-interning an existing key should still work
         let result = store.intern_key("last_key");
         assert!(result.is_ok());
+    }
+
+    // ── PropertyIndex tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_property_index_insert_and_lookup() {
+        let mut idx = PropertyIndex::new();
+        idx.init_key("name");
+        idx.insert(1, "name", &Value::String(CompactString::from("Alice")));
+        idx.insert(2, "name", &Value::String(CompactString::from("Bob")));
+        idx.insert(3, "name", &Value::String(CompactString::from("Alice")));
+
+        let mut result = idx.lookup("name", "Alice");
+        result.sort();
+        assert_eq!(result, vec![1, 3]);
+
+        assert_eq!(idx.lookup("name", "Bob"), vec![2]);
+        assert!(idx.lookup("name", "Charlie").is_empty());
+        assert!(idx.lookup("missing_key", "Alice").is_empty());
+    }
+
+    #[test]
+    fn test_property_index_remove() {
+        let mut idx = PropertyIndex::new();
+        idx.init_key("name");
+        idx.insert(1, "name", &Value::String(CompactString::from("Alice")));
+        idx.insert(2, "name", &Value::String(CompactString::from("Alice")));
+
+        idx.remove(1, "name", &Value::String(CompactString::from("Alice")));
+        assert_eq!(idx.lookup("name", "Alice"), vec![2]);
+
+        idx.remove(2, "name", &Value::String(CompactString::from("Alice")));
+        assert!(idx.lookup("name", "Alice").is_empty());
+    }
+
+    #[test]
+    fn test_property_index_has_index() {
+        let mut idx = PropertyIndex::new();
+        assert!(!idx.has_index("name"));
+        idx.init_key("name");
+        assert!(idx.has_index("name"));
+        assert!(!idx.has_index("age"));
+    }
+
+    #[test]
+    fn test_create_index_on_property_store() {
+        let mut store = PropertyStore::new();
+        store.set_node_property(1, "name", Value::String(CompactString::from("Alice")));
+        store.set_node_property(2, "name", Value::String(CompactString::from("Bob")));
+        store.set_node_property(3, "name", Value::String(CompactString::from("Alice")));
+        store.set_node_property(1, "age", Value::Int(30));
+
+        // Before creating index, has_index returns false
+        assert!(!store.index.has_index("name"));
+
+        // Create index for "name"
+        store.create_index("name");
+        assert!(store.index.has_index("name"));
+
+        // Lookup via index should return correct nodes
+        let mut result = store.index.lookup("name", "Alice");
+        result.sort();
+        assert_eq!(result, vec![1, 3]);
+        assert_eq!(store.index.lookup("name", "Bob"), vec![2]);
+    }
+
+    #[test]
+    fn test_index_maintained_on_set_property() {
+        let mut store = PropertyStore::new();
+
+        // Create index first, then add properties
+        store.create_index("status");
+        store.set_node_property(1, "status", Value::String(CompactString::from("active")));
+        store.set_node_property(2, "status", Value::String(CompactString::from("active")));
+        store.set_node_property(3, "status", Value::String(CompactString::from("inactive")));
+
+        let mut active = store.index.lookup("status", "active");
+        active.sort();
+        assert_eq!(active, vec![1, 2]);
+        assert_eq!(store.index.lookup("status", "inactive"), vec![3]);
+
+        // Update property: node 1 changes from active to inactive
+        store.set_node_property(1, "status", Value::String(CompactString::from("inactive")));
+        assert_eq!(store.index.lookup("status", "active"), vec![2]);
+        let mut inactive = store.index.lookup("status", "inactive");
+        inactive.sort();
+        assert_eq!(inactive, vec![1, 3]);
+    }
+
+    #[test]
+    fn test_index_maintained_on_remove_property() {
+        let mut store = PropertyStore::new();
+        store.create_index("color");
+        store.set_node_property(1, "color", Value::String(CompactString::from("red")));
+        store.set_node_property(2, "color", Value::String(CompactString::from("red")));
+
+        assert_eq!(store.index.lookup("color", "red").len(), 2);
+
+        store.remove_node_property(1, "color");
+        assert_eq!(store.index.lookup("color", "red"), vec![2]);
+    }
+
+    #[test]
+    fn test_index_maintained_on_remove_all_properties() {
+        let mut store = PropertyStore::new();
+        store.create_index("color");
+        store.create_index("size");
+        store.set_node_property(1, "color", Value::String(CompactString::from("red")));
+        store.set_node_property(1, "size", Value::String(CompactString::from("large")));
+        store.set_node_property(2, "color", Value::String(CompactString::from("red")));
+
+        store.remove_all_node_properties(1);
+        assert_eq!(store.index.lookup("color", "red"), vec![2]);
+        assert!(store.index.lookup("size", "large").is_empty());
+    }
+
+    #[test]
+    fn test_index_with_int_values() {
+        let mut store = PropertyStore::new();
+        store.create_index("age");
+        store.set_node_property(1, "age", Value::Int(30));
+        store.set_node_property(2, "age", Value::Int(25));
+        store.set_node_property(3, "age", Value::Int(30));
+
+        let mut result = store.index.lookup("age", "30");
+        result.sort();
+        assert_eq!(result, vec![1, 3]);
+        assert_eq!(store.index.lookup("age", "25"), vec![2]);
+    }
+
+    #[test]
+    fn test_search_with_index_vs_without() {
+        let mut store = PropertyStore::new();
+        store.set_node_property(1, "city", Value::String(CompactString::from("NYC")));
+        store.set_node_property(2, "city", Value::String(CompactString::from("LA")));
+        store.set_node_property(3, "city", Value::String(CompactString::from("NYC")));
+
+        // Without index: use nodes_where
+        let mut scan_result = store.nodes_where("city", &|v| {
+            v.as_str() == Some("NYC")
+        });
+        scan_result.sort();
+
+        // Create index and use lookup
+        store.create_index("city");
+        let mut index_result = store.index.lookup("city", "NYC");
+        index_result.sort();
+
+        // Both should return the same results
+        assert_eq!(scan_result, index_result);
     }
 }

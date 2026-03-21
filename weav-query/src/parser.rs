@@ -90,6 +90,12 @@ pub enum Command {
     NodeMerge(NodeMergeCmd),
     /// Check graph integrity (DBCC CHECK equivalent).
     GraphCheck(String),
+    /// Create a named backup (snapshot + WAL compact).
+    Backup(Option<String>),
+    /// Compact the WAL (discard all entries, start fresh).
+    WalCompact,
+    /// Create a secondary index on a property key for O(1) lookups.
+    CreateIndex(CreateIndexCmd),
 }
 
 impl Command {
@@ -133,6 +139,9 @@ impl Command {
             Command::SchemaGet(_) => "schema_get",
             Command::NodeMerge(_) => "node_merge",
             Command::GraphCheck(_) => "graph_check",
+            Command::Backup(_) => "backup",
+            Command::WalCompact => "wal_compact",
+            Command::CreateIndex(_) => "create_index",
         }
     }
 }
@@ -332,6 +341,13 @@ pub struct NodeMergeCmd {
     pub source_id: u64,
     pub target_id: u64,
     pub conflict_policy: String,
+}
+
+/// Create a secondary index on a property key for fast lookups.
+#[derive(Debug, Clone)]
+pub struct CreateIndexCmd {
+    pub graph: String,
+    pub property_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -553,7 +569,47 @@ pub fn parse_command(input: &str) -> Result<Command, WeavError> {
         "SEARCH" => parse_search_command(&tokens),
         "NEIGHBORS" => parse_neighbors_command(&tokens),
         "SCHEMA" => parse_schema_command(&tokens),
+        "BACKUP" => {
+            let label = if tokens.len() > 1 {
+                Some(unquote(&tokens[1]).to_string())
+            } else {
+                None
+            };
+            Ok(Command::Backup(label))
+        }
+        "WAL" => {
+            if tokens.len() < 2 {
+                return Err(parse_err("WAL requires a subcommand (COMPACT)"));
+            }
+            let sub = tokens[1].to_uppercase();
+            match sub.as_str() {
+                "COMPACT" => Ok(Command::WalCompact),
+                _ => Err(parse_err(format!("unknown WAL subcommand: {}", &tokens[1]))),
+            }
+        }
+        "INDEX" => parse_index_command(&tokens),
         _ => Err(parse_err(format!("unknown command: {}", &tokens[0]))),
+    }
+}
+
+/// Parse: INDEX CREATE "graph" "property_key"
+fn parse_index_command(tokens: &[String]) -> Result<Command, WeavError> {
+    if tokens.len() < 2 {
+        return Err(parse_err("INDEX requires a subcommand (CREATE)"));
+    }
+    let sub = tokens[1].to_uppercase();
+    match sub.as_str() {
+        "CREATE" => {
+            if tokens.len() < 4 {
+                return Err(parse_err(
+                    "INDEX CREATE requires: INDEX CREATE \"graph\" \"property_key\"",
+                ));
+            }
+            let graph = unquote(&tokens[2]).to_string();
+            let property_key = unquote(&tokens[3]).to_string();
+            Ok(Command::CreateIndex(CreateIndexCmd { graph, property_key }))
+        }
+        _ => Err(parse_err(format!("unknown INDEX subcommand: {}", &tokens[1]))),
     }
 }
 
@@ -2955,5 +3011,84 @@ mod tests {
     fn test_graph_check_type_name() {
         let cmd = parse_command(r#"GRAPH CHECK "g""#).unwrap();
         assert_eq!(cmd.type_name(), "graph_check");
+    }
+
+    #[test]
+    fn test_parse_backup_no_label() {
+        let cmd = parse_command("BACKUP").unwrap();
+        assert!(matches!(cmd, Command::Backup(None)));
+        assert_eq!(cmd.type_name(), "backup");
+    }
+
+    #[test]
+    fn test_parse_backup_with_label() {
+        let cmd = parse_command(r#"BACKUP "daily-2026""#).unwrap();
+        match cmd {
+            Command::Backup(Some(label)) => assert_eq!(label, "daily-2026"),
+            other => panic!("expected Backup(Some(...)), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_wal_compact() {
+        let cmd = parse_command("WAL COMPACT").unwrap();
+        assert!(matches!(cmd, Command::WalCompact));
+        assert_eq!(cmd.type_name(), "wal_compact");
+    }
+
+    #[test]
+    fn test_parse_wal_compact_case_insensitive() {
+        let cmd = parse_command("wal compact").unwrap();
+        assert!(matches!(cmd, Command::WalCompact));
+    }
+
+    #[test]
+    fn test_parse_wal_missing_subcommand() {
+        let result = parse_command("WAL");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_wal_unknown_subcommand() {
+        let result = parse_command("WAL PURGE");
+        assert!(result.is_err());
+    }
+
+    // ── INDEX CREATE tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_index_create() {
+        let cmd = parse_command(r#"INDEX CREATE "my_graph" "name""#).unwrap();
+        match cmd {
+            Command::CreateIndex(c) => {
+                assert_eq!(c.graph, "my_graph");
+                assert_eq!(c.property_key, "name");
+            }
+            _ => panic!("expected CreateIndex"),
+        }
+    }
+
+    #[test]
+    fn test_parse_index_create_type_name() {
+        let cmd = parse_command(r#"INDEX CREATE "g" "k""#).unwrap();
+        assert_eq!(cmd.type_name(), "create_index");
+    }
+
+    #[test]
+    fn test_parse_index_missing_subcommand() {
+        let result = parse_command("INDEX");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_index_create_missing_args() {
+        let result = parse_command(r#"INDEX CREATE "my_graph""#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_index_unknown_subcommand() {
+        let result = parse_command(r#"INDEX DROP "my_graph" "name""#);
+        assert!(result.is_err());
     }
 }

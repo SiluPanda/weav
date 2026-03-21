@@ -977,6 +977,9 @@ impl Engine {
             Command::SchemaGet(cmd) => self.handle_schema_get(cmd),
             Command::NodeMerge(cmd) => self.handle_node_merge_authed(cmd, identity),
             Command::GraphCheck(name) => self.handle_graph_check_authed(&name, identity),
+            Command::Backup(label) => self.handle_backup(label),
+            Command::WalCompact => self.handle_wal_compact(),
+            Command::CreateIndex(cmd) => self.handle_create_index(cmd),
         }
     }
 
@@ -1043,7 +1046,9 @@ impl Engine {
             Command::GraphCreate(_) | Command::GraphDrop(_) | Command::Snapshot
             | Command::ConfigSet(_, _) | Command::AclSetUser(_) | Command::AclDelUser(_)
             | Command::AclList | Command::AclGetUser(_) | Command::AclSave
-            | Command::AclLoad | Command::SchemaSet(_) => CommandCategory::Admin,
+            | Command::AclLoad | Command::SchemaSet(_)
+            | Command::Backup(_) | Command::WalCompact
+            | Command::CreateIndex(_) => CommandCategory::Admin,
         };
 
         // Check category permission.
@@ -1164,6 +1169,7 @@ impl Engine {
             Command::SchemaSet(c) => Some(c.graph.clone()),
             Command::SchemaGet(c) => Some(c.graph.clone()),
             Command::NodeMerge(c) => Some(c.graph.clone()),
+            Command::CreateIndex(c) => Some(c.graph.clone()),
             Command::Stats(opt) => opt.clone(),
             _ => None,
         }
@@ -1540,16 +1546,21 @@ impl Engine {
         let graph_arc = self.get_graph(&cmd.graph)?;
         let gs = graph_arc.read();
 
-        let search_value = cmd.value.clone();
-        let matching = gs.properties.nodes_where(&cmd.key, &move |v| {
-            match v {
-                Value::String(s) => s.as_str() == search_value,
-                Value::Int(i) => i.to_string() == search_value,
-                Value::Float(f) => f.to_string() == search_value,
-                Value::Bool(b) => b.to_string() == search_value,
-                _ => false,
-            }
-        });
+        // Use secondary index if available for O(1) lookup, otherwise fall back to O(n) scan.
+        let matching = if gs.properties.index.has_index(&cmd.key) {
+            gs.properties.index.lookup(&cmd.key, &cmd.value)
+        } else {
+            let search_value = cmd.value.clone();
+            gs.properties.nodes_where(&cmd.key, &move |v| {
+                match v {
+                    Value::String(s) => s.as_str() == search_value,
+                    Value::Int(i) => i.to_string() == search_value,
+                    Value::Float(f) => f.to_string() == search_value,
+                    Value::Bool(b) => b.to_string() == search_value,
+                    _ => false,
+                }
+            })
+        };
 
         let limit = cmd.limit.unwrap_or(100) as usize;
         let result_ids: Vec<u64> = matching.into_iter().take(limit).collect();
@@ -1564,6 +1575,16 @@ impl Engine {
         }).collect();
 
         Ok(CommandResponse::StringList(results))
+    }
+
+    fn handle_create_index(
+        &self,
+        cmd: weav_query::parser::CreateIndexCmd,
+    ) -> WeavResult<CommandResponse> {
+        let graph_arc = self.get_graph(&cmd.graph)?;
+        let mut gs = graph_arc.write();
+        gs.properties.create_index(&cmd.property_key);
+        Ok(CommandResponse::Ok)
     }
 
     fn handle_search_text(
@@ -2968,6 +2989,54 @@ impl Engine {
         }
 
         Ok(CommandResponse::Ok)
+    }
+
+    // ── Backup (snapshot + WAL compact) ─────────────────────────────────
+
+    fn handle_backup(&self, label: Option<String>) -> WeavResult<CommandResponse> {
+        // First, take a snapshot (reuse existing logic).
+        self.handle_snapshot()?;
+
+        // Then compact the WAL.
+        let compacted = if let Some(ref wal_mutex) = self.wal {
+            let mut wal = wal_mutex.lock();
+            wal.compact()
+                .map_err(|e| WeavError::Internal(format!("WAL compact failed: {e}")))?
+        } else {
+            0
+        };
+
+        let label_str = label.as_deref().unwrap_or("unlabeled");
+        tracing::info!(
+            "Backup complete (label={}): WAL compacted {} entries",
+            label_str,
+            compacted,
+        );
+
+        Ok(CommandResponse::Text(format!(
+            "backup complete: snapshot saved, {} WAL entries compacted",
+            compacted,
+        )))
+    }
+
+    // ── WAL compact ─────────────────────────────────────────────────────
+
+    fn handle_wal_compact(&self) -> WeavResult<CommandResponse> {
+        let compacted = if let Some(ref wal_mutex) = self.wal {
+            let mut wal = wal_mutex.lock();
+            wal.compact()
+                .map_err(|e| WeavError::Internal(format!("WAL compact failed: {e}")))?
+        } else {
+            return Ok(CommandResponse::Text(
+                "WAL not enabled, nothing to compact".to_string(),
+            ));
+        };
+
+        tracing::info!("WAL compacted: {} entries removed", compacted);
+        Ok(CommandResponse::Text(format!(
+            "{} WAL entries compacted",
+            compacted,
+        )))
     }
 
     // ── Context query ────────────────────────────────────────────────────
@@ -7887,5 +7956,363 @@ mod tests {
             }
             _ => panic!("expected Text response"),
         }
+    }
+
+    // ── Backup & WAL compact tests ──────────────────────────────────────
+
+    #[test]
+    fn test_backup_creates_snapshot_and_compacts_wal() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "weav_backup_test_{}_{}",
+            std::process::id(),
+            weav_persist::now_millis()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let mut config = WeavConfig::default();
+        config.persistence.enabled = true;
+        config.persistence.data_dir = tmp_dir.clone();
+
+        let engine = Engine::new(config);
+        create_test_graph(&engine, "backup_g");
+
+        // Add some nodes to generate WAL entries.
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "backup_g" LABEL "person" PROPERTIES {"name": "Alice"}"#,
+        )
+        .unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "backup_g" LABEL "person" PROPERTIES {"name": "Bob"}"#,
+        )
+        .unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        // Execute BACKUP command.
+        let cmd = parser::parse_command(r#"BACKUP "test-label""#).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(msg) => {
+                assert!(msg.contains("backup complete"));
+                assert!(msg.contains("WAL entries compacted"));
+            }
+            other => panic!("expected Text response, got {:?}", other),
+        }
+
+        // Verify a snapshot file was created.
+        let snapshot_files: Vec<_> = std::fs::read_dir(&tmp_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("snapshot-") && n.ends_with(".bin"))
+            })
+            .collect();
+        assert!(
+            !snapshot_files.is_empty(),
+            "backup should create a snapshot file"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_wal_compact_command() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "weav_walcompact_test_{}_{}",
+            std::process::id(),
+            weav_persist::now_millis()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let mut config = WeavConfig::default();
+        config.persistence.enabled = true;
+        config.persistence.data_dir = tmp_dir.clone();
+
+        let engine = Engine::new(config);
+        create_test_graph(&engine, "wc_g");
+
+        // Add a node to produce WAL entries.
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "wc_g" LABEL "item" PROPERTIES {"x": 1}"#,
+        )
+        .unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        // Execute WAL COMPACT command.
+        let cmd = parser::parse_command("WAL COMPACT").unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(msg) => {
+                assert!(msg.contains("WAL entries compacted"));
+            }
+            other => panic!("expected Text response, got {:?}", other),
+        }
+
+        // After compaction, the WAL file at the original path should be empty.
+        let wal_path = tmp_dir.join("wal");
+        let reader = weav_persist::wal::WalReader::open(&wal_path).unwrap();
+        let entries: Vec<_> = reader.filter_map(|r| r.ok()).collect();
+        assert!(entries.is_empty(), "WAL should be empty after compaction");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_wal_compact_without_persistence() {
+        let engine = make_engine();
+
+        // WAL COMPACT with no persistence enabled should return informational message.
+        let cmd = parser::parse_command("WAL COMPACT").unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(msg) => {
+                assert!(msg.contains("not enabled"));
+            }
+            other => panic!("expected Text response, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_backup_without_label() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "weav_backup_nolabel_test_{}_{}",
+            std::process::id(),
+            weav_persist::now_millis()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let mut config = WeavConfig::default();
+        config.persistence.enabled = true;
+        config.persistence.data_dir = tmp_dir.clone();
+
+        let engine = Engine::new(config);
+        create_test_graph(&engine, "backup_nl");
+
+        // Execute BACKUP with no label.
+        let cmd = parser::parse_command("BACKUP").unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(msg) => {
+                assert!(msg.contains("backup complete"));
+            }
+            other => panic!("expected Text response, got {:?}", other),
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_snapshot_then_compact_data_recoverable() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "weav_snap_compact_recover_{}_{}",
+            std::process::id(),
+            weav_persist::now_millis()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let mut config = WeavConfig::default();
+        config.persistence.enabled = true;
+        config.persistence.data_dir = tmp_dir.clone();
+
+        let engine = Engine::new(config);
+        create_test_graph(&engine, "recover_g");
+
+        // Add nodes.
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "recover_g" LABEL "item" PROPERTIES {"k": "v1"}"#,
+        )
+        .unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        let cmd = parser::parse_command(
+            r#"NODE ADD TO "recover_g" LABEL "item" PROPERTIES {"k": "v2"}"#,
+        )
+        .unwrap();
+        engine.execute_command(cmd, None).unwrap();
+
+        // Snapshot + compact.
+        engine.execute_command(Command::Snapshot, None).unwrap();
+        engine.execute_command(Command::WalCompact, None).unwrap();
+
+        // The snapshot file should exist and contain the data.
+        let snap_engine = weav_persist::snapshot::SnapshotEngine::new(tmp_dir.clone());
+        let latest = snap_engine.latest_snapshot().unwrap();
+        assert!(latest.is_some(), "snapshot should exist after backup");
+
+        let snap = snap_engine.load_snapshot(&latest.unwrap()).unwrap();
+        assert_eq!(snap.graphs.len(), 1);
+        assert_eq!(snap.graphs[0].graph_name, "recover_g");
+        assert_eq!(snap.graphs[0].nodes.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // ── Property secondary index tests ──────────────────────────────────
+
+    #[test]
+    fn test_create_index_command() {
+        let engine = make_engine();
+        create_test_graph(&engine, "idx_test");
+
+        // Add nodes with "name" property
+        engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "idx_test".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![("name".to_string(), Value::String("Alice".into()))],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+        engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "idx_test".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![("name".to_string(), Value::String("Bob".into()))],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        // Create index
+        let resp = engine
+            .execute_command(
+                Command::CreateIndex(parser::CreateIndexCmd {
+                    graph: "idx_test".to_string(),
+                    property_key: "name".to_string(),
+                }),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(resp, CommandResponse::Ok));
+
+        // Search with index should work
+        let resp = engine
+            .execute_command(
+                Command::Search(parser::SearchCmd {
+                    graph: "idx_test".to_string(),
+                    key: "name".to_string(),
+                    value: "Alice".to_string(),
+                    limit: None,
+                }),
+                None,
+            )
+            .unwrap();
+        match resp {
+            CommandResponse::StringList(results) => {
+                assert_eq!(results.len(), 1);
+                assert!(results[0].contains("person"));
+            }
+            _ => panic!("expected StringList"),
+        }
+    }
+
+    #[test]
+    fn test_create_index_via_parser() {
+        let engine = make_engine();
+        create_test_graph(&engine, "idx_parse");
+
+        let cmd = parser::parse_command(r#"INDEX CREATE "idx_parse" "name""#).unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        assert!(matches!(resp, CommandResponse::Ok));
+    }
+
+    #[test]
+    fn test_create_index_graph_not_found() {
+        let engine = make_engine();
+        let cmd = Command::CreateIndex(parser::CreateIndexCmd {
+            graph: "nonexistent".to_string(),
+            property_key: "name".to_string(),
+        });
+        assert!(engine.execute_command(cmd, None).is_err());
+    }
+
+    #[test]
+    fn test_search_with_index_vs_without_same_results() {
+        let engine = make_engine();
+        create_test_graph(&engine, "idx_cmp");
+
+        // Add nodes
+        for name in &["Alice", "Bob", "Alice", "Charlie"] {
+            engine
+                .execute_command(
+                    Command::NodeAdd(parser::NodeAddCmd {
+                        graph: "idx_cmp".to_string(),
+                        label: "person".to_string(),
+                        properties: vec![(
+                            "name".to_string(),
+                            Value::String(CompactString::from(*name)),
+                        )],
+                        embedding: None,
+                        entity_key: None,
+                        ttl_ms: None,
+                    }),
+                    None,
+                )
+                .unwrap();
+        }
+
+        // Search without index
+        let resp_no_idx = engine
+            .execute_command(
+                Command::Search(parser::SearchCmd {
+                    graph: "idx_cmp".to_string(),
+                    key: "name".to_string(),
+                    value: "Alice".to_string(),
+                    limit: None,
+                }),
+                None,
+            )
+            .unwrap();
+        let no_idx_results = match resp_no_idx {
+            CommandResponse::StringList(r) => r,
+            _ => panic!("expected StringList"),
+        };
+
+        // Create index
+        engine
+            .execute_command(
+                Command::CreateIndex(parser::CreateIndexCmd {
+                    graph: "idx_cmp".to_string(),
+                    property_key: "name".to_string(),
+                }),
+                None,
+            )
+            .unwrap();
+
+        // Search with index
+        let resp_idx = engine
+            .execute_command(
+                Command::Search(parser::SearchCmd {
+                    graph: "idx_cmp".to_string(),
+                    key: "name".to_string(),
+                    value: "Alice".to_string(),
+                    limit: None,
+                }),
+                None,
+            )
+            .unwrap();
+        let mut idx_results = match resp_idx {
+            CommandResponse::StringList(r) => r,
+            _ => panic!("expected StringList"),
+        };
+
+        // Both should find the same count (2 Alices)
+        let mut no_idx_sorted = no_idx_results;
+        no_idx_sorted.sort();
+        idx_results.sort();
+        assert_eq!(no_idx_sorted, idx_results);
+        assert_eq!(idx_results.len(), 2);
     }
 }

@@ -120,6 +120,11 @@ pub struct TemporalQueryRequest {
     pub include_edges: Option<bool>,
 }
 
+#[derive(Deserialize)]
+pub struct BackupRequest {
+    pub label: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct ApiResponse<T: Serialize> {
     pub success: bool,
@@ -259,6 +264,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         )
         // Snapshot.
         .route("/v1/snapshot", post(snapshot))
+        // Backup (snapshot + WAL compact).
+        .route("/v1/backup", post(backup))
+        // WAL compact.
+        .route("/v1/wal/compact", post(wal_compact))
         // Server info.
         .route("/v1/info", get(server_info))
         // Context query.
@@ -282,6 +291,8 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         // CSV import/export.
         .route("/v1/graphs/{graph}/import/csv", post(import_csv))
         .route("/v1/graphs/{graph}/export/csv", get(export_csv))
+        // DOT graph export.
+        .route("/v1/graphs/{graph}/export/dot", get(export_dot))
         // Graph algorithms.
         .route(
             "/v1/graphs/{graph}/algorithms/{algorithm}",
@@ -479,17 +490,22 @@ async fn search_nodes(
     let gs = graph_arc.read();
 
     let limit = params.limit.unwrap_or(100) as usize;
-    let value_clone = params.value.clone();
 
-    let matching_nodes: Vec<u64> = gs.properties.nodes_where(&params.key, &move |v| {
-        match v {
-            Value::String(s) => s.as_str() == value_clone,
-            Value::Int(i) => i.to_string() == value_clone,
-            Value::Float(f) => f.to_string() == value_clone,
-            Value::Bool(b) => b.to_string() == value_clone,
-            _ => false,
-        }
-    });
+    // Use secondary index if available for O(1) lookup, otherwise fall back to O(n) scan.
+    let matching_nodes: Vec<u64> = if gs.properties.index.has_index(&params.key) {
+        gs.properties.index.lookup(&params.key, &params.value)
+    } else {
+        let value_clone = params.value.clone();
+        gs.properties.nodes_where(&params.key, &move |v| {
+            match v {
+                Value::String(s) => s.as_str() == value_clone,
+                Value::Int(i) => i.to_string() == value_clone,
+                Value::Float(f) => f.to_string() == value_clone,
+                Value::Bool(b) => b.to_string() == value_clone,
+                _ => false,
+            }
+        })
+    };
 
     let results: Vec<serde_json::Value> = matching_nodes.iter().take(limit).map(|&nid| {
         let label = gs.properties
@@ -957,6 +973,69 @@ fn value_to_csv_string(v: &Value) -> String {
         Value::Timestamp(ts) => ts.to_string(),
         other => serde_json::to_string(&value_to_json(other)).unwrap_or_default(),
     }
+}
+
+/// Export graph in DOT (Graphviz) format.
+/// GET /v1/graphs/{graph}/export/dot
+async fn export_dot(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+) -> impl IntoResponse {
+    let _identity = extract_identity(&engine, &headers);
+    let graph_arc = match engine.get_graph(&graph) {
+        Ok(g) => g,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
+    let gs = graph_arc.read();
+
+    let mut dot = String::from("digraph G {\n");
+    dot.push_str("  rankdir=LR;\n");
+    dot.push_str("  node [shape=record];\n\n");
+
+    // Nodes
+    for &nid in &gs.adjacency.all_node_ids() {
+        let label = gs
+            .properties
+            .get_node_property(nid, "_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("node");
+        let name = gs
+            .properties
+            .get_node_property(nid, "name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        // Escape double quotes in label and name for DOT format
+        let label_escaped = label.replace('"', "\\\"");
+        let name_escaped = name.replace('"', "\\\"");
+        dot.push_str(&format!(
+            "  n{nid} [label=\"{label_escaped}: {name_escaped}\"];\n"
+        ));
+    }
+
+    dot.push('\n');
+
+    // Edges
+    for (eid, meta) in gs.adjacency.all_edges() {
+        let edge_label = gs
+            .interner
+            .resolve_label(meta.label)
+            .unwrap_or("unknown");
+        let edge_label_escaped = edge_label.replace('"', "\\\"");
+        dot.push_str(&format!(
+            "  n{} -> n{} [label=\"{}\" id=\"e{}\"];\n",
+            meta.source, meta.target, edge_label_escaped, eid
+        ));
+    }
+
+    dot.push_str("}\n");
+
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/vnd.graphviz")],
+        dot,
+    )
+        .into_response()
 }
 
 /// Temporal query: return graph state at a point in time or during a time range.
@@ -1708,6 +1787,36 @@ async fn snapshot(
 ) -> impl IntoResponse {
     let identity = extract_identity(&engine, &headers);
     match engine.execute_command(Command::Snapshot, identity.as_ref()) {
+        Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
+        Err(e) => weav_error_to_response(e).into_response(),
+    }
+}
+
+async fn backup(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    body: Option<Json<BackupRequest>>,
+) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
+    let label = body.and_then(|Json(b)| b.label);
+    match engine.execute_command(Command::Backup(label), identity.as_ref()) {
+        Ok(CommandResponse::Text(msg)) => {
+            (StatusCode::OK, Json(ApiResponse::ok(msg))).into_response()
+        }
+        Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
+        Err(e) => weav_error_to_response(e).into_response(),
+    }
+}
+
+async fn wal_compact(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
+    match engine.execute_command(Command::WalCompact, identity.as_ref()) {
+        Ok(CommandResponse::Text(msg)) => {
+            (StatusCode::OK, Json(ApiResponse::ok(msg))).into_response()
+        }
         Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
     }
@@ -4730,5 +4839,170 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── DOT export tests ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_export_dot_empty_graph() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "dot_empty".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let req = Request::builder()
+            .uri("/v1/graphs/dot_empty/export/dot")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let dot = String::from_utf8(body.to_vec()).unwrap();
+        assert!(dot.starts_with("digraph G {"));
+        assert!(dot.contains("rankdir=LR"));
+        assert!(dot.contains("node [shape=record]"));
+        assert!(dot.ends_with("}\n"));
+    }
+
+    #[tokio::test]
+    async fn test_export_dot_with_nodes_and_edges() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "dot_graph".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        // Add two nodes
+        let n1 = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "dot_graph".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![("name".to_string(), Value::String("Alice".into()))],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+        let n2 = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "dot_graph".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![("name".to_string(), Value::String("Bob".into()))],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Add an edge
+        engine
+            .execute_command(
+                Command::EdgeAdd(EdgeAddCmd {
+                    graph: "dot_graph".to_string(),
+                    source: n1,
+                    target: n2,
+                    label: "knows".to_string(),
+                    weight: 1.0,
+                    properties: vec![],
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let req = Request::builder()
+            .uri("/v1/graphs/dot_graph/export/dot")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let dot = String::from_utf8(body.to_vec()).unwrap();
+
+        // Verify DOT structure
+        assert!(dot.starts_with("digraph G {"));
+        assert!(dot.contains(&format!("n{n1}")));
+        assert!(dot.contains(&format!("n{n2}")));
+        assert!(dot.contains("person: Alice"));
+        assert!(dot.contains("person: Bob"));
+        assert!(dot.contains(&format!("n{n1} -> n{n2}")));
+        assert!(dot.contains("[label=\"knows\""));
+        assert!(dot.ends_with("}\n"));
+    }
+
+    #[tokio::test]
+    async fn test_export_dot_not_found() {
+        let app = make_app();
+        let req = Request::builder()
+            .uri("/v1/graphs/nonexistent/export/dot")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_export_dot_content_type() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "dot_ct".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let req = Request::builder()
+            .uri("/v1/graphs/dot_ct/export/dot")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(ct, "text/vnd.graphviz");
     }
 }

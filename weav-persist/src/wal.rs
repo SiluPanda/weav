@@ -306,9 +306,60 @@ impl WriteAheadLog {
         Ok(())
     }
 
+    /// Compact the WAL by renaming the current file to `{path}.compacted.{ts}`
+    /// and opening a fresh empty WAL file. The sequence number is preserved.
+    ///
+    /// This is safe to call after a successful snapshot, since the snapshot
+    /// contains all the data that was in the WAL. Returns the number of
+    /// entries that were in the compacted file.
+    pub fn compact(&mut self) -> io::Result<u64> {
+        // Flush any pending writes.
+        self.writer.flush()?;
+        self.writer.get_ref().sync_all()?;
+
+        // Count existing entries before compaction.
+        let entry_count = if self.path.exists() && self.current_size > 0 {
+            let reader = WalReader::open(&self.path)?;
+            reader.filter_map(|r| r.ok()).count() as u64
+        } else {
+            0
+        };
+
+        if entry_count == 0 {
+            return Ok(0);
+        }
+
+        // Rename the current file to a timestamped compacted name.
+        let ts = now_millis();
+        let compacted_path = PathBuf::from(format!("{}.compacted.{}", self.path.display(), ts));
+        fs::rename(&self.path, &compacted_path)?;
+
+        // Open a new empty file at the original path.
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+
+        self.writer = BufWriter::new(file);
+        self.current_size = 0;
+        // sequence_number is intentionally preserved for monotonicity.
+
+        Ok(entry_count)
+    }
+
     /// The current sequence number (i.e. the seq of the last appended entry).
     pub fn sequence_number(&self) -> u64 {
         self.sequence_number
+    }
+
+    /// The path of the WAL file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The current size in bytes of the WAL file.
+    pub fn current_size(&self) -> u64 {
+        self.current_size
     }
 }
 
@@ -1030,6 +1081,120 @@ mod tests {
         assert_eq!(entries.len(), 5);
         assert_eq!(entries[0].seq, 1);
         assert_eq!(entries[4].seq, 5);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_wal_compact_resets_file() {
+        let dir = test_dir("compact_reset");
+        let wal_path = dir.join("wal");
+
+        let mut wal =
+            WriteAheadLog::new(wal_path.clone(), 1024 * 1024, WalSyncMode::Always).unwrap();
+
+        // Write 5 entries.
+        for _ in 0..5 {
+            wal.append(0, WalOperation::GraphDrop { name: "g".into() })
+                .unwrap();
+        }
+        assert_eq!(wal.sequence_number(), 5);
+        assert!(wal.current_size() > 0);
+
+        // Compact.
+        let compacted = wal.compact().unwrap();
+        assert_eq!(compacted, 5);
+
+        // After compaction the WAL file is fresh and empty.
+        assert_eq!(wal.current_size(), 0);
+
+        // Sequence number is preserved.
+        assert_eq!(wal.sequence_number(), 5);
+
+        // The original path exists and is empty.
+        let reader = WalReader::open(&wal_path).unwrap();
+        let entries: Vec<WalEntry> = reader.filter_map(|r| r.ok()).collect();
+        assert!(entries.is_empty());
+
+        // A compacted archive file exists in the same directory.
+        let compacted_files: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.contains("compacted"))
+            })
+            .collect();
+        assert_eq!(compacted_files.len(), 1);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_wal_compact_empty_noop() {
+        let dir = test_dir("compact_empty");
+        let wal_path = dir.join("wal");
+
+        let mut wal =
+            WriteAheadLog::new(wal_path.clone(), 1024 * 1024, WalSyncMode::Always).unwrap();
+
+        // Compact on empty WAL should return 0.
+        let compacted = wal.compact().unwrap();
+        assert_eq!(compacted, 0);
+        assert_eq!(wal.sequence_number(), 0);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_wal_compact_then_write() {
+        let dir = test_dir("compact_write");
+        let wal_path = dir.join("wal");
+
+        let mut wal =
+            WriteAheadLog::new(wal_path.clone(), 1024 * 1024, WalSyncMode::Always).unwrap();
+
+        // Write 3 entries, compact, then write 2 more.
+        for _ in 0..3 {
+            wal.append(0, WalOperation::GraphDrop { name: "g".into() })
+                .unwrap();
+        }
+        assert_eq!(wal.sequence_number(), 3);
+
+        let compacted = wal.compact().unwrap();
+        assert_eq!(compacted, 3);
+
+        // Write 2 more entries after compaction.
+        wal.append(0, WalOperation::GraphDrop { name: "a".into() })
+            .unwrap();
+        wal.append(0, WalOperation::GraphDrop { name: "b".into() })
+            .unwrap();
+        assert_eq!(wal.sequence_number(), 5);
+
+        // Read back: only the 2 new entries should be in the current WAL file.
+        let reader = WalReader::open(&wal_path).unwrap();
+        let entries: Vec<WalEntry> = reader.map(|r| r.unwrap()).collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].seq, 4);
+        assert_eq!(entries[1].seq, 5);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_wal_path_and_size_accessors() {
+        let dir = test_dir("accessors");
+        let wal_path = dir.join("wal");
+
+        let mut wal =
+            WriteAheadLog::new(wal_path.clone(), 1024 * 1024, WalSyncMode::Always).unwrap();
+        assert_eq!(wal.path(), wal_path.as_path());
+        assert_eq!(wal.current_size(), 0);
+
+        wal.append(0, WalOperation::GraphDrop { name: "g".into() })
+            .unwrap();
+        assert!(wal.current_size() > 0);
 
         fs::remove_dir_all(&dir).ok();
     }
