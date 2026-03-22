@@ -94,6 +94,7 @@ impl AdjacencyStore {
 
     pub fn remove_node(&mut self, node_id: NodeId) -> Result<(), WeavError> {
         if !self.has_node(node_id) {
+            // graph_id 0 is a placeholder; the engine layer re-contextualizes this error
             return Err(WeavError::NodeNotFound(node_id, 0));
         }
         // Collect all edge ids connected to this node
@@ -170,9 +171,11 @@ impl AdjacencyStore {
         edge_id: EdgeId,
     ) -> Result<(), WeavError> {
         if !self.has_node(src) {
+            // graph_id 0 is a placeholder; the engine layer re-contextualizes this error
             return Err(WeavError::NodeNotFound(src, 0));
         }
         if !self.has_node(tgt) {
+            // graph_id 0 is a placeholder; the engine layer re-contextualizes this error
             return Err(WeavError::NodeNotFound(tgt, 0));
         }
 

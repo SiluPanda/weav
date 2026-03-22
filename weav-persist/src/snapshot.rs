@@ -138,7 +138,9 @@ impl SnapshotEngine {
             "wal_sequence": snapshot.meta.wal_sequence,
         });
         if let Ok(json_str) = serde_json::to_string(&meta_json) {
-            let _ = fs::write(&meta_path, json_str);
+            if let Err(e) = fs::write(&meta_path, json_str) {
+                tracing::warn!("failed to write snapshot meta sidecar {}: {e}", meta_path.display());
+            }
         }
 
         Ok(path)
@@ -241,6 +243,9 @@ impl SnapshotEngine {
 
         for meta in snapshots.into_iter().skip(keep) {
             if fs::remove_file(&meta.path).is_ok() {
+                // Also remove the sidecar .meta.json file
+                let sidecar = meta.path.with_extension("meta.json");
+                let _ = fs::remove_file(&sidecar);
                 deleted += 1;
             }
         }

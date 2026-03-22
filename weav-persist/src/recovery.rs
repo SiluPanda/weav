@@ -150,7 +150,7 @@ impl RecoveryManager {
                 None => continue,
             };
 
-            if name.starts_with("wal") {
+            if name == "wal" || name.starts_with("wal.") {
                 wal_files.push(path);
             }
         }

@@ -154,7 +154,10 @@ impl PropertyStore {
     }
 
     pub fn set_node_property(&mut self, node: NodeId, key: &str, value: Value) {
-        let key_id = self.intern_key(key).expect("property key space exhausted");
+        let key_id = match self.intern_key(key) {
+            Ok(id) => id,
+            Err(_) => return, // Key space exhausted, silently skip
+        };
         let column = self
             .node_columns
             .entry(key_id)
@@ -261,7 +264,10 @@ impl PropertyStore {
 
     /// Set a property on an edge.
     pub fn set_edge_property(&mut self, edge_id: EdgeId, key: &str, value: Value) {
-        let key_id = self.intern_key(key).expect("property key space exhausted");
+        let key_id = match self.intern_key(key) {
+            Ok(id) => id,
+            Err(_) => return, // Key space exhausted, silently skip
+        };
         let entry = self.edge_overflow.entry(edge_id).or_default();
         // Update existing key or append
         if let Some(pair) = entry.iter_mut().find(|(k, _)| *k == key_id) {

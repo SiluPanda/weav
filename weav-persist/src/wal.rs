@@ -174,8 +174,7 @@ impl WriteAheadLog {
 
     /// Append an operation to the WAL. Returns the assigned sequence number.
     pub fn append(&mut self, shard_id: ShardId, operation: WalOperation) -> io::Result<u64> {
-        self.sequence_number += 1;
-        let seq = self.sequence_number;
+        let seq = self.sequence_number + 1;
 
         // Compute checksum over the serialized operation bytes.
         let op_bytes = bincode::serialize(&operation).map_err(|e| {
@@ -215,6 +214,9 @@ impl WriteAheadLog {
             }
         }
 
+        // Only increment after successful write.
+        self.sequence_number = seq;
+
         Ok(seq)
     }
 
@@ -240,16 +242,22 @@ impl WriteAheadLog {
         let ts = now_millis();
         let rotated = PathBuf::from(format!("{}.{}", self.path.display(), ts));
 
-        // Rename the current file.
-        fs::rename(&self.path, &rotated)?;
-
-        // Open a new empty file at the original path.
-        let file = OpenOptions::new()
+        // Create the new empty file FIRST (before renaming away the old one).
+        let tmp_path = PathBuf::from(format!("{}.new.tmp", self.path.display()));
+        let new_file = OpenOptions::new()
             .create(true)
-            .append(true)
-            .open(&self.path)?;
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        new_file.sync_all()?;
 
-        self.writer = BufWriter::new(file);
+        // Now rename the old file (safe: new file already exists).
+        fs::rename(&self.path, &rotated)?;
+        fs::rename(&tmp_path, &self.path)?;
+
+        self.writer = BufWriter::new(
+            OpenOptions::new().append(true).open(&self.path)?,
+        );
         self.current_size = 0;
 
         Ok(rotated)
@@ -272,36 +280,35 @@ impl WriteAheadLog {
             .filter(|entry| entry.seq >= seq)
             .collect();
 
-        // Rewrite the WAL file with only the kept entries.
-        let file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
-        let mut writer = BufWriter::new(file);
-
-        let mut new_size = 0u64;
-        for entry in &kept {
-            let entry_bytes = bincode::serialize(entry).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("bincode serialize entry: {e}"),
-                )
-            })?;
-            let len = entry_bytes.len() as u32;
-            writer.write_all(&len.to_le_bytes())?;
-            writer.write_all(&entry_bytes)?;
-            new_size += 4 + entry_bytes.len() as u64;
+        // Write kept entries to a temp file first.
+        let tmp_path = PathBuf::from(format!("{}.truncate.tmp", self.path.display()));
+        {
+            let file = File::create(&tmp_path)?;
+            let mut writer = BufWriter::new(file);
+            let mut new_size = 0u64;
+            for entry in &kept {
+                let entry_bytes = bincode::serialize(entry).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("bincode serialize entry: {e}"),
+                    )
+                })?;
+                let len = entry_bytes.len() as u32;
+                writer.write_all(&len.to_le_bytes())?;
+                writer.write_all(&entry_bytes)?;
+                new_size += 4 + entry_bytes.len() as u64;
+            }
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            self.current_size = new_size;
         }
 
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
+        // Atomic rename over the original.
+        fs::rename(&tmp_path, &self.path)?;
 
-        // Re-open the file in append mode for future writes.
-        let file = OpenOptions::new()
-            .append(true)
-            .open(&self.path)?;
+        // Re-open in append mode.
+        let file = OpenOptions::new().append(true).open(&self.path)?;
         self.writer = BufWriter::new(file);
-        self.current_size = new_size;
 
         Ok(())
     }
@@ -329,18 +336,25 @@ impl WriteAheadLog {
             return Ok(0);
         }
 
-        // Rename the current file to a timestamped compacted name.
         let ts = now_millis();
         let compacted_path = PathBuf::from(format!("{}.compacted.{}", self.path.display(), ts));
-        fs::rename(&self.path, &compacted_path)?;
 
-        // Open a new empty file at the original path.
-        let file = OpenOptions::new()
+        // Create the new empty file FIRST.
+        let tmp_path = PathBuf::from(format!("{}.new.tmp", self.path.display()));
+        let new_file = OpenOptions::new()
             .create(true)
-            .append(true)
-            .open(&self.path)?;
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        new_file.sync_all()?;
 
-        self.writer = BufWriter::new(file);
+        // Now rename the old file (safe: new file exists as fallback).
+        fs::rename(&self.path, &compacted_path)?;
+        fs::rename(&tmp_path, &self.path)?;
+
+        self.writer = BufWriter::new(
+            OpenOptions::new().append(true).open(&self.path)?,
+        );
         self.current_size = 0;
         // sequence_number is intentionally preserved for monotonicity.
 

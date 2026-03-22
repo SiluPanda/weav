@@ -1048,6 +1048,9 @@ fn parse_context_command(tokens: &[String]) -> Result<Command, WeavError> {
                             top_k = tokens[idx + 4]
                                 .parse()
                                 .map_err(|_| parse_err(format!("invalid top_k: {}", &tokens[idx + 4])))?;
+                            if top_k > 10_000 {
+                                return Err(parse_err("top_k exceeds maximum of 10000"));
+                            }
                         }
                     }
                 }
@@ -1091,13 +1094,17 @@ fn parse_context_command(tokens: &[String]) -> Result<Command, WeavError> {
     };
 
     // Parse DEPTH <d>
-    let max_depth = if let Some(d_pos) = find_keyword(tokens, "DEPTH") {
+    let max_depth: u8 = if let Some(d_pos) = find_keyword(tokens, "DEPTH") {
         if d_pos + 1 >= tokens.len() {
             return Err(parse_err("DEPTH requires a value"));
         }
-        tokens[d_pos + 1]
+        let d: u8 = tokens[d_pos + 1]
             .parse()
-            .map_err(|_| parse_err(format!("invalid depth: {}", &tokens[d_pos + 1])))?
+            .map_err(|_| parse_err(format!("invalid depth: {}", &tokens[d_pos + 1])))?;
+        if d > 100 {
+            return Err(parse_err("DEPTH exceeds maximum of 100"));
+        }
+        d
     } else {
         2
     };
@@ -1356,6 +1363,13 @@ fn parse_bulk_nodes(tokens: &[String]) -> Result<Command, WeavError> {
         .as_array()
         .ok_or_else(|| parse_err("BULK NODES DATA must be a JSON array"))?;
 
+    if arr.len() > 10_000 {
+        return Err(parse_err(format!(
+            "BULK NODES exceeds maximum of 10000 items (got {})",
+            arr.len()
+        )));
+    }
+
     let mut nodes = Vec::new();
     for item in arr {
         let obj = item
@@ -1422,6 +1436,13 @@ fn parse_bulk_edges(tokens: &[String]) -> Result<Command, WeavError> {
     let arr = val
         .as_array()
         .ok_or_else(|| parse_err("BULK EDGES DATA must be a JSON array"))?;
+
+    if arr.len() > 10_000 {
+        return Err(parse_err(format!(
+            "BULK EDGES exceeds maximum of 10000 items (got {})",
+            arr.len()
+        )));
+    }
 
     let mut edges = Vec::new();
     for item in arr {

@@ -85,7 +85,7 @@ impl VectorIndex {
         };
 
         let inner = Index::new(&options)
-            .map_err(|e| WeavError::Internal(format!("failed to create usearch index: {e}")))?;
+            .map_err(|_| WeavError::Internal("failed to initialize vector index".into()))?;
 
         Ok(Self {
             inner,
@@ -126,12 +126,12 @@ impl VectorIndex {
         if needed > self.inner.capacity() {
             self.inner
                 .reserve(needed.max(self.inner.capacity() * 2).max(64))
-                .map_err(|e| WeavError::Internal(format!("failed to reserve capacity: {e}")))?;
+                .map_err(|_| WeavError::Internal("failed to grow vector index".into()))?;
         }
 
         self.inner
             .add(key, vector)
-            .map_err(|e| WeavError::Internal(format!("failed to insert vector: {e}")))?;
+            .map_err(|_| WeavError::Internal("failed to insert vector".into()))?;
 
         self.node_to_key.insert(node_id, key);
         self.key_to_node.insert(key, node_id);
@@ -144,7 +144,7 @@ impl VectorIndex {
         if let Some(key) = self.node_to_key.remove(&node_id) {
             self.inner
                 .remove(key)
-                .map_err(|e| WeavError::Internal(format!("failed to remove vector: {e}")))?;
+                .map_err(|_| WeavError::Internal("failed to remove vector".into()))?;
             self.key_to_node.remove(&key);
             self.vectors.remove(&node_id);
             Ok(())
@@ -188,7 +188,7 @@ impl VectorIndex {
         let matches = self
             .inner
             .search(query, k as usize)
-            .map_err(|e| WeavError::Internal(format!("search failed: {e}")))?;
+            .map_err(|_| WeavError::Internal("vector search failed".into()))?;
 
         // Restore original ef_search
         if let Some(orig) = original_ef {
@@ -259,7 +259,7 @@ impl VectorIndex {
         let matches = self
             .inner
             .search(query, oversample)
-            .map_err(|e| WeavError::Internal(format!("search failed: {e}")))?;
+            .map_err(|_| WeavError::Internal("vector search failed".into()))?;
 
         if let Some(orig) = original_ef {
             self.inner.change_expansion_search(orig);
