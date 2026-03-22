@@ -1078,7 +1078,10 @@ impl Engine {
                     &ingest_cmd.graph,
                     weav_auth::identity::GraphPermission::ReadWrite,
                 )?;
-                self.handle_ingest(ingest_cmd).await
+                #[cfg(feature = "extract")]
+                { self.handle_ingest(ingest_cmd).await }
+                #[cfg(not(feature = "extract"))]
+                { Err(WeavError::ExtractionNotEnabled) }
             }
             other => self.execute_command(other, identity),
         }
@@ -3257,6 +3260,7 @@ impl Engine {
 
     // ── Ingest handler ────────────────────────────────────────────────────
 
+    #[cfg(feature = "extract")]
     async fn handle_ingest(
         &self,
         cmd: weav_query::parser::IngestCmd,
@@ -3331,6 +3335,7 @@ impl Engine {
 
     /// Apply extraction results to a graph: insert chunk nodes, entity nodes,
     /// and relationship edges.
+    #[cfg(feature = "extract")]
     fn apply_extraction_result(
         &self,
         graph_name: &str,
@@ -3699,8 +3704,16 @@ impl Engine {
         // Parse label from (n:Label) or (:Label)
         let label = cypher_extract_label(query);
 
-        // Parse WHERE clause
-        let where_clause = cypher_extract_where(query);
+        // Parse enhanced WHERE clause
+        let where_filter = cypher_parse_where(query);
+
+        // Parse RETURN clause (aggregations or plain)
+        let return_clause = cypher_parse_return(query);
+
+        // Parse ORDER BY, LIMIT, SKIP
+        let order_by = cypher_parse_order_by(query);
+        let limit = cypher_parse_limit(query);
+        let skip = cypher_parse_skip(query);
 
         // Check for id(n) = NNN pattern
         let id_lookup = cypher_extract_id_lookup(query);
@@ -3722,7 +3735,7 @@ impl Engine {
 
         // Scan all nodes with filters
         let all_nodes = gs.adjacency.all_node_ids();
-        let mut results: Vec<serde_json::Value> = Vec::new();
+        let mut matched_ids: Vec<u64> = Vec::new();
 
         for &nid in &all_nodes {
             if let Some(ref lbl) = label {
@@ -3735,13 +3748,46 @@ impl Engine {
                 }
             }
 
-            if let Some((ref key, ref value)) = where_clause {
-                if !cypher_property_matches(&gs, nid, key, value) {
+            if let Some(ref filter) = where_filter {
+                if !cypher_where_matches(&gs, nid, filter) {
                     continue;
                 }
             }
 
-            results.push(serde_json::json!({ "n": cypher_node_to_json(&gs, nid) }));
+            matched_ids.push(nid);
+        }
+
+        // Handle aggregation RETURN
+        if let CypherReturn::Aggregations(ref aggs) = return_clause {
+            let agg_result = cypher_compute_aggregations(&gs, &matched_ids, aggs);
+            return Ok(CommandResponse::Text(
+                serde_json::to_string(&vec![agg_result]).unwrap_or_default(),
+            ));
+        }
+
+        // Build result rows
+        let mut results: Vec<serde_json::Value> = matched_ids
+            .iter()
+            .map(|&nid| serde_json::json!({ "n": cypher_node_to_json(&gs, nid) }))
+            .collect();
+
+        // Apply ORDER BY
+        if let Some(ref order) = order_by {
+            cypher_apply_order_by(&mut results, order);
+        }
+
+        // Apply SKIP
+        if let Some(s) = skip {
+            if s < results.len() {
+                results = results.into_iter().skip(s).collect();
+            } else {
+                results.clear();
+            }
+        }
+
+        // Apply LIMIT
+        if let Some(l) = limit {
+            results.truncate(l);
         }
 
         Ok(CommandResponse::Text(
@@ -3875,46 +3921,659 @@ fn cypher_extract_label(query: &str) -> Option<String> {
     }
 }
 
-/// Extract WHERE clause: WHERE n.prop = 'value' or WHERE n.prop = value
-fn cypher_extract_where(query: &str) -> Option<(String, String)> {
+/// Comparison operators for WHERE clauses.
+#[derive(Debug, Clone, PartialEq)]
+enum CypherOp {
+    Eq,
+    Neq,
+    Lt,
+    Gt,
+    Lte,
+    Gte,
+    Contains,
+    StartsWith,
+    EndsWith,
+    IsNull,
+    IsNotNull,
+}
+
+/// A single WHERE condition: key op value.
+#[derive(Debug, Clone)]
+struct CypherCondition {
+    key: String,
+    op: CypherOp,
+    value: String, // unused for IsNull/IsNotNull
+}
+
+/// Boolean combinator for multiple conditions.
+#[derive(Debug, Clone)]
+enum CypherWhere {
+    Single(CypherCondition),
+    And(Vec<CypherWhere>),
+    Or(Vec<CypherWhere>),
+}
+
+/// Extract the raw WHERE clause text from a query, ending before RETURN/ORDER/LIMIT/SKIP.
+fn cypher_extract_where_text(query: &str) -> Option<String> {
     let upper = query.to_uppercase();
     let where_pos = upper.find("WHERE")?;
-    let after_where = query[where_pos + 5..].trim();
+    let after_where = &query[where_pos + 5..];
 
     // Check for id(n) = NNN pattern first — handled separately
-    let after_upper = after_where.to_uppercase();
+    let after_upper = after_where.trim().to_uppercase();
     if after_upper.starts_with("ID(") {
         return None;
     }
 
-    // Parse: n.prop = 'value' or n.prop = value
-    let eq_pos = after_where.find('=')?;
-    let key_part = after_where[..eq_pos].trim();
-    let val_part = after_where[eq_pos + 1..].trim();
+    // End the WHERE clause at RETURN, ORDER, LIMIT, or SKIP
+    let upper_after = after_where.to_uppercase();
+    let end = ["RETURN", "ORDER", "LIMIT", "SKIP"]
+        .iter()
+        .filter_map(|kw| {
+            // Find keyword preceded by whitespace (to avoid matching inside a value)
+            let mut pos = 0;
+            while let Some(idx) = upper_after[pos..].find(kw) {
+                let abs = pos + idx;
+                if abs == 0 || upper_after.as_bytes()[abs - 1].is_ascii_whitespace() {
+                    return Some(abs);
+                }
+                pos = abs + 1;
+            }
+            None
+        })
+        .min()
+        .unwrap_or(after_where.len());
 
-    // Strip variable prefix (n. or m.)
-    let key = if let Some(dot) = key_part.find('.') {
-        key_part[dot + 1..].trim()
-    } else {
-        key_part
-    };
-
-    // Strip RETURN and anything after the value
-    let val_str = val_part
-        .split_whitespace()
-        .next()
-        .unwrap_or(val_part);
-
-    // Remove surrounding quotes
-    let value = val_str
-        .trim_matches('\'')
-        .trim_matches('"')
-        .to_string();
-
-    if key.is_empty() || value.is_empty() {
+    let text = after_where[..end].trim();
+    if text.is_empty() {
         None
     } else {
-        Some((key.to_string(), value))
+        Some(text.to_string())
+    }
+}
+
+/// Parse a WHERE clause string into a CypherWhere tree supporting AND/OR.
+fn cypher_parse_where(query: &str) -> Option<CypherWhere> {
+    let text = cypher_extract_where_text(query)?;
+    Some(parse_where_expr(&text))
+}
+
+fn parse_where_expr(text: &str) -> CypherWhere {
+    // Split by OR first (lower precedence)
+    let or_parts = split_by_keyword(text, " OR ");
+    if or_parts.len() > 1 {
+        return CypherWhere::Or(or_parts.into_iter().map(|p| parse_where_expr(p.trim())).collect());
+    }
+
+    // Split by AND
+    let and_parts = split_by_keyword(text, " AND ");
+    if and_parts.len() > 1 {
+        return CypherWhere::And(and_parts.into_iter().map(|p| parse_where_expr(p.trim())).collect());
+    }
+
+    // Single condition
+    CypherWhere::Single(parse_single_condition(text.trim()))
+}
+
+/// Split text by a keyword (case-insensitive), respecting quoted strings.
+fn split_by_keyword<'a>(text: &'a str, keyword: &str) -> Vec<&'a str> {
+    let upper = text.to_uppercase();
+    let kw_upper = keyword.to_uppercase();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_quote = false;
+    let mut quote_char = ' ';
+
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < text.len() {
+        let ch = bytes[i] as char;
+        if !in_quote && (ch == '\'' || ch == '"') {
+            in_quote = true;
+            quote_char = ch;
+            i += 1;
+            continue;
+        }
+        if in_quote && ch == quote_char {
+            in_quote = false;
+            i += 1;
+            continue;
+        }
+        if !in_quote && i + kw_upper.len() <= upper.len() && upper[i..i + kw_upper.len()] == *kw_upper {
+            parts.push(&text[start..i]);
+            start = i + keyword.len();
+            i = start;
+            continue;
+        }
+        i += 1;
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
+/// Parse a single condition like `n.name = 'Alice'` or `n.age > 25` or `n.x IS NULL`.
+fn parse_single_condition(text: &str) -> CypherCondition {
+    let upper = text.to_uppercase();
+
+    // IS NOT NULL
+    if upper.ends_with("IS NOT NULL") {
+        let key_part = text[..text.len() - 11].trim();
+        let key = strip_var_prefix(key_part);
+        return CypherCondition { key, op: CypherOp::IsNotNull, value: String::new() };
+    }
+    // IS NULL
+    if upper.ends_with("IS NULL") {
+        let key_part = text[..text.len() - 7].trim();
+        let key = strip_var_prefix(key_part);
+        return CypherCondition { key, op: CypherOp::IsNull, value: String::new() };
+    }
+
+    // CONTAINS
+    if let Some(pos) = find_keyword(&upper, " CONTAINS ") {
+        let key = strip_var_prefix(text[..pos].trim());
+        let val = extract_condition_value(text[pos + 10..].trim());
+        return CypherCondition { key, op: CypherOp::Contains, value: val };
+    }
+    // STARTS WITH
+    if let Some(pos) = find_keyword(&upper, " STARTS WITH ") {
+        let key = strip_var_prefix(text[..pos].trim());
+        let val = extract_condition_value(text[pos + 13..].trim());
+        return CypherCondition { key, op: CypherOp::StartsWith, value: val };
+    }
+    // ENDS WITH
+    if let Some(pos) = find_keyword(&upper, " ENDS WITH ") {
+        let key = strip_var_prefix(text[..pos].trim());
+        let val = extract_condition_value(text[pos + 11..].trim());
+        return CypherCondition { key, op: CypherOp::EndsWith, value: val };
+    }
+
+    // Comparison operators: <>, <=, >=, <, >, =
+    let (op, op_len) = if let Some(p) = text.find("<>") {
+        (CypherOp::Neq, (p, 2))
+    } else if let Some(p) = text.find("<=") {
+        (CypherOp::Lte, (p, 2))
+    } else if let Some(p) = text.find(">=") {
+        (CypherOp::Gte, (p, 2))
+    } else if let Some(p) = text.find('<') {
+        (CypherOp::Lt, (p, 1))
+    } else if let Some(p) = text.find('>') {
+        (CypherOp::Gt, (p, 1))
+    } else if let Some(p) = text.find('=') {
+        (CypherOp::Eq, (p, 1))
+    } else {
+        // Fallback: treat as equality with empty value
+        return CypherCondition { key: text.to_string(), op: CypherOp::Eq, value: String::new() };
+    };
+
+    let key = strip_var_prefix(text[..op_len.0].trim());
+    let val = extract_condition_value(text[op_len.0 + op_len.1..].trim());
+    CypherCondition { key, op, value: val }
+}
+
+/// Find a keyword in text (case-insensitive), not inside quotes.
+fn find_keyword(upper_text: &str, keyword: &str) -> Option<usize> {
+    upper_text.find(keyword)
+}
+
+/// Strip variable prefix (n. or m.) from a property reference.
+fn strip_var_prefix(key_part: &str) -> String {
+    if let Some(dot) = key_part.find('.') {
+        key_part[dot + 1..].trim().to_string()
+    } else {
+        key_part.to_string()
+    }
+}
+
+/// Extract the value from a condition, stripping quotes and trailing tokens.
+fn extract_condition_value(val_part: &str) -> String {
+    let trimmed = val_part.trim();
+    // Handle quoted strings (can contain spaces)
+    if (trimmed.starts_with('\'') && trimmed.len() > 1) || (trimmed.starts_with('"') && trimmed.len() > 1) {
+        let quote = trimmed.as_bytes()[0] as char;
+        if let Some(end) = trimmed[1..].find(quote) {
+            return trimmed[1..1 + end].to_string();
+        }
+    }
+    // Unquoted: take first token
+    trimmed
+        .split_whitespace()
+        .next()
+        .unwrap_or(trimmed)
+        .trim_matches('\'')
+        .trim_matches('"')
+        .to_string()
+}
+
+/// Evaluate a CypherWhere filter against a node.
+fn cypher_where_matches(gs: &GraphState, nid: u64, filter: &CypherWhere) -> bool {
+    match filter {
+        CypherWhere::Single(cond) => cypher_condition_matches(gs, nid, cond),
+        CypherWhere::And(parts) => parts.iter().all(|p| cypher_where_matches(gs, nid, p)),
+        CypherWhere::Or(parts) => parts.iter().any(|p| cypher_where_matches(gs, nid, p)),
+    }
+}
+
+/// Evaluate a single condition against a node.
+fn cypher_condition_matches(gs: &GraphState, nid: u64, cond: &CypherCondition) -> bool {
+    let prop = gs.properties.get_node_property(nid, &cond.key);
+
+    match cond.op {
+        CypherOp::IsNull => return prop.is_none() || matches!(prop, Some(Value::Null)),
+        CypherOp::IsNotNull => return prop.is_some() && !matches!(prop, Some(Value::Null)),
+        _ => {}
+    }
+
+    let prop = match prop {
+        Some(v) => v,
+        None => return false,
+    };
+
+    match cond.op {
+        CypherOp::Eq => cypher_property_matches_eq(prop, &cond.value),
+        CypherOp::Neq => !cypher_property_matches_eq(prop, &cond.value),
+        CypherOp::Lt | CypherOp::Gt | CypherOp::Lte | CypherOp::Gte => {
+            cypher_compare_numeric(prop, &cond.value, &cond.op)
+        }
+        CypherOp::Contains => {
+            if let Some(s) = prop.as_str() {
+                s.contains(&cond.value)
+            } else {
+                false
+            }
+        }
+        CypherOp::StartsWith => {
+            if let Some(s) = prop.as_str() {
+                s.starts_with(&cond.value)
+            } else {
+                false
+            }
+        }
+        CypherOp::EndsWith => {
+            if let Some(s) = prop.as_str() {
+                s.ends_with(&cond.value)
+            } else {
+                false
+            }
+        }
+        CypherOp::IsNull | CypherOp::IsNotNull => unreachable!(),
+    }
+}
+
+/// Check if a property equals a string value (with type coercion).
+fn cypher_property_matches_eq(prop: &Value, value: &str) -> bool {
+    match prop {
+        Value::String(s) => s.as_str() == value,
+        Value::Int(i) => i.to_string() == value,
+        Value::Float(f) => f.to_string() == value,
+        Value::Bool(b) => b.to_string() == value,
+        _ => false,
+    }
+}
+
+/// Numeric comparison for <, >, <=, >=.
+fn cypher_compare_numeric(prop: &Value, value: &str, op: &CypherOp) -> bool {
+    if let Some(prop_f) = prop.as_float() {
+        if let Ok(val_f) = value.parse::<f64>() {
+            return match op {
+                CypherOp::Lt => prop_f < val_f,
+                CypherOp::Gt => prop_f > val_f,
+                CypherOp::Lte => prop_f <= val_f,
+                CypherOp::Gte => prop_f >= val_f,
+                _ => false,
+            };
+        }
+    }
+    // String comparison fallback
+    if let Some(s) = prop.as_str() {
+        return match op {
+            CypherOp::Lt => s < value,
+            CypherOp::Gt => s > value,
+            CypherOp::Lte => s <= value,
+            CypherOp::Gte => s >= value,
+            _ => false,
+        };
+    }
+    false
+}
+
+/// Aggregation function types for RETURN clauses.
+#[derive(Debug, Clone)]
+enum CypherAggregation {
+    Count(String),           // COUNT(n) or COUNT(n.prop)
+    CountDistinct(String),   // COUNT(DISTINCT n.prop)
+    Sum(String),             // SUM(n.prop)
+    Avg(String),             // AVG(n.prop)
+    Min(String),             // MIN(n.prop)
+    Max(String),             // MAX(n.prop)
+    Collect(String),         // COLLECT(n.prop)
+}
+
+/// Parsed RETURN clause with optional aggregations.
+#[derive(Debug, Clone)]
+enum CypherReturn {
+    All,                            // RETURN n (raw results)
+    Aggregations(Vec<(String, CypherAggregation)>), // alias -> aggregation
+}
+
+/// Sort direction for ORDER BY.
+#[derive(Debug, Clone)]
+enum CypherSortDir {
+    Asc,
+    Desc,
+}
+
+/// Parsed ORDER BY clause.
+#[derive(Debug, Clone)]
+struct CypherOrderBy {
+    key: String,
+    direction: CypherSortDir,
+}
+
+/// Parse the RETURN clause for aggregation functions.
+fn cypher_parse_return(query: &str) -> CypherReturn {
+    let upper = query.to_uppercase();
+    let return_pos = match upper.find("RETURN") {
+        Some(p) => p,
+        None => return CypherReturn::All,
+    };
+    let after_return = &query[return_pos + 6..];
+
+    // End at ORDER BY, LIMIT, or SKIP
+    let upper_after = after_return.to_uppercase();
+    let end = [" ORDER ", " LIMIT ", " SKIP "]
+        .iter()
+        .filter_map(|kw| upper_after.find(kw))
+        .min()
+        .unwrap_or(after_return.len());
+    let return_text = after_return[..end].trim();
+
+    let upper_return = return_text.to_uppercase();
+
+    // Check for aggregation functions
+    let agg_patterns = ["COUNT(", "SUM(", "AVG(", "MIN(", "MAX(", "COLLECT("];
+    if !agg_patterns.iter().any(|p| upper_return.contains(p)) {
+        return CypherReturn::All;
+    }
+
+    // Parse comma-separated aggregation expressions
+    let mut aggregations = Vec::new();
+    for (idx, expr) in return_text.split(',').enumerate() {
+        let expr = expr.trim();
+        let upper_expr = expr.to_uppercase();
+
+        // Check for AS alias
+        let (func_part, alias) = if let Some(as_pos) = find_keyword(&upper_expr, " AS ") {
+            let a = expr[as_pos + 4..].trim().to_string();
+            (expr[..as_pos].trim(), a)
+        } else {
+            (expr, format!("agg_{}", idx))
+        };
+
+        let upper_func = func_part.to_uppercase();
+
+        if upper_func.starts_with("COUNT(DISTINCT") {
+            let inner = extract_paren_content(func_part, "COUNT(DISTINCT");
+            let prop = strip_var_prefix(&inner);
+            aggregations.push((alias, CypherAggregation::CountDistinct(prop)));
+        } else if upper_func.starts_with("COUNT(") {
+            let inner = extract_paren_content(func_part, "COUNT(");
+            let prop = strip_var_prefix(&inner);
+            aggregations.push((alias, CypherAggregation::Count(prop)));
+        } else if upper_func.starts_with("SUM(") {
+            let inner = extract_paren_content(func_part, "SUM(");
+            let prop = strip_var_prefix(&inner);
+            aggregations.push((alias, CypherAggregation::Sum(prop)));
+        } else if upper_func.starts_with("AVG(") {
+            let inner = extract_paren_content(func_part, "AVG(");
+            let prop = strip_var_prefix(&inner);
+            aggregations.push((alias, CypherAggregation::Avg(prop)));
+        } else if upper_func.starts_with("MIN(") {
+            let inner = extract_paren_content(func_part, "MIN(");
+            let prop = strip_var_prefix(&inner);
+            aggregations.push((alias, CypherAggregation::Min(prop)));
+        } else if upper_func.starts_with("MAX(") {
+            let inner = extract_paren_content(func_part, "MAX(");
+            let prop = strip_var_prefix(&inner);
+            aggregations.push((alias, CypherAggregation::Max(prop)));
+        } else if upper_func.starts_with("COLLECT(") {
+            let inner = extract_paren_content(func_part, "COLLECT(");
+            let prop = strip_var_prefix(&inner);
+            aggregations.push((alias, CypherAggregation::Collect(prop)));
+        }
+    }
+
+    if aggregations.is_empty() {
+        CypherReturn::All
+    } else {
+        CypherReturn::Aggregations(aggregations)
+    }
+}
+
+/// Extract content inside parentheses after a prefix like "COUNT(".
+fn extract_paren_content(expr: &str, _prefix: &str) -> String {
+    let open = match expr.find('(') {
+        Some(p) => p,
+        None => return String::new(),
+    };
+    let close = match expr.rfind(')') {
+        Some(p) => p,
+        None => return String::new(),
+    };
+    if close <= open {
+        return String::new();
+    }
+    let inner = expr[open + 1..close].trim();
+    // Strip DISTINCT keyword if present
+    let upper = inner.to_uppercase();
+    if upper.starts_with("DISTINCT") {
+        inner[8..].trim().to_string()
+    } else {
+        inner.to_string()
+    }
+}
+
+/// Parse ORDER BY clause.
+fn cypher_parse_order_by(query: &str) -> Option<CypherOrderBy> {
+    let upper = query.to_uppercase();
+    let order_pos = upper.find("ORDER BY")?;
+    let after_order = &query[order_pos + 8..];
+
+    // End at LIMIT or SKIP
+    let upper_after = after_order.to_uppercase();
+    let end = [" LIMIT ", " SKIP "]
+        .iter()
+        .filter_map(|kw| upper_after.find(kw))
+        .min()
+        .unwrap_or(after_order.len());
+    let order_text = after_order[..end].trim();
+
+    let upper_order = order_text.to_uppercase();
+    let direction = if upper_order.ends_with(" DESC") {
+        CypherSortDir::Desc
+    } else {
+        CypherSortDir::Asc
+    };
+
+    // Strip ASC/DESC suffix
+    let key_part = if upper_order.ends_with(" ASC") || upper_order.ends_with(" DESC") {
+        let last_space = order_text.rfind(' ').unwrap_or(order_text.len());
+        order_text[..last_space].trim()
+    } else {
+        order_text
+    };
+
+    let key = strip_var_prefix(key_part);
+    if key.is_empty() {
+        None
+    } else {
+        Some(CypherOrderBy { key, direction })
+    }
+}
+
+/// Parse LIMIT value.
+fn cypher_parse_limit(query: &str) -> Option<usize> {
+    let upper = query.to_uppercase();
+    let limit_pos = upper.find("LIMIT")?;
+    let after_limit = query[limit_pos + 5..].trim();
+    after_limit
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse::<usize>().ok())
+}
+
+/// Parse SKIP value.
+fn cypher_parse_skip(query: &str) -> Option<usize> {
+    let upper = query.to_uppercase();
+    let skip_pos = upper.find("SKIP")?;
+    let after_skip = query[skip_pos + 4..].trim();
+    after_skip
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse::<usize>().ok())
+}
+
+/// Compute aggregations over matched node results.
+fn cypher_compute_aggregations(
+    gs: &GraphState,
+    node_ids: &[u64],
+    aggregations: &[(String, CypherAggregation)],
+) -> serde_json::Value {
+    let mut result = serde_json::Map::new();
+
+    for (alias, agg) in aggregations {
+        let value = match agg {
+            CypherAggregation::Count(prop) => {
+                if prop == "n" || prop == "*" || prop.is_empty() {
+                    serde_json::json!(node_ids.len())
+                } else {
+                    let count = node_ids.iter()
+                        .filter(|&&nid| {
+                            let v = gs.properties.get_node_property(nid, prop);
+                            v.is_some() && !matches!(v, Some(Value::Null))
+                        })
+                        .count();
+                    serde_json::json!(count)
+                }
+            }
+            CypherAggregation::CountDistinct(prop) => {
+                let mut seen = std::collections::HashSet::new();
+                for &nid in node_ids {
+                    if let Some(v) = gs.properties.get_node_property(nid, prop) {
+                        if !matches!(v, Value::Null) {
+                            seen.insert(format!("{:?}", v));
+                        }
+                    }
+                }
+                serde_json::json!(seen.len())
+            }
+            CypherAggregation::Sum(prop) => {
+                let mut sum = 0.0_f64;
+                for &nid in node_ids {
+                    if let Some(v) = gs.properties.get_node_property(nid, prop) {
+                        if let Some(f) = v.as_float() {
+                            sum += f;
+                        }
+                    }
+                }
+                // Return as int if no fractional part
+                if sum.fract() == 0.0 && sum.abs() < i64::MAX as f64 {
+                    serde_json::json!(sum as i64)
+                } else {
+                    serde_json::json!(sum)
+                }
+            }
+            CypherAggregation::Avg(prop) => {
+                let mut sum = 0.0_f64;
+                let mut count = 0_u64;
+                for &nid in node_ids {
+                    if let Some(v) = gs.properties.get_node_property(nid, prop) {
+                        if let Some(f) = v.as_float() {
+                            sum += f;
+                            count += 1;
+                        }
+                    }
+                }
+                if count > 0 {
+                    serde_json::json!(sum / count as f64)
+                } else {
+                    serde_json::Value::Null
+                }
+            }
+            CypherAggregation::Min(prop) => {
+                let mut min_val: Option<f64> = None;
+                for &nid in node_ids {
+                    if let Some(v) = gs.properties.get_node_property(nid, prop) {
+                        if let Some(f) = v.as_float() {
+                            min_val = Some(min_val.map_or(f, |m: f64| m.min(f)));
+                        }
+                    }
+                }
+                match min_val {
+                    Some(v) if v.fract() == 0.0 && v.abs() < i64::MAX as f64 => serde_json::json!(v as i64),
+                    Some(v) => serde_json::json!(v),
+                    None => serde_json::Value::Null,
+                }
+            }
+            CypherAggregation::Max(prop) => {
+                let mut max_val: Option<f64> = None;
+                for &nid in node_ids {
+                    if let Some(v) = gs.properties.get_node_property(nid, prop) {
+                        if let Some(f) = v.as_float() {
+                            max_val = Some(max_val.map_or(f, |m: f64| m.max(f)));
+                        }
+                    }
+                }
+                match max_val {
+                    Some(v) if v.fract() == 0.0 && v.abs() < i64::MAX as f64 => serde_json::json!(v as i64),
+                    Some(v) => serde_json::json!(v),
+                    None => serde_json::Value::Null,
+                }
+            }
+            CypherAggregation::Collect(prop) => {
+                let mut collected = Vec::new();
+                for &nid in node_ids {
+                    if let Some(v) = gs.properties.get_node_property(nid, prop) {
+                        if !matches!(v, Value::Null) {
+                            collected.push(cypher_value_to_json(v));
+                        }
+                    }
+                }
+                serde_json::Value::Array(collected)
+            }
+        };
+        result.insert(alias.clone(), value);
+    }
+
+    serde_json::Value::Object(result)
+}
+
+/// Apply ORDER BY to result rows by extracting a sort key from each row's "n.properties".
+fn cypher_apply_order_by(results: &mut [serde_json::Value], order: &CypherOrderBy) {
+    results.sort_by(|a, b| {
+        let a_val = &a["n"]["properties"][&order.key];
+        let b_val = &b["n"]["properties"][&order.key];
+
+        let cmp = compare_json_values(a_val, b_val);
+        match order.direction {
+            CypherSortDir::Asc => cmp,
+            CypherSortDir::Desc => cmp.reverse(),
+        }
+    });
+}
+
+/// Compare two JSON values for ordering.
+fn compare_json_values(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (serde_json::Value::Number(an), serde_json::Value::Number(bn)) => {
+            let af = an.as_f64().unwrap_or(0.0);
+            let bf = bn.as_f64().unwrap_or(0.0);
+            af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
+        }
+        (serde_json::Value::String(a_s), serde_json::Value::String(b_s)) => a_s.cmp(b_s),
+        (serde_json::Value::Null, serde_json::Value::Null) => std::cmp::Ordering::Equal,
+        (serde_json::Value::Null, _) => std::cmp::Ordering::Greater,
+        (_, serde_json::Value::Null) => std::cmp::Ordering::Less,
+        _ => std::cmp::Ordering::Equal,
     }
 }
 
@@ -3998,18 +4657,6 @@ fn extract_label_from_pattern(pattern: &str) -> Option<String> {
         None
     } else {
         Some(label.to_string())
-    }
-}
-
-/// Check if a node property matches a value (string comparison with type coercion).
-fn cypher_property_matches(gs: &GraphState, nid: u64, key: &str, value: &str) -> bool {
-    let prop = gs.properties.get_node_property(nid, key);
-    match prop {
-        Some(Value::String(s)) => s.as_str() == value,
-        Some(Value::Int(i)) => i.to_string() == value,
-        Some(Value::Float(f)) => f.to_string() == value,
-        Some(Value::Bool(b)) => b.to_string() == value,
-        _ => false,
     }
 }
 
@@ -9479,6 +10126,483 @@ mod tests {
             CommandResponse::Text(json_str) => {
                 let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
                 assert_eq!(results.len(), 4, "should find all 4 nodes (3 Person + 1 City)");
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    // ── Enhanced Cypher: WHERE operators ──────────────────────────────────
+
+    #[test]
+    fn test_cypher_where_greater_than() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) WHERE n.age > 28 RETURN n"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 2, "Alice(30) and Charlie(35) have age > 28");
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_where_less_than() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) WHERE n.age < 30 RETURN n"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 1, "only Bob(25) has age < 30");
+                assert_eq!(results[0]["n"]["properties"]["name"], "Bob");
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_where_gte_lte() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        // >= 30
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) WHERE n.age >= 30 RETURN n"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 2, "Alice(30) and Charlie(35) have age >= 30");
+            }
+            _ => panic!("expected Text response"),
+        }
+
+        // <= 25
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) WHERE n.age <= 25 RETURN n"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 1, "only Bob(25) has age <= 25");
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_where_not_equal() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) WHERE n.name <> 'Alice' RETURN n"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 2, "Bob and Charlie are not Alice");
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_where_contains() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) WHERE n.name CONTAINS 'li' RETURN n"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 2, "Alice and Charlie contain 'li'");
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_where_starts_ends_with() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        // STARTS WITH
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) WHERE n.name STARTS WITH 'Al' RETURN n"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0]["n"]["properties"]["name"], "Alice");
+            }
+            _ => panic!("expected Text response"),
+        }
+
+        // ENDS WITH
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) WHERE n.name ENDS WITH 'ob' RETURN n"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0]["n"]["properties"]["name"], "Bob");
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_where_and() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) WHERE n.age > 20 AND n.age < 32 RETURN n"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 2, "Bob(25) and Alice(30) match");
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_where_or() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) WHERE n.name = 'Alice' OR n.name = 'Charlie' RETURN n"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 2, "Alice and Charlie match OR");
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_where_is_null() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        // City nodes have no 'age' property
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n) WHERE n.age IS NULL RETURN n"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 1, "only City node has no age");
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_where_is_not_null() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n) WHERE n.age IS NOT NULL RETURN n"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 3, "3 Person nodes have age");
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    // ── Enhanced Cypher: RETURN aggregations ─────────────────────────────
+
+    #[test]
+    fn test_cypher_count() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) RETURN COUNT(n) AS total"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0]["total"], 3);
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_count_distinct() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        // All 4 nodes have different labels (Person x3, City x1 — but the _label
+        // property isn't exposed). Use "name" which is unique per node.
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n) RETURN COUNT(DISTINCT n.name) AS distinct_names"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0]["distinct_names"], 4);
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_sum_avg() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        // SUM of ages: 30 + 25 + 35 = 90
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) RETURN SUM(n.age) AS total_age"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results[0]["total_age"], 90);
+            }
+            _ => panic!("expected Text response"),
+        }
+
+        // AVG of ages: 90 / 3 = 30.0
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) RETURN AVG(n.age) AS avg_age"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results[0]["avg_age"], 30.0);
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_min_max() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) RETURN MIN(n.age) AS youngest, MAX(n.age) AS oldest"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results[0]["youngest"], 25);
+                assert_eq!(results[0]["oldest"], 35);
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_collect() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) RETURN COLLECT(n.name) AS names"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                let names = results[0]["names"].as_array().unwrap();
+                assert_eq!(names.len(), 3);
+                let name_strs: Vec<&str> = names.iter().map(|v| v.as_str().unwrap()).collect();
+                assert!(name_strs.contains(&"Alice"));
+                assert!(name_strs.contains(&"Bob"));
+                assert!(name_strs.contains(&"Charlie"));
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    // ── Enhanced Cypher: ORDER BY, LIMIT, SKIP ──────────────────────────
+
+    #[test]
+    fn test_cypher_order_by_asc() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) RETURN n ORDER BY n.age ASC"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 3);
+                assert_eq!(results[0]["n"]["properties"]["name"], "Bob");
+                assert_eq!(results[1]["n"]["properties"]["name"], "Alice");
+                assert_eq!(results[2]["n"]["properties"]["name"], "Charlie");
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_order_by_desc() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) RETURN n ORDER BY n.age DESC"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 3);
+                assert_eq!(results[0]["n"]["properties"]["name"], "Charlie");
+                assert_eq!(results[1]["n"]["properties"]["name"], "Alice");
+                assert_eq!(results[2]["n"]["properties"]["name"], "Bob");
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_limit() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) RETURN n LIMIT 2"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 2);
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_skip() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) RETURN n ORDER BY n.age ASC SKIP 1"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 2, "skip first, 2 remain");
+                // After ordering by age ASC (Bob=25, Alice=30, Charlie=35), skip 1 => Alice, Charlie
+                assert_eq!(results[0]["n"]["properties"]["name"], "Alice");
+                assert_eq!(results[1]["n"]["properties"]["name"], "Charlie");
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_order_limit_skip_combined() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) RETURN n ORDER BY n.age ASC SKIP 1 LIMIT 1"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0]["n"]["properties"]["name"], "Alice");
+            }
+            _ => panic!("expected Text response"),
+        }
+    }
+
+    #[test]
+    fn test_cypher_order_by_string() {
+        let engine = make_engine();
+        let _ids = setup_cypher_graph(&engine);
+
+        let cmd = parser::parse_command(
+            r#"CYPHER "cypher_g" MATCH (n:Person) RETURN n ORDER BY n.name ASC"#,
+        )
+        .unwrap();
+        let resp = engine.execute_command(cmd, None).unwrap();
+        match resp {
+            CommandResponse::Text(json_str) => {
+                let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
+                assert_eq!(results.len(), 3);
+                assert_eq!(results[0]["n"]["properties"]["name"], "Alice");
+                assert_eq!(results[1]["n"]["properties"]["name"], "Bob");
+                assert_eq!(results[2]["n"]["properties"]["name"], "Charlie");
             }
             _ => panic!("expected Text response"),
         }

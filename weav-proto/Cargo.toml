@@ -3,6 +3,10 @@ name = "weav-proto"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["grpc"]
+grpc = ["dep:tonic", "dep:prost", "dep:tonic-build"]
+
 [dependencies]
 weav-core = { path = "../weav-core" }
 weav-query = { path = "../weav-query" }
@@ -12,8 +16,8 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 compact_str = { workspace = true }
-tonic = { workspace = true }
-prost = { workspace = true }
+tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
 
 [build-dependencies]
-tonic-build = { workspace = true }
+tonic-build = { workspace = true, optional = true }

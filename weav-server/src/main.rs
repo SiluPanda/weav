@@ -1,7 +1,11 @@
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use weav_core::config::{WalSyncMode, WeavConfig};
-use weav_server::{engine::Engine, grpc_server::WeavGrpcService, http, resp3_server, tls};
+use weav_server::{engine::Engine, http};
+
+#[cfg(feature = "grpc")]
+use weav_server::grpc_server::WeavGrpcService;
+#[cfg(feature = "grpc")]
 use weav_proto::grpc::weav_service_server::WeavServiceServer;
 
 #[tokio::main]
@@ -107,51 +111,14 @@ async fn main() {
         tracing::info!("TTL sweep task started (10s interval)");
     }
 
+    // HTTP server (always enabled).
     let app = http::build_router(engine.clone());
-
     let http_addr = format!(
         "{}:{}",
         config.server.bind_address,
         config.server.http_port.unwrap_or(6382)
     );
-    let resp3_addr = format!(
-        "{}:{}",
-        config.server.bind_address,
-        config.server.port
-    );
-
-    // Load TLS config if enabled.
-    let tls_config = if config.server.tls_enabled {
-        let cert_path = config.server.tls_cert_path.as_deref().unwrap();
-        let key_path = config.server.tls_key_path.as_deref().unwrap();
-        match tls::load_tls_config(cert_path, key_path) {
-            Ok(tls_cfg) => {
-                tracing::info!("TLS enabled: cert={}, key={}", cert_path, key_path);
-                Some(tls_cfg)
-            }
-            Err(e) => {
-                tracing::error!("Failed to load TLS config: {e}");
-                std::process::exit(1);
-            }
-        }
-    } else {
-        None
-    };
-
-    let tls_scheme = if tls_config.is_some() { "s" } else { "" };
-    tracing::info!("Weav HTTP{} server listening on {}", tls_scheme, http_addr);
-    tracing::info!("Weav RESP3{} server listening on {}", if tls_config.is_some() { "+TLS" } else { "" }, resp3_addr);
-
-    let grpc_addr = format!(
-        "{}:{}",
-        config.server.bind_address,
-        config.server.grpc_port.unwrap_or(6381)
-    );
-
-    let engine_resp3 = engine.clone();
-    let resp3_handle = tokio::spawn(async move {
-        resp3_server::run_resp3_server(engine_resp3, &resp3_addr).await;
-    });
+    tracing::info!("Weav HTTP server listening on {}", http_addr);
 
     let http_listener = tokio::net::TcpListener::bind(&http_addr).await.unwrap();
     let http_shutdown_token = shutdown_token.clone();
@@ -162,42 +129,88 @@ async fn main() {
             .unwrap();
     });
 
-    let grpc_service = WeavGrpcService {
-        engine: engine.clone(),
+    // RESP3 server (optional).
+    #[cfg(feature = "resp3")]
+    let resp3_handle = {
+        let resp3_addr = format!(
+            "{}:{}",
+            config.server.bind_address,
+            config.server.port
+        );
+        tracing::info!("Weav RESP3 server listening on {}", resp3_addr);
+        let engine_resp3 = engine.clone();
+        tokio::spawn(async move {
+            weav_server::resp3_server::run_resp3_server(engine_resp3, &resp3_addr).await;
+        })
     };
-    tracing::info!("Weav gRPC server listening on {}", grpc_addr);
-    let grpc_addr_parsed: std::net::SocketAddr = grpc_addr.parse().unwrap();
-    let grpc_shutdown_token = shutdown_token.clone();
-    let grpc_tls_config = tls_config.clone();
-    let grpc_handle = tokio::spawn(async move {
+
+    // gRPC server (optional).
+    #[cfg(feature = "grpc")]
+    let grpc_handle = {
+        let grpc_addr = format!(
+            "{}:{}",
+            config.server.bind_address,
+            config.server.grpc_port.unwrap_or(6381)
+        );
+        tracing::info!("Weav gRPC server listening on {}", grpc_addr);
+        let grpc_service = WeavGrpcService {
+            engine: engine.clone(),
+        };
+        let grpc_addr_parsed: std::net::SocketAddr = grpc_addr.parse().unwrap();
+        let grpc_shutdown_token = shutdown_token.clone();
+
+        #[allow(unused_mut)]
         let mut builder = tonic::transport::Server::builder();
-        if let Some(ref _tls_cfg) = grpc_tls_config
-            && let (Some(cert_path), Some(key_path)) = (
+
+        #[cfg(feature = "tls")]
+        if config.server.tls_enabled {
+            if let (Some(cert_path), Some(key_path)) = (
                 config.server.tls_cert_path.as_deref(),
                 config.server.tls_key_path.as_deref(),
-            )
-            && let (Ok(cert), Ok(key)) = (
-                std::fs::read_to_string(cert_path),
-                std::fs::read_to_string(key_path),
-            )
-        {
-            let tls = tonic::transport::ServerTlsConfig::new()
-                .identity(tonic::transport::Identity::from_pem(cert, key));
-            builder = builder.tls_config(tls).expect("invalid gRPC TLS config");
-            tracing::info!("gRPC TLS enabled");
+            ) {
+                if let (Ok(cert), Ok(key)) = (
+                    std::fs::read_to_string(cert_path),
+                    std::fs::read_to_string(key_path),
+                ) {
+                    let tls = tonic::transport::ServerTlsConfig::new()
+                        .identity(tonic::transport::Identity::from_pem(cert, key));
+                    builder = builder.tls_config(tls).expect("invalid gRPC TLS config");
+                    tracing::info!("gRPC TLS enabled");
+                }
+            }
         }
-        builder
-            .add_service(WeavServiceServer::new(grpc_service))
-            .serve_with_shutdown(grpc_addr_parsed, async move {
-                grpc_shutdown_token.cancelled().await;
-            })
-            .await
-            .unwrap();
-    });
 
+        tokio::spawn(async move {
+            builder
+                .add_service(WeavServiceServer::new(grpc_service))
+                .serve_with_shutdown(grpc_addr_parsed, async move {
+                    grpc_shutdown_token.cancelled().await;
+                })
+                .await
+                .unwrap();
+        })
+    };
+
+    // Wait for servers to finish.
+    #[cfg(all(feature = "resp3", feature = "grpc"))]
     tokio::select! {
         _ = http_handle => {}
         _ = resp3_handle => {}
         _ = grpc_handle => {}
     }
+
+    #[cfg(all(feature = "resp3", not(feature = "grpc")))]
+    tokio::select! {
+        _ = http_handle => {}
+        _ = resp3_handle => {}
+    }
+
+    #[cfg(all(not(feature = "resp3"), feature = "grpc"))]
+    tokio::select! {
+        _ = http_handle => {}
+        _ = grpc_handle => {}
+    }
+
+    #[cfg(all(not(feature = "resp3"), not(feature = "grpc")))]
+    http_handle.await.unwrap();
 }

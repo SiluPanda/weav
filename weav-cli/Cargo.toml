@@ -8,7 +8,7 @@ name = "weav-cli"
 path = "src/main.rs"
 
 [dependencies]
-weav-proto = { path = "../weav-proto" }
+weav-proto = { path = "../weav-proto", default-features = false }
 weav-core = { path = "../weav-core" }
 clap = { workspace = true }
 tokio = { workspace = true }

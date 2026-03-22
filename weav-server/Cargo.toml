@@ -7,15 +7,22 @@ edition.workspace = true
 name = "weav-server"
 path = "src/main.rs"
 
+[features]
+default = ["extract", "grpc", "tls", "resp3"]
+extract = ["dep:weav-extract"]
+grpc = ["dep:tonic", "dep:prost", "weav-proto/grpc"]
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
+resp3 = ["dep:weav-proto"]
+
 [dependencies]
 weav-core = { path = "../weav-core" }
 weav-graph = { path = "../weav-graph" }
 weav-vector = { path = "../weav-vector" }
 weav-query = { path = "../weav-query" }
 weav-persist = { path = "../weav-persist" }
-weav-proto = { path = "../weav-proto" }
 weav-auth = { path = "../weav-auth" }
-weav-extract = { path = "../weav-extract" }
+weav-extract = { path = "../weav-extract", optional = true }
+weav-proto = { path = "../weav-proto", default-features = false, optional = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 axum = { workspace = true }
@@ -31,16 +38,16 @@ parking_lot = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 futures = "0.3"
-tonic = { workspace = true }
-prost = { workspace = true }
-prometheus = "0.13"
+tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+prometheus = { version = "0.13", default-features = false }
 base64 = { workspace = true }
 tokio-stream = "0.1"
 uuid = { version = "1", features = ["v4"] }
 csv = { workspace = true }
-rustls = { workspace = true }
-tokio-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }

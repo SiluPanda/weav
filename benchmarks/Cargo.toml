@@ -9,7 +9,7 @@ weav-graph = { path = "../weav-graph" }
 weav-vector = { path = "../weav-vector" }
 weav-query = { path = "../weav-query" }
 weav-persist = { path = "../weav-persist" }
-weav-server = { path = "../weav-server" }
+weav-server = { path = "../weav-server", default-features = false, features = [] }
 criterion = { workspace = true }
 compact_str = { workspace = true }
 

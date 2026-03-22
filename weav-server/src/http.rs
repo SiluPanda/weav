@@ -289,6 +289,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/graphs/{graph}/ingest", post(ingest))
         // Schema introspection.
         .route("/v1/graphs/{graph}/schema", get(get_graph_schema))
+        // Schema inference from data.
+        .route("/v1/graphs/{graph}/schema/infer", post(infer_schema))
+        // GNN neighbor sampling.
+        .route("/v1/graphs/{graph}/sample/neighbors", post(sample_neighbors))
         // Detailed graph statistics.
         .route(
             "/v1/graphs/{graph}/stats/detailed",
@@ -3066,6 +3070,214 @@ struct MstResponse {
     edge_count: usize,
 }
 
+// ─── Schema Inference ───────────────────────────────────────────────────────
+
+/// Infer schema from graph data.
+/// POST /v1/graphs/{graph}/schema/infer
+async fn infer_schema(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+) -> impl IntoResponse {
+    let _identity = extract_identity(&engine, &headers);
+    let graph_arc = match engine.get_graph(&graph) {
+        Ok(g) => g,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
+    let gs = graph_arc.read();
+
+    // Collect node type info
+    let all_nodes = gs.adjacency.all_node_ids();
+    let mut label_props: std::collections::HashMap<String, std::collections::HashMap<String, (String, u64, u64, std::collections::HashSet<String>)>> =
+        std::collections::HashMap::new();
+    let mut label_counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+
+    for &nid in &all_nodes {
+        let label = gs.properties
+            .get_node_property(nid, "_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        *label_counts.entry(label.clone()).or_insert(0) += 1;
+
+        let props = gs.properties.get_all_node_properties(nid);
+        let entry = label_props.entry(label).or_default();
+        for (key, value) in props {
+            if key.starts_with('_') { continue; }
+            let type_name = match value {
+                weav_core::types::Value::String(_) => "String",
+                weav_core::types::Value::Int(_) => "Int",
+                weav_core::types::Value::Float(_) => "Float",
+                weav_core::types::Value::Bool(_) => "Bool",
+                weav_core::types::Value::Vector(_) => "Vector",
+                weav_core::types::Value::List(_) => "List",
+                weav_core::types::Value::Map(_) => "Map",
+                weav_core::types::Value::Bytes(_) => "Bytes",
+                weav_core::types::Value::Timestamp(_) => "Timestamp",
+                weav_core::types::Value::Null => "Null",
+            }.to_string();
+            let val_str = format!("{:?}", value);
+            let e = entry.entry(key.to_string()).or_insert_with(|| (type_name.clone(), 0, 0, std::collections::HashSet::new()));
+            e.1 += 1; // present count
+            e.3.insert(val_str); // unique values
+        }
+    }
+
+    let node_types: Vec<serde_json::Value> = label_counts.iter().map(|(label, count)| {
+        let props = label_props.get(label);
+        let properties: Vec<serde_json::Value> = props.map(|p| {
+            p.iter().map(|(key, (type_name, present, _, uniq_vals))| {
+                let total = *count;
+                let null_rate = 1.0 - (*present as f64 / total as f64);
+                serde_json::json!({
+                    "key": key,
+                    "type": type_name,
+                    "required": null_rate == 0.0,
+                    "unique": uniq_vals.len() as u64 == *present,
+                    "null_rate": (null_rate * 1000.0).round() / 1000.0,
+                })
+            }).collect()
+        }).unwrap_or_default();
+        serde_json::json!({
+            "label": label,
+            "count": count,
+            "properties": properties,
+        })
+    }).collect();
+
+    // Collect edge type info
+    let mut edge_types: std::collections::HashMap<String, (u64, std::collections::HashSet<String>, std::collections::HashSet<String>)> =
+        std::collections::HashMap::new();
+    for (_, meta) in gs.adjacency.all_edges() {
+        let label = gs.interner.resolve_label(meta.label).unwrap_or("unknown").to_string();
+        let src_label = gs.properties
+            .get_node_property(meta.source, "_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let tgt_label = gs.properties
+            .get_node_property(meta.target, "_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let e = edge_types.entry(label).or_insert_with(|| (0, std::collections::HashSet::new(), std::collections::HashSet::new()));
+        e.0 += 1;
+        e.1.insert(src_label);
+        e.2.insert(tgt_label);
+    }
+
+    let edge_type_list: Vec<serde_json::Value> = edge_types.iter().map(|(label, (count, src, tgt))| {
+        serde_json::json!({
+            "label": label,
+            "count": count,
+            "source_labels": src.iter().collect::<Vec<_>>(),
+            "target_labels": tgt.iter().collect::<Vec<_>>(),
+        })
+    }).collect();
+
+    // Suggest indexes for properties that are unique and required (good lookup candidates).
+    let mut suggested_indexes: Vec<String> = Vec::new();
+    for (label, props) in &label_props {
+        if let Some(count) = label_counts.get(label) {
+            for (key, (_type_name, present, _, uniq_vals)) in props {
+                let is_required = *present == *count;
+                let is_unique = uniq_vals.len() as u64 == *present && *present > 0;
+                if is_required && is_unique {
+                    suggested_indexes.push(format!("{}.{}", label, key));
+                }
+            }
+        }
+    }
+    suggested_indexes.sort();
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::ok(serde_json::json!({
+            "node_types": node_types,
+            "edge_types": edge_type_list,
+            "suggested_indexes": suggested_indexes,
+            "total_nodes": all_nodes.len(),
+            "total_edges": gs.adjacency.edge_count(),
+        }))),
+    ).into_response()
+}
+
+// ─── GNN Neighbor Sampling ──────────────────────────────────────────────────
+
+/// POST /v1/graphs/{graph}/sample/neighbors
+/// Multi-hop neighbor sampling for GNN training (PyTorch Geometric compatible).
+async fn sample_neighbors(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::Read,
+    ) {
+        return weav_error_to_response(e).into_response();
+    }
+
+    let graph_arc = match engine.get_graph(&graph) {
+        Ok(arc) => arc,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
+    let gs = graph_arc.read();
+
+    let seed_nodes: Vec<u64> = match body.get("seed_nodes").and_then(|v| v.as_array()) {
+        Some(arr) => arr.iter().filter_map(|v| v.as_u64()).collect(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<()>::err(
+                    "missing required field: seed_nodes (array of node IDs)".to_string(),
+                )),
+            )
+                .into_response()
+        }
+    };
+
+    let num_neighbors: Vec<usize> = match body.get("num_neighbors").and_then(|v| v.as_array()) {
+        Some(arr) => arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<()>::err(
+                    "missing required field: num_neighbors (array of fan-out per hop)".to_string(),
+                )),
+            )
+                .into_response()
+        }
+    };
+
+    let seed = body.get("seed").and_then(|v| v.as_u64()).unwrap_or(42);
+
+    let result = weav_graph::traversal::neighbor_sample(
+        &gs.adjacency,
+        &seed_nodes,
+        &num_neighbors,
+        seed,
+    );
+
+    let num_nodes = result.node_ids.len();
+    let num_edges = result.edge_index.0.len();
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::ok(serde_json::json!({
+            "node_ids": result.node_ids,
+            "edge_index": [result.edge_index.0, result.edge_index.1],
+            "num_seeds": result.num_seeds,
+            "num_nodes": num_nodes,
+            "num_edges": num_edges,
+        }))),
+    )
+        .into_response()
+}
+
 // ─── Algorithm handler ──────────────────────────────────────────────────────
 
 async fn run_algorithm(
@@ -3089,6 +3301,16 @@ async fn run_algorithm(
     };
     let gs = graph_arc.read();
 
+    // Optional node_labels filter: restrict algorithms to nodes with matching _label.
+    let node_label_filter: Option<std::collections::HashSet<String>> = body
+        .get("node_labels")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        });
+
     match algorithm.as_str() {
         "pagerank" => {
             let damping = body
@@ -3101,8 +3323,23 @@ async fn run_algorithm(
                 .unwrap_or(20) as u32;
 
             // Uniform PPR = standard PageRank: seed every node with equal weight.
+            // If node_labels filter is set, only seed nodes matching the filter.
             let all_nodes = gs.adjacency.all_node_ids();
-            let seeds: Vec<(u64, f32)> = all_nodes.iter().map(|&nid| (nid, 1.0)).collect();
+            let seeds: Vec<(u64, f32)> = if let Some(ref labels) = node_label_filter {
+                all_nodes
+                    .iter()
+                    .filter(|&&nid| {
+                        gs.properties
+                            .get_node_property(nid, "_label")
+                            .and_then(|v| v.as_str())
+                            .map(|l| labels.contains(l))
+                            .unwrap_or(false)
+                    })
+                    .map(|&nid| (nid, 1.0))
+                    .collect()
+            } else {
+                all_nodes.iter().map(|&nid| (nid, 1.0)).collect()
+            };
 
             let scored = weav_graph::traversal::personalized_pagerank(
                 &gs.adjacency,
@@ -3114,6 +3351,17 @@ async fn run_algorithm(
 
             let mut scores: Vec<AlgoNodeScore> = scored
                 .iter()
+                .filter(|s| {
+                    if let Some(ref labels) = node_label_filter {
+                        gs.properties
+                            .get_node_property(s.node_id, "_label")
+                            .and_then(|v| v.as_str())
+                            .map(|l| labels.contains(l))
+                            .unwrap_or(false)
+                    } else {
+                        true
+                    }
+                })
                 .map(|s| AlgoNodeScore {
                     node_id: s.node_id,
                     score: s.score as f64,
@@ -3146,10 +3394,20 @@ async fn run_algorithm(
             let community_map =
                 weav_graph::traversal::modularity_communities(&gs.adjacency, 100, resolution);
 
-            // Group nodes by community.
+            // Group nodes by community, filtering by node_labels if set.
             let mut groups: std::collections::HashMap<u64, Vec<u64>> =
                 std::collections::HashMap::new();
             for (&node_id, &comm_id) in &community_map {
+                if let Some(ref labels) = node_label_filter {
+                    let matches = gs.properties
+                        .get_node_property(node_id, "_label")
+                        .and_then(|v| v.as_str())
+                        .map(|l| labels.contains(l))
+                        .unwrap_or(false);
+                    if !matches {
+                        continue;
+                    }
+                }
                 groups.entry(comm_id).or_default().push(node_id);
             }
             let mut communities: Vec<Vec<u64>> = groups.into_values().collect();
@@ -3258,6 +3516,16 @@ async fn run_algorithm(
             let label_map = weav_graph::traversal::label_propagation(&gs.adjacency, iterations);
             let mut groups: std::collections::HashMap<u64, Vec<u64>> = std::collections::HashMap::new();
             for (&node_id, &label) in &label_map {
+                if let Some(ref labels) = node_label_filter {
+                    let matches = gs.properties
+                        .get_node_property(node_id, "_label")
+                        .and_then(|v| v.as_str())
+                        .map(|l| labels.contains(l))
+                        .unwrap_or(false);
+                    if !matches {
+                        continue;
+                    }
+                }
                 groups.entry(label).or_default().push(node_id);
             }
             let mut communities: Vec<Vec<u64>> = groups.into_values().collect();
@@ -3273,6 +3541,16 @@ async fn run_algorithm(
             let community_map = weav_graph::traversal::leiden_communities(&gs.adjacency, 100, resolution, gamma);
             let mut groups: std::collections::HashMap<u64, Vec<u64>> = std::collections::HashMap::new();
             for (&node_id, &comm_id) in &community_map {
+                if let Some(ref labels) = node_label_filter {
+                    let matches = gs.properties
+                        .get_node_property(node_id, "_label")
+                        .and_then(|v| v.as_str())
+                        .map(|l| labels.contains(l))
+                        .unwrap_or(false);
+                    if !matches {
+                        continue;
+                    }
+                }
                 groups.entry(comm_id).or_default().push(node_id);
             }
             let mut communities: Vec<Vec<u64>> = groups.into_values().collect();
@@ -3623,7 +3901,9 @@ async fn run_algorithm(
                  topological_sort, triangle_count, degree, eigenvector, hits, fastrp, \
                  similarity, link_prediction, random_walk, k_core, max_flow, mst, \
                  harmonic, katz, article_rank, bellman_ford, k1_coloring, conductance, \
-                 clustering_coefficient"
+                 clustering_coefficient. \
+                 Optional: node_labels (array) filters results for pagerank, communities, \
+                 label_propagation, leiden"
             ))),
         )
             .into_response(),
@@ -5113,6 +5393,31 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_algorithm_pagerank_with_label_filter() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+        let (n1, _n2, _n3) = setup_triangle_graph(&engine, "pr_filter");
+
+        // PageRank with node_labels filter: only return nodes with label "a"
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/pr_filter/algorithms/pagerank")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"node_labels": ["a"]}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+
+        let scores = json["data"]["scores"].as_array().unwrap();
+        // Only node with label "a" should be in the results
+        assert_eq!(scores.len(), 1);
+        assert_eq!(scores[0]["node_id"].as_u64().unwrap(), n1);
+        assert!(scores[0]["score"].as_f64().unwrap() > 0.0);
     }
 
     #[tokio::test]
@@ -6734,5 +7039,142 @@ mod tests {
         }
 
         (ids[0], ids[1], ids[2])
+    }
+
+    // ── Schema inference tests ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_schema_infer_basic() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "infer_g".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        // Add Person nodes with typed properties
+        for (name, age) in &[("Alice", 30i64), ("Bob", 25)] {
+            engine
+                .execute_command(
+                    Command::NodeAdd(NodeAddCmd {
+                        graph: "infer_g".to_string(),
+                        label: "Person".to_string(),
+                        properties: vec![
+                            ("name".to_string(), Value::String(compact_str::CompactString::from(*name))),
+                            ("age".to_string(), Value::Int(*age)),
+                        ],
+                        embedding: None,
+                        entity_key: None,
+                        ttl_ms: None,
+                    }),
+                    None,
+                )
+                .unwrap();
+        }
+
+        // Add a City node (different label)
+        engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "infer_g".to_string(),
+                    label: "City".to_string(),
+                    properties: vec![
+                        ("name".to_string(), Value::String(compact_str::CompactString::from("London"))),
+                        ("population".to_string(), Value::Int(9000000)),
+                    ],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/infer_g/schema/infer")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+
+        let data = &json["data"];
+        assert_eq!(data["total_nodes"], 3);
+
+        // Check node_types
+        let node_types = data["node_types"].as_array().unwrap();
+        assert_eq!(node_types.len(), 2);
+
+        // Find Person type
+        let person_type = node_types
+            .iter()
+            .find(|t| t["label"] == "Person")
+            .expect("Person type should exist");
+        assert_eq!(person_type["count"], 2);
+
+        let person_props = person_type["properties"].as_array().unwrap();
+        let name_prop = person_props.iter().find(|p| p["key"] == "name").unwrap();
+        assert_eq!(name_prop["type"], "String");
+        assert_eq!(name_prop["required"], true);
+        assert_eq!(name_prop["unique"], true);
+        assert_eq!(name_prop["null_rate"], 0.0);
+
+        let age_prop = person_props.iter().find(|p| p["key"] == "age").unwrap();
+        assert_eq!(age_prop["type"], "Int");
+
+        // Check City type
+        let city_type = node_types
+            .iter()
+            .find(|t| t["label"] == "City")
+            .expect("City type should exist");
+        assert_eq!(city_type["count"], 1);
+
+        // Check suggested_indexes includes unique+required properties
+        let indexes = data["suggested_indexes"].as_array().unwrap();
+        let idx_strs: Vec<&str> = indexes.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(idx_strs.contains(&"Person.name"), "Person.name should be suggested");
+    }
+
+    #[tokio::test]
+    async fn test_schema_infer_empty_graph() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "empty_infer".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/empty_infer/schema/infer")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+
+        let data = &json["data"];
+        assert_eq!(data["total_nodes"], 0);
+        assert_eq!(data["total_edges"], 0);
+        assert!(data["node_types"].as_array().unwrap().is_empty());
+        assert!(data["edge_types"].as_array().unwrap().is_empty());
+        assert!(data["suggested_indexes"].as_array().unwrap().is_empty());
     }
 }

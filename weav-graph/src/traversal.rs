@@ -4139,6 +4139,127 @@ pub fn local_clustering_coefficient(adjacency: &AdjacencyStore) -> Vec<(NodeId, 
     result
 }
 
+// ─── GNN Neighbor Sampling ──────────────────────────────────────────────────
+
+/// Multi-hop neighbor sampling for GNN training (PyTorch Geometric compatible).
+/// Returns sampled subgraph with node IDs, edge indices, and features.
+pub struct NeighborSampleResult {
+    /// All unique node IDs in the sampled subgraph (seeds first, then sampled)
+    pub node_ids: Vec<NodeId>,
+    /// Edge index in COO format: (source_indices, target_indices) into node_ids
+    pub edge_index: (Vec<usize>, Vec<usize>),
+    /// Number of seed nodes (first N entries in node_ids)
+    pub num_seeds: usize,
+}
+
+/// Multi-hop neighbor sampling for GNN training.
+///
+/// Performs layered sampling starting from `seeds`, sampling up to
+/// `num_neighbors[hop]` neighbors per node at each hop level.
+/// Uses xorshift64 PRNG seeded by `seed` for deterministic sampling.
+pub fn neighbor_sample(
+    adjacency: &AdjacencyStore,
+    seeds: &[NodeId],
+    num_neighbors: &[usize],
+    seed: u64,
+) -> NeighborSampleResult {
+    // Map from NodeId -> position in node_ids vec
+    let mut node_index: HashMap<NodeId, usize> = HashMap::new();
+    let mut node_ids: Vec<NodeId> = Vec::new();
+
+    // Add seed nodes first
+    for &s in seeds {
+        if adjacency.has_node(s) && !node_index.contains_key(&s) {
+            let idx = node_ids.len();
+            node_index.insert(s, idx);
+            node_ids.push(s);
+        }
+    }
+    let num_seeds = node_ids.len();
+
+    let mut edge_sources: Vec<usize> = Vec::new();
+    let mut edge_targets: Vec<usize> = Vec::new();
+
+    // Track edges we've already added to avoid duplicates
+    let mut seen_edges: HashSet<(usize, usize)> = HashSet::new();
+
+    let mut rng_state: u64 = if seed == 0 { 1 } else { seed };
+    let mut frontier: Vec<NodeId> = node_ids.clone();
+
+    for hop in 0..num_neighbors.len() {
+        let fan_out = num_neighbors[hop];
+        let mut next_frontier: Vec<NodeId> = Vec::new();
+
+        for &node in &frontier {
+            // Collect all undirected neighbors
+            let mut neighbors: Vec<NodeId> = Vec::new();
+            for &(nbr, _) in adjacency.neighbors_out(node, None).iter() {
+                neighbors.push(nbr);
+            }
+            for &(nbr, _) in adjacency.neighbors_in(node, None).iter() {
+                if !neighbors.contains(&nbr) {
+                    neighbors.push(nbr);
+                }
+            }
+
+            if neighbors.is_empty() {
+                continue;
+            }
+
+            // Sample if more neighbors than fan_out
+            let sampled: Vec<NodeId> = if neighbors.len() <= fan_out {
+                neighbors
+            } else {
+                // Fisher-Yates partial shuffle using xorshift64
+                let mut pool = neighbors;
+                let take = fan_out.min(pool.len());
+                for i in 0..take {
+                    rng_state ^= rng_state << 13;
+                    rng_state ^= rng_state >> 7;
+                    rng_state ^= rng_state << 17;
+                    let j = i + (rng_state as usize) % (pool.len() - i);
+                    pool.swap(i, j);
+                }
+                pool.truncate(take);
+                pool
+            };
+
+            let node_idx = node_index[&node];
+
+            for nbr in sampled {
+                // Ensure neighbor is in node_ids
+                let nbr_idx = if let Some(&idx) = node_index.get(&nbr) {
+                    idx
+                } else {
+                    let idx = node_ids.len();
+                    node_index.insert(nbr, idx);
+                    node_ids.push(nbr);
+                    next_frontier.push(nbr);
+                    idx
+                };
+
+                // Add edge in both directions (undirected representation)
+                if seen_edges.insert((node_idx, nbr_idx)) {
+                    edge_sources.push(node_idx);
+                    edge_targets.push(nbr_idx);
+                }
+                if seen_edges.insert((nbr_idx, node_idx)) {
+                    edge_sources.push(nbr_idx);
+                    edge_targets.push(node_idx);
+                }
+            }
+        }
+
+        frontier = next_frontier;
+    }
+
+    NeighborSampleResult {
+        node_ids,
+        edge_index: (edge_sources, edge_targets),
+        num_seeds,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7622,5 +7743,46 @@ mod tests {
         for &(_, cc) in &result {
             assert!((cc).abs() < 1e-10, "expected 0.0, got {}", cc);
         }
+    }
+
+    // ─── Neighbor Sampling Tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_neighbor_sampling_basic() {
+        // Build a small graph: 1-2, 1-3, 2-4, 3-5
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=5 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(2, 4, 0, make_meta(2, 4, 0)).unwrap();
+        adj.add_edge(3, 5, 0, make_meta(3, 5, 0)).unwrap();
+
+        // Sample 1-hop neighbors of node 1 with large fan-out (get all)
+        let result = neighbor_sample(&adj, &[1], &[10], 42);
+        assert_eq!(result.num_seeds, 1);
+        assert_eq!(result.node_ids[0], 1); // seed first
+        assert!(result.node_ids.contains(&2));
+        assert!(result.node_ids.contains(&3));
+        // Edges should exist between seed and neighbors
+        assert!(!result.edge_index.0.is_empty());
+        assert_eq!(result.edge_index.0.len(), result.edge_index.1.len());
+
+        // 2-hop sampling: fan-out [10, 10] should reach nodes 4 and 5
+        let result2 = neighbor_sample(&adj, &[1], &[10, 10], 42);
+        assert_eq!(result2.num_seeds, 1);
+        assert!(result2.node_ids.contains(&4) || result2.node_ids.contains(&5),
+            "2-hop should reach at least one of nodes 4 or 5");
+    }
+
+    #[test]
+    fn test_neighbor_sampling_empty() {
+        let adj = AdjacencyStore::new();
+        let result = neighbor_sample(&adj, &[1, 2, 3], &[10, 5], 42);
+        assert_eq!(result.num_seeds, 0);
+        assert!(result.node_ids.is_empty());
+        assert!(result.edge_index.0.is_empty());
+        assert!(result.edge_index.1.is_empty());
     }
 }

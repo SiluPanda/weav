@@ -10,7 +10,13 @@
 
 pub mod engine;
 pub mod http;
-pub mod resp3_server;
-pub mod grpc_server;
 pub mod metrics;
+
+#[cfg(feature = "resp3")]
+pub mod resp3_server;
+
+#[cfg(feature = "grpc")]
+pub mod grpc_server;
+
+#[cfg(feature = "tls")]
 pub mod tls;
