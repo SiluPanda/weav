@@ -11,7 +11,7 @@ cargo build --workspace
 cargo build --release              # Optimized (thin LTO, codegen-units=1, opt-level=3)
 
 # Test
-cargo test --workspace             # All 1230+ Rust tests
+cargo test --workspace             # All 1327+ Rust tests
 cargo test -p weav-core            # Single crate
 cargo test -p weav-server          # Unit tests
 cargo test -p weav-server --test integration  # Integration tests

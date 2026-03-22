@@ -226,6 +226,60 @@ impl VectorIndex {
     pub fn contains(&self, node_id: NodeId) -> bool {
         self.node_to_key.contains_key(&node_id)
     }
+
+    /// Search with post-filtering: retrieve more candidates and apply a predicate.
+    ///
+    /// This is the standard approach for filtered vector search when the filter
+    /// is not integrated into the index structure. We over-fetch by
+    /// `oversample_factor` (default 4x) and then keep the top-k that pass.
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        k: u16,
+        filter: &dyn Fn(NodeId) -> bool,
+        ef_search: Option<u16>,
+    ) -> Result<Vec<(NodeId, f32)>, WeavError> {
+        self.validate_dims(query)?;
+
+        if self.inner.size() == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Over-fetch candidates to compensate for filtering
+        let oversample = (k as usize * 4).min(self.inner.size());
+
+        let original_ef = if let Some(ef) = ef_search {
+            let orig = self.inner.expansion_search();
+            self.inner.change_expansion_search(ef as usize);
+            Some(orig)
+        } else {
+            None
+        };
+
+        let matches = self
+            .inner
+            .search(query, oversample)
+            .map_err(|e| WeavError::Internal(format!("search failed: {e}")))?;
+
+        if let Some(orig) = original_ef {
+            self.inner.change_expansion_search(orig);
+        }
+
+        let results: Vec<(NodeId, f32)> = matches
+            .keys
+            .iter()
+            .zip(matches.distances.iter())
+            .filter_map(|(&key, &dist)| {
+                self.key_to_node
+                    .get(&key)
+                    .filter(|&&node_id| filter(node_id))
+                    .map(|&node_id| (node_id, dist))
+            })
+            .take(k as usize)
+            .collect();
+
+        Ok(results)
+    }
 }
 
 #[cfg(test)]

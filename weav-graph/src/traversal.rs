@@ -2808,6 +2808,678 @@ fn fastrp_hash(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+// ─── Node Similarity ────────────────────────────────────────────────────────
+
+/// Metric for node similarity computation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimilarityMetric {
+    Jaccard,
+    Cosine,
+    Overlap,
+}
+
+/// Collect all undirected neighbors for a node (both outgoing and incoming),
+/// excluding self-loops. Returns a `HashSet<NodeId>`.
+fn undirected_neighbors(adjacency: &AdjacencyStore, node: NodeId) -> HashSet<NodeId> {
+    let mut neighbors = HashSet::new();
+    for &(nbr, _) in adjacency.neighbors_out(node, None).iter() {
+        if nbr != node {
+            neighbors.insert(nbr);
+        }
+    }
+    for &(nbr, _) in adjacency.neighbors_in(node, None).iter() {
+        if nbr != node {
+            neighbors.insert(nbr);
+        }
+    }
+    neighbors
+}
+
+/// Compute Jaccard similarity between two nodes based on their neighborhoods.
+///
+/// J(a, b) = |N(a) ∩ N(b)| / |N(a) ∪ N(b)|
+///
+/// Returns 0.0 if both neighborhoods are empty. Returns 1.0 if both nodes
+/// are identical (same node ID).
+pub fn jaccard_similarity(adjacency: &AdjacencyStore, node_a: NodeId, node_b: NodeId) -> f64 {
+    let na = undirected_neighbors(adjacency, node_a);
+    let nb = undirected_neighbors(adjacency, node_b);
+    let union_size = na.union(&nb).count();
+    if union_size == 0 {
+        return 0.0;
+    }
+    let intersection_size = na.intersection(&nb).count();
+    intersection_size as f64 / union_size as f64
+}
+
+/// Compute Cosine similarity between two nodes based on their neighborhoods.
+///
+/// cos(a, b) = |N(a) ∩ N(b)| / sqrt(|N(a)| * |N(b)|)
+///
+/// Returns 0.0 if either neighborhood is empty.
+pub fn cosine_similarity(adjacency: &AdjacencyStore, node_a: NodeId, node_b: NodeId) -> f64 {
+    let na = undirected_neighbors(adjacency, node_a);
+    let nb = undirected_neighbors(adjacency, node_b);
+    let product = na.len() * nb.len();
+    if product == 0 {
+        return 0.0;
+    }
+    let intersection_size = na.intersection(&nb).count();
+    intersection_size as f64 / (product as f64).sqrt()
+}
+
+/// Compute Overlap coefficient between two nodes based on their neighborhoods.
+///
+/// overlap(a, b) = |N(a) ∩ N(b)| / min(|N(a)|, |N(b)|)
+///
+/// Returns 0.0 if either neighborhood is empty.
+pub fn overlap_similarity(adjacency: &AdjacencyStore, node_a: NodeId, node_b: NodeId) -> f64 {
+    let na = undirected_neighbors(adjacency, node_a);
+    let nb = undirected_neighbors(adjacency, node_b);
+    let min_size = na.len().min(nb.len());
+    if min_size == 0 {
+        return 0.0;
+    }
+    let intersection_size = na.intersection(&nb).count();
+    intersection_size as f64 / min_size as f64
+}
+
+/// Compute all-pairs node similarity (top-k).
+///
+/// Evaluates every pair of nodes using the specified metric and returns
+/// pairs sorted by similarity descending. Only includes pairs where
+/// similarity > 0.
+pub fn all_pairs_similarity(
+    adjacency: &AdjacencyStore,
+    metric: SimilarityMetric,
+    top_k: usize,
+) -> Vec<(NodeId, NodeId, f64)> {
+    let all_nodes = adjacency.all_node_ids();
+    let n = all_nodes.len();
+    let mut results: Vec<(NodeId, NodeId, f64)> = Vec::new();
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let a = all_nodes[i];
+            let b = all_nodes[j];
+            let sim = match metric {
+                SimilarityMetric::Jaccard => jaccard_similarity(adjacency, a, b),
+                SimilarityMetric::Cosine => cosine_similarity(adjacency, a, b),
+                SimilarityMetric::Overlap => overlap_similarity(adjacency, a, b),
+            };
+            if sim > 0.0 {
+                results.push((a, b, sim));
+            }
+        }
+    }
+
+    results.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+            .then(a.1.cmp(&b.1))
+    });
+    results.truncate(top_k);
+    results
+}
+
+// ─── Link Prediction ────────────────────────────────────────────────────────
+
+/// Metric for link prediction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkPredictionMetric {
+    AdamicAdar,
+    CommonNeighbors,
+    PreferentialAttachment,
+    ResourceAllocation,
+}
+
+/// Adamic-Adar index between two nodes.
+///
+/// sum(1 / log(|N(z)|)) for z in N(a) ∩ N(b)
+///
+/// Neighbors with degree 1 are skipped (log(1) = 0).
+pub fn adamic_adar(adjacency: &AdjacencyStore, node_a: NodeId, node_b: NodeId) -> f64 {
+    let na = undirected_neighbors(adjacency, node_a);
+    let nb = undirected_neighbors(adjacency, node_b);
+    let mut score = 0.0;
+    for &z in na.intersection(&nb) {
+        let degree = undirected_neighbors(adjacency, z).len();
+        if degree > 1 {
+            score += 1.0 / (degree as f64).ln();
+        }
+    }
+    score
+}
+
+/// Common neighbors count between two nodes.
+///
+/// |N(a) ∩ N(b)|
+pub fn common_neighbors_count(
+    adjacency: &AdjacencyStore,
+    node_a: NodeId,
+    node_b: NodeId,
+) -> usize {
+    let na = undirected_neighbors(adjacency, node_a);
+    let nb = undirected_neighbors(adjacency, node_b);
+    na.intersection(&nb).count()
+}
+
+/// Preferential attachment score between two nodes.
+///
+/// |N(a)| * |N(b)|
+pub fn preferential_attachment(
+    adjacency: &AdjacencyStore,
+    node_a: NodeId,
+    node_b: NodeId,
+) -> f64 {
+    let na = undirected_neighbors(adjacency, node_a).len();
+    let nb = undirected_neighbors(adjacency, node_b).len();
+    (na * nb) as f64
+}
+
+/// Resource allocation index between two nodes.
+///
+/// sum(1 / |N(z)|) for z in N(a) ∩ N(b)
+pub fn resource_allocation(
+    adjacency: &AdjacencyStore,
+    node_a: NodeId,
+    node_b: NodeId,
+) -> f64 {
+    let na = undirected_neighbors(adjacency, node_a);
+    let nb = undirected_neighbors(adjacency, node_b);
+    let mut score = 0.0;
+    for &z in na.intersection(&nb) {
+        let degree = undirected_neighbors(adjacency, z).len();
+        if degree > 0 {
+            score += 1.0 / degree as f64;
+        }
+    }
+    score
+}
+
+/// Predict top-k most likely new links based on the given metric.
+///
+/// Evaluates every pair of nodes that are NOT already directly connected
+/// and ranks them by the specified link prediction score. Returns pairs
+/// sorted descending by score.
+pub fn predict_links(
+    adjacency: &AdjacencyStore,
+    metric: LinkPredictionMetric,
+    top_k: usize,
+) -> Vec<(NodeId, NodeId, f64)> {
+    let all_nodes = adjacency.all_node_ids();
+    let n = all_nodes.len();
+    let mut results: Vec<(NodeId, NodeId, f64)> = Vec::new();
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let a = all_nodes[i];
+            let b = all_nodes[j];
+
+            // Skip pairs that are already connected (either direction)
+            if adjacency.edge_between(a, b, None).is_some()
+                || adjacency.edge_between(b, a, None).is_some()
+            {
+                continue;
+            }
+
+            let score = match metric {
+                LinkPredictionMetric::AdamicAdar => adamic_adar(adjacency, a, b),
+                LinkPredictionMetric::CommonNeighbors => {
+                    common_neighbors_count(adjacency, a, b) as f64
+                }
+                LinkPredictionMetric::PreferentialAttachment => {
+                    preferential_attachment(adjacency, a, b)
+                }
+                LinkPredictionMetric::ResourceAllocation => {
+                    resource_allocation(adjacency, a, b)
+                }
+            };
+            if score > 0.0 {
+                results.push((a, b, score));
+            }
+        }
+    }
+
+    results.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+            .then(a.1.cmp(&b.1))
+    });
+    results.truncate(top_k);
+    results
+}
+
+// ─── Random Walk ────────────────────────────────────────────────────────────
+
+/// Perform a simple random walk starting from a node.
+///
+/// At each step, picks a random undirected neighbor (both outgoing and
+/// incoming edges). If the current node has no neighbors, the walk
+/// terminates early.
+///
+/// Uses a deterministic xorshift64 PRNG seeded with the given seed for
+/// reproducibility.
+///
+/// Returns the sequence of visited node IDs (including the start node).
+pub fn random_walk(
+    adjacency: &AdjacencyStore,
+    start: NodeId,
+    length: usize,
+    seed: u64,
+) -> Vec<NodeId> {
+    let mut rng_state = if seed == 0 { 1 } else { seed };
+    let mut path = Vec::with_capacity(length + 1);
+    path.push(start);
+
+    let mut current = start;
+    for _ in 0..length {
+        let mut neighbors: Vec<NodeId> = Vec::new();
+        for &(nbr, _) in adjacency.neighbors_out(current, None).iter() {
+            neighbors.push(nbr);
+        }
+        for &(nbr, _) in adjacency.neighbors_in(current, None).iter() {
+            neighbors.push(nbr);
+        }
+
+        if neighbors.is_empty() {
+            break;
+        }
+
+        // Xorshift64
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+
+        let idx = (rng_state as usize) % neighbors.len();
+        current = neighbors[idx];
+        path.push(current);
+    }
+
+    path
+}
+
+// ─── K-Core Decomposition ───────────────────────────────────────────────────
+
+/// K-Core decomposition: assigns each node its core number.
+///
+/// The core number of a node is the largest k such that the node belongs
+/// to a k-core (a maximal subgraph where every node has degree >= k).
+///
+/// Uses the standard peeling algorithm: repeatedly removes the node with
+/// the smallest effective degree, assigning core number = current minimum
+/// degree. Treats the graph as undirected.
+///
+/// Returns a map from NodeId to its core number.
+pub fn k_core_decomposition(adjacency: &AdjacencyStore) -> HashMap<NodeId, u32> {
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() {
+        return HashMap::new();
+    }
+
+    // Compute initial undirected degree for each node
+    let mut degree: HashMap<NodeId, u32> = HashMap::with_capacity(all_nodes.len());
+    for &node in &all_nodes {
+        let d = undirected_neighbors(adjacency, node).len() as u32;
+        degree.insert(node, d);
+    }
+
+    // Build sorted list by degree for the peeling order
+    let mut nodes_by_degree: Vec<NodeId> = all_nodes.clone();
+    nodes_by_degree.sort_by_key(|n| degree[n]);
+
+    let mut core_number: HashMap<NodeId, u32> = HashMap::with_capacity(all_nodes.len());
+    let mut removed: HashSet<NodeId> = HashSet::new();
+
+    for &node in &nodes_by_degree {
+        if removed.contains(&node) {
+            continue;
+        }
+        let k = degree[&node];
+        core_number.insert(node, k);
+        removed.insert(node);
+
+        // Decrease degree of remaining neighbors
+        for nbr in undirected_neighbors(adjacency, node) {
+            if !removed.contains(&nbr)
+                && let Some(d) = degree.get_mut(&nbr)
+                && *d > k
+            {
+                *d = (*d).saturating_sub(1);
+            }
+        }
+    }
+
+    // Re-sort remaining nodes after degree updates by re-running peeling
+    // The simple approach above doesn't correctly handle re-ordering after
+    // degree decreases. Use the standard BZ algorithm instead.
+    //
+    // Reset and do it properly with a bucket-based approach.
+    core_number.clear();
+    let mut deg: HashMap<NodeId, u32> = HashMap::with_capacity(all_nodes.len());
+    for &node in &all_nodes {
+        let d = undirected_neighbors(adjacency, node).len() as u32;
+        deg.insert(node, d);
+    }
+
+    let max_deg = deg.values().copied().max().unwrap_or(0);
+    let mut buckets: Vec<Vec<NodeId>> = vec![Vec::new(); (max_deg + 1) as usize];
+    let mut pos: HashMap<NodeId, usize> = HashMap::with_capacity(all_nodes.len());
+
+    for &node in &all_nodes {
+        let d = deg[&node] as usize;
+        pos.insert(node, buckets[d].len());
+        buckets[d].push(node);
+    }
+
+    let mut processed: HashSet<NodeId> = HashSet::new();
+
+    for k in 0..=max_deg {
+        while let Some(node) = buckets[k as usize].pop() {
+            if processed.contains(&node) {
+                continue;
+            }
+            core_number.insert(node, k);
+            processed.insert(node);
+
+            for nbr in undirected_neighbors(adjacency, node) {
+                if !processed.contains(&nbr) {
+                    let old_d = deg[&nbr];
+                    if old_d > k {
+                        let new_d = old_d - 1;
+                        deg.insert(nbr, new_d);
+                        buckets[new_d as usize].push(nbr);
+                    }
+                }
+            }
+        }
+    }
+
+    core_number
+}
+
+// ─── Max Flow (Edmonds-Karp) ────────────────────────────────────────────────
+
+/// Result of a maximum flow computation.
+pub struct MaxFlowResult {
+    /// The maximum flow value from source to sink.
+    pub max_flow: f64,
+    /// Per-edge flow assignments.
+    pub flow_edges: Vec<FlowEdge>,
+}
+
+/// Flow assignment on a single edge.
+pub struct FlowEdge {
+    pub source: NodeId,
+    pub target: NodeId,
+    pub flow: f64,
+    pub capacity: f64,
+}
+
+/// Compute maximum flow from source to sink using Edmonds-Karp algorithm
+/// (BFS-based Ford-Fulkerson).
+///
+/// Edge weights are used as capacities. The graph is treated as directed;
+/// for each directed edge a reverse residual edge with zero capacity is
+/// created.
+///
+/// Returns the maximum flow value and the flow on each edge with non-zero
+/// flow.
+pub fn max_flow(
+    adjacency: &AdjacencyStore,
+    source: NodeId,
+    sink: NodeId,
+) -> WeavResult<MaxFlowResult> {
+    if source == sink {
+        return Ok(MaxFlowResult {
+            max_flow: 0.0,
+            flow_edges: Vec::new(),
+        });
+    }
+
+    if !adjacency.has_node(source) {
+        return Err(WeavError::NodeNotFound(source, 0));
+    }
+    if !adjacency.has_node(sink) {
+        return Err(WeavError::NodeNotFound(sink, 0));
+    }
+
+    // Build capacity/flow graph using adjacency list of indices.
+    // Map NodeId -> index for efficient lookup.
+    let all_nodes = adjacency.all_node_ids();
+    let node_to_idx: HashMap<NodeId, usize> = all_nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| (n, i))
+        .collect();
+    let n = all_nodes.len();
+
+    // Adjacency list of (neighbor_index, edge_index_in_edges_vec)
+    let mut graph: Vec<Vec<usize>> = vec![Vec::new(); n];
+    // Edges stored as (from_idx, to_idx, capacity, flow)
+    let mut edges: Vec<(usize, usize, f64, f64)> = Vec::new();
+
+    // Add forward and reverse edges for each directed edge
+    for (_, meta) in adjacency.all_edges() {
+        let src_idx = node_to_idx[&meta.source];
+        let tgt_idx = node_to_idx[&meta.target];
+        let cap = meta.weight as f64;
+
+        let fwd_idx = edges.len();
+        edges.push((src_idx, tgt_idx, cap, 0.0));
+        let rev_idx = edges.len();
+        edges.push((tgt_idx, src_idx, 0.0, 0.0));
+
+        graph[src_idx].push(fwd_idx);
+        graph[tgt_idx].push(rev_idx);
+    }
+
+    let source_idx = node_to_idx[&source];
+    let sink_idx = node_to_idx[&sink];
+    let mut total_flow = 0.0;
+
+    // BFS to find augmenting paths
+    loop {
+        let mut parent_edge: Vec<Option<usize>> = vec![None; n];
+        let mut visited = vec![false; n];
+        let mut queue = VecDeque::new();
+        visited[source_idx] = true;
+        queue.push_back(source_idx);
+
+        while let Some(u) = queue.pop_front() {
+            if u == sink_idx {
+                break;
+            }
+            for &edge_idx in &graph[u] {
+                let (_, to, cap, flow) = edges[edge_idx];
+                let residual = cap - flow;
+                if !visited[to] && residual > 1e-12 {
+                    visited[to] = true;
+                    parent_edge[to] = Some(edge_idx);
+                    queue.push_back(to);
+                }
+            }
+        }
+
+        if !visited[sink_idx] {
+            break;
+        }
+
+        // Find bottleneck
+        let mut bottleneck = f64::INFINITY;
+        let mut v = sink_idx;
+        while v != source_idx {
+            let edge_idx = parent_edge[v].unwrap();
+            let (_, _, cap, flow) = edges[edge_idx];
+            bottleneck = bottleneck.min(cap - flow);
+            v = edges[edge_idx].0;
+        }
+
+        // Update flow along the path
+        v = sink_idx;
+        while v != source_idx {
+            let edge_idx = parent_edge[v].unwrap();
+            edges[edge_idx].3 += bottleneck;
+            // Reverse edge is always edge_idx ^ 1 (they are added in pairs)
+            let rev_idx = edge_idx ^ 1;
+            edges[rev_idx].3 -= bottleneck;
+            v = edges[edge_idx].0;
+        }
+
+        total_flow += bottleneck;
+    }
+
+    // Collect flow edges (only forward edges with positive flow)
+    let mut flow_edges = Vec::new();
+    for (i, &(from, to, cap, flow)) in edges.iter().enumerate() {
+        if i % 2 == 0 && flow > 1e-12 {
+            flow_edges.push(FlowEdge {
+                source: all_nodes[from],
+                target: all_nodes[to],
+                flow,
+                capacity: cap,
+            });
+        }
+    }
+
+    Ok(MaxFlowResult {
+        max_flow: total_flow,
+        flow_edges,
+    })
+}
+
+// ─── Minimum Spanning Tree (Kruskal's) ─────────────────────────────────────
+
+/// Result of a minimum spanning tree computation.
+pub struct MstResult {
+    /// Edges in the minimum spanning tree.
+    pub edges: Vec<MstEdge>,
+    /// Total weight of the MST.
+    pub total_weight: f64,
+}
+
+/// An edge in the minimum spanning tree.
+pub struct MstEdge {
+    pub source: NodeId,
+    pub target: NodeId,
+    pub edge_id: EdgeId,
+    pub weight: f64,
+}
+
+/// Union-Find (Disjoint Set Union) for cycle detection in Kruskal's algorithm.
+struct UnionFind {
+    parent: HashMap<NodeId, NodeId>,
+    rank: HashMap<NodeId, u32>,
+}
+
+impl UnionFind {
+    fn new(nodes: &[NodeId]) -> Self {
+        let mut parent = HashMap::with_capacity(nodes.len());
+        let mut rank = HashMap::with_capacity(nodes.len());
+        for &node in nodes {
+            parent.insert(node, node);
+            rank.insert(node, 0);
+        }
+        Self { parent, rank }
+    }
+
+    fn find(&mut self, mut x: NodeId) -> NodeId {
+        while self.parent[&x] != x {
+            let grandparent = self.parent[&self.parent[&x]];
+            self.parent.insert(x, grandparent);
+            x = grandparent;
+        }
+        x
+    }
+
+    fn union(&mut self, a: NodeId, b: NodeId) -> bool {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra == rb {
+            return false;
+        }
+        let rank_a = self.rank[&ra];
+        let rank_b = self.rank[&rb];
+        if rank_a < rank_b {
+            self.parent.insert(ra, rb);
+        } else if rank_a > rank_b {
+            self.parent.insert(rb, ra);
+        } else {
+            self.parent.insert(rb, ra);
+            self.rank.insert(ra, rank_a + 1);
+        }
+        true
+    }
+}
+
+/// Compute the minimum spanning tree using Kruskal's algorithm.
+///
+/// Uses edge weights as costs (lower weight = preferred). Since Weav edge
+/// weights represent strength (higher = stronger connection), this finds
+/// the tree that connects all nodes using the weakest (cheapest) edges.
+///
+/// Only considers the graph as undirected; duplicate edges between the
+/// same pair of nodes (in both directions) are deduplicated by keeping
+/// the one with the lower weight.
+///
+/// Returns the edges in the MST and the total weight.
+pub fn minimum_spanning_tree(adjacency: &AdjacencyStore) -> MstResult {
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() {
+        return MstResult {
+            edges: Vec::new(),
+            total_weight: 0.0,
+        };
+    }
+
+    // Collect all edges, dedup by (min(src,tgt), max(src,tgt)) keeping lowest weight
+    let mut edge_map: HashMap<(NodeId, NodeId), (EdgeId, f64)> = HashMap::new();
+    for (eid, meta) in adjacency.all_edges() {
+        let key = if meta.source <= meta.target {
+            (meta.source, meta.target)
+        } else {
+            (meta.target, meta.source)
+        };
+        let w = meta.weight as f64;
+        let entry = edge_map.entry(key).or_insert((eid, w));
+        if w < entry.1 {
+            *entry = (eid, w);
+        }
+    }
+
+    // Sort edges by weight ascending (lower weight = lower cost)
+    let mut sorted_edges: Vec<((NodeId, NodeId), (EdgeId, f64))> =
+        edge_map.into_iter().collect();
+    sorted_edges.sort_by(|a, b| {
+        a.1 .1
+            .partial_cmp(&b.1 .1)
+            .unwrap_or(Ordering::Equal)
+    });
+
+    let mut uf = UnionFind::new(&all_nodes);
+    let mut mst_edges = Vec::new();
+    let mut total_weight = 0.0;
+
+    for ((src, tgt), (eid, weight)) in sorted_edges {
+        if uf.union(src, tgt) {
+            mst_edges.push(MstEdge {
+                source: src,
+                target: tgt,
+                edge_id: eid,
+                weight,
+            });
+            total_weight += weight;
+        }
+    }
+
+    MstResult {
+        edges: mst_edges,
+        total_weight,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5379,5 +6051,631 @@ mod tests {
                 "node {nid} embedding norm={norm}, expected ~1.0"
             );
         }
+    }
+
+    // ─── Node Similarity Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_jaccard_triangle() {
+        // Triangle: 1-2-3-1 (bidirectional)
+        // N(1) = {2, 3}, N(2) = {1, 3}, N(3) = {1, 2}
+        // J(1,2) = |{3}| / |{1, 2, 3}| = 1/3
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let sim = jaccard_similarity(&adj, 1, 2);
+        assert!(
+            (sim - 1.0 / 3.0).abs() < 1e-10,
+            "expected 1/3, got {sim}"
+        );
+    }
+
+    #[test]
+    fn test_jaccard_isolated_node() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        let sim = jaccard_similarity(&adj, 1, 2);
+        assert_eq!(sim, 0.0);
+    }
+
+    #[test]
+    fn test_jaccard_identical_neighbors() {
+        // Star: center=1, spokes 2,3,4. Nodes 2,3,4 all have neighbor {1}.
+        // J(2,3) = |{1}| / |{1}| = 1.0
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=4 {
+            adj.add_node(i);
+        }
+        for i in 2..=4 {
+            adj.add_edge(1, i, 0, make_meta(1, i, 0)).unwrap();
+            adj.add_edge(i, 1, 0, make_meta(i, 1, 0)).unwrap();
+        }
+        let sim = jaccard_similarity(&adj, 2, 3);
+        assert!((sim - 1.0).abs() < 1e-10, "expected 1.0, got {sim}");
+    }
+
+    #[test]
+    fn test_cosine_triangle() {
+        // Triangle: N(1) = {2,3}, N(2) = {1,3}
+        // cos(1,2) = |{3}| / sqrt(2*2) = 1/2
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let sim = cosine_similarity(&adj, 1, 2);
+        assert!((sim - 0.5).abs() < 1e-10, "expected 0.5, got {sim}");
+    }
+
+    #[test]
+    fn test_cosine_empty_neighborhood() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        assert_eq!(cosine_similarity(&adj, 1, 2), 0.0);
+    }
+
+    #[test]
+    fn test_cosine_star_spokes() {
+        // Star: center=1, spokes 2,3. N(2) = {1}, N(3) = {1}
+        // cos(2,3) = |{1}| / sqrt(1*1) = 1.0
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let sim = cosine_similarity(&adj, 2, 3);
+        assert!((sim - 1.0).abs() < 1e-10, "expected 1.0, got {sim}");
+    }
+
+    #[test]
+    fn test_overlap_triangle() {
+        // Triangle: N(1) = {2,3}, N(2) = {1,3}
+        // overlap(1,2) = |{3}| / min(2,2) = 1/2
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let sim = overlap_similarity(&adj, 1, 2);
+        assert!((sim - 0.5).abs() < 1e-10, "expected 0.5, got {sim}");
+    }
+
+    #[test]
+    fn test_overlap_subset_neighbors() {
+        // 1->2, 1->3, 1->4 (bidirectional), 2->3 (bidirectional)
+        // N(1) = {2,3,4}, N(2) = {1,3}
+        // overlap(1,2) = |{3}| / min(3,2) = 1/2
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=4 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+        adj.add_edge(1, 4, 0, make_meta(1, 4, 0)).unwrap();
+        adj.add_edge(4, 1, 0, make_meta(4, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+
+        let sim = overlap_similarity(&adj, 1, 2);
+        assert!((sim - 0.5).abs() < 1e-10, "expected 0.5, got {sim}");
+    }
+
+    #[test]
+    fn test_overlap_empty() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        assert_eq!(overlap_similarity(&adj, 1, 2), 0.0);
+    }
+
+    #[test]
+    fn test_all_pairs_similarity() {
+        // Triangle graph: all pairs should have Jaccard = 1/3
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let results = all_pairs_similarity(&adj, SimilarityMetric::Jaccard, 10);
+        assert_eq!(results.len(), 3);
+        for (_, _, sim) in &results {
+            assert!(
+                (sim - 1.0 / 3.0).abs() < 1e-10,
+                "expected 1/3, got {sim}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_pairs_similarity_top_k() {
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let results = all_pairs_similarity(&adj, SimilarityMetric::Cosine, 1);
+        assert_eq!(results.len(), 1);
+    }
+
+    // ─── Link Prediction Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_adamic_adar_triangle() {
+        // Triangle: N(1)={2,3}, N(2)={1,3}, common={3}
+        // |N(3)| = 2, so AA = 1/ln(2)
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let score = adamic_adar(&adj, 1, 2);
+        let expected = 1.0 / 2.0_f64.ln();
+        assert!(
+            (score - expected).abs() < 1e-10,
+            "expected {expected}, got {score}"
+        );
+    }
+
+    #[test]
+    fn test_adamic_adar_no_common() {
+        // No common neighbors
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=4 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(3, 4, 0, make_meta(3, 4, 0)).unwrap();
+
+        let score = adamic_adar(&adj, 1, 3);
+        assert_eq!(score, 0.0);
+    }
+
+    #[test]
+    fn test_adamic_adar_empty() {
+        let adj = AdjacencyStore::new();
+        let score = adamic_adar(&adj, 1, 2);
+        assert_eq!(score, 0.0);
+    }
+
+    #[test]
+    fn test_common_neighbors_count_triangle() {
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        assert_eq!(common_neighbors_count(&adj, 1, 2), 1); // common = {3}
+    }
+
+    #[test]
+    fn test_common_neighbors_count_isolated() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        assert_eq!(common_neighbors_count(&adj, 1, 2), 0);
+    }
+
+    #[test]
+    fn test_common_neighbors_count_star() {
+        // Star with center 1: N(2)={1}, N(3)={1}, common = {1}
+        let adj = build_star_graph();
+        assert_eq!(common_neighbors_count(&adj, 2, 3), 1);
+    }
+
+    #[test]
+    fn test_preferential_attachment_star() {
+        // Star: |N(1)|=4, |N(2)|=1 -> PA = 4
+        let adj = build_star_graph();
+        let score = preferential_attachment(&adj, 1, 2);
+        assert!((score - 4.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_preferential_attachment_isolated() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        assert_eq!(preferential_attachment(&adj, 1, 2), 0.0);
+    }
+
+    #[test]
+    fn test_preferential_attachment_complete() {
+        // Complete graph K3: |N(1)|=2, |N(2)|=2 -> PA = 4
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let score = preferential_attachment(&adj, 1, 2);
+        assert!((score - 4.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_resource_allocation_triangle() {
+        // Triangle: common neighbor of (1,2) is {3}, |N(3)| = 2
+        // RA = 1/2 = 0.5
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let score = resource_allocation(&adj, 1, 2);
+        assert!((score - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_resource_allocation_empty() {
+        let adj = AdjacencyStore::new();
+        assert_eq!(resource_allocation(&adj, 1, 2), 0.0);
+    }
+
+    #[test]
+    fn test_resource_allocation_no_common() {
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=4 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(3, 4, 0, make_meta(3, 4, 0)).unwrap();
+
+        assert_eq!(resource_allocation(&adj, 1, 3), 0.0);
+    }
+
+    #[test]
+    fn test_predict_links_basic() {
+        // Path: 1-2-3 (bidirectional), predict link 1-3
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+
+        let predictions = predict_links(&adj, LinkPredictionMetric::CommonNeighbors, 5);
+        assert_eq!(predictions.len(), 1);
+        assert_eq!(predictions[0].0, 1);
+        assert_eq!(predictions[0].1, 3);
+        assert!((predictions[0].2 - 1.0).abs() < 1e-10); // 1 common neighbor (2)
+    }
+
+    #[test]
+    fn test_predict_links_empty_graph() {
+        let adj = AdjacencyStore::new();
+        let predictions = predict_links(&adj, LinkPredictionMetric::AdamicAdar, 5);
+        assert!(predictions.is_empty());
+    }
+
+    #[test]
+    fn test_predict_links_complete_graph() {
+        // Complete graph: no links to predict
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let predictions =
+            predict_links(&adj, LinkPredictionMetric::PreferentialAttachment, 5);
+        assert!(predictions.is_empty());
+    }
+
+    // ─── Random Walk Tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_random_walk_basic() {
+        let adj = build_linear_graph();
+        let walk = random_walk(&adj, 1, 10, 42);
+        assert!(!walk.is_empty());
+        assert_eq!(walk[0], 1);
+        // Walk length should be at most length+1 (start + steps)
+        assert!(walk.len() <= 11);
+    }
+
+    #[test]
+    fn test_random_walk_isolated_node() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        let walk = random_walk(&adj, 1, 10, 42);
+        assert_eq!(walk, vec![1]); // Terminates immediately
+    }
+
+    #[test]
+    fn test_random_walk_deterministic() {
+        // Same seed should produce the same walk
+        let adj = build_linear_graph();
+        let walk1 = random_walk(&adj, 1, 5, 12345);
+        let walk2 = random_walk(&adj, 1, 5, 12345);
+        assert_eq!(walk1, walk2);
+    }
+
+    #[test]
+    fn test_random_walk_zero_length() {
+        let adj = build_linear_graph();
+        let walk = random_walk(&adj, 1, 0, 42);
+        assert_eq!(walk, vec![1]);
+    }
+
+    // ─── K-Core Decomposition Tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_k_core_triangle() {
+        // Complete triangle: each node has degree 2, so all are in 2-core
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let cores = k_core_decomposition(&adj);
+        assert_eq!(cores[&1], 2);
+        assert_eq!(cores[&2], 2);
+        assert_eq!(cores[&3], 2);
+    }
+
+    #[test]
+    fn test_k_core_empty() {
+        let adj = AdjacencyStore::new();
+        let cores = k_core_decomposition(&adj);
+        assert!(cores.is_empty());
+    }
+
+    #[test]
+    fn test_k_core_star() {
+        // Star: center has degree 4, leaves have degree 1
+        // All nodes should be in 1-core (removing a leaf doesn't change min degree)
+        let adj = build_star_graph();
+        let cores = k_core_decomposition(&adj);
+        assert_eq!(cores[&1], 1); // center
+        for i in 2..=5 {
+            assert_eq!(cores[&i], 1, "leaf {i} should be 1-core");
+        }
+    }
+
+    #[test]
+    fn test_k_core_isolated_node() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        let cores = k_core_decomposition(&adj);
+        assert_eq!(cores[&1], 0);
+    }
+
+    // ─── Max Flow Tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_max_flow_simple_path() {
+        // 1 --(w=3)--> 2 --(w=2)--> 3
+        // Max flow from 1 to 3 = 2 (bottleneck at edge 2->3)
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
+        let meta1 = EdgeMeta {
+            source: 1, target: 2, label: 0,
+            temporal: BiTemporal::new_current(1000),
+            provenance: None, weight: 3.0, token_cost: 0,
+        };
+        adj.add_edge(1, 2, 0, meta1).unwrap();
+        let meta2 = EdgeMeta {
+            source: 2, target: 3, label: 0,
+            temporal: BiTemporal::new_current(1000),
+            provenance: None, weight: 2.0, token_cost: 0,
+        };
+        adj.add_edge(2, 3, 0, meta2).unwrap();
+
+        let result = max_flow(&adj, 1, 3).unwrap();
+        assert!((result.max_flow - 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_max_flow_same_node() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        let result = max_flow(&adj, 1, 1).unwrap();
+        assert_eq!(result.max_flow, 0.0);
+    }
+
+    #[test]
+    fn test_max_flow_no_path() {
+        // Two disconnected nodes
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        let result = max_flow(&adj, 1, 2).unwrap();
+        assert_eq!(result.max_flow, 0.0);
+    }
+
+    #[test]
+    fn test_max_flow_parallel_paths() {
+        // 1 -> 2 (w=3), 1 -> 3 (w=2), 2 -> 4 (w=3), 3 -> 4 (w=2)
+        // Max flow from 1 to 4 = 3 + 2 = 5
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=4 {
+            adj.add_node(i);
+        }
+        let edges = [(1, 2, 3.0), (1, 3, 2.0), (2, 4, 3.0), (3, 4, 2.0)];
+        for (s, t, w) in edges {
+            let meta = EdgeMeta {
+                source: s, target: t, label: 0,
+                temporal: BiTemporal::new_current(1000),
+                provenance: None, weight: w, token_cost: 0,
+            };
+            adj.add_edge(s, t, 0, meta).unwrap();
+        }
+
+        let result = max_flow(&adj, 1, 4).unwrap();
+        assert!(
+            (result.max_flow - 5.0).abs() < 1e-10,
+            "expected 5.0, got {}",
+            result.max_flow
+        );
+    }
+
+    #[test]
+    fn test_max_flow_invalid_node() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        let result = max_flow(&adj, 1, 999);
+        assert!(result.is_err());
+    }
+
+    // ─── Minimum Spanning Tree Tests ────────────────────────────────────────
+
+    #[test]
+    fn test_mst_linear() {
+        // Linear: 1-2-3-4, all weight 1.0
+        let adj = build_linear_graph();
+        let mst = minimum_spanning_tree(&adj);
+        assert_eq!(mst.edges.len(), 3);
+        assert!((mst.total_weight - 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_mst_empty_graph() {
+        let adj = AdjacencyStore::new();
+        let mst = minimum_spanning_tree(&adj);
+        assert!(mst.edges.is_empty());
+        assert_eq!(mst.total_weight, 0.0);
+    }
+
+    #[test]
+    fn test_mst_triangle_with_weights() {
+        // Triangle: 1-2 (w=1), 2-3 (w=2), 1-3 (w=3)
+        // MST should include edges w=1 and w=2, total=3
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
+        let meta1 = EdgeMeta {
+            source: 1, target: 2, label: 0,
+            temporal: BiTemporal::new_current(1000),
+            provenance: None, weight: 1.0, token_cost: 0,
+        };
+        adj.add_edge(1, 2, 0, meta1).unwrap();
+        let meta1r = EdgeMeta {
+            source: 2, target: 1, label: 0,
+            temporal: BiTemporal::new_current(1000),
+            provenance: None, weight: 1.0, token_cost: 0,
+        };
+        adj.add_edge(2, 1, 0, meta1r).unwrap();
+        let meta2 = EdgeMeta {
+            source: 2, target: 3, label: 0,
+            temporal: BiTemporal::new_current(1000),
+            provenance: None, weight: 2.0, token_cost: 0,
+        };
+        adj.add_edge(2, 3, 0, meta2).unwrap();
+        let meta2r = EdgeMeta {
+            source: 3, target: 2, label: 0,
+            temporal: BiTemporal::new_current(1000),
+            provenance: None, weight: 2.0, token_cost: 0,
+        };
+        adj.add_edge(3, 2, 0, meta2r).unwrap();
+        let meta3 = EdgeMeta {
+            source: 1, target: 3, label: 0,
+            temporal: BiTemporal::new_current(1000),
+            provenance: None, weight: 3.0, token_cost: 0,
+        };
+        adj.add_edge(1, 3, 0, meta3).unwrap();
+        let meta3r = EdgeMeta {
+            source: 3, target: 1, label: 0,
+            temporal: BiTemporal::new_current(1000),
+            provenance: None, weight: 3.0, token_cost: 0,
+        };
+        adj.add_edge(3, 1, 0, meta3r).unwrap();
+
+        let mst = minimum_spanning_tree(&adj);
+        assert_eq!(mst.edges.len(), 2);
+        assert!(
+            (mst.total_weight - 3.0).abs() < 1e-10,
+            "expected total weight 3.0, got {}",
+            mst.total_weight
+        );
+    }
+
+    #[test]
+    fn test_mst_isolated_nodes() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        adj.add_node(3);
+        // No edges => MST has no edges
+        let mst = minimum_spanning_tree(&adj);
+        assert!(mst.edges.is_empty());
+        assert_eq!(mst.total_weight, 0.0);
     }
 }

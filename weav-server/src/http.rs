@@ -298,6 +298,8 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/graphs/{graph}/search", get(search_nodes))
         // Full-text search with BM25 scoring.
         .route("/v1/graphs/{graph}/search/text", get(search_text))
+        // Vector similarity search with optional filtering.
+        .route("/v1/graphs/{graph}/search/vector", post(search_vector))
         // Graph export/import.
         .route("/v1/graphs/{graph}/export", get(export_graph))
         .route("/v1/graphs/{graph}/import", post(import_graph))
@@ -315,6 +317,21 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route(
             "/v1/graphs/{graph}/temporal",
             post(temporal_query),
+        )
+        // Graph temporal diff.
+        .route("/v1/graphs/{graph}/diff", post(graph_diff))
+        // Community summary storage and search (GraphRAG).
+        .route(
+            "/v1/graphs/{graph}/communities/summarize",
+            post(community_summarize),
+        )
+        .route(
+            "/v1/graphs/{graph}/communities/summaries",
+            get(community_summaries),
+        )
+        .route(
+            "/v1/graphs/{graph}/communities/search",
+            post(community_search),
         )
         // Node history.
         .route(
@@ -617,6 +634,127 @@ async fn search_text(
             "limit": limit,
         }))),
     ).into_response()
+}
+
+/// Vector similarity search with optional label/property filtering.
+/// POST /v1/graphs/{graph}/search/vector
+/// Body: { "embedding": [...], "k": 10, "labels": ["Person"], "properties": {"status": "active"} }
+async fn search_vector(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let _identity = extract_identity(&engine, &headers);
+    let graph_arc = match engine.get_graph(&graph) {
+        Ok(g) => g,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
+    let gs = graph_arc.read();
+
+    let embedding = match body.get("embedding").and_then(|v| v.as_array()) {
+        Some(arr) => {
+            let vec: Vec<f32> = arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
+            if vec.len() != arr.len() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse::<()>::err("embedding must be array of numbers".to_string())),
+                ).into_response();
+            }
+            vec
+        }
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<()>::err("missing required field: embedding".to_string())),
+            ).into_response();
+        }
+    };
+
+    let k = body.get("k").and_then(|v| v.as_u64()).unwrap_or(10) as u16;
+    let filter_labels: Option<Vec<String>> = body.get("labels").and_then(|v| v.as_array()).map(|arr| {
+        arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+    });
+    let filter_props: Option<serde_json::Map<String, serde_json::Value>> = body.get("properties").and_then(|v| v.as_object()).cloned();
+
+    let has_filter = filter_labels.is_some() || filter_props.is_some();
+
+    let search_result = if has_filter {
+        let filter_labels_ref = &filter_labels;
+        let filter_props_ref = &filter_props;
+        let gs_ref = &gs;
+        gs.vector_index.search_filtered(
+            &embedding,
+            k,
+            &|node_id: u64| {
+                // Label filter
+                if let Some(labels) = filter_labels_ref {
+                    let node_label = gs_ref.properties
+                        .get_node_property(node_id, "_label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !labels.iter().any(|l| l == node_label) {
+                        return false;
+                    }
+                }
+                // Property filter
+                if let Some(props) = filter_props_ref {
+                    for (key, expected_val) in props {
+                        match gs_ref.properties.get_node_property(node_id, key) {
+                            Some(actual) => {
+                                let actual_json = value_to_json(actual);
+                                if actual_json != *expected_val {
+                                    return false;
+                                }
+                            }
+                            None => return false,
+                        }
+                    }
+                }
+                true
+            },
+            None,
+        )
+    } else {
+        gs.vector_index.search(&embedding, k, None)
+    };
+
+    match search_result {
+        Ok(results) => {
+            let matches: Vec<serde_json::Value> = results.iter().map(|&(nid, dist)| {
+                let label = gs.properties
+                    .get_node_property(nid, "_label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let props = gs.properties.get_all_node_properties(nid);
+                let mut props_map = serde_json::Map::new();
+                for (k, v) in props {
+                    if !k.starts_with('_') {
+                        props_map.insert(k.to_string(), value_to_json(v));
+                    }
+                }
+                serde_json::json!({
+                    "node_id": nid,
+                    "label": label,
+                    "distance": dist,
+                    "similarity": 1.0 - dist as f64,
+                    "properties": props_map,
+                })
+            }).collect();
+
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(serde_json::json!({
+                    "matches": matches,
+                    "total": results.len(),
+                    "k": k,
+                    "filtered": has_filter,
+                }))),
+            ).into_response()
+        }
+        Err(e) => weav_error_to_response(e).into_response(),
+    }
 }
 
 /// Export an entire graph as JSON.
@@ -1262,6 +1400,365 @@ async fn temporal_query(
         }))),
     )
         .into_response()
+}
+
+/// Graph temporal diff: compare graph state between two timestamps.
+/// POST /v1/graphs/{graph}/diff
+/// Body: { "from_timestamp": 1234, "to_timestamp": 5678 }
+async fn graph_diff(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let _identity = extract_identity(&engine, &headers);
+    let graph_arc = match engine.get_graph(&graph) {
+        Ok(g) => g,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
+    let gs = graph_arc.read();
+
+    let from_ts = match body.get("from_timestamp").and_then(|v| v.as_u64()) {
+        Some(ts) => ts,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<()>::err("missing required field: from_timestamp".to_string())),
+            ).into_response();
+        }
+    };
+    let to_ts = match body.get("to_timestamp").and_then(|v| v.as_u64()) {
+        Some(ts) => ts,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::<()>::err("missing required field: to_timestamp".to_string())),
+            ).into_response();
+        }
+    };
+
+    if from_ts >= to_ts {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::err("from_timestamp must be less than to_timestamp".to_string())),
+        ).into_response();
+    }
+
+    let mut added_edges: Vec<u64> = Vec::new();
+    let mut removed_edges: Vec<u64> = Vec::new();
+    let mut active_at_start: Vec<u64> = Vec::new();
+    let mut active_at_end: Vec<u64> = Vec::new();
+
+    let mut added_nodes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut removed_nodes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut nodes_at_start: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut nodes_at_end: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+    for (eid, meta) in gs.adjacency.all_edges() {
+        let t = &meta.temporal;
+
+        // Edge was added during [from_ts, to_ts)
+        if t.tx_from >= from_ts && t.tx_from < to_ts {
+            added_edges.push(eid);
+            added_nodes.insert(meta.source);
+            added_nodes.insert(meta.target);
+        }
+
+        // Edge was removed during [from_ts, to_ts)
+        if t.tx_until != u64::MAX && t.tx_until >= from_ts && t.tx_until < to_ts {
+            removed_edges.push(eid);
+            removed_nodes.insert(meta.source);
+            removed_nodes.insert(meta.target);
+        }
+
+        // Edge active at from_ts
+        if t.is_valid_at(from_ts) && t.is_current_at(from_ts) {
+            active_at_start.push(eid);
+            nodes_at_start.insert(meta.source);
+            nodes_at_start.insert(meta.target);
+        }
+
+        // Edge active at to_ts
+        if t.is_valid_at(to_ts) && t.is_current_at(to_ts) {
+            active_at_end.push(eid);
+            nodes_at_end.insert(meta.source);
+            nodes_at_end.insert(meta.target);
+        }
+    }
+
+    // Filter added_nodes to only those not present at start
+    let truly_added_nodes: Vec<u64> = added_nodes
+        .iter()
+        .filter(|n| !nodes_at_start.contains(n))
+        .copied()
+        .collect();
+
+    // Filter removed_nodes to only those not present at end
+    let truly_removed_nodes: Vec<u64> = removed_nodes
+        .iter()
+        .filter(|n| !nodes_at_end.contains(n))
+        .copied()
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::ok(serde_json::json!({
+            "from_timestamp": from_ts,
+            "to_timestamp": to_ts,
+            "edges": {
+                "added": added_edges,
+                "removed": removed_edges,
+                "added_count": added_edges.len(),
+                "removed_count": removed_edges.len(),
+                "active_at_start": active_at_start.len(),
+                "active_at_end": active_at_end.len(),
+            },
+            "nodes": {
+                "added": truly_added_nodes,
+                "removed": truly_removed_nodes,
+                "added_count": truly_added_nodes.len(),
+                "removed_count": truly_removed_nodes.len(),
+                "active_at_start": nodes_at_start.len(),
+                "active_at_end": nodes_at_end.len(),
+            },
+        }))),
+    ).into_response()
+}
+
+/// Run community detection and store summaries as synthetic nodes.
+/// POST /v1/graphs/{graph}/communities/summarize
+async fn community_summarize(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let _identity = extract_identity(&engine, &headers);
+    let graph_arc = match engine.get_graph(&graph) {
+        Ok(g) => g,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
+    let mut gs = graph_arc.write();
+
+    let algorithm = body.get("algorithm").and_then(|v| v.as_str()).unwrap_or("leiden");
+    let max_iterations = body.get("max_iterations").and_then(|v| v.as_u64()).unwrap_or(10) as u32;
+    let resolution = body.get("resolution").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+
+    // Run community detection
+    let communities: std::collections::HashMap<u64, u64> = match algorithm {
+        "label_propagation" => weav_graph::traversal::label_propagation(&gs.adjacency, max_iterations),
+        _ => weav_graph::traversal::leiden_communities(&gs.adjacency, max_iterations, resolution, 0.01),
+    };
+
+    // Group nodes by community
+    let mut community_members: std::collections::HashMap<u64, Vec<u64>> = std::collections::HashMap::new();
+    for (&node_id, &comm_id) in &communities {
+        community_members.entry(comm_id).or_default().push(node_id);
+    }
+
+    // Remove existing community summary nodes
+    let existing_summaries: Vec<u64> = gs.adjacency.all_node_ids().iter()
+        .filter(|&&nid| {
+            gs.properties
+                .get_node_property(nid, "_label")
+                .and_then(|v| v.as_str())
+                == Some("_community_summary")
+        })
+        .copied()
+        .collect();
+    for nid in &existing_summaries {
+        let _ = gs.adjacency.remove_node(*nid);
+    }
+
+    // Create summary nodes for each community
+    let mut summary_nodes: Vec<serde_json::Value> = Vec::new();
+    for (comm_id, members) in &community_members {
+        // Build summary text from member properties
+        let mut summary_parts: Vec<String> = Vec::new();
+        for &member_nid in members {
+            let label = gs.properties
+                .get_node_property(member_nid, "_label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let name = gs.properties
+                .get_node_property(member_nid, "name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let desc = gs.properties
+                .get_node_property(member_nid, "description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !name.is_empty() {
+                if !desc.is_empty() {
+                    summary_parts.push(format!("{label} '{name}': {desc}"));
+                } else {
+                    summary_parts.push(format!("{label} '{name}'"));
+                }
+            }
+        }
+        let summary_text = if summary_parts.is_empty() {
+            format!("Community {} with {} members", comm_id, members.len())
+        } else {
+            summary_parts.join("; ")
+        };
+
+        let node_id = gs.next_node_id;
+        gs.next_node_id += 1;
+        gs.adjacency.add_node(node_id);
+        gs.properties.set_node_property(node_id, "_label", Value::String(compact_str::CompactString::from("_community_summary")));
+        gs.properties.set_node_property(node_id, "community_id", Value::Int(*comm_id as i64));
+        gs.properties.set_node_property(node_id, "summary", Value::String(compact_str::CompactString::from(summary_text.as_str())));
+        gs.properties.set_node_property(node_id, "member_count", Value::Int(members.len() as i64));
+
+        let member_ids: Vec<Value> = members.iter().map(|&id| Value::Int(id as i64)).collect();
+        gs.properties.set_node_property(node_id, "member_node_ids", Value::List(member_ids));
+
+        // Index the summary text for BM25 search
+        gs.text_index.index_node(node_id, &summary_text);
+
+        summary_nodes.push(serde_json::json!({
+            "node_id": node_id,
+            "community_id": comm_id,
+            "member_count": members.len(),
+            "summary": summary_text,
+        }));
+    }
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::ok(serde_json::json!({
+            "algorithm": algorithm,
+            "community_count": community_members.len(),
+            "summaries": summary_nodes,
+            "removed_previous": existing_summaries.len(),
+        }))),
+    ).into_response()
+}
+
+/// Retrieve stored community summaries.
+/// GET /v1/graphs/{graph}/communities/summaries
+async fn community_summaries(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+) -> impl IntoResponse {
+    let _identity = extract_identity(&engine, &headers);
+    let graph_arc = match engine.get_graph(&graph) {
+        Ok(g) => g,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
+    let gs = graph_arc.read();
+
+    let summaries: Vec<serde_json::Value> = gs.adjacency.all_node_ids().iter()
+        .filter(|&&nid| {
+            gs.properties
+                .get_node_property(nid, "_label")
+                .and_then(|v| v.as_str())
+                == Some("_community_summary")
+        })
+        .map(|&nid| {
+            let props = gs.properties.get_all_node_properties(nid);
+            let mut props_map = serde_json::Map::new();
+            for (k, v) in props {
+                if !k.starts_with('_') {
+                    props_map.insert(k.to_string(), value_to_json(v));
+                }
+            }
+            serde_json::json!({
+                "node_id": nid,
+                "properties": props_map,
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::ok(serde_json::json!({
+            "summaries": summaries,
+            "total": summaries.len(),
+        }))),
+    ).into_response()
+}
+
+/// Search across community summaries (global search for GraphRAG).
+/// POST /v1/graphs/{graph}/communities/search
+/// Body: { "query": "search text", "limit": 10 }
+async fn community_search(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let _identity = extract_identity(&engine, &headers);
+    let graph_arc = match engine.get_graph(&graph) {
+        Ok(g) => g,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
+    let gs = graph_arc.read();
+
+    let query_text = body.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    let limit = body.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+
+    // Collect all community summary node IDs
+    let summary_nids: Vec<u64> = gs.adjacency.all_node_ids().iter()
+        .filter(|&&nid| {
+            gs.properties
+                .get_node_property(nid, "_label")
+                .and_then(|v| v.as_str())
+                == Some("_community_summary")
+        })
+        .copied()
+        .collect();
+
+    let results: Vec<serde_json::Value> = if !query_text.is_empty() {
+        // Use BM25 text search and filter to community summaries
+        let search_results = gs.text_index.search(query_text, limit * 5);
+        let summary_set: std::collections::HashSet<u64> = summary_nids.into_iter().collect();
+        search_results.iter()
+            .filter(|&&(nid, _)| summary_set.contains(&nid))
+            .take(limit)
+            .map(|&(nid, score)| {
+                let props = gs.properties.get_all_node_properties(nid);
+                let mut props_map = serde_json::Map::new();
+                for (k, v) in props {
+                    if !k.starts_with('_') {
+                        props_map.insert(k.to_string(), value_to_json(v));
+                    }
+                }
+                serde_json::json!({
+                    "node_id": nid,
+                    "score": score,
+                    "properties": props_map,
+                })
+            })
+            .collect()
+    } else {
+        // No query text -- return all summaries up to limit
+        summary_nids.iter()
+            .take(limit)
+            .map(|&nid| {
+                let props = gs.properties.get_all_node_properties(nid);
+                let mut props_map = serde_json::Map::new();
+                for (k, v) in props {
+                    if !k.starts_with('_') {
+                        props_map.insert(k.to_string(), value_to_json(v));
+                    }
+                }
+                serde_json::json!({
+                    "node_id": nid,
+                    "properties": props_map,
+                })
+            })
+            .collect()
+    };
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::ok(serde_json::json!({
+            "matches": results,
+            "total": results.len(),
+        }))),
+    ).into_response()
 }
 
 /// Node history: return all temporal versions of a node's data.
@@ -2526,6 +3023,49 @@ struct FastRPResponse {
     embeddings: Vec<FastRPEmbedding>,
 }
 
+#[derive(Serialize)]
+struct SimilarityPair {
+    node_a: u64,
+    node_b: u64,
+    similarity: f64,
+}
+
+#[derive(Serialize)]
+struct SimilarityResponse {
+    pairs: Vec<SimilarityPair>,
+}
+
+#[derive(Serialize)]
+struct RandomWalkResponse {
+    walk: Vec<u64>,
+    length: usize,
+}
+
+#[derive(Serialize)]
+struct KCoreResponse {
+    cores: Vec<KCoreNode>,
+    max_core: u32,
+}
+
+#[derive(Serialize)]
+struct KCoreNode {
+    node_id: u64,
+    core_number: u32,
+}
+
+#[derive(Serialize)]
+struct MaxFlowResponse {
+    max_flow: f64,
+    flow_edges: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct MstResponse {
+    edges: Vec<serde_json::Value>,
+    total_weight: f64,
+    edge_count: usize,
+}
+
 // ─── Algorithm handler ──────────────────────────────────────────────────────
 
 async fn run_algorithm(
@@ -2818,12 +3358,160 @@ async fn run_algorithm(
             (StatusCode::OK, Json(ApiResponse::ok(FastRPResponse { embeddings: results }))).into_response()
         }
 
+        "similarity" => {
+            let metric_str = body.get("metric").and_then(|v| v.as_str()).unwrap_or("jaccard");
+            let node_a = body.get("node_a").and_then(|v| v.as_u64());
+            let node_b = body.get("node_b").and_then(|v| v.as_u64());
+
+            if let (Some(a), Some(b)) = (node_a, node_b) {
+                // Pairwise similarity
+                let score = match metric_str {
+                    "cosine" => weav_graph::traversal::cosine_similarity(&gs.adjacency, a, b),
+                    "overlap" => weav_graph::traversal::overlap_similarity(&gs.adjacency, a, b),
+                    _ => weav_graph::traversal::jaccard_similarity(&gs.adjacency, a, b),
+                };
+                (StatusCode::OK, Json(ApiResponse::ok(SimilarityResponse {
+                    pairs: vec![SimilarityPair { node_a: a, node_b: b, similarity: score }],
+                }))).into_response()
+            } else {
+                // All-pairs similarity
+                let top_k = body.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+                let metric = match metric_str {
+                    "cosine" => weav_graph::traversal::SimilarityMetric::Cosine,
+                    "overlap" => weav_graph::traversal::SimilarityMetric::Overlap,
+                    _ => weav_graph::traversal::SimilarityMetric::Jaccard,
+                };
+                let results = weav_graph::traversal::all_pairs_similarity(&gs.adjacency, metric, top_k);
+                let pairs: Vec<SimilarityPair> = results.into_iter()
+                    .map(|(a, b, s)| SimilarityPair { node_a: a, node_b: b, similarity: s })
+                    .collect();
+                (StatusCode::OK, Json(ApiResponse::ok(SimilarityResponse { pairs }))).into_response()
+            }
+        }
+
+        "link_prediction" => {
+            let metric_str = body.get("metric").and_then(|v| v.as_str()).unwrap_or("adamic_adar");
+            let node_a = body.get("node_a").and_then(|v| v.as_u64());
+            let node_b = body.get("node_b").and_then(|v| v.as_u64());
+
+            if let (Some(a), Some(b)) = (node_a, node_b) {
+                // Pairwise link prediction
+                let score = match metric_str {
+                    "common_neighbors" => weav_graph::traversal::common_neighbors_count(&gs.adjacency, a, b) as f64,
+                    "preferential_attachment" => weav_graph::traversal::preferential_attachment(&gs.adjacency, a, b),
+                    "resource_allocation" => weav_graph::traversal::resource_allocation(&gs.adjacency, a, b),
+                    _ => weav_graph::traversal::adamic_adar(&gs.adjacency, a, b),
+                };
+                (StatusCode::OK, Json(ApiResponse::ok(SimilarityResponse {
+                    pairs: vec![SimilarityPair { node_a: a, node_b: b, similarity: score }],
+                }))).into_response()
+            } else {
+                // Top-K link predictions
+                let top_k = body.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+                let metric = match metric_str {
+                    "common_neighbors" => weav_graph::traversal::LinkPredictionMetric::CommonNeighbors,
+                    "preferential_attachment" => weav_graph::traversal::LinkPredictionMetric::PreferentialAttachment,
+                    "resource_allocation" => weav_graph::traversal::LinkPredictionMetric::ResourceAllocation,
+                    _ => weav_graph::traversal::LinkPredictionMetric::AdamicAdar,
+                };
+                let results = weav_graph::traversal::predict_links(&gs.adjacency, metric, top_k);
+                let pairs: Vec<SimilarityPair> = results.into_iter()
+                    .map(|(a, b, s)| SimilarityPair { node_a: a, node_b: b, similarity: s })
+                    .collect();
+                (StatusCode::OK, Json(ApiResponse::ok(SimilarityResponse { pairs }))).into_response()
+            }
+        }
+
+        "random_walk" => {
+            let start = match body.get("start").and_then(|v| v.as_u64()) {
+                Some(s) => s,
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiResponse::<()>::err("missing required field: start".to_string())),
+                    ).into_response();
+                }
+            };
+            let length = body.get("length").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+            let seed = body.get("seed").and_then(|v| v.as_u64()).unwrap_or(42);
+            let walk = weav_graph::traversal::random_walk(&gs.adjacency, start, length, seed);
+            let walk_len = walk.len();
+            (StatusCode::OK, Json(ApiResponse::ok(RandomWalkResponse { walk, length: walk_len }))).into_response()
+        }
+
+        "k_core" => {
+            let decomposition = weav_graph::traversal::k_core_decomposition(&gs.adjacency);
+            let max_core = decomposition.values().copied().max().unwrap_or(0);
+            let mut cores: Vec<KCoreNode> = decomposition.into_iter()
+                .map(|(node_id, core_number)| KCoreNode { node_id, core_number })
+                .collect();
+            cores.sort_by(|a, b| b.core_number.cmp(&a.core_number).then(a.node_id.cmp(&b.node_id)));
+            (StatusCode::OK, Json(ApiResponse::ok(KCoreResponse { cores, max_core }))).into_response()
+        }
+
+        "max_flow" => {
+            let source = match body.get("source").and_then(|v| v.as_u64()) {
+                Some(s) => s,
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiResponse::<()>::err("missing required field: source".to_string())),
+                    ).into_response();
+                }
+            };
+            let sink = match body.get("sink").and_then(|v| v.as_u64()) {
+                Some(s) => s,
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiResponse::<()>::err("missing required field: sink".to_string())),
+                    ).into_response();
+                }
+            };
+            match weav_graph::traversal::max_flow(&gs.adjacency, source, sink) {
+                Ok(result) => {
+                    let flow_edges: Vec<serde_json::Value> = result.flow_edges.iter().map(|fe| {
+                        serde_json::json!({
+                            "source": fe.source,
+                            "target": fe.target,
+                            "flow": fe.flow,
+                            "capacity": fe.capacity,
+                        })
+                    }).collect();
+                    (StatusCode::OK, Json(ApiResponse::ok(MaxFlowResponse {
+                        max_flow: result.max_flow,
+                        flow_edges,
+                    }))).into_response()
+                }
+                Err(e) => weav_error_to_response(e).into_response(),
+            }
+        }
+
+        "mst" => {
+            let result = weav_graph::traversal::minimum_spanning_tree(&gs.adjacency);
+            let edges: Vec<serde_json::Value> = result.edges.iter().map(|e| {
+                serde_json::json!({
+                    "source": e.source,
+                    "target": e.target,
+                    "edge_id": e.edge_id,
+                    "weight": e.weight,
+                })
+            }).collect();
+            let edge_count = edges.len();
+            (StatusCode::OK, Json(ApiResponse::ok(MstResponse {
+                edges,
+                total_weight: result.total_weight,
+                edge_count,
+            }))).into_response()
+        }
+
         _ => (
             StatusCode::BAD_REQUEST,
             Json(ApiResponse::<()>::err(format!(
                 "unknown algorithm: {algorithm}. Supported: pagerank, betweenness, closeness, \
                  communities, label_propagation, leiden, shortest_path, components, scc, \
-                 topological_sort, triangle_count, degree, eigenvector, hits, fastrp"
+                 topological_sort, triangle_count, degree, eigenvector, hits, fastrp, \
+                 similarity, link_prediction, random_walk, k_core, max_flow, mst"
             ))),
         )
             .into_response(),
