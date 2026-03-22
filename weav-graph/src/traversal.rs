@@ -3480,6 +3480,665 @@ pub fn minimum_spanning_tree(adjacency: &AdjacencyStore) -> MstResult {
     }
 }
 
+// ─── Bellman-Ford Single-Source Shortest Path ────────────────────────────────
+
+/// Bellman-Ford single-source shortest path. Handles negative edge weights.
+///
+/// Returns shortest distances from source to all reachable nodes, or error
+/// if a negative cycle exists. Edge weights are inverted (`1.0 / weight`)
+/// to convert Weav's strength-based weights (higher = stronger) into costs
+/// (higher strength = lower cost).
+///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `source`: the starting node.
+///
+/// Returns a list of `(NodeId, distance)` sorted ascending by distance,
+/// or `WeavError::Internal` if a negative cycle is detected.
+///
+/// Complexity: O(V * E).
+pub fn bellman_ford(
+    adjacency: &AdjacencyStore,
+    source: NodeId,
+) -> WeavResult<Vec<(NodeId, f64)>> {
+    if !adjacency.has_node(source) {
+        return Err(WeavError::NodeNotFound(source, 0));
+    }
+
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut dist: HashMap<NodeId, f64> = HashMap::with_capacity(all_nodes.len());
+    for &node in &all_nodes {
+        dist.insert(node, f64::INFINITY);
+    }
+    dist.insert(source, 0.0);
+
+    // Collect all edges as (src, tgt, cost)
+    let mut edges: Vec<(NodeId, NodeId, f64)> = Vec::new();
+    for (_, meta) in adjacency.all_edges() {
+        let cost = if meta.weight > 0.0 {
+            1.0 / meta.weight as f64
+        } else {
+            f64::INFINITY
+        };
+        edges.push((meta.source, meta.target, cost));
+    }
+
+    let v = all_nodes.len();
+
+    // Relax edges V-1 times
+    for _ in 0..v.saturating_sub(1) {
+        let mut updated = false;
+        for &(src, tgt, cost) in &edges {
+            let d_src = dist[&src];
+            if d_src < f64::INFINITY {
+                let new_dist = d_src + cost;
+                if new_dist < dist[&tgt] {
+                    dist.insert(tgt, new_dist);
+                    updated = true;
+                }
+            }
+        }
+        if !updated {
+            break;
+        }
+    }
+
+    // Check for negative cycles
+    for &(src, tgt, cost) in &edges {
+        let d_src = dist[&src];
+        if d_src < f64::INFINITY && d_src + cost < dist[&tgt] - 1e-12 {
+            return Err(WeavError::Internal(
+                "negative cycle detected in Bellman-Ford".to_string(),
+            ));
+        }
+    }
+
+    // Return only reachable nodes, sorted by distance ascending
+    let mut result: Vec<(NodeId, f64)> = dist
+        .into_iter()
+        .filter(|&(_, d)| d < f64::INFINITY)
+        .collect();
+    result.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    Ok(result)
+}
+
+// ─── Harmonic Centrality ────────────────────────────────────────────────────
+
+/// Harmonic centrality: sum of inverse shortest-path distances.
+///
+/// Handles disconnected graphs correctly (unlike closeness centrality).
+/// `H(v) = (1/(n-1)) * sum_{u != v} 1/d(v,u)` where unreachable nodes
+/// contribute 0 to the sum.
+///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `filter`: criteria to restrict which edges are traversed.
+///
+/// Returns a list of `(NodeId, centrality)` sorted descending by score.
+///
+/// Complexity: O(V * (V + E)) — one BFS per node.
+pub fn harmonic_centrality(adjacency: &AdjacencyStore, filter: &EdgeFilter) -> Vec<(NodeId, f64)> {
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() {
+        return Vec::new();
+    }
+
+    let n = all_nodes.len();
+    let denominator = if n > 1 { (n - 1) as f64 } else { 1.0 };
+    let mut result: Vec<(NodeId, f64)> = Vec::with_capacity(n);
+
+    for &source in &all_nodes {
+        // BFS to compute shortest distances from source (undirected)
+        let mut dist: HashMap<NodeId, u64> = HashMap::new();
+        dist.insert(source, 0);
+        let mut queue: VecDeque<NodeId> = VecDeque::new();
+        queue.push_back(source);
+
+        while let Some(v) = queue.pop_front() {
+            let d_v = dist[&v];
+            let out_nbrs = adjacency.neighbors_out(v, None);
+            let in_nbrs = adjacency.neighbors_in(v, None);
+            for &(w, eid) in out_nbrs.iter().chain(in_nbrs.iter()) {
+                if !edge_passes_filter(adjacency, eid, filter) {
+                    continue;
+                }
+                if let std::collections::hash_map::Entry::Vacant(e) = dist.entry(w) {
+                    e.insert(d_v + 1);
+                    queue.push_back(w);
+                }
+            }
+        }
+
+        // Sum 1/distance for all reachable nodes (skip self and unreachable)
+        let mut sum_inv = 0.0;
+        for (&node, &d) in &dist {
+            if node != source && d > 0 {
+                sum_inv += 1.0 / d as f64;
+            }
+        }
+
+        result.push((source, sum_inv / denominator));
+    }
+
+    result.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    result
+}
+
+// ─── Katz Centrality ────────────────────────────────────────────────────────
+
+/// Katz centrality: counts all walks between nodes weighted by attenuation
+/// factor alpha.
+///
+/// Works on DAGs where eigenvector centrality gives all zeros.
+/// `x_i = alpha * sum_j A_ij * x_j + beta`
+///
+/// Uses power iteration. Convergence is reached when the L2 norm of score
+/// changes falls below `tolerance`. Scores are L2-normalized after
+/// convergence.
+///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `alpha`: attenuation factor (should be < 1/spectral_radius).
+/// - `beta`: bias term (typically 1.0).
+/// - `max_iterations`: maximum number of power iterations.
+/// - `tolerance`: convergence threshold on the maximum score change.
+///
+/// Returns a list of `(NodeId, centrality)` sorted descending by score.
+///
+/// Complexity: O(I * (V + E)) where I is the number of iterations.
+pub fn katz_centrality(
+    adjacency: &AdjacencyStore,
+    alpha: f64,
+    beta: f64,
+    max_iterations: u32,
+    tolerance: f64,
+) -> Vec<(NodeId, f64)> {
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() {
+        return Vec::new();
+    }
+
+    let n = all_nodes.len();
+    let node_to_idx: HashMap<NodeId, usize> = all_nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &nid)| (nid, i))
+        .collect();
+
+    // Pre-compute undirected neighbor indices for each node
+    let mut neighbor_indices: Vec<Vec<usize>> = Vec::with_capacity(n);
+    for &node in &all_nodes {
+        let mut nbr_set: HashSet<NodeId> = HashSet::new();
+        for &(nbr, _) in adjacency.neighbors_out(node, None).iter() {
+            nbr_set.insert(nbr);
+        }
+        for &(nbr, _) in adjacency.neighbors_in(node, None).iter() {
+            nbr_set.insert(nbr);
+        }
+        let idx_list: Vec<usize> = nbr_set
+            .into_iter()
+            .filter_map(|nbr| node_to_idx.get(&nbr).copied())
+            .collect();
+        neighbor_indices.push(idx_list);
+    }
+
+    let mut scores: Vec<f64> = vec![0.0; n];
+
+    for _ in 0..max_iterations {
+        let mut new_scores = vec![0.0_f64; n];
+
+        // x_i = alpha * sum_j A_ij * x_j + beta
+        for i in 0..n {
+            let mut s = 0.0;
+            for &j in &neighbor_indices[i] {
+                s += scores[j];
+            }
+            new_scores[i] = alpha * s + beta;
+        }
+
+        // Check convergence (max absolute change)
+        let max_change = scores
+            .iter()
+            .zip(new_scores.iter())
+            .map(|(old, new)| (old - new).abs())
+            .fold(0.0_f64, f64::max);
+
+        scores = new_scores;
+
+        if max_change < tolerance {
+            break;
+        }
+    }
+
+    // L2-normalize
+    let l2_norm: f64 = scores.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if l2_norm > 0.0 {
+        for s in &mut scores {
+            *s /= l2_norm;
+        }
+    }
+
+    let mut result: Vec<(NodeId, f64)> = all_nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &nid)| (nid, scores[i]))
+        .collect();
+    result.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    result
+}
+
+// ─── ArticleRank ────────────────────────────────────────────────────────────
+
+/// ArticleRank: PageRank variant that reduces bias toward high-authority
+/// low-outdegree nodes.
+///
+/// Denominator is `outdegree(v) + avg_outdegree` instead of `outdegree(v)`.
+/// This dampens the influence of nodes with very low outdegree that would
+/// otherwise concentrate all their rank into a few neighbors.
+///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `damping`: damping factor (typically 0.85).
+/// - `max_iterations`: maximum number of power iterations.
+/// - `tolerance`: convergence threshold on the maximum score change.
+///
+/// Returns a list of `(NodeId, score)` sorted descending by score.
+///
+/// Complexity: O(I * (V + E)) where I is the number of iterations.
+pub fn article_rank(
+    adjacency: &AdjacencyStore,
+    damping: f32,
+    max_iterations: u32,
+    tolerance: f64,
+) -> Vec<(NodeId, f64)> {
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() {
+        return Vec::new();
+    }
+
+    let n = all_nodes.len();
+    let node_to_idx: HashMap<NodeId, usize> = all_nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &nid)| (nid, i))
+        .collect();
+
+    // Pre-compute out-neighbors and in-neighbors as indices
+    let mut out_neighbors: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut in_neighbors: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+    for (i, &node) in all_nodes.iter().enumerate() {
+        for &(nbr, _) in adjacency.neighbors_out(node, None).iter() {
+            if let Some(&j) = node_to_idx.get(&nbr) {
+                out_neighbors[i].push(j);
+            }
+        }
+        for &(nbr, _) in adjacency.neighbors_in(node, None).iter() {
+            if let Some(&j) = node_to_idx.get(&nbr) {
+                in_neighbors[i].push(j);
+            }
+        }
+    }
+
+    // Compute average outdegree
+    let total_out_edges: usize = out_neighbors.iter().map(|v| v.len()).sum();
+    let avg_outdegree = if n > 0 {
+        total_out_edges as f64 / n as f64
+    } else {
+        1.0
+    };
+
+    let d = damping as f64;
+    let init_score = 1.0 / n as f64;
+    let mut scores: Vec<f64> = vec![init_score; n];
+
+    for _ in 0..max_iterations {
+        let mut new_scores = vec![(1.0 - d) / n as f64; n];
+
+        for i in 0..n {
+            // Contribute to neighbors: score[i] / (outdegree[i] + avg_outdegree)
+            let out_deg = out_neighbors[i].len() as f64;
+            let contribution = if out_deg + avg_outdegree > 0.0 {
+                d * scores[i] / (out_deg + avg_outdegree)
+            } else {
+                0.0
+            };
+            for &j in &out_neighbors[i] {
+                new_scores[j] += contribution;
+            }
+        }
+
+        // Check convergence
+        let max_change = scores
+            .iter()
+            .zip(new_scores.iter())
+            .map(|(old, new)| (old - new).abs())
+            .fold(0.0_f64, f64::max);
+
+        scores = new_scores;
+
+        if max_change < tolerance {
+            break;
+        }
+    }
+
+    let mut result: Vec<(NodeId, f64)> = all_nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &nid)| (nid, scores[i]))
+        .collect();
+    result.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    result
+}
+
+// ─── K-1 Coloring ───────────────────────────────────────────────────────────
+
+/// Result of a graph coloring computation.
+pub struct GraphColoringResult {
+    /// Map from NodeId to its assigned color (0-based).
+    pub colors: HashMap<NodeId, u32>,
+    /// Number of distinct colors used.
+    pub num_colors: u32,
+    /// Number of remaining conflicts (0 if valid coloring).
+    pub conflicts: u32,
+}
+
+/// K-1 Coloring: greedy graph coloring.
+///
+/// Assigns colors to nodes such that no two adjacent nodes share a color,
+/// using at most K colors where K <= max_degree + 1.
+///
+/// Initializes all nodes with random colors, then iteratively reassigns
+/// each node the smallest color not used by any neighbor. Repeats until
+/// stable or `max_iterations` reached.
+///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `max_iterations`: maximum number of coloring passes.
+///
+/// Returns a `GraphColoringResult` with the color assignment, the number
+/// of distinct colors used, and the remaining conflict count.
+///
+/// Complexity: O(I * V * d) where d is the maximum node degree and I is
+/// the number of iterations.
+pub fn k1_coloring(
+    adjacency: &AdjacencyStore,
+    max_iterations: u32,
+) -> GraphColoringResult {
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() {
+        return GraphColoringResult {
+            colors: HashMap::new(),
+            num_colors: 0,
+            conflicts: 0,
+        };
+    }
+
+    // Initialize colors using a simple hash-based pseudo-random assignment
+    let mut colors: HashMap<NodeId, u32> = HashMap::with_capacity(all_nodes.len());
+    for &node in &all_nodes {
+        // Simple deterministic "random" initial color based on node ID
+        let initial_color = (node.wrapping_mul(2654435761) >> 16) as u32 % all_nodes.len() as u32;
+        colors.insert(node, initial_color);
+    }
+
+    for _ in 0..max_iterations {
+        let mut changed = false;
+
+        for &node in &all_nodes {
+            // Collect neighbor colors
+            let mut neighbor_colors: HashSet<u32> = HashSet::new();
+            for &(nbr, _) in adjacency.neighbors_out(node, None).iter() {
+                if nbr != node {
+                    if let Some(&c) = colors.get(&nbr) {
+                        neighbor_colors.insert(c);
+                    }
+                }
+            }
+            for &(nbr, _) in adjacency.neighbors_in(node, None).iter() {
+                if nbr != node {
+                    if let Some(&c) = colors.get(&nbr) {
+                        neighbor_colors.insert(c);
+                    }
+                }
+            }
+
+            // Find smallest color not used by any neighbor
+            let mut new_color: u32 = 0;
+            while neighbor_colors.contains(&new_color) {
+                new_color += 1;
+            }
+
+            if colors[&node] != new_color {
+                colors.insert(node, new_color);
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    // Count conflicts
+    let mut conflicts: u32 = 0;
+    for &node in &all_nodes {
+        let node_color = colors[&node];
+        for &(nbr, _) in adjacency.neighbors_out(node, None).iter() {
+            if nbr != node && colors.get(&nbr) == Some(&node_color) {
+                conflicts += 1;
+            }
+        }
+    }
+    // Each conflict edge is counted twice (from both endpoints), divide by 2
+    conflicts /= 2;
+
+    let num_colors = {
+        let unique: HashSet<u32> = colors.values().copied().collect();
+        unique.len() as u32
+    };
+
+    GraphColoringResult {
+        colors,
+        num_colors,
+        conflicts,
+    }
+}
+
+// ─── Conductance ────────────────────────────────────────────────────────────
+
+/// Conductance: measures community quality. Lower = better community.
+///
+/// `conductance(C) = edges_leaving_C / min(vol(C), vol(V\C))`
+///
+/// where `vol(X) = sum of degrees of nodes in X` (undirected degree).
+/// Edges are treated as undirected. Returns 0.0 for empty communities or
+/// if `min(vol(C), vol(V\C))` is zero.
+///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `community`: set of node IDs forming the community.
+///
+/// Returns the conductance score (0.0 to 1.0).
+pub fn conductance(adjacency: &AdjacencyStore, community: &HashSet<NodeId>) -> f64 {
+    if community.is_empty() {
+        return 0.0;
+    }
+
+    let all_nodes = adjacency.all_node_ids();
+    let all_set: HashSet<NodeId> = all_nodes.iter().copied().collect();
+
+    // If the community is the entire graph, conductance is 0
+    if community.len() == all_set.len() && community.is_subset(&all_set) {
+        return 0.0;
+    }
+
+    let mut vol_community = 0u64;
+    let mut vol_complement = 0u64;
+    let mut crossing_edges = 0u64;
+
+    for &node in &all_nodes {
+        let degree = undirected_neighbors(adjacency, node).len() as u64;
+        if community.contains(&node) {
+            vol_community += degree;
+
+            // Count edges leaving the community
+            let neighbors = undirected_neighbors(adjacency, node);
+            for nbr in &neighbors {
+                if !community.contains(nbr) {
+                    crossing_edges += 1;
+                }
+            }
+        } else {
+            vol_complement += degree;
+        }
+    }
+
+    let min_vol = vol_community.min(vol_complement);
+    if min_vol == 0 {
+        return 0.0;
+    }
+
+    crossing_edges as f64 / min_vol as f64
+}
+
+/// Per-community conductance for a full community assignment.
+///
+/// Computes conductance for each community given a map from node IDs to
+/// community labels. Returns `(community_label, conductance)` pairs
+/// sorted by community label ascending.
+///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+/// - `communities`: map from NodeId to community label.
+///
+/// Returns a list of `(community_label, conductance)` pairs.
+pub fn all_community_conductance(
+    adjacency: &AdjacencyStore,
+    communities: &HashMap<NodeId, u64>,
+) -> Vec<(u64, f64)> {
+    // Group nodes by community
+    let mut community_sets: HashMap<u64, HashSet<NodeId>> = HashMap::new();
+    for (&node, &label) in communities {
+        community_sets.entry(label).or_default().insert(node);
+    }
+
+    let mut result: Vec<(u64, f64)> = community_sets
+        .iter()
+        .map(|(&label, members)| (label, conductance(adjacency, members)))
+        .collect();
+
+    result.sort_by_key(|&(label, _)| label);
+    result
+}
+
+// ─── Local Clustering Coefficient ───────────────────────────────────────────
+
+/// Compute local clustering coefficient for all nodes.
+///
+/// `LCC(v) = 2*T(v) / (deg(v) * (deg(v) - 1))` where `T(v)` is the
+/// number of triangles through node v and `deg(v)` is its undirected
+/// degree. Nodes with degree < 2 have coefficient 0.0.
+///
+/// This provides a simpler API than `triangle_count`, returning only the
+/// per-node clustering coefficient without the full triangle result.
+///
+/// Parameters:
+/// - `adjacency`: the graph's adjacency store.
+///
+/// Returns a list of `(NodeId, coefficient)` sorted descending by score.
+///
+/// Complexity: O(V * d^2) where d is the maximum node degree.
+pub fn local_clustering_coefficient(adjacency: &AdjacencyStore) -> Vec<(NodeId, f64)> {
+    let all_nodes = adjacency.all_node_ids();
+    if all_nodes.is_empty() {
+        return Vec::new();
+    }
+
+    // Build undirected neighbor sets
+    let mut neighbors: HashMap<NodeId, HashSet<NodeId>> = HashMap::with_capacity(all_nodes.len());
+    for &node in &all_nodes {
+        let mut nbr_set = HashSet::new();
+        for &(w, _) in adjacency.neighbors_out(node, None).iter() {
+            if w != node {
+                nbr_set.insert(w);
+            }
+        }
+        for &(w, _) in adjacency.neighbors_in(node, None).iter() {
+            if w != node {
+                nbr_set.insert(w);
+            }
+        }
+        neighbors.insert(node, nbr_set);
+    }
+
+    // Count triangles per node
+    let mut node_triangles: HashMap<NodeId, u32> = all_nodes.iter().map(|&n| (n, 0)).collect();
+
+    for &u in &all_nodes {
+        let u_nbrs = &neighbors[&u];
+        let u_nbrs_sorted: Vec<NodeId> = {
+            let mut v: Vec<NodeId> = u_nbrs.iter().copied().collect();
+            v.sort_unstable();
+            v
+        };
+
+        for (i, &v) in u_nbrs_sorted.iter().enumerate() {
+            if v <= u {
+                continue;
+            }
+            for &w in &u_nbrs_sorted[i + 1..] {
+                if neighbors[&v].contains(&w) {
+                    *node_triangles.get_mut(&u).unwrap() += 1;
+                    *node_triangles.get_mut(&v).unwrap() += 1;
+                    *node_triangles.get_mut(&w).unwrap() += 1;
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<(NodeId, f64)> = all_nodes
+        .iter()
+        .map(|&n| {
+            let t = node_triangles[&n];
+            let k = neighbors[&n].len() as u64;
+            let cc = if k >= 2 {
+                (2 * t as u64) as f64 / (k * (k - 1)) as f64
+            } else {
+                0.0
+            };
+            (n, cc)
+        })
+        .collect();
+
+    result.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6677,5 +7336,291 @@ mod tests {
         let mst = minimum_spanning_tree(&adj);
         assert!(mst.edges.is_empty());
         assert_eq!(mst.total_weight, 0.0);
+    }
+
+    // ─── Bellman-Ford Tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_bellman_ford_linear() {
+        let adj = build_linear_graph(); // 1->2->3->4, weight=1.0
+        let result = bellman_ford(&adj, 1).unwrap();
+        // With weight=1.0, cost = 1/1.0 = 1.0 per edge
+        assert_eq!(result.len(), 4);
+        // Source distance = 0
+        assert_eq!(result[0], (1, 0.0));
+        // Node 2: distance 1.0
+        assert!((result[1].1 - 1.0).abs() < 1e-10);
+        assert_eq!(result[1].0, 2);
+        // Node 3: distance 2.0
+        assert!((result[2].1 - 2.0).abs() < 1e-10);
+        assert_eq!(result[2].0, 3);
+        // Node 4: distance 3.0
+        assert!((result[3].1 - 3.0).abs() < 1e-10);
+        assert_eq!(result[3].0, 4);
+    }
+
+    #[test]
+    fn test_bellman_ford_empty_graph() {
+        let adj = AdjacencyStore::new();
+        let result = bellman_ford(&adj, 1);
+        assert!(result.is_err()); // Node not found
+    }
+
+    #[test]
+    fn test_bellman_ford_single_node() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        let result = bellman_ford(&adj, 1).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], (1, 0.0));
+    }
+
+    #[test]
+    fn test_bellman_ford_star() {
+        let adj = build_star_graph(); // 1->2, 1->3, 1->4, 1->5
+        let result = bellman_ford(&adj, 1).unwrap();
+        assert_eq!(result.len(), 5);
+        assert_eq!(result[0], (1, 0.0));
+        // All spokes are distance 1.0 from center
+        for &(_, dist) in &result[1..] {
+            assert!((dist - 1.0).abs() < 1e-10);
+        }
+    }
+
+    // ─── Harmonic Centrality Tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_harmonic_centrality_star() {
+        let adj = build_star_graph(); // center=1, spokes: 1->2, 1->3, 1->4, 1->5
+        let result = harmonic_centrality(&adj, &EdgeFilter::none());
+        // Center node (1) can reach all 4 others at distance 1
+        // H(1) = (1/4) * (1/1 + 1/1 + 1/1 + 1/1) = 1.0
+        assert!(!result.is_empty());
+        assert_eq!(result[0].0, 1);
+        assert!((result[0].1 - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_harmonic_centrality_empty() {
+        let adj = AdjacencyStore::new();
+        let result = harmonic_centrality(&adj, &EdgeFilter::none());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_harmonic_centrality_isolated_nodes() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        adj.add_node(2);
+        // No edges => all harmonic centrality = 0
+        let result = harmonic_centrality(&adj, &EdgeFilter::none());
+        assert_eq!(result.len(), 2);
+        for &(_, score) in &result {
+            assert!((score).abs() < 1e-10);
+        }
+    }
+
+    // ─── Katz Centrality Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_katz_centrality_star() {
+        let adj = build_star_graph();
+        let result = katz_centrality(&adj, 0.1, 1.0, 100, 1e-6);
+        // Center node should have highest score (most connections)
+        assert!(!result.is_empty());
+        assert_eq!(result[0].0, 1);
+    }
+
+    #[test]
+    fn test_katz_centrality_empty() {
+        let adj = AdjacencyStore::new();
+        let result = katz_centrality(&adj, 0.1, 1.0, 100, 1e-6);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_katz_centrality_single_node() {
+        let mut adj = AdjacencyStore::new();
+        adj.add_node(1);
+        let result = katz_centrality(&adj, 0.1, 1.0, 100, 1e-6);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 1);
+        // Single node gets score = beta normalized, which is 1.0
+        assert!((result[0].1 - 1.0).abs() < 1e-6);
+    }
+
+    // ─── ArticleRank Tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_article_rank_star() {
+        let adj = build_star_graph();
+        let result = article_rank(&adj, 0.85, 100, 1e-6);
+        // All nodes should have non-zero scores
+        assert_eq!(result.len(), 5);
+        for &(_, score) in &result {
+            assert!(score > 0.0);
+        }
+    }
+
+    #[test]
+    fn test_article_rank_empty() {
+        let adj = AdjacencyStore::new();
+        let result = article_rank(&adj, 0.85, 100, 1e-6);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_article_rank_linear() {
+        let adj = build_linear_graph(); // 1->2->3->4
+        let result = article_rank(&adj, 0.85, 100, 1e-6);
+        assert_eq!(result.len(), 4);
+        // All scores should be positive
+        for &(_, score) in &result {
+            assert!(score > 0.0);
+        }
+        // Scores should be sorted descending
+        for w in result.windows(2) {
+            assert!(w[0].1 >= w[1].1);
+        }
+    }
+
+    // ─── K-1 Coloring Tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_k1_coloring_triangle() {
+        // Triangle: 1-2, 2-3, 1-3 (needs 3 colors)
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let result = k1_coloring(&adj, 100);
+        assert_eq!(result.conflicts, 0);
+        assert!(result.num_colors >= 3);
+        // Verify no adjacent nodes share a color
+        assert_ne!(result.colors[&1], result.colors[&2]);
+        assert_ne!(result.colors[&2], result.colors[&3]);
+        assert_ne!(result.colors[&1], result.colors[&3]);
+    }
+
+    #[test]
+    fn test_k1_coloring_empty() {
+        let adj = AdjacencyStore::new();
+        let result = k1_coloring(&adj, 100);
+        assert!(result.colors.is_empty());
+        assert_eq!(result.num_colors, 0);
+        assert_eq!(result.conflicts, 0);
+    }
+
+    #[test]
+    fn test_k1_coloring_bipartite() {
+        // Bipartite graph: 1-3, 1-4, 2-3, 2-4 (needs 2 colors)
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=4 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+        adj.add_edge(1, 4, 0, make_meta(1, 4, 0)).unwrap();
+        adj.add_edge(4, 1, 0, make_meta(4, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(2, 4, 0, make_meta(2, 4, 0)).unwrap();
+        adj.add_edge(4, 2, 0, make_meta(4, 2, 0)).unwrap();
+
+        let result = k1_coloring(&adj, 100);
+        assert_eq!(result.conflicts, 0);
+        assert!(result.num_colors <= 2);
+    }
+
+    // ─── Conductance Tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_conductance_star() {
+        let adj = build_star_graph(); // center=1, spokes: 1->2, 1->3, 1->4, 1->5
+        // Community = {1, 2} — 1 edge inside (1->2), edges leaving: 1->3, 1->4, 1->5 = 3
+        let community: HashSet<NodeId> = [1, 2].iter().copied().collect();
+        let c = conductance(&adj, &community);
+        assert!(c > 0.0, "conductance should be positive");
+    }
+
+    #[test]
+    fn test_conductance_empty_community() {
+        let adj = build_star_graph();
+        let community: HashSet<NodeId> = HashSet::new();
+        let c = conductance(&adj, &community);
+        assert!((c).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_conductance_entire_graph() {
+        let adj = build_star_graph();
+        let community: HashSet<NodeId> = [1, 2, 3, 4, 5].iter().copied().collect();
+        let c = conductance(&adj, &community);
+        // Entire graph = no crossing edges
+        assert!((c).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_all_community_conductance() {
+        let adj = build_star_graph();
+        let mut communities: HashMap<NodeId, u64> = HashMap::new();
+        communities.insert(1, 0);
+        communities.insert(2, 0);
+        communities.insert(3, 1);
+        communities.insert(4, 1);
+        communities.insert(5, 1);
+        let result = all_community_conductance(&adj, &communities);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, 0);
+        assert_eq!(result[1].0, 1);
+    }
+
+    // ─── Local Clustering Coefficient Tests ─────────────────────────────────
+
+    #[test]
+    fn test_local_clustering_coefficient_triangle() {
+        // Complete triangle: 1-2, 2-3, 1-3
+        let mut adj = AdjacencyStore::new();
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
+        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
+        adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
+        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
+        adj.add_edge(3, 2, 0, make_meta(3, 2, 0)).unwrap();
+        adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
+        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
+
+        let result = local_clustering_coefficient(&adj);
+        assert_eq!(result.len(), 3);
+        // In a complete triangle, every node has LCC = 1.0
+        for &(_, cc) in &result {
+            assert!((cc - 1.0).abs() < 1e-10, "expected 1.0, got {}", cc);
+        }
+    }
+
+    #[test]
+    fn test_local_clustering_coefficient_empty() {
+        let adj = AdjacencyStore::new();
+        let result = local_clustering_coefficient(&adj);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_local_clustering_coefficient_star() {
+        let adj = build_star_graph();
+        let result = local_clustering_coefficient(&adj);
+        // Star graph: center has degree 4 but no triangles => LCC = 0
+        // Leaf nodes have degree 1 => LCC = 0
+        for &(_, cc) in &result {
+            assert!((cc).abs() < 1e-10, "expected 0.0, got {}", cc);
+        }
     }
 }

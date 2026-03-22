@@ -288,6 +288,86 @@ export class WeavClient {
     );
   }
 
+  // ── Vector search ───────────────────────────────────────────────────
+
+  async searchVector(
+    graph: string,
+    embedding: number[],
+    options?: {
+      k?: number;
+      labels?: string[];
+      properties?: Record<string, unknown>;
+    },
+  ): Promise<Record<string, unknown>> {
+    const body: Record<string, unknown> = { embedding };
+    if (options?.k !== undefined) {
+      body.k = options.k;
+    }
+    if (options?.labels !== undefined) {
+      body.labels = options.labels;
+    }
+    if (options?.properties !== undefined) {
+      body.properties = options.properties;
+    }
+    return this.request<Record<string, unknown>>(
+      'POST',
+      `/v1/graphs/${encodeURIComponent(graph)}/search/vector`,
+      body,
+    );
+  }
+
+  // ── Graph diff ─────────────────────────────────────────────────────
+
+  async graphDiff(
+    graph: string,
+    fromTimestamp: number,
+    toTimestamp: number,
+  ): Promise<Record<string, unknown>> {
+    return this.request<Record<string, unknown>>(
+      'POST',
+      `/v1/graphs/${encodeURIComponent(graph)}/diff`,
+      { from_timestamp: fromTimestamp, to_timestamp: toTimestamp },
+    );
+  }
+
+  // ── Community operations ───────────────────────────────────────────
+
+  async communitySummarize(
+    graph: string,
+    options?: {
+      algorithm?: string;
+      resolution?: number;
+    },
+  ): Promise<Record<string, unknown>> {
+    return this.request<Record<string, unknown>>(
+      'POST',
+      `/v1/graphs/${encodeURIComponent(graph)}/communities/summarize`,
+      {
+        algorithm: options?.algorithm ?? 'leiden',
+        resolution: options?.resolution ?? 1.0,
+      },
+    );
+  }
+
+  async communitySummaries(graph: string): Promise<Record<string, unknown>> {
+    return this.request<Record<string, unknown>>(
+      'GET',
+      `/v1/graphs/${encodeURIComponent(graph)}/communities/summaries`,
+    );
+  }
+
+  async communitySearch(
+    graph: string,
+    query: string,
+    limit?: number,
+  ): Promise<Record<string, unknown>> {
+    return this.request<Record<string, unknown>>(
+      'POST',
+      `/v1/graphs/${encodeURIComponent(graph)}/communities/search`,
+      { query, limit: limit ?? 10 },
+    );
+  }
+
   // ── Algorithms ──────────────────────────────────────────────────────
 
   async runAlgorithm(

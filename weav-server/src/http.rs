@@ -3505,13 +3505,125 @@ async fn run_algorithm(
             }))).into_response()
         }
 
+        "wcc" => {
+            // Alias for connected components (standard naming)
+            let component_map = weav_graph::traversal::connected_components(&gs.adjacency);
+            let mut groups: std::collections::HashMap<u32, Vec<u64>> =
+                std::collections::HashMap::new();
+            for (&node_id, &comp_id) in &component_map {
+                groups.entry(comp_id).or_default().push(node_id);
+            }
+            let mut components: Vec<Vec<u64>> = groups.into_values().collect();
+            for c in &mut components { c.sort(); }
+            components.sort_by_key(|c| std::cmp::Reverse(c.len()));
+            let count = components.len();
+            (StatusCode::OK, Json(ApiResponse::ok(ComponentsResponse { components, count }))).into_response()
+        }
+
+        "harmonic" => {
+            let filter = weav_graph::traversal::EdgeFilter::none();
+            let result = weav_graph::traversal::harmonic_centrality(&gs.adjacency, &filter);
+            let scores: Vec<AlgoNodeScore> = result
+                .into_iter()
+                .map(|(node_id, score)| AlgoNodeScore { node_id, score })
+                .collect();
+            (StatusCode::OK, Json(ApiResponse::ok(PageRankResponse { scores }))).into_response()
+        }
+
+        "katz" => {
+            let alpha = body.get("alpha").and_then(|v| v.as_f64()).unwrap_or(0.1);
+            let beta = body.get("beta").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let max_iter = body.get("iterations").and_then(|v| v.as_u64()).unwrap_or(100) as u32;
+            let tolerance = body.get("tolerance").and_then(|v| v.as_f64()).unwrap_or(1e-6);
+            let result = weav_graph::traversal::katz_centrality(&gs.adjacency, alpha, beta, max_iter, tolerance);
+            let scores: Vec<AlgoNodeScore> = result
+                .into_iter()
+                .map(|(node_id, score)| AlgoNodeScore { node_id, score })
+                .collect();
+            (StatusCode::OK, Json(ApiResponse::ok(PageRankResponse { scores }))).into_response()
+        }
+
+        "article_rank" => {
+            let damping = body.get("damping").and_then(|v| v.as_f64()).unwrap_or(0.85) as f32;
+            let max_iter = body.get("iterations").and_then(|v| v.as_u64()).unwrap_or(20) as u32;
+            let tolerance = body.get("tolerance").and_then(|v| v.as_f64()).unwrap_or(1e-6);
+            let result = weav_graph::traversal::article_rank(&gs.adjacency, damping, max_iter, tolerance);
+            let scores: Vec<AlgoNodeScore> = result
+                .into_iter()
+                .map(|(node_id, score)| AlgoNodeScore { node_id, score })
+                .collect();
+            (StatusCode::OK, Json(ApiResponse::ok(PageRankResponse { scores }))).into_response()
+        }
+
+        "bellman_ford" => {
+            let source = match body.get("source").and_then(|v| v.as_u64()) {
+                Some(s) => s,
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ApiResponse::<()>::err("missing required field: source".to_string())),
+                    ).into_response()
+                }
+            };
+            match weav_graph::traversal::bellman_ford(&gs.adjacency, source) {
+                Ok(distances) => {
+                    let scores: Vec<AlgoNodeScore> = distances
+                        .into_iter()
+                        .map(|(node_id, score)| AlgoNodeScore { node_id, score })
+                        .collect();
+                    (StatusCode::OK, Json(ApiResponse::ok(PageRankResponse { scores }))).into_response()
+                }
+                Err(e) => weav_error_to_response(e).into_response(),
+            }
+        }
+
+        "k1_coloring" | "graph_coloring" => {
+            let max_iter = body.get("iterations").and_then(|v| v.as_u64()).unwrap_or(100) as u32;
+            let result = weav_graph::traversal::k1_coloring(&gs.adjacency, max_iter);
+            let mut colors: Vec<serde_json::Value> = result.colors
+                .iter()
+                .map(|(&nid, &color)| serde_json::json!({"node_id": nid, "color": color}))
+                .collect();
+            colors.sort_by_key(|v| v["node_id"].as_u64());
+            (StatusCode::OK, Json(ApiResponse::ok(serde_json::json!({
+                "num_colors": result.num_colors,
+                "conflicts": result.conflicts,
+                "colors": colors,
+            })))).into_response()
+        }
+
+        "conductance" => {
+            // Compute communities first, then conductance per community
+            let community_map = weav_graph::traversal::modularity_communities(&gs.adjacency, 100, 1.0);
+            let conductances = weav_graph::traversal::all_community_conductance(&gs.adjacency, &community_map);
+            let results: Vec<serde_json::Value> = conductances
+                .iter()
+                .map(|&(comm_id, cond)| serde_json::json!({"community_id": comm_id, "conductance": cond}))
+                .collect();
+            (StatusCode::OK, Json(ApiResponse::ok(serde_json::json!({
+                "community_count": results.len(),
+                "conductances": results,
+            })))).into_response()
+        }
+
+        "clustering_coefficient" => {
+            let result = weav_graph::traversal::local_clustering_coefficient(&gs.adjacency);
+            let scores: Vec<AlgoNodeScore> = result
+                .into_iter()
+                .map(|(node_id, score)| AlgoNodeScore { node_id, score })
+                .collect();
+            (StatusCode::OK, Json(ApiResponse::ok(PageRankResponse { scores }))).into_response()
+        }
+
         _ => (
             StatusCode::BAD_REQUEST,
             Json(ApiResponse::<()>::err(format!(
                 "unknown algorithm: {algorithm}. Supported: pagerank, betweenness, closeness, \
-                 communities, label_propagation, leiden, shortest_path, components, scc, \
+                 communities, label_propagation, leiden, shortest_path, components, wcc, scc, \
                  topological_sort, triangle_count, degree, eigenvector, hits, fastrp, \
-                 similarity, link_prediction, random_walk, k_core, max_flow, mst"
+                 similarity, link_prediction, random_walk, k_core, max_flow, mst, \
+                 harmonic, katz, article_rank, bellman_ford, k1_coloring, conductance, \
+                 clustering_coefficient"
             ))),
         )
             .into_response(),
@@ -6110,5 +6222,517 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Vector search tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_search_vector_basic() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "vs_basic".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        // Add nodes with embeddings (1536 dimensions).
+        let mut emb1 = vec![0.0f32; 1536];
+        emb1[0] = 1.0;
+        let mut emb2 = vec![0.0f32; 1536];
+        emb2[1] = 1.0;
+
+        engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "vs_basic".to_string(),
+                    label: "doc".to_string(),
+                    properties: vec![("name".to_string(), Value::String("first".into()))],
+                    embedding: Some(emb1.clone()),
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+        engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "vs_basic".to_string(),
+                    label: "doc".to_string(),
+                    properties: vec![("name".to_string(), Value::String("second".into()))],
+                    embedding: Some(emb2),
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        // Search by vector.
+        let search_body = serde_json::json!({
+            "embedding": emb1,
+            "k": 2
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/vs_basic/search/vector")
+            .header("content-type", "application/json")
+            .body(Body::from(search_body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        let matches = json["data"]["matches"].as_array().unwrap();
+        assert!(!matches.is_empty());
+        assert!(matches[0]["node_id"].as_u64().is_some());
+        assert!(matches[0]["similarity"].as_f64().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_search_vector_with_label_filter() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "vs_filter".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let mut emb = vec![0.0f32; 1536];
+        emb[0] = 1.0;
+
+        // Add two nodes with different labels.
+        engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "vs_filter".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![("name".to_string(), Value::String("Alice".into()))],
+                    embedding: Some(emb.clone()),
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+        engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "vs_filter".to_string(),
+                    label: "org".to_string(),
+                    properties: vec![("name".to_string(), Value::String("Acme".into()))],
+                    embedding: Some(emb.clone()),
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        // Search with label filter for "person" only.
+        let search_body = serde_json::json!({
+            "embedding": emb,
+            "k": 10,
+            "labels": ["person"]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/vs_filter/search/vector")
+            .header("content-type", "application/json")
+            .body(Body::from(search_body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["filtered"], true);
+        let matches = json["data"]["matches"].as_array().unwrap();
+        // All returned matches should be "person" label.
+        for m in matches {
+            assert_eq!(m["label"], "person");
+        }
+    }
+
+    // ── Graph diff tests ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_graph_diff_basic() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "diff_g".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let n1 = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "diff_g".to_string(),
+                    label: "a".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+        let n2 = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "diff_g".to_string(),
+                    label: "b".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        // Add an edge (timestamp is recorded internally).
+        engine
+            .execute_command(
+                Command::EdgeAdd(EdgeAddCmd {
+                    graph: "diff_g".to_string(),
+                    source: n1,
+                    target: n2,
+                    label: "link".to_string(),
+                    weight: 1.0,
+                    properties: vec![],
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // Diff from past to future should capture the edge addition.
+        let diff_body = serde_json::json!({
+            "from_timestamp": 0,
+            "to_timestamp": now_ms + 10000
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/diff_g/diff")
+            .header("content-type", "application/json")
+            .body(Body::from(diff_body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["from_timestamp"], 0);
+        assert!(json["data"]["edges"]["added_count"].as_u64().unwrap() >= 1);
+    }
+
+    // ── Community summarize/search tests ───────────────────────────────
+
+    #[tokio::test]
+    async fn test_community_summarize_basic() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "cs_g".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        // Create a small community: 3 nodes with edges forming a triangle.
+        let (n1, n2, _n3) = setup_triangle_graph_named(&engine, "cs_g");
+        let _ = (n1, n2); // suppress unused warnings
+
+        // Run community summarize.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/cs_g/communities/summarize")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"algorithm": "leiden", "resolution": 1.0}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        assert!(json["data"]["community_count"].as_u64().unwrap() >= 1);
+        let summaries = json["data"]["summaries"].as_array().unwrap();
+        assert!(!summaries.is_empty());
+        for s in summaries {
+            assert!(s["node_id"].as_u64().is_some());
+            assert!(s["member_count"].as_u64().unwrap() >= 1);
+            assert!(s["summary"].as_str().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_community_search_basic() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "csearch_g".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        // Add nodes with names so summaries contain searchable text.
+        let mut ids = Vec::new();
+        for name in ["Alice", "Bob", "Charlie"] {
+            let id = match engine
+                .execute_command(
+                    Command::NodeAdd(NodeAddCmd {
+                        graph: "csearch_g".to_string(),
+                        label: "person".to_string(),
+                        properties: vec![("name".to_string(), Value::String(name.into()))],
+                        embedding: None,
+                        entity_key: None,
+                        ttl_ms: None,
+                    }),
+                    None,
+                )
+                .unwrap()
+            {
+                CommandResponse::Integer(id) => id,
+                _ => panic!("expected Integer"),
+            };
+            ids.push(id);
+        }
+        // Add edges to form a triangle.
+        for &(s, t) in &[(ids[0], ids[1]), (ids[1], ids[2]), (ids[2], ids[0])] {
+            engine
+                .execute_command(
+                    Command::EdgeAdd(EdgeAddCmd {
+                        graph: "csearch_g".to_string(),
+                        source: s,
+                        target: t,
+                        label: "knows".to_string(),
+                        weight: 1.0,
+                        properties: vec![],
+                        ttl_ms: None,
+                    }),
+                    None,
+                )
+                .unwrap();
+        }
+
+        // First, run summarize to create community summaries.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/csearch_g/communities/summarize")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"algorithm": "leiden"}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Get summaries to verify they exist.
+        let req = Request::builder()
+            .uri("/v1/graphs/csearch_g/communities/summaries")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert!(json["data"]["total"].as_u64().unwrap() >= 1);
+
+        // Search community summaries.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/csearch_g/communities/search")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query": "Alice", "limit": 5}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+    }
+
+    // ── Additional algorithm endpoint tests ────────────────────────────
+
+    #[tokio::test]
+    async fn test_algorithm_similarity() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+        let (n1, n2, _n3) = setup_triangle_graph(&engine, "sim");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/sim/algorithms/similarity")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"node_a": n1, "node_b": n2, "metric": "jaccard"}).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        let pairs = json["data"]["pairs"].as_array().unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0]["node_a"].as_u64().unwrap(), n1);
+        assert_eq!(pairs[0]["node_b"].as_u64().unwrap(), n2);
+        assert!(pairs[0]["similarity"].as_f64().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_algorithm_random_walk() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+        let (n1, _n2, _n3) = setup_triangle_graph(&engine, "rw");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/rw/algorithms/random_walk")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"start": n1, "length": 5, "seed": 42}).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        let walk = json["data"]["walk"].as_array().unwrap();
+        assert!(!walk.is_empty());
+        // Walk should start from n1.
+        assert_eq!(walk[0].as_u64().unwrap(), n1);
+        assert!(json["data"]["length"].as_u64().unwrap() >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_algorithm_k_core() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+        setup_triangle_graph(&engine, "kc");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/kc/algorithms/k_core")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        let cores = json["data"]["cores"].as_array().unwrap();
+        assert_eq!(cores.len(), 3);
+        for c in cores {
+            assert!(c["node_id"].as_u64().is_some());
+            assert!(c["core_number"].as_u64().is_some());
+        }
+        assert!(json["data"]["max_core"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_algorithm_mst() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+        setup_triangle_graph(&engine, "mst_g");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/mst_g/algorithms/mst")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        let edges = json["data"]["edges"].as_array().unwrap();
+        // MST of 3 nodes needs exactly 2 edges.
+        assert_eq!(edges.len(), 2);
+        assert_eq!(json["data"]["edge_count"].as_u64().unwrap(), 2);
+        assert!(json["data"]["total_weight"].as_f64().is_some());
+        for e in edges {
+            assert!(e["source"].as_u64().is_some());
+            assert!(e["target"].as_u64().is_some());
+            assert!(e["weight"].as_f64().is_some());
+        }
+    }
+
+    /// Helper: add nodes and edges to an existing graph (for community tests).
+    fn setup_triangle_graph_named(engine: &Arc<Engine>, name: &str) -> (u64, u64, u64) {
+        let mut ids = Vec::new();
+        for label in ["a", "b", "c"] {
+            let id = match engine
+                .execute_command(
+                    Command::NodeAdd(NodeAddCmd {
+                        graph: name.to_string(),
+                        label: label.to_string(),
+                        properties: vec![],
+                        embedding: None,
+                        entity_key: None,
+                        ttl_ms: None,
+                    }),
+                    None,
+                )
+                .unwrap()
+            {
+                CommandResponse::Integer(id) => id,
+                _ => panic!("expected Integer"),
+            };
+            ids.push(id);
+        }
+
+        for &(s, t) in &[(ids[0], ids[1]), (ids[1], ids[2]), (ids[2], ids[0])] {
+            engine
+                .execute_command(
+                    Command::EdgeAdd(EdgeAddCmd {
+                        graph: name.to_string(),
+                        source: s,
+                        target: t,
+                        label: "link".to_string(),
+                        weight: 1.0,
+                        properties: vec![],
+                        ttl_ms: None,
+                    }),
+                    None,
+                )
+                .unwrap();
+        }
+
+        (ids[0], ids[1], ids[2])
     }
 }

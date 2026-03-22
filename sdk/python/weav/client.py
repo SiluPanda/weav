@@ -429,12 +429,70 @@ class WeavClient:
 
     # -- Algorithms --------------------------------------------------------
 
+    def search_vector(
+        self,
+        graph: str,
+        embedding: list[float],
+        k: int = 10,
+        labels: list[str] | None = None,
+        properties: dict | None = None,
+    ) -> dict:
+        """Vector similarity search with optional filtering."""
+        body: dict[str, Any] = {"embedding": embedding, "k": k}
+        if labels is not None:
+            body["labels"] = labels
+        if properties is not None:
+            body["properties"] = properties
+        resp = self._client.post(f"/v1/graphs/{graph}/search/vector", json=body)
+        return _check_response(resp)
+
+    # -- Graph diff --------------------------------------------------------
+
+    def graph_diff(self, graph: str, from_timestamp: int, to_timestamp: int) -> dict:
+        """Compare graph state between two timestamps."""
+        resp = self._client.post(
+            f"/v1/graphs/{graph}/diff",
+            json={"from_timestamp": from_timestamp, "to_timestamp": to_timestamp},
+        )
+        return _check_response(resp)
+
+    # -- Community operations ----------------------------------------------
+
+    def community_summarize(
+        self,
+        graph: str,
+        algorithm: str = "leiden",
+        resolution: float = 1.0,
+    ) -> dict:
+        """Run community detection and generate summaries."""
+        resp = self._client.post(
+            f"/v1/graphs/{graph}/communities/summarize",
+            json={"algorithm": algorithm, "resolution": resolution},
+        )
+        return _check_response(resp)
+
+    def community_summaries(self, graph: str) -> dict:
+        """Get all community summaries."""
+        resp = self._client.get(f"/v1/graphs/{graph}/communities/summaries")
+        return _check_response(resp)
+
+    def community_search(self, graph: str, query: str, limit: int = 10) -> dict:
+        """Search community summaries."""
+        resp = self._client.post(
+            f"/v1/graphs/{graph}/communities/search",
+            json={"query": query, "limit": limit},
+        )
+        return _check_response(resp)
+
+    # -- Algorithms --------------------------------------------------------
+
     def run_algorithm(self, graph: str, algorithm: str, **kwargs: Any) -> dict:
         """Run a graph algorithm.
 
         Supported: pagerank, communities, shortest_path, betweenness,
         closeness, degree, triangle_count, scc, topological_sort,
-        label_propagation, leiden, eigenvector, hits.
+        label_propagation, leiden, eigenvector, hits, similarity,
+        link_prediction, random_walk, k_core, max_flow, mst.
         """
         resp = self._client.post(
             f"/v1/graphs/{graph}/algorithms/{algorithm}",
@@ -785,12 +843,70 @@ class AsyncWeavClient:
 
     # -- Algorithms --------------------------------------------------------
 
+    async def search_vector(
+        self,
+        graph: str,
+        embedding: list[float],
+        k: int = 10,
+        labels: list[str] | None = None,
+        properties: dict | None = None,
+    ) -> dict:
+        """Vector similarity search with optional filtering."""
+        body: dict[str, Any] = {"embedding": embedding, "k": k}
+        if labels is not None:
+            body["labels"] = labels
+        if properties is not None:
+            body["properties"] = properties
+        resp = await self._client.post(f"/v1/graphs/{graph}/search/vector", json=body)
+        return _check_response(resp)
+
+    # -- Graph diff --------------------------------------------------------
+
+    async def graph_diff(self, graph: str, from_timestamp: int, to_timestamp: int) -> dict:
+        """Compare graph state between two timestamps."""
+        resp = await self._client.post(
+            f"/v1/graphs/{graph}/diff",
+            json={"from_timestamp": from_timestamp, "to_timestamp": to_timestamp},
+        )
+        return _check_response(resp)
+
+    # -- Community operations ----------------------------------------------
+
+    async def community_summarize(
+        self,
+        graph: str,
+        algorithm: str = "leiden",
+        resolution: float = 1.0,
+    ) -> dict:
+        """Run community detection and generate summaries."""
+        resp = await self._client.post(
+            f"/v1/graphs/{graph}/communities/summarize",
+            json={"algorithm": algorithm, "resolution": resolution},
+        )
+        return _check_response(resp)
+
+    async def community_summaries(self, graph: str) -> dict:
+        """Get all community summaries."""
+        resp = await self._client.get(f"/v1/graphs/{graph}/communities/summaries")
+        return _check_response(resp)
+
+    async def community_search(self, graph: str, query: str, limit: int = 10) -> dict:
+        """Search community summaries."""
+        resp = await self._client.post(
+            f"/v1/graphs/{graph}/communities/search",
+            json={"query": query, "limit": limit},
+        )
+        return _check_response(resp)
+
+    # -- Algorithms --------------------------------------------------------
+
     async def run_algorithm(self, graph: str, algorithm: str, **kwargs: Any) -> dict:
         """Run a graph algorithm.
 
         Supported: pagerank, communities, shortest_path, betweenness,
         closeness, degree, triangle_count, scc, topological_sort,
-        label_propagation, leiden, eigenvector, hits.
+        label_propagation, leiden, eigenvector, hits, similarity,
+        link_prediction, random_walk, k_core, max_flow, mst.
         """
         resp = await self._client.post(
             f"/v1/graphs/{graph}/algorithms/{algorithm}",

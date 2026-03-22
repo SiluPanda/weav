@@ -198,6 +198,43 @@ pub struct VectorSearchParams {
     pub embedding: Vec<f32>,
     /// Number of results to return (default 10).
     pub top_k: Option<usize>,
+    /// Filter by node labels (only return nodes with these labels).
+    pub labels: Option<Vec<String>>,
+    /// Filter by property values (only return nodes matching all these properties).
+    pub properties: Option<HashMap<String, serde_json::Value>>,
+}
+
+/// Parameters for graph temporal diff.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GraphDiffParams {
+    /// Name of the graph.
+    pub graph: String,
+    /// Start timestamp (milliseconds since epoch).
+    pub from_timestamp: u64,
+    /// End timestamp (milliseconds since epoch).
+    pub to_timestamp: u64,
+}
+
+/// Parameters for community summarization.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CommunitySummarizeParams {
+    /// Name of the graph.
+    pub graph: String,
+    /// Algorithm to use: "leiden" (default) or "label_propagation".
+    pub algorithm: Option<String>,
+    /// Resolution parameter (default 1.0).
+    pub resolution: Option<f64>,
+}
+
+/// Parameters for community search.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CommunitySearchParams {
+    /// Name of the graph.
+    pub graph: String,
+    /// Search query text.
+    pub query: String,
+    /// Maximum results (default 10).
+    pub limit: Option<usize>,
 }
 
 /// Parameters for running a graph algorithm.
@@ -1038,7 +1075,7 @@ impl WeavMcpServer {
     }
 
     /// Vector similarity search.
-    #[tool(description = "Search for the most similar nodes using vector embeddings (HNSW index). Returns nodes ranked by cosine similarity to the query vector.")]
+    #[tool(description = "Search for the most similar nodes using vector embeddings (HNSW index). Returns nodes ranked by cosine similarity to the query vector. Optionally filter by labels and/or property values.")]
     fn vector_search(
         &self,
         Parameters(params): Parameters<VectorSearchParams>,
@@ -1049,8 +1086,43 @@ impl WeavMcpServer {
         let gs = graph_arc.read();
 
         let top_k = params.top_k.unwrap_or(10) as u16;
-        let results = gs.vector_index.search(&params.embedding, top_k, None)
-            .unwrap_or_default();
+        let has_filter = params.labels.is_some() || params.properties.is_some();
+        let results = if has_filter {
+            let filter_labels = &params.labels;
+            let filter_props = &params.properties;
+            gs.vector_index.search_filtered(
+                &params.embedding,
+                top_k,
+                &|node_id: u64| {
+                    if let Some(labels) = filter_labels {
+                        let node_label = gs.properties
+                            .get_node_property(node_id, "_label")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if !labels.iter().any(|l| l == node_label) {
+                            return false;
+                        }
+                    }
+                    if let Some(props) = filter_props {
+                        for (key, expected) in props {
+                            match gs.properties.get_node_property(node_id, key) {
+                                Some(actual) => {
+                                    if value_to_json(actual) != *expected {
+                                        return false;
+                                    }
+                                }
+                                None => return false,
+                            }
+                        }
+                    }
+                    true
+                },
+                None,
+            ).unwrap_or_default()
+        } else {
+            gs.vector_index.search(&params.embedding, top_k, None)
+                .unwrap_or_default()
+        };
 
         let items: Vec<serde_json::Value> = results
             .iter()
@@ -1085,7 +1157,7 @@ impl WeavMcpServer {
     }
 
     /// Run a graph algorithm.
-    #[tool(description = "Run a graph algorithm on a graph. Supported algorithms: 'pagerank' (Personalized PageRank), 'communities' (Louvain modularity), 'label_propagation', 'shortest_path' (Dijkstra, requires source+target), 'connected_components', 'betweenness' (centrality), 'closeness' (centrality), 'degree' (centrality), 'triangle_count', 'scc' (strongly connected components), 'topological_sort', 'fastrp' (Fast Random Projection node embeddings). Returns algorithm-specific results.")]
+    #[tool(description = "Run a graph algorithm on a graph. Supported algorithms: 'pagerank', 'communities' (Louvain), 'label_propagation', 'shortest_path' (Dijkstra, requires source+target), 'connected_components', 'wcc' (alias), 'betweenness', 'closeness', 'degree', 'triangle_count', 'scc', 'topological_sort', 'fastrp', 'similarity' (Jaccard/Cosine/Overlap, requires source+target), 'link_prediction' (Adamic-Adar top-k), 'random_walk' (requires source), 'k_core', 'max_flow' (requires source+target), 'mst' (minimum spanning tree).")]
     fn run_algorithm(
         &self,
         Parameters(params): Parameters<RunAlgorithmParams>,
@@ -1344,10 +1416,130 @@ impl WeavMcpServer {
                     "results": results,
                 }))
             }
+            "similarity" => {
+                let node_a = params.source.ok_or_else(|| {
+                    McpError::invalid_params("'source' (node_a) required for similarity", None)
+                })?;
+                let node_b = params.target.ok_or_else(|| {
+                    McpError::invalid_params("'target' (node_b) required for similarity", None)
+                })?;
+                let jaccard = traversal::jaccard_similarity(&gs.adjacency, node_a, node_b);
+                let cosine = traversal::cosine_similarity(&gs.adjacency, node_a, node_b);
+                let overlap = traversal::overlap_similarity(&gs.adjacency, node_a, node_b);
+                success_json(&serde_json::json!({
+                    "algorithm": "similarity",
+                    "node_a": node_a,
+                    "node_b": node_b,
+                    "jaccard": jaccard,
+                    "cosine": cosine,
+                    "overlap": overlap,
+                }))
+            }
+            "link_prediction" => {
+                let top_k = limit;
+                let predictions = traversal::predict_links(
+                    &gs.adjacency,
+                    traversal::LinkPredictionMetric::AdamicAdar,
+                    top_k,
+                );
+                let results: Vec<serde_json::Value> = predictions
+                    .iter()
+                    .map(|&(a, b, score)| serde_json::json!({"node_a": a, "node_b": b, "score": score}))
+                    .collect();
+                success_json(&serde_json::json!({
+                    "algorithm": "link_prediction",
+                    "count": results.len(),
+                    "results": results,
+                }))
+            }
+            "random_walk" => {
+                let start = params.source.ok_or_else(|| {
+                    McpError::invalid_params("'source' (start node) required for random_walk", None)
+                })?;
+                let length = params.max_iterations.unwrap_or(10) as usize;
+                let walk = traversal::random_walk(&gs.adjacency, start, length, 42);
+                success_json(&serde_json::json!({
+                    "algorithm": "random_walk",
+                    "walk": walk,
+                    "length": walk.len(),
+                }))
+            }
+            "k_core" => {
+                let cores = traversal::k_core_decomposition(&gs.adjacency);
+                let mut results: Vec<serde_json::Value> = cores
+                    .iter()
+                    .map(|(&nid, &core)| serde_json::json!({"node_id": nid, "core_number": core}))
+                    .collect();
+                results.sort_by(|a, b| {
+                    b["core_number"].as_u64().cmp(&a["core_number"].as_u64())
+                });
+                let max_core = cores.values().max().copied().unwrap_or(0);
+                success_json(&serde_json::json!({
+                    "algorithm": "k_core",
+                    "max_core": max_core,
+                    "count": results.len(),
+                    "results": results,
+                }))
+            }
+            "max_flow" => {
+                let source = params.source.ok_or_else(|| {
+                    McpError::invalid_params("'source' required for max_flow", None)
+                })?;
+                let sink = params.target.ok_or_else(|| {
+                    McpError::invalid_params("'target' (sink) required for max_flow", None)
+                })?;
+                match traversal::max_flow(&gs.adjacency, source, sink) {
+                    Ok(result) => {
+                        let edges: Vec<serde_json::Value> = result.flow_edges
+                            .iter()
+                            .map(|e| serde_json::json!({
+                                "source": e.source, "target": e.target,
+                                "flow": e.flow, "capacity": e.capacity,
+                            }))
+                            .collect();
+                        success_json(&serde_json::json!({
+                            "algorithm": "max_flow",
+                            "max_flow": result.max_flow,
+                            "flow_edges": edges,
+                        }))
+                    }
+                    Err(e) => weav_error(e),
+                }
+            }
+            "mst" => {
+                let result = traversal::minimum_spanning_tree(&gs.adjacency);
+                let edges: Vec<serde_json::Value> = result.edges
+                    .iter()
+                    .map(|e| serde_json::json!({
+                        "source": e.source, "target": e.target,
+                        "weight": e.weight, "edge_id": e.edge_id,
+                    }))
+                    .collect();
+                success_json(&serde_json::json!({
+                    "algorithm": "mst",
+                    "total_weight": result.total_weight,
+                    "edge_count": edges.len(),
+                    "edges": edges,
+                }))
+            }
+            "wcc" => {
+                // Alias for connected_components
+                let comp_map = traversal::connected_components(&gs.adjacency);
+                let mut groups: HashMap<u32, Vec<u64>> = HashMap::new();
+                for (&node, &comp) in &comp_map {
+                    groups.entry(comp).or_default().push(node);
+                }
+                let count = groups.len();
+                success_json(&serde_json::json!({
+                    "algorithm": "wcc",
+                    "component_count": count,
+                }))
+            }
             other => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Unknown algorithm '{other}'. Supported: pagerank, communities, label_propagation, \
-                 shortest_path, connected_components, betweenness, closeness, degree, \
-                 triangle_count, scc, topological_sort, fastrp"
+                 shortest_path, connected_components, wcc, betweenness, closeness, degree, \
+                 triangle_count, scc, topological_sort, fastrp, similarity, link_prediction, \
+                 random_walk, k_core, max_flow, mst"
             ))])),
         }
     }
@@ -1382,6 +1574,180 @@ impl WeavMcpServer {
             ))])),
             Err(e) => weav_error(e),
         }
+    }
+
+    /// Compare graph state between two timestamps (temporal diff).
+    #[tool(description = "Compare graph state between two timestamps. Returns edges added/removed and active node/edge counts at each timestamp. Useful for understanding temporal evolution of a knowledge graph.")]
+    fn graph_diff(
+        &self,
+        Parameters(params): Parameters<GraphDiffParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let graph_arc = self.engine.get_graph(&params.graph).map_err(|e| {
+            McpError::internal_error(e.to_string(), None)
+        })?;
+        let gs = graph_arc.read();
+
+        let mut added_edges = Vec::new();
+        let mut removed_edges = Vec::new();
+
+        for (eid, meta) in gs.adjacency.all_edges() {
+            if meta.temporal.tx_from >= params.from_timestamp
+                && meta.temporal.tx_from < params.to_timestamp
+            {
+                added_edges.push(eid);
+            }
+            if meta.temporal.tx_until > 0
+                && meta.temporal.tx_until >= params.from_timestamp
+                && meta.temporal.tx_until < params.to_timestamp
+            {
+                removed_edges.push(eid);
+            }
+        }
+
+        success_json(&serde_json::json!({
+            "graph": params.graph,
+            "from_timestamp": params.from_timestamp,
+            "to_timestamp": params.to_timestamp,
+            "edges_added": added_edges.len(),
+            "edges_removed": removed_edges.len(),
+            "added_edge_ids": added_edges,
+            "removed_edge_ids": removed_edges,
+        }))
+    }
+
+    /// Run community detection and generate summaries (GraphRAG pattern).
+    #[tool(description = "Run community detection on a graph and generate text summaries for each community. Creates synthetic _community_summary nodes searchable via BM25. Algorithms: 'leiden' (default), 'label_propagation'.")]
+    fn community_summarize(
+        &self,
+        Parameters(params): Parameters<CommunitySummarizeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let graph_arc = self.engine.get_graph(&params.graph).map_err(|e| {
+            McpError::internal_error(e.to_string(), None)
+        })?;
+        let mut gs = graph_arc.write();
+
+        let algorithm = params.algorithm.as_deref().unwrap_or("leiden");
+        let resolution = params.resolution.unwrap_or(1.0) as f32;
+
+        let community_map = match algorithm {
+            "label_propagation" => {
+                weav_graph::traversal::label_propagation(&gs.adjacency, 100)
+            }
+            _ => {
+                weav_graph::traversal::leiden_communities(&gs.adjacency, 100, resolution, 0.3)
+            }
+        };
+
+        // Group nodes by community
+        let mut groups: HashMap<u64, Vec<u64>> = HashMap::new();
+        for (&node, &comm) in &community_map {
+            groups.entry(comm).or_default().push(node);
+        }
+
+        let mut summaries_created = 0;
+        for (comm_id, members) in &groups {
+            // Build summary from member properties
+            let mut summary_parts = Vec::new();
+            for &nid in members.iter().take(20) {
+                let label = gs.properties
+                    .get_node_property(nid, "_label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("node")
+                    .to_string();
+                let name = gs.properties
+                    .get_node_property(nid, "name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !name.is_empty() {
+                    summary_parts.push(format!("{label}: {name}"));
+                }
+            }
+            let summary_text = if summary_parts.is_empty() {
+                format!("Community {} with {} members", comm_id, members.len())
+            } else {
+                summary_parts.join(", ")
+            };
+
+            // Create summary node
+            let node_id = gs.next_node_id;
+            gs.next_node_id += 1;
+            gs.adjacency.add_node(node_id);
+            gs.properties.set_node_property(node_id, "_label",
+                weav_core::types::Value::String(compact_str::CompactString::from("_community_summary")));
+            gs.properties.set_node_property(node_id, "community_id",
+                weav_core::types::Value::Int(*comm_id as i64));
+            gs.properties.set_node_property(node_id, "summary",
+                weav_core::types::Value::String(compact_str::CompactString::from(summary_text.as_str())));
+            gs.properties.set_node_property(node_id, "member_count",
+                weav_core::types::Value::Int(members.len() as i64));
+            gs.text_index.index_node(node_id, &summary_text);
+            summaries_created += 1;
+        }
+
+        success_json(&serde_json::json!({
+            "graph": params.graph,
+            "algorithm": algorithm,
+            "communities_found": groups.len(),
+            "summaries_created": summaries_created,
+        }))
+    }
+
+    /// Search community summaries using BM25 text search.
+    #[tool(description = "Search community summaries using BM25 text ranking. Returns matching community summaries ordered by relevance. Use after running community_summarize.")]
+    fn community_search(
+        &self,
+        Parameters(params): Parameters<CommunitySearchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let graph_arc = self.engine.get_graph(&params.graph).map_err(|e| {
+            McpError::internal_error(e.to_string(), None)
+        })?;
+        let gs = graph_arc.read();
+
+        let limit = params.limit.unwrap_or(10);
+        let results = gs.text_index.search(&params.query, limit * 2);
+
+        // Filter to only _community_summary nodes
+        let matches: Vec<serde_json::Value> = results
+            .iter()
+            .filter(|&&(nid, _)| {
+                gs.properties
+                    .get_node_property(nid, "_label")
+                    .and_then(|v| v.as_str())
+                    .map(|l| l == "_community_summary")
+                    .unwrap_or(false)
+            })
+            .take(limit)
+            .map(|&(nid, score)| {
+                let summary = gs.properties
+                    .get_node_property(nid, "summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let comm_id = gs.properties
+                    .get_node_property(nid, "community_id")
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0);
+                let member_count = gs.properties
+                    .get_node_property(nid, "member_count")
+                    .and_then(|v| v.as_int())
+                    .unwrap_or(0);
+                serde_json::json!({
+                    "node_id": nid,
+                    "community_id": comm_id,
+                    "summary": summary,
+                    "member_count": member_count,
+                    "score": score,
+                })
+            })
+            .collect();
+
+        success_json(&serde_json::json!({
+            "graph": params.graph,
+            "query": params.query,
+            "count": matches.len(),
+            "results": matches,
+        }))
     }
 
     /// Set a schema constraint on a graph.
