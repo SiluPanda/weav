@@ -1,0 +1,56 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#e0e0e0', 'primaryBorderColor': '#4a4a6a', 'lineColor': '#6c63ff', 'secondaryColor': '#16213e', 'tertiaryColor': '#0f3460', 'background': '#0d1117', 'mainBkg': '#161b22', 'nodeBorder': '#30363d', 'clusterBkg': '#161b22', 'clusterBorder': '#30363d', 'titleColor': '#e0e0e0', 'edgeLabelBackground': '#161b22'}}}%%
+graph TB
+    subgraph "Incoming Requests"
+        R1["HTTP\n:6382"]
+        R2["RESP3\n:6380"]
+        R3["gRPC\n:6381"]
+    end
+
+    subgraph "tokio Runtime (multi-thread)"
+        T1["Task: HTTP handler"]
+        T2["Task: RESP3 handler"]
+        T3["Task: gRPC handler"]
+        T4["Task: TTL sweep (periodic)"]
+        T5["Task: Snapshot (periodic)"]
+        T6["Task: WAL sync (periodic)"]
+    end
+
+    R1 --> T1
+    R2 --> T2
+    R3 --> T3
+
+    subgraph "Engine"
+        OUTER["RwLock&lt;HashMap&lt;String, Arc&lt;RwLock&lt;GraphState&gt;&gt;&gt;&gt;\n\nOuter lock: graph registry\n• read: concurrent graph access\n• write: graph create/drop only"]
+
+        subgraph "Per-Graph Isolation"
+            G1["RwLock&lt;GraphState&gt; — 'graph_a'\n• read: queries, searches, info\n• write: node/edge mutations"]
+            G2["RwLock&lt;GraphState&gt; — 'graph_b'\n• read: queries, searches, info\n• write: node/edge mutations"]
+        end
+
+        WALM["Mutex&lt;WriteAheadLog&gt;\nserializes all WAL writes"]
+        EVENTS["broadcast::channel\nfan-out CDC events"]
+    end
+
+    T1 --> OUTER
+    T2 --> OUTER
+    T3 --> OUTER
+    OUTER --> G1
+    OUTER --> G2
+    G1 -.->|"write ops"| WALM
+    G2 -.->|"write ops"| WALM
+    G1 -.->|"mutations"| EVENTS
+    T4 --> G1
+    T4 --> G2
+    T5 --> G1
+    T5 --> G2
+    T6 --> WALM
+
+    classDef request fill:#1a1a2e,stroke:#ff6b6b,color:#e0e0e0
+    classDef task fill:#16213e,stroke:#4a9eff,color:#e0e0e0
+    classDef lock fill:#0f3460,stroke:#ffd93d,color:#e0e0e0
+    classDef graphst fill:#1a1a2e,stroke:#6c63ff,color:#e0e0e0
+
+    class R1,R2,R3 request
+    class T1,T2,T3,T4,T5,T6 task
+    class OUTER,WALM lock
+    class G1,G2,EVENTS graphst

@@ -1,0 +1,46 @@
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#1a1a2e', 'primaryTextColor': '#e0e0e0', 'primaryBorderColor': '#4a4a6a', 'lineColor': '#6c63ff', 'secondaryColor': '#16213e', 'tertiaryColor': '#0f3460', 'background': '#0d1117', 'mainBkg': '#161b22', 'nodeBorder': '#30363d', 'clusterBkg': '#161b22', 'clusterBorder': '#30363d', 'titleColor': '#e0e0e0', 'edgeLabelBackground': '#161b22'}}}%%
+graph LR
+    subgraph "Build Profiles"
+        MIN["Minimal\n--no-default-features\n~70 crates | 12 MB | 10s"]
+        STD["Standard\n--features resp3,vector\n~90 crates | 25 MB | 20s"]
+        FULL["Full (default)\nall features\n~150 crates | 64 MB | 65s"]
+    end
+
+    subgraph "Feature Flags (weav-server)"
+        V["vector\nweav-vector + HNSW\ntoken counting"]
+        E["extract\nweav-extract\nPDF, LLM, chunking"]
+        G["grpc\ntonic + prost\ngRPC protocol"]
+        T["tls\nrustls\nTLS encryption"]
+        R["resp3\nweav-proto\nRedis protocol"]
+        O["observability\nprometheus\nmetrics endpoint"]
+        CSV["csv-export\nCSV import/export"]
+    end
+
+    subgraph "Sub-Features"
+        EP["extract/pdf\npdf_oxide, zip"]
+        EL["extract/llm-providers\nllm crate, schemars"]
+        QV["query/vector\nweav-vector in executor"]
+    end
+
+    MIN -.-> |"HTTP + graph only"| MIN
+    STD --> R
+    STD --> V
+    FULL --> V
+    FULL --> E
+    FULL --> G
+    FULL --> T
+    FULL --> R
+    FULL --> O
+    FULL --> CSV
+
+    V --> QV
+    E --> EP
+    E --> EL
+
+    classDef profile fill:#1a1a2e,stroke:#6c63ff,color:#e0e0e0,stroke-width:2px
+    classDef feature fill:#16213e,stroke:#4a9eff,color:#e0e0e0
+    classDef sub fill:#0f3460,stroke:#ffd93d,color:#e0e0e0
+
+    class MIN,STD,FULL profile
+    class V,E,G,T,R,O,CSV feature
+    class EP,EL,QV sub
