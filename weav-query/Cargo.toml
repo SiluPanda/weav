@@ -3,10 +3,14 @@ name = "weav-query"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["vector"]
+vector = ["dep:weav-vector"]
+
 [dependencies]
 weav-core = { path = "../weav-core" }
 weav-graph = { path = "../weav-graph" }
-weav-vector = { path = "../weav-vector" }
+weav-vector = { path = "../weav-vector", optional = true }
 roaring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -10,6 +10,7 @@
 
 pub mod engine;
 pub mod http;
+#[cfg(feature = "observability")]
 pub mod metrics;
 
 #[cfg(feature = "resp3")]

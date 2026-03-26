@@ -15,12 +15,6 @@ members = [
     "benchmarks",
 ]
 default-members = [
-    "weav-core",
-    "weav-graph",
-    "weav-vector",
-    "weav-query",
-    "weav-persist",
-    "weav-auth",
     "weav-server",
 ]
 
@@ -31,8 +25,8 @@ license = "MIT"
 rust-version = "1.85"
 
 [workspace.dependencies]
-# Async runtime
-tokio = { version = "1", features = ["full"] }
+# Async runtime — only features actually used (no fs, process, io-std)
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal", "io-util"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 
 # Concurrency
@@ -111,10 +105,13 @@ tonic-build = "0.12"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [profile.dev]
-debug = 0                     # No debug info — smallest possible build
-incremental = false           # No incremental cache (~100MB savings)
+debug = 0                     # No DWARF debug info — saves ~2GB
+incremental = false           # No incremental cache — saves ~500MB
+strip = "symbols"             # Strip all symbols from dev binaries
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 opt-level = 3
+strip = true                  # Strip all symbols — smallest binary
+panic = "abort"               # No unwind tables — smaller binary + fewer deps

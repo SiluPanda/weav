@@ -3,17 +3,22 @@ name = "weav-extract"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["pdf", "llm-providers"]
+pdf = ["dep:pdf_oxide", "dep:zip"]
+llm-providers = ["dep:llm", "dep:schemars"]
+
 [dependencies]
 weav-core = { path = "../weav-core" }
 weav-graph = { path = "../weav-graph" }
 
-# LLM integration
-llm = "1.3"
-schemars = "1"
+# LLM integration (optional)
+llm = { version = "1.3", optional = true }
+schemars = { version = "1", optional = true }
 
-# Document parsing
-pdf_oxide = "0.3"
-zip = "2"
+# Document parsing (pdf_oxide and zip are optional)
+pdf_oxide = { version = "0.3", optional = true }
+zip = { version = "2", optional = true }
 csv = "1.4"
 
 # Text chunking

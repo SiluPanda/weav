@@ -14,7 +14,7 @@ use weav_persist::snapshot::{
 };
 use weav_persist::wal::{WalOperation, WriteAheadLog};
 use weav_query::budget::enforce_budget;
-use weav_query::executor::ContextChunk;
+use weav_core::context::ContextChunk;
 use weav_query::parser::parse_command;
 use weav_server::engine::Engine;
 use weav_vector::index::{VectorConfig, VectorIndex};

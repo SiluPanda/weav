@@ -10,133 +10,16 @@ use weav_graph::adjacency::AdjacencyStore;
 use weav_graph::properties::PropertyStore;
 use weav_graph::text_index::TextIndex;
 use weav_graph::traversal::{flow_score, modularity_communities};
+#[cfg(feature = "vector")]
 use weav_vector::index::VectorIndex;
+#[cfg(feature = "vector")]
 use weav_vector::tokens::TokenCounter;
 
 use crate::budget::enforce_budget;
 use crate::parser::{ContextQuery, SeedStrategy, SortDirection, SortField};
 
-// ─── Result types ───────────────────────────────────────────────────────────
-
-/// Information about a detected conflict between two nodes.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ConflictInfo {
-    pub node_a: NodeId,
-    pub node_b: NodeId,
-    pub property: String,
-    pub value_a: String,
-    pub value_b: String,
-    pub resolution: String,
-}
-
-/// The complete result of a context query.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ContextResult {
-    /// Ordered context chunks.
-    pub chunks: Vec<ContextChunk>,
-    /// Total tokens consumed by included chunks.
-    pub total_tokens: u32,
-    /// Fraction of token budget used (0.0..1.0).
-    pub budget_used: f32,
-    /// Total number of nodes considered during traversal.
-    pub nodes_considered: u32,
-    /// Number of nodes included in the final output.
-    pub nodes_included: u32,
-    /// Wall-clock query time in microseconds.
-    pub query_time_us: u64,
-    /// Detected conflicts between nodes.
-    pub conflicts: Vec<ConflictInfo>,
-    /// Timing breakdown: seed acquisition (microseconds).
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub seed_time_us: u64,
-    /// Timing breakdown: flow scoring + fusion (microseconds).
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub flow_time_us: u64,
-    /// Timing breakdown: RRF fusion (microseconds).
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub fusion_time_us: u64,
-    /// Timing breakdown: chunk building (microseconds).
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub chunk_time_us: u64,
-    /// Timing breakdown: budget enforcement (microseconds).
-    #[serde(skip_serializing_if = "is_zero_u64")]
-    pub budget_time_us: u64,
-    /// Query plan description (populated when explain=true).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub plan: Option<String>,
-    /// LLM-ready formatted messages (populated when output_format is set).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub formatted_messages: Option<String>,
-    /// Optional subgraph of relevant nodes and edges (when include_subgraph=true).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub subgraph: Option<ContextSubgraph>,
-}
-
-/// A subgraph extracted from the context query results.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ContextSubgraph {
-    pub nodes: Vec<SubgraphNode>,
-    pub edges: Vec<SubgraphEdge>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct SubgraphNode {
-    pub node_id: u64,
-    pub label: String,
-    pub importance: f32,
-    pub properties: Vec<(String, String)>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct SubgraphEdge {
-    pub edge_id: u64,
-    pub source: u64,
-    pub target: u64,
-    pub label: String,
-    pub weight: f32,
-}
-
-fn is_zero_u64(v: &u64) -> bool {
-    *v == 0
-}
-
-/// A single chunk of context extracted from the graph.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ContextChunk {
-    /// The node this chunk represents.
-    pub node_id: NodeId,
-    /// Concatenated text content from the node's string properties.
-    pub content: String,
-    /// The node's label.
-    pub label: String,
-    /// Relevance score (from flow scoring).
-    pub relevance_score: f32,
-    /// BFS/flow depth from the seed nodes.
-    pub depth: u8,
-    /// Token count for this chunk.
-    pub token_count: u32,
-    /// Optional provenance metadata.
-    pub provenance: Option<Provenance>,
-    /// Summary of this node's relationships.
-    pub relationships: Vec<RelationshipSummary>,
-    /// Optional bi-temporal metadata for the node.
-    pub temporal: Option<BiTemporal>,
-}
-
-/// Summary of a relationship (edge) for context output.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct RelationshipSummary {
-    /// The edge label.
-    pub edge_label: String,
-    /// The node on the other end of the edge.
-    pub target_node_id: NodeId,
-    /// Optional name/title of the target node.
-    pub target_name: Option<String>,
-    /// Direction of the edge relative to the chunk's node.
-    pub direction: String,
-    /// Edge weight.
-    pub weight: f32,
-}
+// Re-export context types for backward compatibility.
+pub use weav_core::context::*;
 
 // ─── Executor ───────────────────────────────────────────────────────────────
 
@@ -151,6 +34,7 @@ pub struct RelationshipSummary {
 /// 6. Run budget enforcement
 /// 7. Build `RelationshipSummary` for each included node
 /// 8. Return `ContextResult` with timing
+#[cfg(feature = "vector")]
 pub fn execute_context_query(
     query: &ContextQuery,
     adjacency: &AdjacencyStore,
@@ -720,6 +604,411 @@ pub fn execute_context_query(
     })
 }
 
+/// Execute a context query without vector search support.
+///
+/// When the `vector` feature is disabled, only `SeedStrategy::Nodes` is supported.
+/// Vector and Both seed strategies return an error. Token counting uses a simple
+/// char/4 approximation.
+#[cfg(not(feature = "vector"))]
+pub fn execute_context_query(
+    query: &ContextQuery,
+    adjacency: &AdjacencyStore,
+    properties: &PropertyStore,
+    text_index: &TextIndex,
+    interner: &StringInterner,
+) -> Result<ContextResult, WeavError> {
+    let start = Instant::now();
+
+    // ── EXPLAIN mode ─────────────────────────────────────────────────────
+    if query.explain {
+        let plan = crate::planner::plan_context_query(query);
+        let plan_description = plan
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(i, step)| format!("  {}. {step}", i + 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        return Ok(ContextResult {
+            chunks: Vec::new(),
+            total_tokens: 0,
+            budget_used: 0.0,
+            nodes_considered: 0,
+            nodes_included: 0,
+            query_time_us: start.elapsed().as_micros() as u64,
+            conflicts: Vec::new(),
+            seed_time_us: 0,
+            flow_time_us: 0,
+            fusion_time_us: 0,
+            chunk_time_us: 0,
+            budget_time_us: 0,
+            plan: Some(plan_description),
+            formatted_messages: None,
+            subgraph: None,
+        });
+    }
+
+    // ── Step 1: Get seed nodes (node-key lookup only) ────────────────────
+    let step_start = Instant::now();
+    let mut seeds_with_scores: Vec<(NodeId, f32)> = Vec::new();
+
+    match &query.seeds {
+        SeedStrategy::Vector { .. } | SeedStrategy::Both { .. } => {
+            return Err(WeavError::Internal(
+                "vector search not available — enable the 'vector' feature".into(),
+            ));
+        }
+        SeedStrategy::Nodes(keys) => {
+            for key in keys {
+                let key_clone = key.clone();
+                let nodes = properties.nodes_where("entity_key", &move |v| {
+                    v.as_str() == Some(key_clone.as_str())
+                });
+                for nid in nodes {
+                    seeds_with_scores.push((nid, 1.0));
+                }
+            }
+        }
+    }
+
+    let seed_time_us = step_start.elapsed().as_micros() as u64;
+
+    // ── Step 2: Flow score ───────────────────────────────────────────────
+    let step_start = Instant::now();
+    let plan = crate::planner::plan_context_query(query);
+    let (alpha, theta) = plan.steps.iter().find_map(|step| {
+        if let crate::planner::PlanStep::FlowScore { alpha, theta, .. } = step {
+            Some((*alpha, *theta))
+        } else {
+            None
+        }
+    }).unwrap_or((0.5, 0.01));
+
+    let scored_nodes = flow_score(
+        adjacency,
+        &seeds_with_scores,
+        alpha,
+        theta,
+        query.max_depth,
+    );
+    let flow_time_us = step_start.elapsed().as_micros() as u64;
+
+    // ── Step 2b: BM25 fusion (no vector) ─────────────────────────────────
+    let step_start = Instant::now();
+    let bm25_ranked: Vec<NodeId> = if let Some(ref query_text) = query.query_text {
+        if !query_text.is_empty() && !text_index.is_empty() {
+            text_index
+                .search(query_text, (adjacency.node_count() as usize).min(500))
+                .into_iter()
+                .map(|(nid, _)| nid)
+                .collect()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    let final_scores: Vec<(NodeId, f32)> = if !bm25_ranked.is_empty() {
+        let graph_ranked: Vec<NodeId> = scored_nodes.iter()
+            .map(|s| s.node_id)
+            .collect();
+
+        let rrf_config = RrfConfig { k: 60.0, weights: vec![1.0, 0.8] };
+        let ranked_lists = vec![graph_ranked, bm25_ranked];
+        let fused = reciprocal_rank_fusion(&ranked_lists, &rrf_config);
+
+        let max_rrf = fused.first().map(|(_, s)| *s).unwrap_or(1.0);
+        fused.into_iter()
+            .map(|(nid, score)| (nid, if max_rrf > 0.0 { score / max_rrf } else { 0.0 }))
+            .collect()
+    } else {
+        scored_nodes.iter()
+            .map(|s| (s.node_id, s.score))
+            .collect()
+    };
+
+    let nodes_considered = final_scores.len() as u32;
+    let fusion_time_us = step_start.elapsed().as_micros() as u64;
+
+    let step_start = Instant::now();
+    let depth_lookup: std::collections::HashMap<NodeId, u8> = scored_nodes.iter()
+        .map(|s| (s.node_id, s.depth))
+        .collect();
+
+    // ── Step 3: Build ContextChunks ──────────────────────────────────────
+    let mut chunks: Vec<ContextChunk> = Vec::new();
+
+    for &(node_id, score) in &final_scores {
+        let all_props = properties.get_all_node_properties(node_id);
+        let content = build_content(&all_props);
+        let label = if let Some(label_val) = properties.get_node_property(node_id, "_label") {
+            label_val.as_str().unwrap_or("unknown").to_string()
+        } else if let Some(label_id_val) = properties.get_node_property(node_id, "_label_id") {
+            if let Some(lid) = label_id_val.as_int() {
+                interner.resolve_label(lid as u16).unwrap_or("unknown").to_string()
+            } else {
+                "unknown".to_string()
+            }
+        } else {
+            "unknown".to_string()
+        };
+
+        // Simple token count approximation (char/4) when vector feature is off
+        let token_count = (content.len() / 4).max(1) as u32;
+
+        let provenance = {
+            let source_prop = properties
+                .get_node_property(node_id, "provenance")
+                .or_else(|| properties.get_node_property(node_id, "source"));
+            source_prop.and_then(|v| v.as_str().map(|s| Provenance::new(s, 1.0)))
+        };
+
+        let temporal = {
+            let valid_from = properties.get_node_property(node_id, "_valid_from")
+                .and_then(|v| v.as_int()).map(|i| i as u64);
+            let valid_until = properties.get_node_property(node_id, "_valid_until")
+                .and_then(|v| v.as_int()).map(|i| i as u64);
+            let tx_from = properties.get_node_property(node_id, "_tx_from")
+                .and_then(|v| v.as_int()).map(|i| i as u64);
+            let tx_until = properties.get_node_property(node_id, "_tx_until")
+                .and_then(|v| v.as_int()).map(|i| i as u64);
+            if let Some(vf) = valid_from {
+                Some(BiTemporal {
+                    valid_from: vf,
+                    valid_until: valid_until.unwrap_or(BiTemporal::OPEN),
+                    tx_from: tx_from.unwrap_or(vf),
+                    tx_until: tx_until.unwrap_or(BiTemporal::OPEN),
+                })
+            } else {
+                None
+            }
+        };
+
+        let depth = depth_lookup.get(&node_id).copied().unwrap_or(0);
+
+        chunks.push(ContextChunk {
+            node_id,
+            content,
+            label,
+            relevance_score: score,
+            depth,
+            token_count,
+            provenance,
+            relationships: Vec::new(),
+            temporal,
+        });
+    }
+
+    // ── Step 3b: Detect conflicts ────────────────────────────────────────
+    let mut conflicts: Vec<ConflictInfo> = Vec::new();
+    {
+        let mut label_groups: std::collections::HashMap<&str, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (idx, chunk) in chunks.iter().enumerate() {
+            label_groups.entry(chunk.label.as_str()).or_default().push(idx);
+        }
+        for indices in label_groups.values() {
+            if indices.len() < 2 { continue; }
+            for i in 0..indices.len() {
+                for j in (i + 1)..indices.len() {
+                    let node_a = chunks[indices[i]].node_id;
+                    let node_b = chunks[indices[j]].node_id;
+                    let props_a = properties.get_all_node_properties(node_a);
+                    let props_b = properties.get_all_node_properties(node_b);
+                    for (key_a, val_a) in &props_a {
+                        if key_a.starts_with('_') { continue; }
+                        for (key_b, val_b) in &props_b {
+                            if key_a == key_b {
+                                let str_a = format!("{val_a:?}");
+                                let str_b = format!("{val_b:?}");
+                                if str_a != str_b {
+                                    let resolution = if chunks[indices[i]].relevance_score
+                                        >= chunks[indices[j]].relevance_score
+                                    {
+                                        format!("kept node {} (higher relevance)", node_a)
+                                    } else {
+                                        format!("kept node {} (higher relevance)", node_b)
+                                    };
+                                    conflicts.push(ConflictInfo {
+                                        node_a, node_b,
+                                        property: key_a.to_string(),
+                                        value_a: str_a, value_b: str_b,
+                                        resolution,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Step 4: Temporal filter ──────────────────────────────────────────
+    if let Some(ts) = query.temporal_at {
+        chunks.retain(|chunk| {
+            if let Some(valid_from) = properties.get_node_property(chunk.node_id, "_valid_from") {
+                if let Some(vf) = valid_from.as_int() {
+                    if (vf as u64) > ts { return false; }
+                }
+            }
+            if let Some(valid_until) = properties.get_node_property(chunk.node_id, "_valid_until") {
+                if let Some(vu) = valid_until.as_int() {
+                    let vu = vu as u64;
+                    if vu != u64::MAX && ts >= vu { return false; }
+                }
+            }
+            true
+        });
+    }
+
+    // ── Step 5: Decay ────────────────────────────────────────────────────
+    if let Some(ref decay) = query.decay {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as Timestamp;
+        for chunk in &mut chunks {
+            let item_ts = if let Some(ts_val) = properties.get_node_property(chunk.node_id, "_created_at") {
+                ts_val.as_int().unwrap_or(0) as Timestamp
+            } else { 0 };
+            chunk.relevance_score = decay.apply(chunk.relevance_score, item_ts, now);
+        }
+        chunks.retain(|c| c.relevance_score > 0.0);
+    }
+
+    if let Some(limit) = query.limit {
+        chunks.sort_by(|a, b| {
+            b.relevance_score.partial_cmp(&a.relevance_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.node_id.cmp(&b.node_id))
+        });
+        chunks.truncate(limit as usize);
+    }
+
+    let chunk_time_us = step_start.elapsed().as_micros() as u64;
+
+    // ── Step 6: Budget ───────────────────────────────────────────────────
+    let step_start = Instant::now();
+    let (final_chunks, total_tokens, budget_used) = if let Some(ref budget) = query.budget {
+        let result = enforce_budget(chunks, budget);
+        let total = result.total_tokens;
+        let util = result.budget_utilization;
+        (result.included, total, util)
+    } else {
+        let total: u32 = chunks.iter().map(|c| c.token_count).sum();
+        (chunks, total, 0.0)
+    };
+    let budget_time_us = step_start.elapsed().as_micros() as u64;
+
+    // ── Step 7: Relationships ────────────────────────────────────────────
+    let mut result_chunks: Vec<ContextChunk> = final_chunks;
+    for chunk in &mut result_chunks {
+        let neighbors = adjacency.neighbors_both(chunk.node_id, None);
+        for (neighbor_id, edge_id, dir) in &neighbors {
+            if let Some(edge_meta) = adjacency.get_edge(*edge_id) {
+                let edge_label = interner.resolve_label(edge_meta.label).unwrap_or("unknown").to_string();
+                let target_name = properties.get_node_property(*neighbor_id, "name")
+                    .and_then(|v| v.as_str()).map(|s| s.to_string());
+                let direction_str = match dir {
+                    Direction::Outgoing => "outgoing".to_string(),
+                    Direction::Incoming => "incoming".to_string(),
+                    Direction::Both => "both".to_string(),
+                };
+                chunk.relationships.push(RelationshipSummary {
+                    edge_label, target_node_id: *neighbor_id,
+                    target_name, direction: direction_str,
+                    weight: edge_meta.weight,
+                });
+            }
+        }
+    }
+
+    // ── Step 7b: Sort ────────────────────────────────────────────────────
+    if let Some(ref sort) = query.sort {
+        result_chunks.sort_by(|a, b| {
+            let cmp = match sort.field {
+                SortField::Relevance => a.relevance_score.partial_cmp(&b.relevance_score)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                SortField::Recency => {
+                    let ts_a = a.temporal.map(|t| t.valid_from).unwrap_or(0);
+                    let ts_b = b.temporal.map(|t| t.valid_from).unwrap_or(0);
+                    ts_a.cmp(&ts_b)
+                }
+                SortField::Confidence => {
+                    let conf_a = a.provenance.as_ref().map(|p| p.confidence).unwrap_or(0.0);
+                    let conf_b = b.provenance.as_ref().map(|p| p.confidence).unwrap_or(0.0);
+                    conf_a.partial_cmp(&conf_b).unwrap_or(std::cmp::Ordering::Equal)
+                }
+            };
+            let cmp = cmp.then_with(|| a.node_id.cmp(&b.node_id));
+            if sort.direction == SortDirection::Asc { cmp } else { cmp.reverse() }
+        });
+    }
+
+    // ── Step 8: Result ───────────────────────────────────────────────────
+    let elapsed = start.elapsed();
+    let nodes_included = result_chunks.len() as u32;
+
+    let formatted_messages = format_llm_messages(
+        query.output_format.as_deref(),
+        query.query_text.as_deref(),
+        &result_chunks,
+    );
+
+    let subgraph = if query.include_subgraph {
+        let result_node_ids: std::collections::HashSet<NodeId> =
+            result_chunks.iter().map(|c| c.node_id).collect();
+        let sg_nodes: Vec<SubgraphNode> = result_chunks.iter().map(|c| {
+            SubgraphNode {
+                node_id: c.node_id, label: c.label.clone(), importance: c.relevance_score,
+                properties: properties.get_all_node_properties(c.node_id).into_iter()
+                    .filter(|(k, _)| !k.starts_with('_'))
+                    .map(|(k, v)| (k.to_string(), format!("{v:?}"))).collect(),
+            }
+        }).collect();
+        let mut sg_edges = Vec::new();
+        for &nid in &result_node_ids {
+            for (neighbor, edge_id, _) in &adjacency.neighbors_both(nid, None) {
+                if result_node_ids.contains(neighbor) {
+                    if let Some(meta) = adjacency.get_edge(*edge_id) {
+                        let label = interner.resolve_label(meta.label).unwrap_or("").to_string();
+                        sg_edges.push(SubgraphEdge {
+                            edge_id: *edge_id, source: meta.source, target: meta.target,
+                            label, weight: meta.weight,
+                        });
+                    }
+                }
+            }
+        }
+        sg_edges.sort_by_key(|e| e.edge_id);
+        sg_edges.dedup_by_key(|e| e.edge_id);
+        Some(ContextSubgraph { nodes: sg_nodes, edges: sg_edges })
+    } else {
+        None
+    };
+
+    Ok(ContextResult {
+        chunks: result_chunks,
+        total_tokens,
+        budget_used,
+        nodes_considered,
+        nodes_included,
+        query_time_us: elapsed.as_micros() as u64,
+        conflicts,
+        seed_time_us,
+        flow_time_us,
+        fusion_time_us,
+        chunk_time_us,
+        budget_time_us,
+        plan: None,
+        formatted_messages,
+        subgraph,
+    })
+}
+
 // ─── Reciprocal Rank Fusion ──────────────────────────────────────────────────
 
 /// Configuration for Reciprocal Rank Fusion.
@@ -801,6 +1090,7 @@ pub struct CommunitySummary {
 ///
 /// The caller can then pass each community's `content` field to an LLM
 /// to generate a natural language summary.
+#[cfg(feature = "vector")]
 pub fn extract_community_summaries(
     adjacency: &AdjacencyStore,
     properties: &PropertyStore,
@@ -911,6 +1201,94 @@ pub fn extract_community_summaries(
     summaries
 }
 
+/// Extract community summaries without token counting (vector feature disabled).
+/// Uses char/4 approximation for token counts.
+#[cfg(not(feature = "vector"))]
+pub fn extract_community_summaries(
+    adjacency: &AdjacencyStore,
+    properties: &PropertyStore,
+    _interner: &StringInterner,
+    max_iterations: u32,
+    resolution: f32,
+) -> Vec<CommunitySummary> {
+    let node_to_community = modularity_communities(adjacency, max_iterations, resolution);
+    if node_to_community.is_empty() {
+        return Vec::new();
+    }
+
+    let mut communities: std::collections::HashMap<u64, Vec<NodeId>> =
+        std::collections::HashMap::new();
+    for (&node_id, &comm_id) in &node_to_community {
+        communities.entry(comm_id).or_default().push(node_id);
+    }
+
+    let community_sets: std::collections::HashMap<u64, std::collections::HashSet<NodeId>> =
+        communities.iter().map(|(&comm_id, nodes)| {
+            (comm_id, nodes.iter().copied().collect())
+        }).collect();
+
+    let mut summaries: Vec<CommunitySummary> = Vec::with_capacity(communities.len());
+
+    for (&comm_id, nodes) in &communities {
+        let node_set = &community_sets[&comm_id];
+        let mut labels: Vec<String> = Vec::new();
+        let mut key_entities: Vec<String> = Vec::new();
+        let mut content_parts: Vec<String> = Vec::new();
+        let mut internal_edge_count: usize = 0;
+
+        let mut sorted_nodes = nodes.clone();
+        sorted_nodes.sort_unstable();
+
+        for &node_id in &sorted_nodes {
+            if let Some(label_val) = properties.get_node_property(node_id, "_label") {
+                if let Some(label_str) = label_val.as_str() {
+                    if !labels.contains(&label_str.to_string()) {
+                        labels.push(label_str.to_string());
+                    }
+                }
+            }
+            let entity_name = properties.get_node_property(node_id, "name")
+                .and_then(|v| v.as_str())
+                .or_else(|| properties.get_node_property(node_id, "title").and_then(|v| v.as_str()));
+            if let Some(name) = entity_name {
+                key_entities.push(name.to_string());
+            }
+            let all_props = properties.get_all_node_properties(node_id);
+            let node_content = build_content(&all_props);
+            if !node_content.is_empty() {
+                content_parts.push(node_content);
+            }
+            for (neighbor_id, _edge_id) in adjacency.neighbors_out(node_id, None) {
+                if node_set.contains(&neighbor_id) {
+                    internal_edge_count += 1;
+                }
+            }
+        }
+
+        labels.sort();
+        key_entities.sort();
+        let content = content_parts.join("\n---\n");
+        let token_count = (content.len() / 4).max(1) as u32;
+
+        summaries.push(CommunitySummary {
+            community_id: comm_id,
+            node_count: sorted_nodes.len(),
+            internal_edge_count,
+            node_ids: sorted_nodes,
+            labels,
+            content,
+            token_count,
+            key_entities,
+        });
+    }
+
+    summaries.sort_by(|a, b| {
+        b.node_count.cmp(&a.node_count).then_with(|| a.community_id.cmp(&b.community_id))
+    });
+
+    summaries
+}
+
 /// Format context chunks as LLM-ready messages for the given output format.
 ///
 /// Returns `None` for `None` / `"raw"` format, or a JSON string containing
@@ -981,7 +1359,7 @@ fn build_content(props: &[(&str, &weav_core::types::Value)]) -> String {
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, feature = "vector"))]
 mod tests {
     use super::*;
     use compact_str::CompactString;

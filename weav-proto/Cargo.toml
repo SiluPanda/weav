@@ -9,7 +9,7 @@ grpc = ["dep:tonic", "dep:prost", "dep:tonic-build"]
 
 [dependencies]
 weav-core = { path = "../weav-core" }
-weav-query = { path = "../weav-query" }
+weav-query = { path = "../weav-query", default-features = false }
 bytes = { workspace = true }
 tokio-util = { workspace = true }
 thiserror = { workspace = true }

@@ -8,17 +8,21 @@ name = "weav-server"
 path = "src/main.rs"
 
 [features]
-default = ["extract", "grpc", "tls", "resp3"]
+default = ["extract", "grpc", "tls", "resp3", "observability", "csv-export", "vector"]
+full = ["extract", "grpc", "tls", "resp3", "observability", "csv-export", "vector"]
 extract = ["dep:weav-extract"]
 grpc = ["dep:tonic", "dep:prost", "weav-proto/grpc"]
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
 resp3 = ["dep:weav-proto"]
+observability = ["dep:prometheus"]
+csv-export = ["dep:csv"]
+vector = ["dep:weav-vector", "weav-query/vector"]
 
 [dependencies]
 weav-core = { path = "../weav-core" }
 weav-graph = { path = "../weav-graph" }
-weav-vector = { path = "../weav-vector" }
-weav-query = { path = "../weav-query" }
+weav-vector = { path = "../weav-vector", optional = true }
+weav-query = { path = "../weav-query", default-features = false }
 weav-persist = { path = "../weav-persist" }
 weav-auth = { path = "../weav-auth" }
 weav-extract = { path = "../weav-extract", optional = true }
@@ -40,11 +44,11 @@ tower-http = { workspace = true }
 futures = "0.3"
 tonic = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
-prometheus = { version = "0.13", default-features = false }
+prometheus = { version = "0.13", default-features = false, optional = true }
 base64 = { workspace = true }
 tokio-stream = "0.1"
 uuid = { version = "1", features = ["v4"] }
-csv = { workspace = true }
+csv = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }

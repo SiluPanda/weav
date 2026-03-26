@@ -5,7 +5,7 @@
 //! representation and the internal command / result types.
 
 use weav_core::error::WeavError;
-use weav_query::executor::{ContextChunk, ContextResult, RelationshipSummary};
+use weav_core::context::{ContextChunk, ContextResult, RelationshipSummary};
 
 use crate::resp3::Resp3Value;
 
@@ -233,7 +233,7 @@ pub fn string_list_to_resp3(items: Vec<String>) -> Resp3Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weav_query::executor::{ContextChunk, ContextResult, RelationshipSummary};
+    use weav_core::context::{ContextChunk, ContextResult, RelationshipSummary};
 
     // -- resp3_to_command_string -----------------------------------------------
 

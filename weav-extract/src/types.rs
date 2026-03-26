@@ -1,5 +1,6 @@
 //! Core types for the extraction pipeline.
 
+#[cfg(feature = "llm-providers")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -64,14 +65,16 @@ pub struct ChunkWithEmbedding {
 // ─── LLM output types (with JsonSchema for structured output) ────────────────
 
 /// The JSON structure the LLM returns for extraction.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "llm-providers", derive(JsonSchema))]
 pub struct LlmExtractionOutput {
     pub entities: Vec<LlmEntity>,
     pub relationships: Vec<LlmRelationship>,
 }
 
 /// An entity as extracted by the LLM.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "llm-providers", derive(JsonSchema))]
 pub struct LlmEntity {
     pub name: String,
     pub entity_type: String,
@@ -84,7 +87,8 @@ pub struct LlmEntity {
 }
 
 /// A relationship as extracted by the LLM.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "llm-providers", derive(JsonSchema))]
 pub struct LlmRelationship {
     pub source_entity: String,
     pub target_entity: String,
@@ -254,6 +258,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "llm-providers")]
     fn test_llm_extraction_output_schema() {
         let schema = schemars::schema_for!(LlmExtractionOutput);
         let json = serde_json::to_string(&schema).unwrap();

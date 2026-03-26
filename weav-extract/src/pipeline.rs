@@ -3,13 +3,16 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+#[cfg(feature = "llm-providers")]
 use tokio::sync::Semaphore;
 use weav_core::config::ExtractConfig;
 use weav_core::error::WeavResult;
 
 use crate::chunker;
 use crate::document;
+#[cfg(feature = "llm-providers")]
 use crate::extractor;
+#[cfg(feature = "llm-providers")]
 use crate::llm_client::LlmClient;
 use crate::types::*;
 
@@ -18,10 +21,10 @@ use crate::types::*;
 /// Steps:
 /// 1. Parse document to text
 /// 2. Chunk text
-/// 3. Generate chunk embeddings (batched, concurrent)
-/// 4. Extract entities/relationships via LLM (batched by token limit)
+/// 3. Generate chunk embeddings (batched, concurrent) — requires `llm-providers`
+/// 4. Extract entities/relationships via LLM (batched by token limit) — requires `llm-providers`
 /// 5. Deduplicate entities by name
-/// 6. Generate entity description embeddings
+/// 6. Generate entity description embeddings — requires `llm-providers`
 /// 7. Deduplicate relationships by (source, target, type)
 /// 8. Return ExtractionResult
 pub async fn run_pipeline(
@@ -58,105 +61,132 @@ pub async fn run_pipeline(
     stats.total_chunks = chunks.len();
     tracing::debug!(chunks = chunks.len(), "text chunked");
 
-    // Step 3: Generate chunk embeddings.
-    let llm = LlmClient::new(config)?;
-    let chunk_texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+    // When llm-providers is enabled, use LLM for embeddings and entity extraction.
+    #[cfg(feature = "llm-providers")]
+    let (chunks_with_embeddings, entities_with_embeddings, mut relationships) = {
+        // Step 3: Generate chunk embeddings.
+        let llm = LlmClient::new(config)?;
+        let chunk_texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
 
-    let embedding_semaphore = Semaphore::new(config.max_concurrent_embedding_calls);
-    let chunk_embeddings = embed_texts_batched(
-        &llm,
-        &chunk_texts,
-        config.embedding_batch_size,
-        &embedding_semaphore,
-        &mut stats,
-    )
-    .await?;
-
-    let chunks_with_embeddings: Vec<ChunkWithEmbedding> = chunks
-        .into_iter()
-        .zip(chunk_embeddings.into_iter())
-        .map(|(chunk, embedding)| ChunkWithEmbedding { chunk, embedding })
-        .collect();
-
-    // Step 4: Extract entities/relationships via LLM (if not skipped).
-    let mut entities: Vec<ExtractedEntity> = Vec::new();
-    let mut relationships: Vec<ExtractedRelationship> = Vec::new();
-
-    if !options.skip_extraction {
-        let extraction_batches =
-            batch_chunks_by_tokens(&chunks_with_embeddings, config.max_extraction_tokens);
-
-        let _llm_semaphore = Semaphore::new(config.max_concurrent_llm_calls);
-
-        for batch in &extraction_batches {
-            let batch_chunks: Vec<&TextChunk> =
-                batch.iter().map(|cwe| &cwe.chunk).collect();
-            let chunk_indices: Vec<usize> =
-                batch_chunks.iter().map(|c| c.chunk_index).collect();
-
-            let text_chunks: Vec<TextChunk> =
-                batch_chunks.iter().map(|c| (*c).clone()).collect();
-
-            let output = llm
-                .extract_entities(
-                    &text_chunks,
-                    options.entity_types.as_deref(),
-                    options.custom_extraction_prompt.as_deref(),
-                )
-                .await?;
-            stats.llm_calls += 1;
-
-            let batch_entities = extractor::map_entities(&output, &chunk_indices);
-            let batch_rels = extractor::map_relationships(&output, &chunk_indices);
-
-            entities.extend(batch_entities);
-            relationships.extend(batch_rels);
-        }
-    }
-
-    // Step 5: Deduplicate entities by name.
-    if !options.skip_dedup {
-        let original_count = entities.len();
-        entities = dedup_entities(entities);
-        stats.entities_merged = original_count - entities.len();
-    }
-    stats.total_entities = entities.len();
-
-    // Step 6: Generate entity description embeddings.
-    let entity_descriptions: Vec<String> = entities
-        .iter()
-        .map(|e| {
-            if e.description.is_empty() {
-                format!("{} ({})", e.name, e.entity_type)
-            } else {
-                e.description.clone()
-            }
-        })
-        .collect();
-
-    let entity_embeddings = if !entity_descriptions.is_empty() {
-        embed_texts_batched(
+        let embedding_semaphore = Semaphore::new(config.max_concurrent_embedding_calls);
+        let chunk_embeddings = embed_texts_batched(
             &llm,
-            &entity_descriptions,
+            &chunk_texts,
             config.embedding_batch_size,
             &embedding_semaphore,
             &mut stats,
         )
-        .await?
-    } else {
-        Vec::new()
+        .await?;
+
+        let chunks_with_embeddings: Vec<ChunkWithEmbedding> = chunks
+            .into_iter()
+            .zip(chunk_embeddings.into_iter())
+            .map(|(chunk, embedding)| ChunkWithEmbedding { chunk, embedding })
+            .collect();
+
+        // Step 4: Extract entities/relationships via LLM (if not skipped).
+        let mut entities: Vec<ExtractedEntity> = Vec::new();
+        let mut relationships: Vec<ExtractedRelationship> = Vec::new();
+
+        if !options.skip_extraction {
+            let extraction_batches =
+                batch_chunks_by_tokens(&chunks_with_embeddings, config.max_extraction_tokens);
+
+            let _llm_semaphore = Semaphore::new(config.max_concurrent_llm_calls);
+
+            for batch in &extraction_batches {
+                let batch_chunks: Vec<&TextChunk> =
+                    batch.iter().map(|cwe| &cwe.chunk).collect();
+                let chunk_indices: Vec<usize> =
+                    batch_chunks.iter().map(|c| c.chunk_index).collect();
+
+                let text_chunks: Vec<TextChunk> =
+                    batch_chunks.iter().map(|c| (*c).clone()).collect();
+
+                let output = llm
+                    .extract_entities(
+                        &text_chunks,
+                        options.entity_types.as_deref(),
+                        options.custom_extraction_prompt.as_deref(),
+                    )
+                    .await?;
+                stats.llm_calls += 1;
+
+                let batch_entities = extractor::map_entities(&output, &chunk_indices);
+                let batch_rels = extractor::map_relationships(&output, &chunk_indices);
+
+                entities.extend(batch_entities);
+                relationships.extend(batch_rels);
+            }
+        }
+
+        // Step 5: Deduplicate entities by name.
+        if !options.skip_dedup {
+            let original_count = entities.len();
+            entities = dedup_entities(entities);
+            stats.entities_merged = original_count - entities.len();
+        }
+        stats.total_entities = entities.len();
+
+        // Step 6: Generate entity description embeddings.
+        let entity_descriptions: Vec<String> = entities
+            .iter()
+            .map(|e| {
+                if e.description.is_empty() {
+                    format!("{} ({})", e.name, e.entity_type)
+                } else {
+                    e.description.clone()
+                }
+            })
+            .collect();
+
+        let entity_embeddings = if !entity_descriptions.is_empty() {
+            embed_texts_batched(
+                &llm,
+                &entity_descriptions,
+                config.embedding_batch_size,
+                &embedding_semaphore,
+                &mut stats,
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
+
+        let entities_with_embeddings: Vec<EntityWithEmbedding> = entities
+            .into_iter()
+            .zip(
+                entity_embeddings
+                    .into_iter()
+                    .map(Some)
+                    .chain(std::iter::repeat(None)),
+            )
+            .map(|(entity, embedding)| EntityWithEmbedding { entity, embedding })
+            .collect();
+
+        (chunks_with_embeddings, entities_with_embeddings, relationships)
     };
 
-    let entities_with_embeddings: Vec<EntityWithEmbedding> = entities
-        .into_iter()
-        .zip(
-            entity_embeddings
-                .into_iter()
-                .map(Some)
-                .chain(std::iter::repeat(None)),
-        )
-        .map(|(entity, embedding)| EntityWithEmbedding { entity, embedding })
-        .collect();
+    // When llm-providers is disabled, return chunks with empty embeddings and no entities.
+    #[cfg(not(feature = "llm-providers"))]
+    let (chunks_with_embeddings, entities_with_embeddings, mut relationships) = {
+        let chunks_with_embeddings: Vec<ChunkWithEmbedding> = chunks
+            .into_iter()
+            .map(|chunk| ChunkWithEmbedding {
+                chunk,
+                embedding: Vec::new(),
+            })
+            .collect();
+
+        let entities_with_embeddings: Vec<EntityWithEmbedding> = Vec::new();
+        let relationships: Vec<ExtractedRelationship> = Vec::new();
+
+        tracing::debug!(
+            "LLM providers not available - skipping embeddings and entity extraction"
+        );
+
+        (chunks_with_embeddings, entities_with_embeddings, relationships)
+    };
 
     // Step 7: Deduplicate relationships by (source, target, type).
     if !options.skip_dedup {
@@ -186,6 +216,7 @@ pub async fn run_pipeline(
 }
 
 /// Batch texts for embedding and call the LLM client.
+#[cfg(feature = "llm-providers")]
 async fn embed_texts_batched(
     llm: &LlmClient,
     texts: &[String],
@@ -210,6 +241,7 @@ async fn embed_texts_batched(
 }
 
 /// Batch chunks by cumulative token count, respecting max_extraction_tokens.
+#[cfg(any(feature = "llm-providers", test))]
 fn batch_chunks_by_tokens(
     chunks: &[ChunkWithEmbedding],
     max_tokens: usize,
@@ -235,10 +267,12 @@ fn batch_chunks_by_tokens(
 }
 
 /// Default Jaro-Winkler similarity threshold for entity deduplication.
+#[cfg(any(feature = "llm-providers", test))]
 const DEDUP_FUZZY_THRESHOLD: f64 = 0.85;
 
 /// Deduplicate entities by fuzzy name matching (Jaro-Winkler similarity),
 /// merging source_chunks and keeping the higher confidence.
+#[cfg(any(feature = "llm-providers", test))]
 fn dedup_entities(entities: Vec<ExtractedEntity>) -> Vec<ExtractedEntity> {
     let mut result: Vec<ExtractedEntity> = Vec::new();
 

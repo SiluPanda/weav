@@ -25,7 +25,9 @@ use weav_persist::snapshot::{
 use weav_persist::wal::{WalOperation, WriteAheadLog};
 use weav_query::executor;
 use weav_query::parser::Command;
+#[cfg(feature = "vector")]
 use weav_vector::index::{DistanceMetric, Quantization, VectorConfig, VectorIndex};
+#[cfg(feature = "vector")]
 use weav_vector::tokens::TokenCounter;
 
 // ─── Response types ──────────────────────────────────────────────────────────
@@ -96,6 +98,7 @@ pub struct GraphState {
     pub graph_id: GraphId,
     pub adjacency: AdjacencyStore,
     pub properties: PropertyStore,
+    #[cfg(feature = "vector")]
     pub vector_index: VectorIndex,
     pub interner: StringInterner,
     pub config: GraphConfig,
@@ -118,6 +121,7 @@ pub struct GraphState {
 pub struct Engine {
     graphs: RwLock<HashMap<String, Arc<RwLock<GraphState>>>>,
     next_graph_id: RwLock<GraphId>,
+    #[cfg(feature = "vector")]
     token_counter: TokenCounter,
     config: WeavConfig,
     wal: Option<Mutex<WriteAheadLog>>,
@@ -204,6 +208,7 @@ pub fn compute_node_importance(
 }
 
 /// Extract graph name and operation type from a WAL operation for metric labels.
+#[cfg(feature = "observability")]
 fn wal_op_labels(op: &WalOperation) -> (&str, &str) {
     match op {
         WalOperation::GraphCreate { name, .. } => (name.as_str(), "GraphCreate"),
@@ -222,6 +227,7 @@ fn wal_op_labels(op: &WalOperation) -> (&str, &str) {
 impl Engine {
     /// Create a new engine with the given configuration.
     pub fn new(config: WeavConfig) -> Self {
+        #[cfg(feature = "vector")]
         let token_counter = TokenCounter::new(config.engine.token_counter.clone());
         let (wal, snapshot_engine) = if config.persistence.enabled {
             let data_dir = config.persistence.data_dir.clone();
@@ -251,6 +257,7 @@ impl Engine {
         Self {
             graphs: RwLock::new(HashMap::new()),
             next_graph_id: RwLock::new(1),
+            #[cfg(feature = "vector")]
             token_counter,
             config,
             wal,
@@ -293,17 +300,22 @@ impl Engine {
         // Remove the node (cascades edges via AdjacencyStore::remove_node).
         let _ = gs.adjacency.remove_node(victim_id);
         gs.properties.remove_all_node_properties(victim_id);
-        let _ = gs.vector_index.remove(victim_id);
+        #[cfg(feature = "vector")]
+        { let _ = gs.vector_index.remove(victim_id); }
         gs.text_index.remove_node(victim_id);
         gs.access_times.remove(&victim_id);
 
         // Update metrics after eviction.
-        crate::metrics::NODES_TOTAL
-            .with_label_values(&[graph_name])
-            .set(gs.adjacency.node_count() as i64);
-        crate::metrics::EDGES_TOTAL
-            .with_label_values(&[graph_name])
-            .set(gs.adjacency.edge_count() as i64);
+        #[cfg(feature = "observability")]
+        {
+            crate::metrics::NODES_TOTAL
+                .with_label_values(&[graph_name])
+                .set(gs.adjacency.node_count() as i64);
+            crate::metrics::EDGES_TOTAL
+                .with_label_values(&[graph_name])
+                .set(gs.adjacency.edge_count() as i64);
+        }
+        let _ = graph_name;
     }
 
     // ── CDC event infrastructure ──────────────────────────────────────────
@@ -348,18 +360,25 @@ impl Engine {
         }
         if let Some(ref wal_mutex) = self.wal {
             // Extract labels and size before moving `op` into append.
+            #[cfg(feature = "observability")]
             let (graph_label, op_label) = wal_op_labels(&op);
+            #[cfg(feature = "observability")]
             let graph_label = graph_label.to_string();
+            #[cfg(feature = "observability")]
             let op_label = op_label.to_string();
+            #[cfg(feature = "observability")]
             let estimated_bytes = bincode::serialized_size(&op).unwrap_or(0);
             let mut wal = wal_mutex.lock();
             wal.append(0, op)
                 .map_err(|e| WeavError::PersistenceError(format!("WAL write failed: {e}")))?;
-            crate::metrics::WAL_WRITES_TOTAL
-                .with_label_values(&[&graph_label, &op_label])
-                .inc();
-            crate::metrics::WAL_BYTES_WRITTEN
-                .inc_by(4 + estimated_bytes);
+            #[cfg(feature = "observability")]
+            {
+                crate::metrics::WAL_WRITES_TOTAL
+                    .with_label_values(&[&graph_label, &op_label])
+                    .inc();
+                crate::metrics::WAL_BYTES_WRITTEN
+                    .inc_by(4 + estimated_bytes);
+            }
         }
         Ok(())
     }
@@ -367,11 +386,13 @@ impl Engine {
     /// Force-sync the WAL file to disk. Called periodically for EverySecond mode.
     pub fn sync_wal(&self) -> WeavResult<()> {
         if let Some(ref wal_mutex) = self.wal {
+            #[cfg(feature = "observability")]
             let start = std::time::Instant::now();
             let mut wal = wal_mutex.lock();
             wal.sync()
                 .map_err(|e| WeavError::PersistenceError(format!("WAL sync failed: {e}")))?;
-            crate::metrics::WAL_SYNC_DURATION.observe(start.elapsed().as_secs_f64());
+            #[cfg(feature = "observability")]
+            { crate::metrics::WAL_SYNC_DURATION.observe(start.elapsed().as_secs_f64()); }
         }
         Ok(())
     }
@@ -391,7 +412,8 @@ impl Engine {
                 "max connections ({max}) exceeded"
             )));
         }
-        crate::metrics::CONNECTIONS_ACTIVE.set((current + 1) as i64);
+        #[cfg(feature = "observability")]
+        { crate::metrics::CONNECTIONS_ACTIVE.set((current + 1) as i64); }
         Ok(())
     }
 
@@ -409,7 +431,8 @@ impl Engine {
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
             ).is_ok() {
-                crate::metrics::CONNECTIONS_ACTIVE.set((current - 1) as i64);
+                #[cfg(feature = "observability")]
+                { crate::metrics::CONNECTIONS_ACTIVE.set((current - 1) as i64); }
                 break;
             }
         }
@@ -432,7 +455,9 @@ impl Engine {
             registry.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
 
-        for (graph_name, graph_arc) in &graph_arcs {
+        for (_graph_name, graph_arc) in &graph_arcs {
+            #[cfg(feature = "observability")]
+            let graph_name = _graph_name;
             let mut gs = graph_arc.write();
 
             // Sweep expired nodes (those with _ttl_expires_at <= now)
@@ -448,7 +473,8 @@ impl Engine {
             for node_id in &expired_nodes {
                 let _ = gs.adjacency.remove_node(*node_id);
                 gs.properties.remove_all_node_properties(*node_id);
-                let _ = gs.vector_index.remove(*node_id);
+                #[cfg(feature = "vector")]
+                { let _ = gs.vector_index.remove(*node_id); }
             }
             total_expired += expired_nodes.len() as u64;
 
@@ -468,23 +494,26 @@ impl Engine {
             total_expired += expired_edges.len() as u64;
 
             // Update metrics after sweep
-            if !expired_nodes.is_empty() || !expired_edges.is_empty() {
-                crate::metrics::NODES_TOTAL
-                    .with_label_values(&[graph_name])
-                    .set(gs.adjacency.node_count() as i64);
-                crate::metrics::EDGES_TOTAL
-                    .with_label_values(&[graph_name])
-                    .set(gs.adjacency.edge_count() as i64);
-            }
-            if !expired_nodes.is_empty() {
-                crate::metrics::TTL_EXPIRED_TOTAL
-                    .with_label_values(&[graph_name, "node"])
-                    .inc_by(expired_nodes.len() as u64);
-            }
-            if !expired_edges.is_empty() {
-                crate::metrics::TTL_EXPIRED_TOTAL
-                    .with_label_values(&[graph_name, "edge"])
-                    .inc_by(expired_edges.len() as u64);
+            #[cfg(feature = "observability")]
+            {
+                if !expired_nodes.is_empty() || !expired_edges.is_empty() {
+                    crate::metrics::NODES_TOTAL
+                        .with_label_values(&[graph_name])
+                        .set(gs.adjacency.node_count() as i64);
+                    crate::metrics::EDGES_TOTAL
+                        .with_label_values(&[graph_name])
+                        .set(gs.adjacency.edge_count() as i64);
+                }
+                if !expired_nodes.is_empty() {
+                    crate::metrics::TTL_EXPIRED_TOTAL
+                        .with_label_values(&[graph_name, "node"])
+                        .inc_by(expired_nodes.len() as u64);
+                }
+                if !expired_edges.is_empty() {
+                    crate::metrics::TTL_EXPIRED_TOTAL
+                        .with_label_values(&[graph_name, "edge"])
+                        .inc_by(expired_edges.len() as u64);
+                }
             }
         }
 
@@ -518,15 +547,18 @@ impl Engine {
                     serde_json::from_str(&gs.config_json).unwrap_or_default()
                 };
 
-                let vec_config = VectorConfig {
-                    dimensions: graph_config.vector_dimensions,
-                    metric: DistanceMetric::Cosine,
-                    hnsw_m: self.config.engine.default_hnsw_m,
-                    hnsw_ef_construction: self.config.engine.default_hnsw_ef_construction,
-                    hnsw_ef_search: self.config.engine.default_hnsw_ef_search,
-                    quantization: Quantization::None,
+                #[cfg(feature = "vector")]
+                let vector_index = {
+                    let vec_config = VectorConfig {
+                        dimensions: graph_config.vector_dimensions,
+                        metric: DistanceMetric::Cosine,
+                        hnsw_m: self.config.engine.default_hnsw_m,
+                        hnsw_ef_construction: self.config.engine.default_hnsw_ef_construction,
+                        hnsw_ef_search: self.config.engine.default_hnsw_ef_search,
+                        quantization: Quantization::None,
+                    };
+                    VectorIndex::new(vec_config)?
                 };
-                let vector_index = VectorIndex::new(vec_config)?;
 
                 let graph_id = {
                     let mut id = self.next_graph_id.write();
@@ -540,6 +572,7 @@ impl Engine {
                     graph_id,
                     adjacency: AdjacencyStore::new(),
                     properties: PropertyStore::new(),
+                    #[cfg(feature = "vector")]
                     vector_index,
                     interner: StringInterner::new(),
                     config: graph_config,
@@ -600,6 +633,7 @@ impl Engine {
                         state.text_index.index_node(ns.node_id, &text_content);
                     }
 
+                    #[cfg(feature = "vector")]
                     if let Some(ref emb) = ns.embedding {
                         let _ = state.vector_index.insert(ns.node_id, emb);
                     }
@@ -779,6 +813,7 @@ impl Engine {
                                 replay_errors += 1;
                             }
                             gs.properties.remove_all_node_properties(*node_id);
+                            #[cfg(feature = "vector")]
                             if let Err(e) = gs.vector_index.remove(*node_id) {
                                 tracing::warn!("WAL replay NodeDelete vector cleanup({node_id}) failed: {e}");
                             }
@@ -876,19 +911,24 @@ impl Engine {
                     node_id,
                     vector,
                 } => {
-                    let registry = self.graphs.read();
-                    let graph_arc = registry.values()
-                        .find(|arc| arc.read().graph_id == *graph_id)
-                        .cloned();
-                    drop(registry);
-                    if let Some(graph_arc) = graph_arc {
-                        let mut gs = graph_arc.write();
-                        // insert already handles remove-then-add internally
-                        if let Err(e) = gs.vector_index.insert(*node_id, vector) {
-                            tracing::warn!("WAL replay VectorUpdate({node_id}) failed: {e}");
-                            replay_errors += 1;
+                    #[cfg(feature = "vector")]
+                    {
+                        let registry = self.graphs.read();
+                        let graph_arc = registry.values()
+                            .find(|arc| arc.read().graph_id == *graph_id)
+                            .cloned();
+                        drop(registry);
+                        if let Some(graph_arc) = graph_arc {
+                            let mut gs = graph_arc.write();
+                            // insert already handles remove-then-add internally
+                            if let Err(e) = gs.vector_index.insert(*node_id, vector) {
+                                tracing::warn!("WAL replay VectorUpdate({node_id}) failed: {e}");
+                                replay_errors += 1;
+                            }
                         }
                     }
+                    #[cfg(not(feature = "vector"))]
+                    { let _ = (graph_id, node_id, vector); }
                 }
                 WalOperation::Ingest { .. } => {
                     // Ingest WAL entries are metadata only; the actual data changes
@@ -960,20 +1000,25 @@ impl Engine {
         cmd: Command,
         identity: Option<&weav_auth::identity::SessionIdentity>,
     ) -> WeavResult<CommandResponse> {
+        #[cfg(feature = "observability")]
         let cmd_type = cmd.type_name();
+        #[cfg(feature = "observability")]
         let start = std::time::Instant::now();
 
         let result = self.execute_command_inner(cmd, identity);
 
         // Record metrics
-        let elapsed = start.elapsed().as_secs_f64();
-        let status = if result.is_ok() { "ok" } else { "error" };
-        crate::metrics::QUERY_DURATION
-            .with_label_values(&[cmd_type])
-            .observe(elapsed);
-        crate::metrics::QUERY_TOTAL
-            .with_label_values(&[cmd_type, status])
-            .inc();
+        #[cfg(feature = "observability")]
+        {
+            let elapsed = start.elapsed().as_secs_f64();
+            let status = if result.is_ok() { "ok" } else { "error" };
+            crate::metrics::QUERY_DURATION
+                .with_label_values(&[cmd_type])
+                .observe(elapsed);
+            crate::metrics::QUERY_TOTAL
+                .with_label_values(&[cmd_type, status])
+                .inc();
+        }
 
         result
     }
@@ -1449,12 +1494,17 @@ impl Engine {
                 .collect();
             label_parts.sort();
 
+            #[cfg(feature = "vector")]
+            let vector_count = gs.vector_index.len();
+            #[cfg(not(feature = "vector"))]
+            let vector_count = 0usize;
+
             Ok(CommandResponse::Text(format!(
                 "graph={} nodes={} edges={} vectors={} labels={{{}}} avg_degree={:.2} ttl_nodes={} interned_labels={}",
                 name,
                 node_count,
                 edge_count,
-                gs.vector_index.len(),
+                vector_count,
                 label_parts.join(","),
                 avg_degree,
                 ttl_nodes,
@@ -1464,12 +1514,14 @@ impl Engine {
             let registry = self.graphs.read();
             let mut total_nodes: u64 = 0;
             let mut total_edges: u64 = 0;
+            #[allow(unused_mut)]
             let mut total_vectors: usize = 0;
             for graph_arc in registry.values() {
                 let gs = graph_arc.read();
                 total_nodes += gs.adjacency.node_count();
                 total_edges += gs.adjacency.edge_count();
-                total_vectors += gs.vector_index.len();
+                #[cfg(feature = "vector")]
+                { total_vectors += gs.vector_index.len(); }
             }
             Ok(CommandResponse::Text(format!(
                 "graphs={} total_nodes={} total_edges={} total_vectors={} engine=weav-server v{}",
@@ -1553,7 +1605,10 @@ impl Engine {
         // Edge: ~96 B (EdgeMeta)
         // Vector: dimensions * 4 B (f32 per dimension)
         // Text index: ~128 B per term (rough estimate)
+        #[cfg(feature = "vector")]
         let vector_count = gs.vector_index.len();
+        #[cfg(not(feature = "vector"))]
+        let vector_count = 0usize;
         let dims = gs.config.vector_dimensions as usize;
         let text_index_terms = gs.text_index.term_count();
 
@@ -1749,16 +1804,18 @@ impl Engine {
         });
         let config_json = serde_json::to_string(&graph_config).unwrap_or_default();
 
-        let vec_config = VectorConfig {
-            dimensions: graph_config.vector_dimensions,
-            metric: DistanceMetric::Cosine,
-            hnsw_m: self.config.engine.default_hnsw_m,
-            hnsw_ef_construction: self.config.engine.default_hnsw_ef_construction,
-            hnsw_ef_search: self.config.engine.default_hnsw_ef_search,
-            quantization: Quantization::None,
+        #[cfg(feature = "vector")]
+        let vector_index = {
+            let vec_config = VectorConfig {
+                dimensions: graph_config.vector_dimensions,
+                metric: DistanceMetric::Cosine,
+                hnsw_m: self.config.engine.default_hnsw_m,
+                hnsw_ef_construction: self.config.engine.default_hnsw_ef_construction,
+                hnsw_ef_search: self.config.engine.default_hnsw_ef_search,
+                quantization: Quantization::None,
+            };
+            VectorIndex::new(vec_config)?
         };
-
-        let vector_index = VectorIndex::new(vec_config)?;
 
         let graph_id = {
             let mut id = self
@@ -1774,6 +1831,7 @@ impl Engine {
             graph_id,
             adjacency: AdjacencyStore::new(),
             properties: PropertyStore::new(),
+            #[cfg(feature = "vector")]
             vector_index,
             interner: StringInterner::new(),
             config: graph_config,
@@ -1802,7 +1860,8 @@ impl Engine {
             config_json,
         })?;
         graphs.insert(cmd.name, Arc::new(RwLock::new(graph_state)));
-        crate::metrics::GRAPHS_TOTAL.set(graphs.len() as i64);
+        #[cfg(feature = "observability")]
+        { crate::metrics::GRAPHS_TOTAL.set(graphs.len() as i64); }
 
         self.emit_event(&graph_name, EventKind::GraphCreated {
             name: CompactString::from(&graph_name),
@@ -1821,7 +1880,8 @@ impl Engine {
         // Write-ahead: WAL entry before in-memory mutation
         self.append_wal(WalOperation::GraphDrop { name: name.to_string() })?;
         graphs.remove(name);
-        crate::metrics::GRAPHS_TOTAL.set(graphs.len() as i64);
+        #[cfg(feature = "observability")]
+        { crate::metrics::GRAPHS_TOTAL.set(graphs.len() as i64); }
 
         self.emit_event(name, EventKind::GraphDropped {
             name: CompactString::from(name),
@@ -1833,11 +1893,16 @@ impl Engine {
     fn handle_graph_info(&self, name: &str) -> WeavResult<CommandResponse> {
         let graph_arc = self.get_graph(name)?;
         let gs = graph_arc.read();
+        #[cfg(feature = "vector")]
+        let vector_count = gs.vector_index.len();
+        #[cfg(not(feature = "vector"))]
+        let vector_count = 0usize;
+
         Ok(CommandResponse::GraphInfo(GraphInfoResponse {
             name: gs.name.clone(),
             node_count: gs.adjacency.node_count(),
             edge_count: gs.adjacency.edge_count(),
-            vector_count: gs.vector_index.len(),
+            vector_count,
             label_count: gs.interner.label_count(),
             default_ttl_ms: gs.config.default_ttl_ms,
         }))
@@ -1886,7 +1951,10 @@ impl Engine {
         // 3. Build summary.
         let node_count = gs.adjacency.node_count();
         let edge_count = gs.adjacency.edge_count();
+        #[cfg(feature = "vector")]
         let vector_count = gs.vector_index.len();
+        #[cfg(not(feature = "vector"))]
+        let vector_count = 0usize;
         let text_index_count = gs.text_index.len();
 
         let report = format!(
@@ -1933,6 +2001,7 @@ impl Engine {
             );
 
             // Update embedding if provided
+            #[cfg(feature = "vector")]
             if let Some(ref embedding) = cmd.embedding {
                 let _ = gs.vector_index.remove(existing_id);
                 gs.vector_index.insert(existing_id, embedding)?;
@@ -1977,6 +2046,7 @@ impl Engine {
                             &ConflictPolicy::LastWriteWins,
                         );
 
+                        #[cfg(feature = "vector")]
                         if let Some(ref embedding) = cmd.embedding {
                             let _ = gs.vector_index.remove(existing_id);
                             gs.vector_index.insert(existing_id, embedding)?;
@@ -1989,6 +2059,7 @@ impl Engine {
         }
 
         // Moved outside of the collapsed if block
+        #[cfg(feature = "vector")]
         if let Some(ref dedup_cfg) = gs.dedup_config {
             // ── Dedup: vector similarity (if embedding provided) ────────
             if let Some(ref embedding) = cmd.embedding
@@ -2129,6 +2200,7 @@ impl Engine {
             gs.text_index.index_node(node_id, &text_content);
         }
 
+        #[cfg(feature = "vector")]
         if let Some(ref embedding) = cmd.embedding {
             gs.vector_index.insert(node_id, embedding)?;
         }
@@ -2145,9 +2217,12 @@ impl Engine {
         }
 
         // Update metrics
-        crate::metrics::NODES_TOTAL
-            .with_label_values(&[&cmd.graph])
-            .set(gs.adjacency.node_count() as i64);
+        #[cfg(feature = "observability")]
+        {
+            crate::metrics::NODES_TOTAL
+                .with_label_values(&[&cmd.graph])
+                .set(gs.adjacency.node_count() as i64);
+        }
 
         self.emit_event(&cmd.graph, EventKind::NodeCreated {
             node_id,
@@ -2237,16 +2312,20 @@ impl Engine {
         // Apply in-memory mutation
         gs.adjacency.remove_node(cmd.node_id)?;
         gs.properties.remove_all_node_properties(cmd.node_id);
-        gs.vector_index.remove(cmd.node_id)?;
+        #[cfg(feature = "vector")]
+        { gs.vector_index.remove(cmd.node_id)?; }
         gs.text_index.remove_node(cmd.node_id);
 
         // Update metrics
-        crate::metrics::NODES_TOTAL
-            .with_label_values(&[&cmd.graph])
-            .set(gs.adjacency.node_count() as i64);
-        crate::metrics::EDGES_TOTAL
-            .with_label_values(&[&cmd.graph])
-            .set(gs.adjacency.edge_count() as i64);
+        #[cfg(feature = "observability")]
+        {
+            crate::metrics::NODES_TOTAL
+                .with_label_values(&[&cmd.graph])
+                .set(gs.adjacency.node_count() as i64);
+            crate::metrics::EDGES_TOTAL
+                .with_label_values(&[&cmd.graph])
+                .set(gs.adjacency.edge_count() as i64);
+        }
 
         self.emit_event(&cmd.graph, EventKind::NodeDeleted {
             node_id: cmd.node_id,
@@ -2408,10 +2487,13 @@ impl Engine {
         }
 
         // 4. If source has a vector embedding, copy to target if target lacks one
-        if let Some(src_vec) = gs.vector_index.get_vector(cmd.source_id) {
-            let src_vec = src_vec.to_vec();
-            if gs.vector_index.get_vector(cmd.target_id).is_none() {
-                let _ = gs.vector_index.insert(cmd.target_id, &src_vec);
+        #[cfg(feature = "vector")]
+        {
+            if let Some(src_vec) = gs.vector_index.get_vector(cmd.source_id) {
+                let src_vec = src_vec.to_vec();
+                if gs.vector_index.get_vector(cmd.target_id).is_none() {
+                    let _ = gs.vector_index.insert(cmd.target_id, &src_vec);
+                }
             }
         }
 
@@ -2422,15 +2504,19 @@ impl Engine {
         })?;
         gs.adjacency.remove_node(cmd.source_id)?;
         gs.properties.remove_all_node_properties(cmd.source_id);
-        let _ = gs.vector_index.remove(cmd.source_id);
+        #[cfg(feature = "vector")]
+        { let _ = gs.vector_index.remove(cmd.source_id); }
 
         // Update metrics
-        crate::metrics::NODES_TOTAL
-            .with_label_values(&[&cmd.graph])
-            .set(gs.adjacency.node_count() as i64);
-        crate::metrics::EDGES_TOTAL
-            .with_label_values(&[&cmd.graph])
-            .set(gs.adjacency.edge_count() as i64);
+        #[cfg(feature = "observability")]
+        {
+            crate::metrics::NODES_TOTAL
+                .with_label_values(&[&cmd.graph])
+                .set(gs.adjacency.node_count() as i64);
+            crate::metrics::EDGES_TOTAL
+                .with_label_values(&[&cmd.graph])
+                .set(gs.adjacency.edge_count() as i64);
+        }
 
         // Emit CDC events: source was deleted, target was updated with merged properties
         let target_props: Vec<(CompactString, Value)> = gs
@@ -2488,6 +2574,7 @@ impl Engine {
             gs.text_index.index_node(cmd.node_id, &text_content);
         }
 
+        #[cfg(feature = "vector")]
         if let Some(ref embedding) = cmd.embedding {
             // Write-ahead: persist embedding update to WAL
             self.append_wal(WalOperation::VectorUpdate {
@@ -2559,6 +2646,7 @@ impl Engine {
                 gs.properties.set_node_property(node_id, k, v.clone());
             }
 
+            #[cfg(feature = "vector")]
             if let Some(ref embedding) = node_cmd.embedding {
                 gs.vector_index.insert(node_id, embedding)?;
             }
@@ -2742,9 +2830,12 @@ impl Engine {
         }
 
         // Update metrics
-        crate::metrics::EDGES_TOTAL
-            .with_label_values(&[&cmd.graph])
-            .set(gs.adjacency.edge_count() as i64);
+        #[cfg(feature = "observability")]
+        {
+            crate::metrics::EDGES_TOTAL
+                .with_label_values(&[&cmd.graph])
+                .set(gs.adjacency.edge_count() as i64);
+        }
 
         self.emit_event(&cmd.graph, EventKind::EdgeCreated {
             edge_id,
@@ -2946,6 +3037,7 @@ impl Engine {
     // ── Snapshot ──────────────────────────────────────────────────────────
 
     fn handle_snapshot(&self) -> WeavResult<CommandResponse> {
+        #[cfg(feature = "observability")]
         let snap_start = std::time::Instant::now();
         let snapshot_engine = match &self.snapshot_engine {
             Some(se) => se,
@@ -2991,9 +3083,12 @@ impl Engine {
                     .map(|s| s.to_string());
 
                 // Retrieve embedding from vector index for snapshot persistence
+                #[cfg(feature = "vector")]
                 let embedding = gs.vector_index
                     .get_vector(node_id)
                     .map(|v| v.to_vec());
+                #[cfg(not(feature = "vector"))]
+                let embedding: Option<Vec<f32>> = None;
 
                 node_snapshots.push(NodeSnapshot {
                     node_id,
@@ -3059,12 +3154,15 @@ impl Engine {
             graphs: graph_snapshots,
         };
 
-        let saved_path = snapshot_engine.save_snapshot(&full_snapshot)
+        let _saved_path = snapshot_engine.save_snapshot(&full_snapshot)
             .map_err(|e| WeavError::Internal(format!("snapshot save failed: {e}")))?;
 
-        crate::metrics::SNAPSHOT_DURATION.observe(snap_start.elapsed().as_secs_f64());
-        if let Ok(meta) = std::fs::metadata(&saved_path) {
-            crate::metrics::SNAPSHOT_SIZE_BYTES.set(meta.len() as i64);
+        #[cfg(feature = "observability")]
+        {
+            crate::metrics::SNAPSHOT_DURATION.observe(snap_start.elapsed().as_secs_f64());
+            if let Ok(meta) = std::fs::metadata(&_saved_path) {
+                crate::metrics::SNAPSHOT_SIZE_BYTES.set(meta.len() as i64);
+            }
         }
 
         Ok(CommandResponse::Ok)
@@ -3129,6 +3227,8 @@ impl Engine {
         let gs = graph_arc.read();
 
         let ctx_start = std::time::Instant::now();
+
+        #[cfg(feature = "vector")]
         let result = executor::execute_context_query(
             &query,
             &gs.adjacency,
@@ -3139,32 +3239,45 @@ impl Engine {
             &gs.interner,
         )?;
 
-        // Vector search timing (context query always involves vector or graph traversal).
-        crate::metrics::VECTOR_SEARCH_DURATION
-            .with_label_values(&[&graph_name])
-            .observe(ctx_start.elapsed().as_secs_f64());
-        crate::metrics::VECTOR_INDEX_SIZE
-            .with_label_values(&[&graph_name])
-            .set(gs.vector_index.len() as i64);
+        #[cfg(not(feature = "vector"))]
+        let result = executor::execute_context_query(
+            &query,
+            &gs.adjacency,
+            &gs.properties,
+            &gs.text_index,
+            &gs.interner,
+        )?;
 
-        // Token budget metrics.
-        let strategy = query.budget.as_ref().map_or("auto", |b| {
-            match &b.allocation {
-                weav_core::types::TokenAllocation::Auto => "auto",
-                weav_core::types::TokenAllocation::Proportional { .. } => "proportional",
-                weav_core::types::TokenAllocation::Priority(_) => "priority",
-                weav_core::types::TokenAllocation::DiversityAware { .. } => "mmr",
-                weav_core::types::TokenAllocation::SubmodularFacilityLocation { .. } => "submodular",
-            }
-        });
-        crate::metrics::TOKEN_BUDGET_USAGE
-            .with_label_values(&[&graph_name, strategy])
-            .observe(result.budget_used as f64);
-        if result.budget_used >= 1.0 {
-            crate::metrics::TOKEN_BUDGET_OVERFLOW
+        // Metrics
+        #[cfg(feature = "observability")]
+        {
+            crate::metrics::VECTOR_SEARCH_DURATION
                 .with_label_values(&[&graph_name])
-                .inc();
+                .observe(ctx_start.elapsed().as_secs_f64());
+            #[cfg(feature = "vector")]
+            crate::metrics::VECTOR_INDEX_SIZE
+                .with_label_values(&[&graph_name])
+                .set(gs.vector_index.len() as i64);
+
+            let strategy = query.budget.as_ref().map_or("auto", |b| {
+                match &b.allocation {
+                    weav_core::types::TokenAllocation::Auto => "auto",
+                    weav_core::types::TokenAllocation::Proportional { .. } => "proportional",
+                    weav_core::types::TokenAllocation::Priority(_) => "priority",
+                    weav_core::types::TokenAllocation::DiversityAware { .. } => "mmr",
+                    weav_core::types::TokenAllocation::SubmodularFacilityLocation { .. } => "submodular",
+                }
+            });
+            crate::metrics::TOKEN_BUDGET_USAGE
+                .with_label_values(&[&graph_name, strategy])
+                .observe(result.budget_used as f64);
+            if result.budget_used >= 1.0 {
+                crate::metrics::TOKEN_BUDGET_OVERFLOW
+                    .with_label_values(&[&graph_name])
+                    .inc();
+            }
         }
+        let _ = ctx_start;
 
         Ok(CommandResponse::Context(result))
     }
@@ -3215,7 +3328,8 @@ impl Engine {
                 let _ = gs.adjacency.remove_node(*victim_id);
                 gs.properties.remove_all_node_properties(*victim_id);
                 gs.text_index.remove_node(*victim_id);
-                let _ = gs.vector_index.remove(*victim_id);
+                #[cfg(feature = "vector")]
+                { let _ = gs.vector_index.remove(*victim_id); }
                 gs.access_times.remove(victim_id);
                 condensed += 1;
                 continue;
@@ -3238,19 +3352,23 @@ impl Engine {
                 let _ = gs.adjacency.remove_node(*victim_id);
                 gs.properties.remove_all_node_properties(*victim_id);
                 gs.text_index.remove_node(*victim_id);
-                let _ = gs.vector_index.remove(*victim_id);
+                #[cfg(feature = "vector")]
+                { let _ = gs.vector_index.remove(*victim_id); }
                 gs.access_times.remove(victim_id);
                 condensed += 1;
             }
         }
 
         // Update metrics
-        crate::metrics::NODES_TOTAL
-            .with_label_values(&[graph_name])
-            .set(gs.adjacency.node_count() as i64);
-        crate::metrics::EDGES_TOTAL
-            .with_label_values(&[graph_name])
-            .set(gs.adjacency.edge_count() as i64);
+        #[cfg(feature = "observability")]
+        {
+            crate::metrics::NODES_TOTAL
+                .with_label_values(&[graph_name])
+                .set(gs.adjacency.node_count() as i64);
+            crate::metrics::EDGES_TOTAL
+                .with_label_values(&[graph_name])
+                .set(gs.adjacency.edge_count() as i64);
+        }
 
         Ok(CommandResponse::Text(format!(
             "Condensed {} nodes (threshold: {})",
@@ -3323,12 +3441,15 @@ impl Engine {
         // Apply results to graph.
         let response = self.apply_extraction_result(&cmd.graph, &result)?;
 
-        crate::metrics::INGEST_DURATION
-            .with_label_values(&[&cmd.graph, &format_label])
-            .observe(ingest_start.elapsed().as_secs_f64());
-        crate::metrics::INGEST_DOCUMENTS_TOTAL
-            .with_label_values(&[&cmd.graph])
-            .inc();
+        #[cfg(feature = "observability")]
+        {
+            crate::metrics::INGEST_DURATION
+                .with_label_values(&[&cmd.graph, &format_label])
+                .observe(ingest_start.elapsed().as_secs_f64());
+            crate::metrics::INGEST_DOCUMENTS_TOTAL
+                .with_label_values(&[&cmd.graph])
+                .inc();
+        }
 
         Ok(response)
     }
@@ -3391,6 +3512,7 @@ impl Engine {
             gs.properties.set_node_property(node_id, "_tx_from", Value::Int(now as i64));
 
             // Insert embedding.
+            #[cfg(feature = "vector")]
             if !cwe.embedding.is_empty() {
                 let _ = gs.vector_index.insert(node_id, &cwe.embedding);
             }
@@ -3472,6 +3594,7 @@ impl Engine {
             gs.properties.set_node_property(node_id, "_tx_from", Value::Int(now as i64));
 
             // Insert embedding.
+            #[cfg(feature = "vector")]
             if let Some(ref embedding) = ewe.embedding {
                 let _ = gs.vector_index.insert(node_id, embedding);
             }
@@ -3535,15 +3658,13 @@ impl Engine {
 
         match result {
             Ok(identity) => {
-                crate::metrics::AUTH_ATTEMPTS_TOTAL
-                    .with_label_values(&["success"])
-                    .inc();
+                #[cfg(feature = "observability")]
+                { crate::metrics::AUTH_ATTEMPTS_TOTAL.with_label_values(&["success"]).inc(); }
                 Ok(CommandResponse::Text(format!("OK (user: {})", identity.username)))
             }
             Err(e) => {
-                crate::metrics::AUTH_ATTEMPTS_TOTAL
-                    .with_label_values(&["failure"])
-                    .inc();
+                #[cfg(feature = "observability")]
+                { crate::metrics::AUTH_ATTEMPTS_TOTAL.with_label_values(&["failure"]).inc(); }
                 Err(e)
             }
         }
@@ -6277,6 +6398,7 @@ mod tests {
         assert!(result.is_ok(), "reader should see global stats");
     }
 
+    #[cfg(feature = "observability")]
     #[test]
     fn test_metrics_recorded_on_execute() {
         let engine = make_engine();
@@ -6323,6 +6445,7 @@ mod tests {
         assert_eq!(cmd.type_name(), "graph_list");
     }
 
+    #[cfg(feature = "vector")]
     #[test]
     fn test_node_update_with_embedding_persisted() {
         // Verify that node update with embedding creates in-memory vector

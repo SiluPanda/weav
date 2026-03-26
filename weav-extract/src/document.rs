@@ -25,6 +25,7 @@ fn extract_plain_text(content: &DocumentContent) -> WeavResult<String> {
     }
 }
 
+#[cfg(feature = "pdf")]
 fn extract_pdf_text(content: &DocumentContent) -> WeavResult<String> {
     let bytes = match content {
         DocumentContent::Binary(b) => b.as_slice(),
@@ -80,6 +81,14 @@ fn extract_pdf_text(content: &DocumentContent) -> WeavResult<String> {
     result
 }
 
+#[cfg(not(feature = "pdf"))]
+fn extract_pdf_text(_content: &DocumentContent) -> WeavResult<String> {
+    Err(WeavError::Internal(
+        "PDF support not available - enable the 'pdf' feature".into(),
+    ))
+}
+
+#[cfg(feature = "pdf")]
 fn extract_docx_text(content: &DocumentContent) -> WeavResult<String> {
     let bytes = match content {
         DocumentContent::Binary(b) => b.as_slice(),
@@ -115,8 +124,16 @@ fn extract_docx_text(content: &DocumentContent) -> WeavResult<String> {
     Ok(text)
 }
 
+#[cfg(not(feature = "pdf"))]
+fn extract_docx_text(_content: &DocumentContent) -> WeavResult<String> {
+    Err(WeavError::Internal(
+        "DOCX support not available - enable the 'pdf' feature".into(),
+    ))
+}
+
 /// Simple XML text extractor for DOCX word/document.xml.
 /// Extracts text from <w:t> elements and adds paragraph breaks.
+#[cfg(feature = "pdf")]
 fn extract_text_from_docx_xml(xml: &str) -> String {
     let mut result = String::new();
     let mut in_paragraph = false;
@@ -305,6 +322,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "pdf")]
     fn test_extract_pdf_invalid_bytes() {
         let doc = InputDocument {
             document_id: "test".into(),
@@ -316,6 +334,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "pdf")]
     fn test_extract_docx_invalid_bytes() {
         let doc = InputDocument {
             document_id: "test".into(),

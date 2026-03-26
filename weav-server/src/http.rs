@@ -248,7 +248,7 @@ struct EdgeDetailJson {
 
 /// Build the axum Router with all routes.
 pub fn build_router(engine: Arc<Engine>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health))
         // Graph routes.
         .route("/v1/graphs", post(create_graph))
@@ -285,8 +285,6 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/info", get(server_info))
         // Context query.
         .route("/v1/context", post(context_query))
-        // Ingest (extraction pipeline).
-        .route("/v1/graphs/{graph}/ingest", post(ingest))
         // Schema introspection.
         .route("/v1/graphs/{graph}/schema", get(get_graph_schema))
         // Schema inference from data.
@@ -302,14 +300,9 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/graphs/{graph}/search", get(search_nodes))
         // Full-text search with BM25 scoring.
         .route("/v1/graphs/{graph}/search/text", get(search_text))
-        // Vector similarity search with optional filtering.
-        .route("/v1/graphs/{graph}/search/vector", post(search_vector))
         // Graph export/import.
         .route("/v1/graphs/{graph}/export", get(export_graph))
         .route("/v1/graphs/{graph}/import", post(import_graph))
-        // CSV import/export.
-        .route("/v1/graphs/{graph}/import/csv", post(import_csv))
-        .route("/v1/graphs/{graph}/export/csv", get(export_csv))
         // DOT graph export.
         .route("/v1/graphs/{graph}/export/dot", get(export_dot))
         // Graph algorithms.
@@ -361,9 +354,24 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route(
             "/v1/graphs/{graph}/cypher",
             post(cypher_query),
-        )
-        // Prometheus metrics.
-        .route("/metrics", get(metrics_handler))
+        );
+
+    // Feature-gated routes: ingest (extract), vector search, CSV, prometheus.
+    #[cfg(feature = "extract")]
+    let router = router.route("/v1/graphs/{graph}/ingest", post(ingest));
+
+    #[cfg(feature = "vector")]
+    let router = router.route("/v1/graphs/{graph}/search/vector", post(search_vector));
+
+    #[cfg(feature = "csv-export")]
+    let router = router
+        .route("/v1/graphs/{graph}/import/csv", post(import_csv))
+        .route("/v1/graphs/{graph}/export/csv", get(export_csv));
+
+    #[cfg(feature = "observability")]
+    let router = router.route("/metrics", get(metrics_handler));
+
+    router
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(30)))
         .with_state(engine)
@@ -643,6 +651,7 @@ async fn search_text(
 /// Vector similarity search with optional label/property filtering.
 /// POST /v1/graphs/{graph}/search/vector
 /// Body: { "embedding": [...], "k": 10, "labels": ["Person"], "properties": {"status": "active"} }
+#[cfg(feature = "vector")]
 async fn search_vector(
     State(engine): State<Arc<Engine>>,
     headers: HeaderMap,
@@ -801,6 +810,7 @@ async fn export_graph(
         if let Some(key) = entity_key {
             node["entity_key"] = serde_json::Value::String(key);
         }
+        #[cfg(feature = "vector")]
         if let Some(vec) = gs.vector_index.get_vector(nid) {
             node["embedding"] = serde_json::json!(vec);
         }
@@ -958,6 +968,7 @@ async fn import_graph(
 ///
 /// The CSV must have a header row. Required column: `_label` (node label).
 /// Optional column: `_id` (ignored). All other columns become node properties.
+#[cfg(feature = "csv-export")]
 async fn import_csv(
     State(engine): State<Arc<Engine>>,
     headers: HeaderMap,
@@ -1066,6 +1077,7 @@ async fn import_csv(
 
 /// Export all nodes as CSV.
 /// GET /v1/graphs/{graph}/export/csv
+#[cfg(feature = "csv-export")]
 async fn export_csv(
     State(engine): State<Arc<Engine>>,
     headers: HeaderMap,
@@ -1138,6 +1150,7 @@ async fn export_csv(
 }
 
 /// Convert a Value to a CSV-friendly string.
+#[cfg(feature = "csv-export")]
 fn value_to_csv_string(v: &Value) -> String {
     match v {
         Value::Null => String::new(),
@@ -2051,6 +2064,7 @@ async fn cypher_query(
     }
 }
 
+#[cfg(feature = "observability")]
 async fn metrics_handler() -> impl IntoResponse {
     use prometheus::Encoder;
     let encoder = prometheus::TextEncoder::new();
@@ -2768,6 +2782,7 @@ async fn context_query(
 
 // ─── Ingest handler ─────────────────────────────────────────────────────────
 
+#[cfg(feature = "extract")]
 #[derive(Deserialize)]
 pub struct IngestRequest {
     pub content: Option<String>,
@@ -2782,6 +2797,7 @@ pub struct IngestRequest {
     pub entity_types: Option<Vec<String>>,
 }
 
+#[cfg(feature = "extract")]
 #[derive(Serialize)]
 struct IngestResultJson {
     document_id: String,
@@ -2792,6 +2808,7 @@ struct IngestResultJson {
     pipeline_duration_ms: u64,
 }
 
+#[cfg(feature = "extract")]
 async fn ingest(
     State(engine): State<Arc<Engine>>,
     headers: HeaderMap,
