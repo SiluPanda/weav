@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = ["pdf", "llm-providers"]
+default = ["pdf"]
 pdf = ["dep:pdf_oxide", "dep:zip"]
 llm-providers = ["dep:llm", "dep:schemars"]
 

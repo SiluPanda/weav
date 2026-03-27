@@ -36,13 +36,15 @@ RUN for dir in weav-core weav-graph weav-vector weav-auth weav-extract \
     mkdir -p weav-mcp/src && echo "fn main() {}" > weav-mcp/src/main.rs
 
 # Cache dependency build
-RUN cargo build --release --bin weav-server 2>/dev/null || true
+RUN cargo build --release -p weav-server --features weav-server/full 2>/dev/null || true
 
 # Copy actual source
 COPY . .
 
 # Build release binary
-RUN cargo build --release --bin weav-server --bin weav-cli --bin weav-mcp
+RUN cargo build --release -p weav-server --features weav-server/full && \
+    cargo build --release -p weav-cli && \
+    cargo build --release -p weav-mcp
 
 # ─── Runtime Stage ────────────────────────────────────────────────────────────
 

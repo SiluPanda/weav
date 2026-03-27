@@ -20,6 +20,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: cargo test --workspace
+      - name: Run tests (full features)
+        run: cargo test --workspace --features weav-server/full,weav-extract/llm-providers
 
   clippy:
     name: Clippy
@@ -32,6 +34,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run clippy
         run: cargo clippy --workspace -- -D warnings
+      - name: Run clippy (full features)
+        run: cargo clippy --workspace --features weav-server/full,weav-extract/llm-providers -- -D warnings
 
   doc:
     name: Documentation
@@ -65,6 +69,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build release
         run: cargo build --release --workspace
+      - name: Build release (full features)
+        run: cargo build --release --workspace --features weav-server/full,weav-extract/llm-providers
 
   docker:
     name: Docker Build

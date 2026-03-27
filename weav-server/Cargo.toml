@@ -9,8 +9,9 @@ path = "src/main.rs"
 
 [features]
 default = ["extract", "grpc", "tls", "resp3", "observability", "csv-export", "vector"]
-full = ["extract", "grpc", "tls", "resp3", "observability", "csv-export", "vector"]
+full = ["extract", "extract-llm", "grpc", "tls", "resp3", "observability", "csv-export", "vector"]
 extract = ["dep:weav-extract"]
+extract-llm = ["extract", "weav-extract/llm-providers"]
 grpc = ["dep:tonic", "dep:prost", "weav-proto/grpc"]
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
 resp3 = ["dep:weav-proto"]

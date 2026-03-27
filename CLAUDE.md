@@ -9,9 +9,11 @@ Weav is a Rust in-memory context graph database designed for AI/LLM workloads. R
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo build --workspace
 cargo build --release              # Optimized (thin LTO, codegen-units=1, opt-level=3)
+cargo build -p weav-server --features full  # Full build including LLM providers
 
 # Test
-cargo test --workspace             # All 1359+ Rust tests
+cargo test --workspace             # All 1340+ Rust tests (default features)
+cargo test --workspace --features weav-server/full,weav-extract/llm-providers  # Full features
 cargo test -p weav-core            # Single crate
 cargo test -p weav-server          # Unit tests
 cargo test -p weav-server --test integration  # Integration tests

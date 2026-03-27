@@ -33,8 +33,8 @@
 <p align="center">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue.svg">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.85%2B-orange.svg">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-909%20passing-brightgreen.svg">
-  <img alt="Crates" src="https://img.shields.io/badge/crates-11-purple.svg">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-1340%20passing-brightgreen.svg">
+  <img alt="Crates" src="https://img.shields.io/badge/crates-12-purple.svg">
 </p>
 
 ---
@@ -83,6 +83,21 @@ cargo build --release
 #   RESP3  → :6380
 #   gRPC   → :6381
 #   HTTP   → :6382
+```
+
+#### Feature-Gated Builds
+
+The LLM provider integration (AWS SDK, Actix) is opt-in to keep default builds lean:
+
+```bash
+# Default build — everything except LLM providers (~414 crates)
+cargo build --release
+
+# Full build — including LLM extraction (~495 crates)
+cargo build --release -p weav-server --features full
+
+# Minimal — HTTP-only graph database
+cargo build --release -p weav-server --no-default-features
 ```
 
 ### Connect with the CLI
@@ -233,8 +248,8 @@ const prompt = contextToPrompt(result);
 | `weav-core` | Foundation types, config, errors, shard infrastructure, message bus |
 | `weav-graph` | Adjacency store, property store, traversal (BFS, flow scoring, Dijkstra, PPR), entity dedup |
 | `weav-vector` | HNSW vector index (usearch), token counting (tiktoken-rs) |
-| `weav-extract` | Ingestion pipeline: document parsing (PDF/DOCX/CSV/text), chunking, LLM extraction |
-| `weav-query` | Query parser (30 commands), planner, executor, token budget enforcement |
+| `weav-extract` | Ingestion pipeline: document parsing (PDF/DOCX/CSV/text), chunking, LLM extraction (opt-in) |
+| `weav-query` | Query parser (38 commands), planner, executor, token budget enforcement |
 | `weav-auth` | Authentication (Argon2id), API keys (SHA-256), ACL store, command classification |
 | `weav-persist` | Write-ahead log, snapshot engine, crash recovery |
 | `weav-proto` | RESP3 codec, gRPC protobuf definitions, command mapping |
@@ -738,8 +753,11 @@ Benchmarks produce HTML reports via [criterion](https://github.com/bheisler/crit
 ## Testing
 
 ```bash
-# Run all tests
+# Run all tests (default features)
 cargo test --workspace
+
+# Run all tests including LLM provider tests
+cargo test --workspace --features weav-server/full,weav-extract/llm-providers
 
 # Run tests for a specific crate
 cargo test -p weav-core
@@ -753,20 +771,19 @@ cd sdk/python && pip install -e ".[dev]" && pytest
 cd sdk/node && npm test
 ```
 
-**909 Rust tests** across all crates, **983 total** including SDKs — all passing.
+**1,340 Rust tests** across all crates, **1,414 total** including SDKs — all passing.
 
 | Crate | Tests |
 |---|---|
-| weav-core | 109 |
-| weav-graph | 174 |
-| weav-vector | 31 |
-| weav-extract | 43 |
-| weav-query | 155 |
+| weav-core | 134 |
+| weav-graph | 343 |
+| weav-vector | 32 |
+| weav-extract | 32 |
+| weav-query | 227 |
 | weav-auth | 47 |
-| weav-persist | 43 |
+| weav-persist | 47 |
 | weav-proto | 61 |
-| weav-mcp | 8 |
-| weav-server | 199 (103 unit + 28 integration + 68 E2E) |
+| weav-server | 378 (282 unit + 28 integration + 68 E2E) |
 | weav-cli | 39 |
 | Python SDK | 49 |
 | Node SDK | 25 |
@@ -780,8 +797,8 @@ weav/
 ├── weav-core/          Core types, config, errors, shard, message bus
 ├── weav-graph/         Adjacency store, property store, traversal, dedup
 ├── weav-vector/        HNSW vector index, token counter
-├── weav-extract/       Ingestion: document parsing, chunking, LLM extraction
-├── weav-query/         Parser (30 commands), planner, executor, budget enforcer
+├── weav-extract/       Ingestion: document parsing, chunking, LLM extraction (opt-in)
+├── weav-query/         Parser (38 commands), planner, executor, budget enforcer
 ├── weav-auth/          Authentication (Argon2id), API keys, ACL store
 ├── weav-persist/       WAL, snapshots, recovery manager
 ├── weav-proto/         RESP3 codec, gRPC proto, command mapping
@@ -808,6 +825,7 @@ Weav is built on battle-tested Rust crates:
 | gRPC | tonic, prost |
 | Vector Search | usearch (HNSW) |
 | Tokenization | tiktoken-rs (cl100k, o200k) |
+| LLM Integration | llm (opt-in via `extract-llm` feature) |
 | Serialization | serde, bincode, rkyv |
 | Data Structures | roaring, smallvec, compact_str |
 | Hashing | xxhash-rust, crc32fast, sha2 |

@@ -38,7 +38,7 @@ Weav runs as a single process serving three protocols simultaneously:
 | RESP3 | 6380 | Redis-compatible CLI, high-throughput pipelining |
 | gRPC | 6381 | Service mesh, streaming, typed clients |
 
-The server is structured as 11 Rust crates with explicit dependency boundaries and no cyclic dependencies. Heavy subsystems (vector search, document extraction, gRPC, TLS, metrics) are feature-gated so operators can build a minimal binary or a fully-featured one.
+The server is structured as 12 Rust crates with explicit dependency boundaries and no cyclic dependencies. Heavy subsystems (vector search, document extraction, LLM providers, gRPC, TLS, metrics) are feature-gated so operators can build a minimal binary or a fully-featured one. The `llm-providers` feature is opt-in by default to avoid pulling in the AWS SDK and its ~80 transitive crates.
 
 ### Key Design Decisions
 
@@ -337,41 +337,45 @@ Engine
 
 ![Feature Flags](diagrams/feature-flags.svg)
 
-Weav uses Cargo feature flags to enable modular builds. All features are on by default for backward compatibility.
+Weav uses Cargo feature flags to enable modular builds. The `llm-providers` feature (which pulls in the AWS SDK and Actix runtime) is opt-in to keep default builds lean.
 
 ### weav-server features
 
 | Feature | Dependencies Added | What It Enables |
 |---------|-------------------|-----------------|
 | `vector` | weav-vector, usearch, tiktoken-rs | HNSW vector index, token counting, vector search endpoints |
-| `extract` | weav-extract, llm, pdf_oxide, text-splitter, zip | Document ingestion, LLM extraction, `/ingest` endpoint |
+| `extract` | weav-extract, pdf_oxide, text-splitter, zip | Document ingestion, chunking, `/ingest` endpoint |
+| `extract-llm` | extract + llm, schemars | LLM entity extraction, schema generation (adds AWS SDK) |
 | `grpc` | tonic, prost | gRPC server on port 6381 |
 | `tls` | rustls, tokio-rustls | TLS encryption for gRPC and RESP3 |
 | `resp3` | weav-proto | RESP3 binary protocol server on port 6380 |
 | `observability` | prometheus | Prometheus metrics, `/metrics` endpoint |
 | `csv-export` | csv | CSV import/export endpoints |
-| `full` | All of the above | Convenience alias |
+| `full` | All of the above (including extract-llm) | Convenience alias for production builds |
 
 ### weav-extract sub-features
 
 | Feature | Dependencies | What It Enables |
 |---------|-------------|-----------------|
-| `pdf` | pdf_oxide, zip | PDF and DOCX parsing |
-| `llm-providers` | llm, schemars | LLM entity extraction, schema generation |
+| `pdf` (default) | pdf_oxide, zip | PDF and DOCX parsing |
+| `llm-providers` (opt-in) | llm, schemars | LLM entity extraction, schema generation |
 
 ### Build Profiles
 
 ```bash
-# Minimal: HTTP-only graph database (12 MB, 10s build)
+# Default: Full server without LLM providers (~414 crates, ~1.1 GB target)
+cargo build --workspace
+
+# Full: Everything including LLM providers (~495 crates, ~2 GB target)
+cargo build -p weav-server --features full
+
+# Minimal: HTTP-only graph database
 cargo build -p weav-server --no-default-features
 
-# Standard: Graph + RESP3 + vector search (25 MB, 20s build)
+# Standard: Graph + RESP3 + vector search
 cargo build -p weav-server --no-default-features --features resp3,vector
 
-# Full: Everything (64 MB debug / 28 MB release, 65s build)
-cargo build -p weav-server
-
-# Release: Optimized, stripped (28 MB)
+# Release: Optimized, stripped
 cargo build -p weav-server --release
 ```
 

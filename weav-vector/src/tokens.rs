@@ -17,13 +17,11 @@ impl TokenCounter {
             TokenCounterType::CharDiv4 => char_div_4(text),
             TokenCounterType::TiktokenCl100k => {
                 let bpe = tiktoken_rs::cl100k_base_singleton();
-                let lock = bpe.lock();
-                lock.encode_with_special_tokens(text).len() as u32
+                bpe.encode_with_special_tokens(text).len() as u32
             }
             TokenCounterType::TiktokenO200k => {
                 let bpe = tiktoken_rs::o200k_base_singleton();
-                let lock = bpe.lock();
-                lock.encode_with_special_tokens(text).len() as u32
+                bpe.encode_with_special_tokens(text).len() as u32
             }
             TokenCounterType::Exact(path) => {
                 // v0.1: Custom tokenizer loading is not yet implemented.

@@ -29,7 +29,7 @@ dependencies = [
  "actix-rt",
  "actix-service",
  "actix-utils",
- "base64 0.22.1",
+ "base64",
  "bitflags 2.11.0",
  "brotli",
  "bytes",
@@ -337,7 +337,7 @@ dependencies = [
  "actix-service",
  "actix-tls",
  "actix-utils",
- "base64 0.22.1",
+ "base64",
  "bytes",
  "cfg-if",
  "cookie",
@@ -871,12 +871,6 @@ dependencies = [
  "tower-service",
  "tracing",
 ]
-
-[[package]]
-name = "base64"
-version = "0.21.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
 
 [[package]]
 name = "base64"
@@ -2348,7 +2342,7 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -2817,7 +2811,7 @@ dependencies = [
  "aws-sdk-bedrockruntime",
  "aws-smithy-types",
  "axum 0.7.9",
- "base64 0.22.1",
+ "base64",
  "chrono",
  "clap",
  "colored",
@@ -3216,7 +3210,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44149be98548e2044dda79539debf73bd0539834bb8fe8f34e77311d1213895e"
 dependencies = [
  "aes",
- "base64 0.22.1",
+ "base64",
  "bitflags 2.11.0",
  "brotli",
  "byteorder",
@@ -3753,7 +3747,7 @@ version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bytes",
  "encoding_rs",
  "futures-core",
@@ -3848,7 +3842,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2cb14cb9278a12eae884c9f3c0cfeca2cc28f361211206424a1d7abed95f090"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64",
  "chrono",
  "futures",
  "pastey",
@@ -4518,7 +4512,7 @@ dependencies = [
  "memchr",
  "strum 0.27.2",
  "thiserror 2.0.18",
- "tiktoken-rs 0.9.1",
+ "tiktoken-rs",
 ]
 
 [[package]]
@@ -4597,28 +4591,12 @@ dependencies = [
 
 [[package]]
 name = "tiktoken-rs"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44075987ee2486402f0808505dd65692163d243a337fc54363d49afac41087f6"
-dependencies = [
- "anyhow",
- "base64 0.21.7",
- "bstr",
- "fancy-regex",
- "lazy_static",
- "parking_lot",
- "regex",
- "rustc-hash",
-]
-
-[[package]]
-name = "tiktoken-rs"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a19830747d9034cd9da43a60eaa8e552dfda7712424aebf187b7a60126bae0d"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64",
  "bstr",
  "fancy-regex",
  "lazy_static",
@@ -4825,7 +4803,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum 0.7.9",
- "base64 0.22.1",
+ "base64",
  "bytes",
  "h2 0.4.13",
  "http 1.4.0",
@@ -5388,7 +5366,7 @@ dependencies = [
  "serde_json",
  "strsim",
  "text-splitter",
- "tiktoken-rs 0.6.0",
+ "tiktoken-rs",
  "tokio",
  "tracing",
  "uuid",
@@ -5481,7 +5459,7 @@ name = "weav-server"
 version = "0.1.0"
 dependencies = [
  "axum 0.8.8",
- "base64 0.22.1",
+ "base64",
  "bincode",
  "bytes",
  "compact_str",
@@ -5523,7 +5501,7 @@ dependencies = [
  "roaring",
  "serde",
  "thiserror 2.0.18",
- "tiktoken-rs 0.6.0",
+ "tiktoken-rs",
  "tracing",
  "usearch",
  "weav-core",
