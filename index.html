@@ -9,6 +9,44 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;1,300;1,400&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
+:root {
+  --bg: #fafaf9;
+  --bg-card: #ffffff;
+  --bg-code: #f5f4f1;
+  --border: #e8e5e1;
+  --text: #1a1a1a;
+  --text-heading: #0a0a0a;
+  --text-secondary: #525252;
+  --text-tertiary: #8a8a8a;
+  --nav-bg: rgba(250, 250, 249, 0.85);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f0f0f;
+    --bg-card: #1a1a1a;
+    --bg-code: #161616;
+    --border: #2a2a2a;
+    --text: #e0e0e0;
+    --text-heading: #f0f0f0;
+    --text-secondary: #a0a0a0;
+    --text-tertiary: #707070;
+    --nav-bg: rgba(15, 15, 15, 0.85);
+  }
+}
+
+[data-theme="dark"] {
+  --bg: #0f0f0f;
+  --bg-card: #1a1a1a;
+  --bg-code: #161616;
+  --border: #2a2a2a;
+  --text: #e0e0e0;
+  --text-heading: #f0f0f0;
+  --text-secondary: #a0a0a0;
+  --text-tertiary: #707070;
+  --nav-bg: rgba(15, 15, 15, 0.85);
+}
+
 *, *::before, *::after {
   margin: 0;
   padding: 0;
@@ -25,8 +63,8 @@ html {
 body {
   font-family: 'DM Sans', sans-serif;
   font-weight: 400;
-  color: #1a1a1a;
-  background: #fafaf9;
+  color: var(--text);
+  background: var(--bg);
   line-height: 1.6;
   font-size: 16px;
 }
@@ -34,7 +72,7 @@ body {
 h1, h2, h3, h4 {
   font-family: 'Instrument Serif', serif;
   font-weight: 400;
-  color: #0a0a0a;
+  color: var(--text-heading);
 }
 
 .container {
@@ -48,7 +86,7 @@ nav {
   position: sticky;
   top: 0;
   z-index: 100;
-  background: rgba(250, 250, 249, 0.85);
+  background: var(--nav-bg);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
   border-bottom: 1px solid transparent;
@@ -56,7 +94,7 @@ nav {
 }
 
 nav.scrolled {
-  border-bottom-color: #e8e5e1;
+  border-bottom-color: var(--border);
 }
 
 nav .container {
@@ -69,7 +107,7 @@ nav .container {
 .nav-logo {
   font-family: 'Instrument Serif', serif;
   font-size: 22px;
-  color: #0a0a0a;
+  color: var(--text-heading);
   text-decoration: none;
   letter-spacing: -0.5px;
 }
@@ -85,13 +123,13 @@ nav .container {
   font-family: 'DM Sans', sans-serif;
   font-size: 14px;
   font-weight: 400;
-  color: #525252;
+  color: var(--text-secondary);
   text-decoration: none;
   transition: color 0.2s;
 }
 
 .nav-links a:hover {
-  color: #0a0a0a;
+  color: var(--text-heading);
 }
 
 .nav-github {
@@ -116,7 +154,7 @@ nav .container {
 .nav-hamburger svg {
   width: 24px;
   height: 24px;
-  color: #1a1a1a;
+  color: var(--text);
 }
 
 /* ── Mobile nav ── */
@@ -131,8 +169,8 @@ nav .container {
     top: 60px;
     left: 0;
     right: 0;
-    background: #fafaf9;
-    border-bottom: 1px solid #e8e5e1;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
     flex-direction: column;
     padding: 24px;
     gap: 20px;
@@ -149,7 +187,7 @@ section {
 }
 
 section + section {
-  border-top: 1px solid #e8e5e1;
+  border-top: 1px solid var(--border);
 }
 
 .section-title {
@@ -162,7 +200,7 @@ section + section {
 .section-subtitle {
   font-family: 'DM Sans', sans-serif;
   font-size: 17px;
-  color: #525252;
+  color: var(--text-secondary);
   font-weight: 300;
   max-width: 600px;
   margin-bottom: 48px;
@@ -179,7 +217,7 @@ section + section {
   font-family: 'Instrument Serif', serif;
   font-size: clamp(56px, 10vw, 88px);
   letter-spacing: -2px;
-  color: #0a0a0a;
+  color: var(--text-heading);
   line-height: 1;
   margin-bottom: 20px;
 }
@@ -188,7 +226,7 @@ section + section {
   font-family: 'Instrument Serif', serif;
   font-size: clamp(20px, 3vw, 28px);
   font-weight: 400;
-  color: #1a1a1a;
+  color: var(--text);
   margin-bottom: 16px;
   letter-spacing: -0.3px;
 }
@@ -196,7 +234,7 @@ section + section {
 .hero-subtitle {
   font-family: 'DM Sans', sans-serif;
   font-size: 17px;
-  color: #525252;
+  color: var(--text-secondary);
   font-weight: 300;
   max-width: 580px;
   margin: 0 auto 40px;
@@ -215,9 +253,9 @@ section + section {
   font-family: 'DM Sans', sans-serif;
   font-size: 15px;
   font-weight: 500;
-  color: #fafaf9;
-  background: #0a0a0a;
-  border: 1px solid #0a0a0a;
+  color: var(--bg);
+  background: var(--text-heading);
+  border: 1px solid var(--text-heading);
   padding: 12px 32px;
   text-decoration: none;
   transition: opacity 0.2s;
@@ -231,9 +269,9 @@ section + section {
   font-family: 'DM Sans', sans-serif;
   font-size: 15px;
   font-weight: 500;
-  color: #1a1a1a;
+  color: var(--text);
   background: transparent;
-  border: 1px solid #e8e5e1;
+  border: 1px solid var(--border);
   padding: 12px 32px;
   text-decoration: none;
   display: inline-flex;
@@ -243,7 +281,7 @@ section + section {
 }
 
 .btn-secondary:hover {
-  border-color: #1a1a1a;
+  border-color: var(--text);
 }
 
 .btn-secondary svg {
@@ -262,8 +300,8 @@ section + section {
 .tag {
   font-family: 'JetBrains Mono', monospace;
   font-size: 12px;
-  color: #8a8a8a;
-  border: 1px solid #e8e5e1;
+  color: var(--text-tertiary);
+  border: 1px solid var(--border);
   padding: 4px 12px;
   letter-spacing: 0.3px;
 }
@@ -283,21 +321,21 @@ section + section {
 
 .problem-card {
   padding: 32px;
-  background: #ffffff;
-  border: 1px solid #e8e5e1;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
 }
 
 .problem-number {
   font-family: 'JetBrains Mono', monospace;
   font-size: 12px;
-  color: #8a8a8a;
+  color: var(--text-tertiary);
   margin-bottom: 16px;
   letter-spacing: 0.5px;
 }
 
 .problem-card p {
   font-size: 15px;
-  color: #525252;
+  color: var(--text-secondary);
   font-weight: 300;
   line-height: 1.7;
 }
@@ -307,8 +345,8 @@ section + section {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   gap: 1px;
-  background: #e8e5e1;
-  border: 1px solid #e8e5e1;
+  background: var(--border);
+  border: 1px solid var(--border);
 }
 
 @media (max-width: 900px) {
@@ -325,13 +363,13 @@ section + section {
 
 .feature-card {
   padding: 32px;
-  background: #ffffff;
+  background: var(--bg-card);
 }
 
 .feature-label {
   font-family: 'JetBrains Mono', monospace;
   font-size: 12px;
-  color: #8a8a8a;
+  color: var(--text-tertiary);
   letter-spacing: 0.5px;
   text-transform: uppercase;
   margin-bottom: 12px;
@@ -340,13 +378,13 @@ section + section {
 .feature-title {
   font-family: 'Instrument Serif', serif;
   font-size: 20px;
-  color: #0a0a0a;
+  color: var(--text-heading);
   margin-bottom: 10px;
 }
 
 .feature-desc {
   font-size: 14px;
-  color: #525252;
+  color: var(--text-secondary);
   font-weight: 300;
   line-height: 1.6;
 }
@@ -366,8 +404,8 @@ section + section {
 }
 
 .code-block {
-  background: #f5f4f1;
-  border: 1px solid #e8e5e1;
+  background: var(--bg-code);
+  border: 1px solid var(--border);
   padding: 28px;
   overflow-x: auto;
 }
@@ -376,7 +414,7 @@ section + section {
   font-family: 'JetBrains Mono', monospace;
   font-size: 13px;
   line-height: 1.7;
-  color: #1a1a1a;
+  color: var(--text);
   white-space: pre;
   margin: 0;
 }
@@ -384,7 +422,7 @@ section + section {
 .code-block-label {
   font-family: 'JetBrains Mono', monospace;
   font-size: 11px;
-  color: #8a8a8a;
+  color: var(--text-tertiary);
   letter-spacing: 0.5px;
   text-transform: uppercase;
   margin-bottom: 12px;
@@ -398,9 +436,9 @@ section + section {
   display: flex;
   gap: 16px;
   padding: 14px 0;
-  border-bottom: 1px solid #e8e5e1;
+  border-bottom: 1px solid var(--border);
   font-size: 15px;
-  color: #525252;
+  color: var(--text-secondary);
   font-weight: 300;
   line-height: 1.5;
 }
@@ -412,7 +450,7 @@ section + section {
 .step-num {
   font-family: 'JetBrains Mono', monospace;
   font-size: 12px;
-  color: #8a8a8a;
+  color: var(--text-tertiary);
   flex-shrink: 0;
   padding-top: 2px;
 }
@@ -422,7 +460,7 @@ section + section {
   font-family: 'Instrument Serif', serif;
   font-style: italic;
   font-size: 17px;
-  color: #525252;
+  color: var(--text-secondary);
   line-height: 1.6;
 }
 
@@ -446,9 +484,9 @@ section + section {
 
 .arch-list li {
   padding: 12px 0;
-  border-bottom: 1px solid #e8e5e1;
+  border-bottom: 1px solid var(--border);
   font-size: 15px;
-  color: #525252;
+  color: var(--text-secondary);
   font-weight: 300;
   line-height: 1.5;
 }
@@ -465,20 +503,20 @@ section + section {
 .protocol-table th {
   font-family: 'JetBrains Mono', monospace;
   font-size: 11px;
-  color: #8a8a8a;
+  color: var(--text-tertiary);
   letter-spacing: 0.5px;
   text-transform: uppercase;
   text-align: left;
   padding: 12px 16px;
-  border-bottom: 1px solid #e8e5e1;
+  border-bottom: 1px solid var(--border);
   font-weight: 400;
 }
 
 .protocol-table td {
   font-size: 14px;
-  color: #1a1a1a;
+  color: var(--text);
   padding: 14px 16px;
-  border-bottom: 1px solid #e8e5e1;
+  border-bottom: 1px solid var(--border);
 }
 
 .protocol-table tr:last-child td {
@@ -494,7 +532,7 @@ section + section {
 .protocol-table td:nth-child(2) {
   font-family: 'JetBrains Mono', monospace;
   font-size: 13px;
-  color: #525252;
+  color: var(--text-secondary);
 }
 
 /* ── Algorithms ── */
@@ -502,8 +540,8 @@ section + section {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   gap: 1px;
-  background: #e8e5e1;
-  border: 1px solid #e8e5e1;
+  background: var(--border);
+  border: 1px solid var(--border);
 }
 
 @media (max-width: 900px) {
@@ -520,13 +558,13 @@ section + section {
 
 .algo-card {
   padding: 28px;
-  background: #ffffff;
+  background: var(--bg-card);
 }
 
 .algo-category {
   font-family: 'JetBrains Mono', monospace;
   font-size: 11px;
-  color: #8a8a8a;
+  color: var(--text-tertiary);
   letter-spacing: 0.5px;
   text-transform: uppercase;
   margin-bottom: 12px;
@@ -535,13 +573,13 @@ section + section {
 .algo-count {
   font-family: 'Instrument Serif', serif;
   font-size: 28px;
-  color: #0a0a0a;
+  color: var(--text-heading);
   margin-bottom: 12px;
 }
 
 .algo-list {
   font-size: 13px;
-  color: #525252;
+  color: var(--text-secondary);
   font-weight: 300;
   line-height: 1.8;
 }
@@ -550,14 +588,14 @@ section + section {
 .compare-wrapper {
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
-  border: 1px solid #e8e5e1;
+  border: 1px solid var(--border);
 }
 
 .compare-table {
   width: 100%;
   min-width: 700px;
   border-collapse: collapse;
-  background: #ffffff;
+  background: var(--bg-card);
 }
 
 .compare-table thead th {
@@ -565,10 +603,10 @@ section + section {
   font-size: 12px;
   font-weight: 500;
   letter-spacing: 0.3px;
-  color: #0a0a0a;
+  color: var(--text-heading);
   text-align: center;
   padding: 16px 14px;
-  border-bottom: 1px solid #e8e5e1;
+  border-bottom: 1px solid var(--border);
   white-space: nowrap;
 }
 
@@ -576,34 +614,34 @@ section + section {
   text-align: left;
   font-family: 'DM Sans', sans-serif;
   font-size: 13px;
-  color: #8a8a8a;
+  color: var(--text-tertiary);
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
 
 .compare-table thead th:last-child {
-  background: #fafaf9;
+  background: var(--bg);
 }
 
 .compare-table tbody td {
   font-size: 14px;
   text-align: center;
   padding: 14px 14px;
-  border-bottom: 1px solid #e8e5e1;
-  color: #525252;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-secondary);
 }
 
 .compare-table tbody td:first-child {
   text-align: left;
   font-weight: 400;
-  color: #1a1a1a;
+  color: var(--text);
   font-size: 14px;
 }
 
 .compare-table tbody td:last-child {
-  background: #fafaf9;
+  background: var(--bg);
   font-weight: 500;
-  color: #0a0a0a;
+  color: var(--text-heading);
 }
 
 .compare-table tbody tr:last-child td {
@@ -611,11 +649,11 @@ section + section {
 }
 
 .check {
-  color: #1a1a1a;
+  color: var(--text);
 }
 
 .dash {
-  color: #d4d4d4;
+  color: var(--border);
 }
 
 /* ── Get started ── */
@@ -632,16 +670,16 @@ section + section {
 }
 
 .code-block-titled {
-  background: #f5f4f1;
-  border: 1px solid #e8e5e1;
+  background: var(--bg-code);
+  border: 1px solid var(--border);
 }
 
 .code-block-titled .code-header {
   padding: 14px 24px;
-  border-bottom: 1px solid #e8e5e1;
+  border-bottom: 1px solid var(--border);
   font-family: 'JetBrains Mono', monospace;
   font-size: 12px;
-  color: #8a8a8a;
+  color: var(--text-tertiary);
   letter-spacing: 0.3px;
 }
 
@@ -649,7 +687,7 @@ section + section {
   font-family: 'JetBrains Mono', monospace;
   font-size: 13px;
   line-height: 1.7;
-  color: #1a1a1a;
+  color: var(--text);
   padding: 24px;
   overflow-x: auto;
   white-space: pre;
@@ -657,7 +695,7 @@ section + section {
 }
 
 .code-comment {
-  color: #8a8a8a;
+  color: var(--text-tertiary);
 }
 
 /* ── Numbers bar ── */
@@ -677,15 +715,15 @@ section + section {
 .number-item {
   font-family: 'JetBrains Mono', monospace;
   font-size: 13px;
-  color: #525252;
+  color: var(--text-secondary);
   padding: 8px 20px;
-  border: 1px solid #e8e5e1;
+  border: 1px solid var(--border);
   white-space: nowrap;
 }
 
 /* ── Footer ── */
 footer {
-  border-top: 1px solid #e8e5e1;
+  border-top: 1px solid var(--border);
   padding: 64px 0 48px;
 }
 
@@ -700,13 +738,13 @@ footer {
 .footer-brand {
   font-family: 'Instrument Serif', serif;
   font-size: 20px;
-  color: #0a0a0a;
+  color: var(--text-heading);
   margin-bottom: 8px;
 }
 
 .footer-tagline {
   font-size: 13px;
-  color: #8a8a8a;
+  color: var(--text-tertiary);
   font-weight: 300;
 }
 
@@ -719,24 +757,40 @@ footer {
 
 .footer-links a {
   font-size: 14px;
-  color: #525252;
+  color: var(--text-secondary);
   text-decoration: none;
   font-weight: 300;
   transition: color 0.2s;
 }
 
 .footer-links a:hover {
-  color: #0a0a0a;
+  color: var(--text-heading);
 }
 
 .footer-bottom {
   margin-top: 48px;
   padding-top: 24px;
-  border-top: 1px solid #e8e5e1;
+  border-top: 1px solid var(--border);
   font-size: 13px;
-  color: #8a8a8a;
+  color: var(--text-tertiary);
   font-weight: 300;
 }
+
+.theme-toggle {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.15s;
+  flex-shrink: 0;
+}
+.theme-toggle:hover { color: var(--text-heading); }
 </style>
 </head>
 <body>
@@ -763,6 +817,13 @@ footer {
           <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
           GitHub
         </a>
+      </li>
+      <li>
+        <button class="theme-toggle" onclick="toggleTheme()" aria-label="Toggle theme">
+          <svg id="theme-icon" width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 12.5a5.5 5.5 0 1 1 0-11 5.5 5.5 0 0 1 0 11z"/>
+          </svg>
+        </button>
       </li>
     </ul>
   </div>
@@ -1199,6 +1260,40 @@ navLinks.querySelectorAll('a').forEach(link => {
     navLinks.classList.remove('open');
   });
 });
+
+// Theme toggle
+(function() {
+  var t = localStorage.getItem('weav-theme');
+  if (t) document.documentElement.setAttribute('data-theme', t);
+  window.updateThemeIcon = function() {
+    var theme = document.documentElement.getAttribute('data-theme');
+    var icon = document.getElementById('theme-icon');
+    if (!icon) return;
+    if (theme === 'dark') {
+      icon.innerHTML = '<path d="M8 11a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm0-8a1 1 0 0 1 1 1v1a1 1 0 1 1-2 0V4a1 1 0 0 1 1-1zm0 10a1 1 0 0 1 1 1v1a1 1 0 1 1-2 0v-1a1 1 0 0 1 1-1zm4.95-7.95a1 1 0 0 1 0 1.41l-.7.71a1 1 0 1 1-1.42-1.42l.71-.7a1 1 0 0 1 1.41 0zM3.05 11.95a1 1 0 0 1 0 1.41l-.7.71a1 1 0 1 1-1.42-1.42l.71-.7a1 1 0 0 1 1.41 0zM15 8a1 1 0 0 1-1 1h-1a1 1 0 1 1 0-2h1a1 1 0 0 1 1 1zM4 8a1 1 0 0 1-1 1H2a1 1 0 1 1 0-2h1a1 1 0 0 1 1 1z"/>';
+    } else if (theme === 'light') {
+      icon.innerHTML = '<path d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0zm0 14.5A6.5 6.5 0 0 1 3.1 3.68 7.08 7.08 0 0 0 8 14.5z"/>';
+    } else {
+      icon.innerHTML = '<path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 12.5a5.5 5.5 0 1 1 0-11 5.5 5.5 0 0 1 0 11z"/>';
+    }
+  };
+  window.toggleTheme = function() {
+    var html = document.documentElement;
+    var current = html.getAttribute('data-theme');
+    if (current === 'dark') {
+      html.setAttribute('data-theme', 'light');
+      localStorage.setItem('weav-theme', 'light');
+    } else if (current === 'light') {
+      html.removeAttribute('data-theme');
+      localStorage.removeItem('weav-theme');
+    } else {
+      html.setAttribute('data-theme', 'dark');
+      localStorage.setItem('weav-theme', 'dark');
+    }
+    updateThemeIcon();
+  };
+  updateThemeIcon();
+})();
 </script>
 
 </body>
