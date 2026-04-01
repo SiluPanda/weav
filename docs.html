@@ -1,0 +1,2961 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>weav docs - In-Memory Context Graph Database</title>
+<meta name="description" content="Complete documentation for the Weav in-memory context graph database. HTTP API, SDKs, configuration, algorithms, and more.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;1,300;1,400&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  font-family: 'DM Sans', sans-serif;
+  font-weight: 400;
+  color: #1a1a1a;
+  background: #fafaf9;
+  line-height: 1.6;
+  font-size: 16px;
+}
+
+h1, h2, h3, h4 {
+  font-family: 'Instrument Serif', serif;
+  font-weight: 400;
+  color: #0a0a0a;
+}
+
+/* ── Header ── */
+.doc-header {
+  position: sticky;
+  top: 0;
+  z-index: 200;
+  background: rgba(250, 250, 249, 0.85);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-bottom: 1px solid #e8e5e1;
+  height: 52px;
+  display: flex;
+  align-items: center;
+  padding: 0 24px;
+}
+
+.doc-header-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+}
+
+.doc-header-left {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.doc-header-logo {
+  font-family: 'Instrument Serif', serif;
+  font-size: 18px;
+  color: #0a0a0a;
+  text-decoration: none;
+  letter-spacing: -0.5px;
+}
+
+.doc-header-logo span {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 13px;
+  font-weight: 400;
+  color: #8a8a8a;
+  margin-left: 8px;
+}
+
+.doc-header-back {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 13px;
+  color: #525252;
+  text-decoration: none;
+  transition: color 0.2s;
+}
+
+.doc-header-back:hover {
+  color: #0a0a0a;
+}
+
+.sidebar-toggle {
+  display: none;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 4px;
+}
+
+.sidebar-toggle svg {
+  width: 20px;
+  height: 20px;
+  color: #1a1a1a;
+}
+
+/* ── Layout ── */
+.doc-layout {
+  display: flex;
+  min-height: calc(100vh - 52px);
+}
+
+/* ── Sidebar ── */
+.doc-sidebar {
+  width: 240px;
+  flex-shrink: 0;
+  position: sticky;
+  top: 52px;
+  height: calc(100vh - 52px);
+  overflow-y: auto;
+  border-right: 1px solid #e8e5e1;
+  padding: 24px 0;
+  background: #fafaf9;
+}
+
+.doc-sidebar::-webkit-scrollbar {
+  width: 4px;
+}
+
+.doc-sidebar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.doc-sidebar::-webkit-scrollbar-thumb {
+  background: #e8e5e1;
+  border-radius: 2px;
+}
+
+.sidebar-section {
+  margin-bottom: 20px;
+}
+
+.sidebar-section-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  font-weight: 500;
+  color: #8a8a8a;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  padding: 0 24px;
+  margin-bottom: 6px;
+}
+
+.sidebar-link {
+  display: block;
+  font-family: 'DM Sans', sans-serif;
+  font-size: 13px;
+  font-weight: 400;
+  color: #525252;
+  text-decoration: none;
+  padding: 5px 24px;
+  transition: color 0.15s, background 0.15s;
+  line-height: 1.4;
+}
+
+.sidebar-link:hover {
+  color: #0a0a0a;
+  background: rgba(0, 0, 0, 0.02);
+}
+
+.sidebar-link.active {
+  color: #0a0a0a;
+  font-weight: 500;
+  border-right: 2px solid #0a0a0a;
+}
+
+/* ── Main content ── */
+.doc-main {
+  flex: 1;
+  min-width: 0;
+  padding: 48px 48px 96px;
+}
+
+.doc-content {
+  max-width: 800px;
+}
+
+/* ── Section ── */
+.doc-section {
+  margin-bottom: 64px;
+}
+
+.doc-section + .doc-section {
+  padding-top: 48px;
+  border-top: 1px solid #e8e5e1;
+}
+
+.doc-section > h2 {
+  font-size: clamp(24px, 3vw, 32px);
+  letter-spacing: -0.3px;
+  margin-bottom: 24px;
+  line-height: 1.2;
+}
+
+.doc-section h3 {
+  font-size: 20px;
+  margin-top: 36px;
+  margin-bottom: 14px;
+  letter-spacing: -0.2px;
+}
+
+.doc-section h4 {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+  margin-top: 24px;
+  margin-bottom: 10px;
+  color: #1a1a1a;
+}
+
+/* ── Prose ── */
+.doc-section p {
+  font-size: 15px;
+  color: #525252;
+  font-weight: 300;
+  line-height: 1.7;
+  margin-bottom: 14px;
+}
+
+.doc-section ul, .doc-section ol {
+  font-size: 15px;
+  color: #525252;
+  font-weight: 300;
+  line-height: 1.7;
+  margin-bottom: 14px;
+  padding-left: 24px;
+}
+
+.doc-section li {
+  margin-bottom: 4px;
+}
+
+.doc-section strong {
+  color: #1a1a1a;
+  font-weight: 500;
+}
+
+.doc-section a {
+  color: #1a1a1a;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-color: #e8e5e1;
+  transition: text-decoration-color 0.2s;
+}
+
+.doc-section a:hover {
+  text-decoration-color: #1a1a1a;
+}
+
+/* ── Code ── */
+code {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  background: #f5f4f1;
+  padding: 2px 6px;
+  border: 1px solid #e8e5e1;
+}
+
+pre {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  line-height: 1.7;
+  color: #1a1a1a;
+  background: #f5f4f1;
+  border: 1px solid #e8e5e1;
+  padding: 20px 24px;
+  overflow-x: auto;
+  margin-bottom: 18px;
+  white-space: pre;
+}
+
+pre code {
+  background: none;
+  padding: 0;
+  border: none;
+  font-size: 13px;
+}
+
+.code-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: #8a8a8a;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+  display: block;
+}
+
+.code-comment { color: #8a8a8a; }
+.code-string { color: #525252; }
+.code-keyword { color: #0a0a0a; font-weight: 500; }
+.code-number { color: #525252; }
+
+/* ── Tables ── */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 18px;
+  font-size: 14px;
+  border: 1px solid #e8e5e1;
+}
+
+thead th {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  font-weight: 500;
+  color: #8a8a8a;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  text-align: left;
+  padding: 10px 14px;
+  border-bottom: 1px solid #e8e5e1;
+  background: #ffffff;
+}
+
+tbody td {
+  padding: 10px 14px;
+  border-bottom: 1px solid #e8e5e1;
+  color: #1a1a1a;
+  vertical-align: top;
+}
+
+tbody tr:last-child td {
+  border-bottom: none;
+}
+
+tbody td:first-child {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.td-desc {
+  font-weight: 300;
+  color: #525252;
+}
+
+/* ── Details / collapsible ── */
+details {
+  margin-bottom: 12px;
+  border: 1px solid #e8e5e1;
+  background: #ffffff;
+}
+
+details[open] {
+  margin-bottom: 18px;
+}
+
+summary {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  color: #1a1a1a;
+  padding: 12px 16px;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+summary::-webkit-details-marker {
+  display: none;
+}
+
+summary::before {
+  content: '+';
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 14px;
+  color: #8a8a8a;
+  flex-shrink: 0;
+  width: 16px;
+}
+
+details[open] summary::before {
+  content: '-';
+}
+
+.details-content {
+  padding: 0 16px 16px;
+}
+
+.details-content pre {
+  margin-bottom: 12px;
+}
+
+.details-content p {
+  font-size: 14px;
+}
+
+/* ── Endpoint blocks ── */
+.endpoint {
+  margin-bottom: 12px;
+  border: 1px solid #e8e5e1;
+  background: #ffffff;
+}
+
+.endpoint-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.endpoint-method {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+  padding: 2px 8px;
+  border: 1px solid #e8e5e1;
+  flex-shrink: 0;
+}
+
+.method-get { color: #525252; }
+.method-post { color: #0a0a0a; }
+.method-put { color: #525252; }
+.method-delete { color: #525252; }
+
+.endpoint-path {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  color: #1a1a1a;
+}
+
+.endpoint-desc {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 13px;
+  color: #8a8a8a;
+  font-weight: 300;
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+/* ── Back to top ── */
+.back-to-top {
+  display: inline-block;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: #8a8a8a;
+  text-decoration: none;
+  letter-spacing: 0.3px;
+  margin-top: 24px;
+  transition: color 0.2s;
+}
+
+.back-to-top:hover {
+  color: #0a0a0a;
+}
+
+/* ── Algo card grid ── */
+.algo-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  background: #e8e5e1;
+  border: 1px solid #e8e5e1;
+  margin-bottom: 24px;
+}
+
+.algo-card {
+  padding: 20px;
+  background: #ffffff;
+}
+
+.algo-cat {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: #8a8a8a;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+}
+
+.algo-card ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.algo-card li {
+  font-size: 13px;
+  color: #525252;
+  font-weight: 300;
+  line-height: 1.8;
+  margin-bottom: 0;
+}
+
+/* ── Metric table ── */
+.metric-name {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+}
+
+/* ── Tabbed code ── */
+.code-tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid #e8e5e1;
+  margin-bottom: 0;
+}
+
+.code-tab {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: #8a8a8a;
+  padding: 8px 16px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  letter-spacing: 0.3px;
+  transition: color 0.15s;
+}
+
+.code-tab:hover {
+  color: #0a0a0a;
+}
+
+.code-tab.active {
+  color: #0a0a0a;
+  border-bottom-color: #0a0a0a;
+}
+
+.tab-panel {
+  display: none;
+}
+
+.tab-panel.active {
+  display: block;
+}
+
+.tabbed-code {
+  border: 1px solid #e8e5e1;
+  margin-bottom: 18px;
+}
+
+.tabbed-code pre {
+  border: none;
+  border-top: none;
+  margin-bottom: 0;
+}
+
+/* ── Mobile ── */
+@media (max-width: 900px) {
+  .algo-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 768px) {
+  .sidebar-toggle {
+    display: block;
+  }
+
+  .doc-sidebar {
+    position: fixed;
+    left: -280px;
+    top: 52px;
+    width: 280px;
+    z-index: 150;
+    transition: left 0.25s ease;
+    box-shadow: none;
+  }
+
+  .doc-sidebar.open {
+    left: 0;
+    box-shadow: 100px 0 0 100px rgba(0, 0, 0, 0.1);
+  }
+
+  .doc-main {
+    padding: 32px 20px 64px;
+  }
+
+  .endpoint-desc {
+    display: none;
+  }
+
+  .algo-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 520px) {
+  table {
+    font-size: 12px;
+  }
+
+  thead th, tbody td {
+    padding: 8px 10px;
+  }
+
+  pre {
+    font-size: 12px;
+    padding: 14px 16px;
+  }
+}
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<header class="doc-header">
+  <div class="doc-header-inner">
+    <div class="doc-header-left">
+      <button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+          <line x1="4" y1="7" x2="20" y2="7"/>
+          <line x1="4" y1="12" x2="20" y2="12"/>
+          <line x1="4" y1="17" x2="20" y2="17"/>
+        </svg>
+      </button>
+      <a href="../index.html" class="doc-header-logo">weav<span>docs</span></a>
+    </div>
+    <a href="../index.html" class="doc-header-back">Back to main site</a>
+  </div>
+</header>
+
+<div class="doc-layout">
+
+<!-- Sidebar -->
+<nav class="doc-sidebar" id="sidebar">
+
+  <div class="sidebar-section">
+    <div class="sidebar-section-title">Getting Started</div>
+    <a href="#getting-started" class="sidebar-link">Introduction</a>
+    <a href="#quickstart" class="sidebar-link">Quickstart</a>
+    <a href="#installation" class="sidebar-link">Installation</a>
+  </div>
+
+  <div class="sidebar-section">
+    <div class="sidebar-section-title">Concepts</div>
+    <a href="#core-concepts" class="sidebar-link">Core Concepts</a>
+    <a href="#configuration" class="sidebar-link">Configuration</a>
+  </div>
+
+  <div class="sidebar-section">
+    <div class="sidebar-section-title">API</div>
+    <a href="#http-api" class="sidebar-link">HTTP API Reference</a>
+    <a href="#context-retrieval" class="sidebar-link">Context Retrieval</a>
+    <a href="#algorithms" class="sidebar-link">Graph Algorithms</a>
+    <a href="#cypher" class="sidebar-link">Cypher Queries</a>
+  </div>
+
+  <div class="sidebar-section">
+    <div class="sidebar-section-title">Infrastructure</div>
+    <a href="#auth" class="sidebar-link">Authentication</a>
+    <a href="#persistence" class="sidebar-link">Persistence</a>
+    <a href="#schema" class="sidebar-link">Schema</a>
+    <a href="#observability" class="sidebar-link">Observability</a>
+  </div>
+
+  <div class="sidebar-section">
+    <div class="sidebar-section-title">Integrations</div>
+    <a href="#mcp-tools" class="sidebar-link">MCP Tools</a>
+    <a href="#python-sdk" class="sidebar-link">Python SDK</a>
+    <a href="#node-sdk" class="sidebar-link">Node.js SDK</a>
+  </div>
+
+  <div class="sidebar-section">
+    <div class="sidebar-section-title">Reference</div>
+    <a href="#errors" class="sidebar-link">Error Reference</a>
+  </div>
+
+</nav>
+
+<!-- Main content -->
+<main class="doc-main">
+<div class="doc-content">
+
+<!-- ============================================================ -->
+<!-- GETTING STARTED -->
+<!-- ============================================================ -->
+
+<section class="doc-section" id="getting-started">
+<h2>Getting Started</h2>
+
+<p>Weav is an in-memory context graph database for AI, written in Rust. It combines graph storage, vector search, and budget-aware context retrieval into a single binary with sub-millisecond latency. Designed for AI agents, GraphRAG pipelines, and LLM applications.</p>
+
+<p>Weav exposes three protocol interfaces simultaneously:</p>
+
+<table>
+  <thead><tr><th>Protocol</th><th>Port</th><th>Use Case</th></tr></thead>
+  <tbody>
+    <tr><td>RESP3</td><td>6380</td><td class="td-desc">Redis-compatible wire protocol for CLI and existing tooling</td></tr>
+    <tr><td>gRPC</td><td>6381</td><td class="td-desc">High-performance binary protocol for service-to-service</td></tr>
+    <tr><td>HTTP</td><td>6382</td><td class="td-desc">REST API for SDKs, curl, and web applications</td></tr>
+  </tbody>
+</table>
+
+<h3 id="quickstart">Quickstart</h3>
+
+<p>Start the server with default settings, create a graph, add some data, and query context. The examples below use curl and the Python SDK side by side.</p>
+
+<div class="tabbed-code">
+  <div class="code-tabs">
+    <button class="code-tab active" onclick="switchTab(this, 'qs-curl')">curl</button>
+    <button class="code-tab" onclick="switchTab(this, 'qs-python')">Python</button>
+  </div>
+  <div class="tab-panel active" id="qs-curl">
+<pre><code><span class="code-comment"># Start the server</span>
+cargo run --release -p weav-server
+
+<span class="code-comment"># Create a graph</span>
+curl -X POST http://localhost:6382/v1/graphs \
+  -H "Content-Type: application/json" \
+  -d '{"name": "knowledge"}'
+
+<span class="code-comment"># Add nodes</span>
+curl -X POST http://localhost:6382/v1/graphs/knowledge/nodes \
+  -H "Content-Type: application/json" \
+  -d '{
+    "label": "Person",
+    "properties": {"name": "Alice", "role": "Engineer"},
+    "entity_key": "alice"
+  }'
+
+curl -X POST http://localhost:6382/v1/graphs/knowledge/nodes \
+  -H "Content-Type: application/json" \
+  -d '{
+    "label": "Project",
+    "properties": {"name": "Weav", "status": "active"},
+    "entity_key": "weav"
+  }'
+
+<span class="code-comment"># Add an edge</span>
+curl -X POST http://localhost:6382/v1/graphs/knowledge/edges \
+  -H "Content-Type: application/json" \
+  -d '{"source": 1, "target": 2, "label": "WORKS_ON", "weight": 1.0}'
+
+<span class="code-comment"># Query context</span>
+curl -X POST http://localhost:6382/v1/context \
+  -H "Content-Type: application/json" \
+  -d '{
+    "graph": "knowledge",
+    "query": "what does alice work on",
+    "budget": 4096,
+    "max_depth": 3
+  }'</code></pre>
+  </div>
+  <div class="tab-panel" id="qs-python">
+<pre><code><span class="code-keyword">from</span> weav <span class="code-keyword">import</span> WeavClient
+
+<span class="code-keyword">with</span> WeavClient() <span class="code-keyword">as</span> client:
+    <span class="code-comment"># Create a graph</span>
+    client.create_graph(<span class="code-string">"knowledge"</span>)
+
+    <span class="code-comment"># Add nodes</span>
+    alice = client.add_node(
+        <span class="code-string">"knowledge"</span>, <span class="code-string">"Person"</span>,
+        properties={<span class="code-string">"name"</span>: <span class="code-string">"Alice"</span>, <span class="code-string">"role"</span>: <span class="code-string">"Engineer"</span>},
+        entity_key=<span class="code-string">"alice"</span>,
+    )
+    weav = client.add_node(
+        <span class="code-string">"knowledge"</span>, <span class="code-string">"Project"</span>,
+        properties={<span class="code-string">"name"</span>: <span class="code-string">"Weav"</span>, <span class="code-string">"status"</span>: <span class="code-string">"active"</span>},
+        entity_key=<span class="code-string">"weav"</span>,
+    )
+
+    <span class="code-comment"># Add an edge</span>
+    client.add_edge(
+        <span class="code-string">"knowledge"</span>, alice, weav,
+        <span class="code-string">"WORKS_ON"</span>, weight=<span class="code-number">1.0</span>,
+    )
+
+    <span class="code-comment"># Query context</span>
+    result = client.context(
+        <span class="code-string">"knowledge"</span>,
+        query=<span class="code-string">"what does alice work on"</span>,
+        budget=<span class="code-number">4096</span>,
+    )
+
+    <span class="code-comment"># Use in an LLM prompt</span>
+    print(result.to_prompt())</code></pre>
+  </div>
+</div>
+
+<h3 id="installation">Installation</h3>
+
+<h4>From source</h4>
+<pre><code>git clone https://github.com/SiluPanda/weav.git
+cd weav
+cargo build --workspace --release
+./target/release/weav-server</code></pre>
+
+<h4>Full build with LLM providers</h4>
+<pre><code>cargo build -p weav-server --features full --release</code></pre>
+
+<h4>Python SDK</h4>
+<pre><code>pip install weav</code></pre>
+
+<h4>Node.js SDK</h4>
+<pre><code>npm install @weav/client</code></pre>
+
+<a href="#getting-started" class="back-to-top">Back to top</a>
+</section>
+
+<!-- ============================================================ -->
+<!-- CORE CONCEPTS -->
+<!-- ============================================================ -->
+
+<section class="doc-section" id="core-concepts">
+<h2>Core Concepts</h2>
+
+<h3>Graphs</h3>
+<p>Graphs are named containers for nodes and edges. A single Weav server can host multiple independent graphs. Each graph has its own adjacency store, property store, vector index, and string interner. Graphs are created and dropped at runtime via the API.</p>
+
+<h3>Nodes</h3>
+<p>Nodes are the primary entities in a graph. Each node has:</p>
+<ul>
+  <li><strong>Node ID</strong> -- a <code>u64</code> identifier assigned on creation</li>
+  <li><strong>Label</strong> -- a type string (e.g. "Person", "Document", "Concept")</li>
+  <li><strong>Properties</strong> -- arbitrary key-value pairs</li>
+  <li><strong>Embedding</strong> -- an optional float vector for similarity search</li>
+  <li><strong>Entity Key</strong> -- an optional unique string for deduplication and lookup</li>
+</ul>
+
+<h3>Edges</h3>
+<p>Edges are directed connections between two nodes. Each edge has:</p>
+<ul>
+  <li><strong>Edge ID</strong> -- a <code>u64</code> identifier</li>
+  <li><strong>Source / Target</strong> -- the node IDs it connects</li>
+  <li><strong>Label</strong> -- a relationship type string (e.g. "WORKS_ON", "KNOWS")</li>
+  <li><strong>Weight</strong> -- a <code>f32</code> value (default 1.0) used in traversal scoring</li>
+  <li><strong>Properties</strong> -- optional key-value pairs</li>
+</ul>
+
+<h3>Property Values</h3>
+<p>Properties support dynamic typed values:</p>
+<table>
+  <thead><tr><th>Type</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>Null</td><td class="td-desc">Absence of value</td></tr>
+    <tr><td>Bool</td><td class="td-desc">true / false</td></tr>
+    <tr><td>Int</td><td class="td-desc">64-bit signed integer (i64)</td></tr>
+    <tr><td>Float</td><td class="td-desc">64-bit floating point (f64)</td></tr>
+    <tr><td>String</td><td class="td-desc">UTF-8 text</td></tr>
+    <tr><td>Bytes</td><td class="td-desc">Raw binary data</td></tr>
+    <tr><td>Vector</td><td class="td-desc">Array of f32 values</td></tr>
+    <tr><td>List</td><td class="td-desc">Ordered array of values</td></tr>
+    <tr><td>Map</td><td class="td-desc">Nested key-value object</td></tr>
+    <tr><td>Timestamp</td><td class="td-desc">Milliseconds since epoch (u64)</td></tr>
+  </tbody>
+</table>
+
+<h3>Bi-Temporal Tracking</h3>
+<p>Every entity (node and edge) in Weav carries two time dimensions:</p>
+<ul>
+  <li><strong>Valid time</strong> (<code>valid_from</code> / <code>valid_until</code>) -- when the fact was true in the real world</li>
+  <li><strong>Transaction time</strong> (<code>tx_from</code> / <code>tx_until</code>) -- when the fact was recorded in the database</li>
+</ul>
+<p>This enables point-in-time queries: "What did the graph look like at timestamp T?" Entities are never physically deleted -- they are invalidated by setting <code>valid_until</code>, which preserves the full history for auditing and temporal queries.</p>
+
+<h3>Provenance</h3>
+<p>Provenance tracks the origin and confidence of every fact in the graph:</p>
+<ul>
+  <li><strong>source</strong> -- free-text origin identifier</li>
+  <li><strong>confidence</strong> -- a float from 0.0 to 1.0</li>
+  <li><strong>extraction_method</strong> -- one of: <code>LlmExtracted</code>, <code>NlpPipeline</code>, <code>UserProvided</code>, <code>Derived</code>, <code>Imported</code></li>
+</ul>
+
+<h3>String Interning</h3>
+<p>Labels and property keys are stored internally as <code>LabelId</code> / <code>PropertyKeyId</code> (both <code>u16</code>) via a <code>StringInterner</code>. This avoids heap-allocating repeated strings and reduces memory usage significantly for graphs with many nodes sharing the same labels and property keys.</p>
+
+<h3>Token Budget</h3>
+<p>Weav's context retrieval uses a greedy knapsack algorithm to pack the most valuable context chunks within an LLM's token limit. Each chunk has a relevance score and a token count; the budget enforcer selects the optimal subset by value-density (relevance per token). This is the core differentiator from plain graph or vector databases.</p>
+
+<a href="#getting-started" class="back-to-top">Back to top</a>
+</section>
+
+<!-- ============================================================ -->
+<!-- CONFIGURATION -->
+<!-- ============================================================ -->
+
+<section class="doc-section" id="configuration">
+<h2>Configuration</h2>
+
+<p>Weav uses TOML-based configuration with environment variable overrides. Environment variables use the <code>WEAV_</code> prefix with <code>_</code> separators (e.g. <code>WEAV_SERVER_PORT=6380</code>). Pass a config file path as the first CLI argument: <code>weav-server config.toml</code>.</p>
+
+<h3>[server]</h3>
+<table>
+  <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Env Override</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>bind_address</td><td>String</td><td>"0.0.0.0"</td><td>WEAV_SERVER_BIND_ADDRESS</td><td class="td-desc">Listen address</td></tr>
+    <tr><td>port</td><td>u16</td><td>6380</td><td>WEAV_SERVER_PORT</td><td class="td-desc">RESP3 TCP port</td></tr>
+    <tr><td>http_port</td><td>Option&lt;u16&gt;</td><td>6382</td><td>WEAV_SERVER_HTTP_PORT</td><td class="td-desc">HTTP REST API port</td></tr>
+    <tr><td>grpc_port</td><td>Option&lt;u16&gt;</td><td>6381</td><td>WEAV_SERVER_GRPC_PORT</td><td class="td-desc">gRPC port</td></tr>
+    <tr><td>max_connections</td><td>u32</td><td>10000</td><td></td><td class="td-desc">Maximum concurrent connections</td></tr>
+    <tr><td>tcp_keepalive_secs</td><td>u32</td><td>300</td><td></td><td class="td-desc">TCP keepalive interval in seconds</td></tr>
+    <tr><td>read_timeout_ms</td><td>u64</td><td>30000</td><td></td><td class="td-desc">Read timeout per request in ms</td></tr>
+    <tr><td>tls_enabled</td><td>bool</td><td>false</td><td>WEAV_TLS_ENABLED</td><td class="td-desc">Enable TLS for all protocols</td></tr>
+    <tr><td>tls_cert_path</td><td>Option&lt;String&gt;</td><td>None</td><td>WEAV_TLS_CERT</td><td class="td-desc">Path to PEM certificate file</td></tr>
+    <tr><td>tls_key_path</td><td>Option&lt;String&gt;</td><td>None</td><td>WEAV_TLS_KEY</td><td class="td-desc">Path to PEM private key file</td></tr>
+  </tbody>
+</table>
+
+<h3>[engine]</h3>
+<table>
+  <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Env Override</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>num_shards</td><td>Option&lt;u16&gt;</td><td>None</td><td>WEAV_ENGINE_NUM_SHARDS</td><td class="td-desc">Shard count (auto-detects CPU count)</td></tr>
+    <tr><td>default_vector_dimensions</td><td>u16</td><td>1536</td><td></td><td class="td-desc">Default embedding dimensions</td></tr>
+    <tr><td>max_vector_dimensions</td><td>u16</td><td>4096</td><td></td><td class="td-desc">Maximum allowed dimensions</td></tr>
+    <tr><td>default_hnsw_m</td><td>u16</td><td>16</td><td></td><td class="td-desc">HNSW index max connections per node</td></tr>
+    <tr><td>default_hnsw_ef_construction</td><td>u16</td><td>200</td><td></td><td class="td-desc">HNSW build-time search width</td></tr>
+    <tr><td>default_hnsw_ef_search</td><td>u16</td><td>50</td><td></td><td class="td-desc">HNSW query-time search width</td></tr>
+    <tr><td>default_conflict_policy</td><td>enum</td><td>LastWriteWins</td><td></td><td class="td-desc">LastWriteWins | HighestConfidence | TemporalInvalidation</td></tr>
+    <tr><td>enable_temporal</td><td>bool</td><td>true</td><td></td><td class="td-desc">Enable bi-temporal tracking</td></tr>
+    <tr><td>enable_provenance</td><td>bool</td><td>true</td><td></td><td class="td-desc">Enable provenance metadata</td></tr>
+    <tr><td>token_counter</td><td>enum</td><td>CharDiv4</td><td></td><td class="td-desc">CharDiv4 | TiktokenCl100k | TiktokenO200k</td></tr>
+  </tbody>
+</table>
+
+<h3>[persistence]</h3>
+<table>
+  <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Env Override</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>enabled</td><td>bool</td><td>false</td><td>WEAV_PERSISTENCE_ENABLED</td><td class="td-desc">Enable WAL and snapshots</td></tr>
+    <tr><td>data_dir</td><td>PathBuf</td><td>"./weav-data"</td><td>WEAV_PERSISTENCE_DATA_DIR</td><td class="td-desc">Data directory path</td></tr>
+    <tr><td>wal_enabled</td><td>bool</td><td>true</td><td></td><td class="td-desc">Enable write-ahead log</td></tr>
+    <tr><td>wal_sync_mode</td><td>enum</td><td>EverySecond</td><td></td><td class="td-desc">Always | EverySecond | Never</td></tr>
+    <tr><td>snapshot_interval_secs</td><td>u64</td><td>3600</td><td></td><td class="td-desc">Auto-snapshot interval in seconds</td></tr>
+    <tr><td>max_wal_size_mb</td><td>u64</td><td>256</td><td></td><td class="td-desc">Maximum WAL file size in MB</td></tr>
+  </tbody>
+</table>
+
+<h3>[memory]</h3>
+<table>
+  <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Env Override</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>max_memory_mb</td><td>Option&lt;u64&gt;</td><td>None</td><td>WEAV_MEMORY_MAX_MEMORY_MB</td><td class="td-desc">Memory limit (unlimited if None)</td></tr>
+    <tr><td>eviction_policy</td><td>enum</td><td>NoEviction</td><td></td><td class="td-desc">NoEviction | LRU | RelevanceDecay</td></tr>
+    <tr><td>arena_size_mb</td><td>u16</td><td>64</td><td></td><td class="td-desc">Memory arena block size in MB</td></tr>
+  </tbody>
+</table>
+
+<h3>[auth]</h3>
+<table>
+  <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Env Override</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>enabled</td><td>bool</td><td>false</td><td>WEAV_AUTH_ENABLED</td><td class="td-desc">Enable auth subsystem</td></tr>
+    <tr><td>require_auth</td><td>bool</td><td>false</td><td>WEAV_AUTH_REQUIRE_AUTH</td><td class="td-desc">Require auth for all connections</td></tr>
+    <tr><td>default_password</td><td>Option&lt;String&gt;</td><td>None</td><td>WEAV_AUTH_DEFAULT_PASSWORD</td><td class="td-desc">Redis-compat single password</td></tr>
+    <tr><td>acl_file</td><td>Option&lt;PathBuf&gt;</td><td>None</td><td></td><td class="td-desc">Path to ACL definition file</td></tr>
+    <tr><td>users</td><td>array</td><td>[]</td><td></td><td class="td-desc">Statically-defined user list</td></tr>
+  </tbody>
+</table>
+
+<h3>[extract]</h3>
+<table>
+  <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Env Override</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>enabled</td><td>bool</td><td>false</td><td>WEAV_EXTRACT_ENABLED</td><td class="td-desc">Enable extraction pipeline</td></tr>
+    <tr><td>llm_backend</td><td>String</td><td>"openai"</td><td>WEAV_EXTRACT_LLM_BACKEND</td><td class="td-desc">LLM provider: openai, anthropic, ollama</td></tr>
+    <tr><td>extraction_model</td><td>String</td><td>"gpt-4.1-mini"</td><td>WEAV_EXTRACT_EXTRACTION_MODEL</td><td class="td-desc">Model for entity extraction</td></tr>
+    <tr><td>embedding_model</td><td>String</td><td>"text-embedding-3-small"</td><td>WEAV_EXTRACT_EMBEDDING_MODEL</td><td class="td-desc">Model for embeddings</td></tr>
+    <tr><td>embedding_dimensions</td><td>u16</td><td>1536</td><td>WEAV_EXTRACT_EMBEDDING_DIMENSIONS</td><td class="td-desc">Output embedding dimensions</td></tr>
+    <tr><td>chunk_size</td><td>usize</td><td>512</td><td>WEAV_EXTRACT_CHUNK_SIZE</td><td class="td-desc">Target chunk size in tokens</td></tr>
+    <tr><td>chunk_overlap</td><td>usize</td><td>50</td><td>WEAV_EXTRACT_CHUNK_OVERLAP</td><td class="td-desc">Overlap between chunks</td></tr>
+    <tr><td>max_concurrent_llm_calls</td><td>usize</td><td>4</td><td>WEAV_EXTRACT_MAX_CONCURRENT_LLM_CALLS</td><td class="td-desc">Concurrent extraction calls</td></tr>
+    <tr><td>max_concurrent_embedding_calls</td><td>usize</td><td>8</td><td>WEAV_EXTRACT_MAX_CONCURRENT_EMBEDDING_CALLS</td><td class="td-desc">Concurrent embedding calls</td></tr>
+  </tbody>
+</table>
+
+<h3>Example Configuration</h3>
+
+<details>
+  <summary>Complete weav.toml example</summary>
+  <div class="details-content">
+<pre><code><span class="code-comment"># Weav Server Configuration</span>
+
+[server]
+bind_address = "0.0.0.0"
+port = 6380
+http_port = 6382
+grpc_port = 6381
+max_connections = 10000
+tcp_keepalive_secs = 300
+read_timeout_ms = 30000
+tls_enabled = false
+
+[engine]
+default_vector_dimensions = 1536
+max_vector_dimensions = 4096
+default_hnsw_m = 16
+default_hnsw_ef_construction = 200
+default_hnsw_ef_search = 50
+default_conflict_policy = "LastWriteWins"
+enable_temporal = true
+enable_provenance = true
+token_counter = "char_div_4"
+
+[persistence]
+enabled = true
+data_dir = "./weav-data"
+wal_enabled = true
+wal_sync_mode = "EverySecond"
+snapshot_interval_secs = 3600
+max_wal_size_mb = 256
+
+[memory]
+eviction_policy = "NoEviction"
+arena_size_mb = 64
+
+[auth]
+enabled = true
+require_auth = true
+default_password = "changeme"
+
+[[auth.users]]
+username = "admin"
+password = "admin_secret"
+categories = ["+@all"]
+enabled = true
+
+  [[auth.users.graph_patterns]]
+  pattern = "*"
+  permission = "Admin"
+
+[[auth.users]]
+username = "reader"
+password = "reader_secret"
+categories = ["+@connection", "+@read"]
+enabled = true
+
+  [[auth.users.graph_patterns]]
+  pattern = "public:*"
+  permission = "Read"
+
+[extract]
+enabled = false
+llm_backend = "openai"
+extraction_model = "gpt-4.1-mini"
+embedding_model = "text-embedding-3-small"
+embedding_dimensions = 1536
+chunk_size = 512
+chunk_overlap = 50
+max_concurrent_llm_calls = 4
+max_concurrent_embedding_calls = 8</code></pre>
+  </div>
+</details>
+
+<a href="#getting-started" class="back-to-top">Back to top</a>
+</section>
+
+<!-- ============================================================ -->
+<!-- HTTP API REFERENCE -->
+<!-- ============================================================ -->
+
+<section class="doc-section" id="http-api">
+<h2>HTTP API Reference</h2>
+
+<p>All endpoints return JSON with the structure <code>{"success": bool, "data": ..., "error": ...}</code>. The HTTP API listens on port 6382 by default. Request bodies are limited to 10 MB. Requests time out after 30 seconds.</p>
+
+<h3>Health and Info</h3>
+
+<details>
+  <summary><span class="endpoint-method method-get">GET</span> /health</summary>
+  <div class="details-content">
+    <p>Health check endpoint. Returns <code>{"status": "ok"}</code>.</p>
+<pre><code>curl http://localhost:6382/health</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-get">GET</span> /v1/info</summary>
+  <div class="details-content">
+    <p>Server information including version and graph count.</p>
+<pre><code>curl http://localhost:6382/v1/info</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-get">GET</span> /metrics</summary>
+  <div class="details-content">
+    <p>Prometheus metrics endpoint. Returns metrics in Prometheus text exposition format. Requires the <code>observability</code> feature.</p>
+<pre><code>curl http://localhost:6382/metrics</code></pre>
+  </div>
+</details>
+
+<h3>Graph Management</h3>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/graphs -- Create graph</summary>
+  <div class="details-content">
+    <p>Create a new named graph.</p>
+<pre><code><span class="code-comment"># Request</span>
+{"name": "my_graph"}
+
+<span class="code-comment"># Response</span>
+{"success": true, "data": null}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-get">GET</span> /v1/graphs -- List graphs</summary>
+  <div class="details-content">
+    <p>List all graph names.</p>
+<pre><code><span class="code-comment"># Response</span>
+{"success": true, "data": ["knowledge", "docs"]}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-get">GET</span> /v1/graphs/{name} -- Graph info</summary>
+  <div class="details-content">
+    <p>Get metadata about a graph.</p>
+<pre><code><span class="code-comment"># Response</span>
+{
+  "success": true,
+  "data": {
+    "name": "knowledge",
+    "node_count": 1250,
+    "edge_count": 3400,
+    "vector_count": 800,
+    "label_count": 12
+  }
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-delete">DELETE</span> /v1/graphs/{name} -- Drop graph</summary>
+  <div class="details-content">
+    <p>Permanently delete a graph and all its data.</p>
+<pre><code>curl -X DELETE http://localhost:6382/v1/graphs/my_graph</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-get">GET</span> /v1/graphs/{graph}/check -- Integrity check</summary>
+  <div class="details-content">
+    <p>Run an integrity check on a graph. Validates adjacency consistency, orphaned edges, and index state.</p>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-get">GET</span> /v1/graphs/{graph}/stats/detailed -- Detailed stats</summary>
+  <div class="details-content">
+    <p>Comprehensive graph statistics: degree distribution (min/max/avg/p50/p95/p99), label distribution, edge type distribution, memory estimates, temporal node count.</p>
+  </div>
+</details>
+
+<h3>Node Operations</h3>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/graphs/{graph}/nodes -- Add node</summary>
+  <div class="details-content">
+<pre><code><span class="code-comment"># Request</span>
+{
+  "label": "Person",
+  "properties": {"name": "Alice", "age": 30},
+  "embedding": [0.1, 0.2, ...],   <span class="code-comment">// optional</span>
+  "entity_key": "alice",           <span class="code-comment">// optional, for dedup</span>
+  "ttl_ms": 3600000                <span class="code-comment">// optional, auto-expire</span>
+}
+
+<span class="code-comment"># Response</span>
+{"success": true, "data": {"node_id": 1}}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-get">GET</span> /v1/graphs/{graph}/nodes/{id} -- Get node</summary>
+  <div class="details-content">
+<pre><code><span class="code-comment"># Response</span>
+{
+  "success": true,
+  "data": {
+    "node_id": 1,
+    "label": "Person",
+    "properties": {"name": "Alice", "age": 30}
+  }
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-put">PUT</span> /v1/graphs/{graph}/nodes/{id} -- Update node</summary>
+  <div class="details-content">
+    <p>Merge-update a node's properties and/or embedding. Existing properties not in the request are preserved.</p>
+<pre><code><span class="code-comment"># Request</span>
+{
+  "properties": {"role": "Senior Engineer"},
+  "embedding": [0.1, 0.2, ...]
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-delete">DELETE</span> /v1/graphs/{graph}/nodes/{id} -- Delete node</summary>
+  <div class="details-content">
+    <p>Delete a node and all its connected edges.</p>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-get">GET</span> /v1/graphs/{graph}/nodes/{id}/neighbors -- Get neighbors</summary>
+  <div class="details-content">
+    <p>Get all neighbors (incoming and outgoing) of a node, including edge metadata.</p>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-get">GET</span> /v1/graphs/{graph}/nodes/{id}/importance -- Node importance</summary>
+  <div class="details-content">
+    <p>Get the importance score for a single node (based on degree and connectivity).</p>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-get">GET</span> /v1/graphs/{graph}/nodes/{id}/history -- Node history</summary>
+  <div class="details-content">
+    <p>Get the temporal history of a node, showing all changes over time.</p>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/graphs/{graph}/nodes/bulk -- Bulk add nodes</summary>
+  <div class="details-content">
+<pre><code><span class="code-comment"># Request</span>
+{
+  "nodes": [
+    {"label": "Person", "properties": {"name": "Alice"}},
+    {"label": "Person", "properties": {"name": "Bob"}}
+  ]
+}
+
+<span class="code-comment"># Response</span>
+{"success": true, "data": {"node_ids": [1, 2]}}</code></pre>
+  </div>
+</details>
+
+<h3>Edge Operations</h3>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/graphs/{graph}/edges -- Add edge</summary>
+  <div class="details-content">
+<pre><code><span class="code-comment"># Request</span>
+{
+  "source": 1,
+  "target": 2,
+  "label": "KNOWS",
+  "weight": 0.9,
+  "properties": {"since": "2024-01"},
+  "ttl_ms": 86400000
+}
+
+<span class="code-comment"># Response</span>
+{"success": true, "data": {"edge_id": 1}}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-get">GET</span> /v1/graphs/{graph}/edges/{id} -- Get edge</summary>
+  <div class="details-content">
+<pre><code><span class="code-comment"># Response</span>
+{
+  "success": true,
+  "data": {
+    "edge_id": 1,
+    "source": 1,
+    "target": 2,
+    "label": "KNOWS",
+    "weight": 0.9,
+    "properties": {"since": "2024-01"}
+  }
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-delete">DELETE</span> /v1/graphs/{graph}/edges/{id} -- Delete edge</summary>
+  <div class="details-content">
+    <p>Permanently delete an edge.</p>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/graphs/{graph}/edges/{id}/invalidate -- Soft-delete edge</summary>
+  <div class="details-content">
+    <p>Temporally invalidate an edge by setting its <code>valid_until</code> to now. The edge remains in history for temporal queries but is excluded from current traversals.</p>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/graphs/{graph}/edges/bulk -- Bulk add edges</summary>
+  <div class="details-content">
+<pre><code><span class="code-comment"># Request</span>
+{
+  "edges": [
+    {"source": 1, "target": 2, "label": "KNOWS"},
+    {"source": 2, "target": 3, "label": "WORKS_WITH", "weight": 0.8}
+  ]
+}
+
+<span class="code-comment"># Response</span>
+{"success": true, "data": {"edge_ids": [1, 2]}}</code></pre>
+  </div>
+</details>
+
+<h3>Search</h3>
+
+<details>
+  <summary><span class="endpoint-method method-get">GET</span> /v1/graphs/{graph}/search -- Property search</summary>
+  <div class="details-content">
+    <p>Search nodes by property key-value match.</p>
+<pre><code>curl "http://localhost:6382/v1/graphs/knowledge/search?key=name&value=Alice&limit=100"</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-get">GET</span> /v1/graphs/{graph}/search/text -- BM25 text search</summary>
+  <div class="details-content">
+    <p>Full-text search across all node content using BM25 ranking. Text is auto-indexed.</p>
+<pre><code>curl "http://localhost:6382/v1/graphs/knowledge/search/text?q=machine+learning&limit=20"</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/graphs/{graph}/search/vector -- Vector search</summary>
+  <div class="details-content">
+    <p>Nearest-neighbor vector search using the HNSW index. Optionally filter by labels and/or property values. Uses 4x oversampling when filters are applied.</p>
+<pre><code><span class="code-comment"># Request</span>
+{
+  "embedding": [0.1, 0.2, ...],
+  "k": 10,
+  "labels": ["Document"],          <span class="code-comment">// optional filter</span>
+  "properties": {"status": "active"} <span class="code-comment">// optional filter</span>
+}
+
+<span class="code-comment"># Response</span>
+{
+  "success": true,
+  "data": {
+    "results": [
+      {"node_id": 42, "score": 0.95, "label": "Document", "properties": {...}},
+      ...
+    ]
+  }
+}</code></pre>
+  </div>
+</details>
+
+<h3>Context Retrieval</h3>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/context -- Context query</summary>
+  <div class="details-content">
+    <p>The primary context retrieval endpoint. See the <a href="#context-retrieval">detailed Context Retrieval section</a> below.</p>
+<pre><code><span class="code-comment"># Request</span>
+{
+  "graph": "knowledge",
+  "query": "what does alice work on",
+  "budget": 4096,
+  "max_depth": 3,
+  "output_format": "anthropic"
+}</code></pre>
+  </div>
+</details>
+
+<h3>Temporal</h3>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/graphs/{graph}/temporal -- Point-in-time query</summary>
+  <div class="details-content">
+    <p>Query graph state at a specific timestamp or time range.</p>
+<pre><code><span class="code-comment"># Request</span>
+{
+  "timestamp": 1711900800000,
+  "node_ids": [1, 2, 3],
+  "include_edges": true
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/graphs/{graph}/diff -- Graph diff</summary>
+  <div class="details-content">
+    <p>Compare graph state between two timestamps. Returns edges added/removed and node/edge counts at each timestamp.</p>
+<pre><code><span class="code-comment"># Request</span>
+{
+  "from_timestamp": 1711800000000,
+  "to_timestamp": 1711900800000
+}</code></pre>
+  </div>
+</details>
+
+<h3>Import and Export</h3>
+
+<details>
+  <summary><span class="endpoint-method method-get">GET</span> /v1/graphs/{graph}/export -- JSON export</summary>
+  <div class="details-content">
+    <p>Export an entire graph as JSON (nodes + edges with all properties).</p>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/graphs/{graph}/import -- JSON import</summary>
+  <div class="details-content">
+    <p>Import nodes and edges from a JSON export.</p>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-get">GET</span> /v1/graphs/{graph}/export/csv -- CSV export</summary>
+  <div class="details-content">
+    <p>Export all nodes as CSV. Requires the <code>csv-export</code> feature.</p>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/graphs/{graph}/import/csv -- CSV import</summary>
+  <div class="details-content">
+    <p>Import nodes from CSV. First row is headers; use <code>_label</code> column for node labels. Requires the <code>csv-export</code> feature.</p>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-get">GET</span> /v1/graphs/{graph}/export/dot -- Graphviz DOT export</summary>
+  <div class="details-content">
+    <p>Export graph as Graphviz DOT format for visualization.</p>
+  </div>
+</details>
+
+<h3>Communities / GraphRAG</h3>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/graphs/{graph}/communities/summarize -- Generate summaries</summary>
+  <div class="details-content">
+    <p>Run community detection and generate text summaries for each community. Creates synthetic <code>_community_summary</code> nodes searchable via BM25.</p>
+<pre><code><span class="code-comment"># Request</span>
+{
+  "algorithm": "leiden",       <span class="code-comment">// or "label_propagation"</span>
+  "resolution": 1.0
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-get">GET</span> /v1/graphs/{graph}/communities/summaries -- List summaries</summary>
+  <div class="details-content">
+    <p>Get all community summaries stored in the graph.</p>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/graphs/{graph}/communities/search -- Search summaries</summary>
+  <div class="details-content">
+    <p>Search community summaries using BM25 text ranking.</p>
+<pre><code><span class="code-comment"># Request</span>
+{"query": "machine learning", "limit": 10}</code></pre>
+  </div>
+</details>
+
+<h3>Algorithms</h3>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/graphs/{graph}/algorithms/{algorithm} -- Run algorithm</summary>
+  <div class="details-content">
+    <p>Execute a graph algorithm. See the <a href="#algorithms">Graph Algorithms section</a> for the full list and parameters.</p>
+<pre><code><span class="code-comment"># Example: PageRank</span>
+curl -X POST http://localhost:6382/v1/graphs/knowledge/algorithms/pagerank \
+  -H "Content-Type: application/json" \
+  -d '{"damping": 0.85, "iterations": 20}'</code></pre>
+  </div>
+</details>
+
+<h3>Ingestion</h3>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/graphs/{graph}/ingest -- Ingest document</summary>
+  <div class="details-content">
+    <p>Ingest a document through the extraction pipeline. Chunks text, extracts entities and relationships using LLM, generates embeddings, and builds the graph automatically. Requires the <code>extract</code> feature and configured LLM provider.</p>
+<pre><code><span class="code-comment"># Request</span>
+{
+  "content": "Alice is an engineer who works on the Weav project...",
+  "format": "text",
+  "document_id": "doc_001",
+  "skip_extraction": false,
+  "skip_dedup": false,
+  "chunk_size": 512,
+  "entity_types": ["Person", "Project", "Organization"]
+}
+
+<span class="code-comment"># Response</span>
+{
+  "success": true,
+  "data": {
+    "document_id": "doc_001",
+    "chunks_created": 5,
+    "entities_created": 8,
+    "entities_merged": 2,
+    "relationships_created": 12,
+    "pipeline_duration_ms": 3200
+  }
+}</code></pre>
+  </div>
+</details>
+
+<h3>Schema</h3>
+
+<details>
+  <summary><span class="endpoint-method method-get">GET</span> /v1/graphs/{graph}/schema -- Get schema</summary>
+  <div class="details-content">
+    <p>Get all schema constraints defined for a graph.</p>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/graphs/{graph}/schema/infer -- Infer schema</summary>
+  <div class="details-content">
+    <p>Automatically infer schema constraints from existing data in the graph.</p>
+  </div>
+</details>
+
+<h3>Persistence</h3>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/snapshot -- Trigger snapshot</summary>
+  <div class="details-content">
+    <p>Trigger an immediate persistence snapshot of all graph data to disk.</p>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/backup -- Backup</summary>
+  <div class="details-content">
+    <p>Create a snapshot and compact the WAL in one operation.</p>
+<pre><code><span class="code-comment"># Request (optional label)</span>
+{"label": "pre-migration"}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/wal/compact -- Compact WAL</summary>
+  <div class="details-content">
+    <p>Compact the write-ahead log, removing entries already covered by the latest snapshot.</p>
+  </div>
+</details>
+
+<h3>Cypher</h3>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/graphs/{graph}/cypher -- Execute Cypher query</summary>
+  <div class="details-content">
+    <p>Execute a Cypher query against the graph.</p>
+<pre><code><span class="code-comment"># Request</span>
+{"query": "MATCH (n:Person)-[r:KNOWS]->(m) RETURN n, r, m LIMIT 10"}</code></pre>
+  </div>
+</details>
+
+<h3>Other Endpoints</h3>
+
+<details>
+  <summary><span class="endpoint-method method-get">GET</span> /v1/graphs/{graph}/importance -- Graph importance ranking</summary>
+  <div class="details-content">
+    <p>Get the top-N nodes by importance score for the entire graph.</p>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/graphs/{graph}/condense -- Condense graph</summary>
+  <div class="details-content">
+    <p>Condense a graph by merging similar or redundant nodes.</p>
+  </div>
+</details>
+
+<details>
+  <summary><span class="endpoint-method method-post">POST</span> /v1/graphs/{graph}/sample/neighbors -- GNN neighbor sampling</summary>
+  <div class="details-content">
+    <p>Sample neighbors for GNN-style mini-batch training.</p>
+  </div>
+</details>
+
+<a href="#getting-started" class="back-to-top">Back to top</a>
+</section>
+
+<!-- ============================================================ -->
+<!-- CONTEXT RETRIEVAL -->
+<!-- ============================================================ -->
+
+<section class="doc-section" id="context-retrieval">
+<h2>Context Retrieval</h2>
+
+<p>The <code>CONTEXT</code> command is Weav's core differentiator. It retrieves graph-aware, budget-constrained context optimized for LLM consumption. No other graph database offers this: a single query that traverses the graph, scores relevance, respects token limits, and outputs LLM-ready formatted content.</p>
+
+<h3>Request Parameters</h3>
+
+<table>
+  <thead><tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>graph</td><td>string</td><td>required</td><td class="td-desc">Target graph name</td></tr>
+    <tr><td>query</td><td>string</td><td>null</td><td class="td-desc">Text query for vector search seeding</td></tr>
+    <tr><td>embedding</td><td>float[]</td><td>null</td><td class="td-desc">Pre-computed embedding vector</td></tr>
+    <tr><td>seed_nodes</td><td>string[]</td><td>null</td><td class="td-desc">Entity keys to start traversal from</td></tr>
+    <tr><td>budget</td><td>u32</td><td>4096</td><td class="td-desc">Token budget limit</td></tr>
+    <tr><td>budget_preset</td><td>string</td><td>null</td><td class="td-desc">Named preset (overrides budget)</td></tr>
+    <tr><td>max_depth</td><td>u8</td><td>3</td><td class="td-desc">Maximum traversal depth from seeds</td></tr>
+    <tr><td>include_provenance</td><td>bool</td><td>false</td><td class="td-desc">Include provenance in output</td></tr>
+    <tr><td>include_subgraph</td><td>bool</td><td>false</td><td class="td-desc">Include subgraph structure</td></tr>
+    <tr><td>decay</td><td>object</td><td>null</td><td class="td-desc">Relevance decay function</td></tr>
+    <tr><td>temporal_at</td><td>u64</td><td>null</td><td class="td-desc">Point-in-time timestamp (ms)</td></tr>
+    <tr><td>edge_labels</td><td>string[]</td><td>null</td><td class="td-desc">Filter to specific edge types</td></tr>
+    <tr><td>direction</td><td>string</td><td>"both"</td><td class="td-desc">"outgoing", "incoming", or "both"</td></tr>
+    <tr><td>limit</td><td>u32</td><td>null</td><td class="td-desc">Max chunks to return</td></tr>
+    <tr><td>sort_field</td><td>string</td><td>null</td><td class="td-desc">"relevance", "depth", "timestamp"</td></tr>
+    <tr><td>sort_direction</td><td>string</td><td>"desc"</td><td class="td-desc">"asc" or "desc"</td></tr>
+    <tr><td>output_format</td><td>string</td><td>"raw"</td><td class="td-desc">"raw", "anthropic", or "openai"</td></tr>
+    <tr><td>explain</td><td>bool</td><td>false</td><td class="td-desc">Return query plan without executing</td></tr>
+  </tbody>
+</table>
+
+<h3>The 8-Stage Pipeline</h3>
+
+<p>A context query passes through these stages in order:</p>
+
+<ol>
+  <li><strong>Vector Search</strong> -- if a query or embedding is provided, find the nearest vectors in the HNSW index to establish seed nodes</li>
+  <li><strong>Entity Lookup</strong> -- resolve seed_nodes entity keys to node IDs via the entity key index</li>
+  <li><strong>Graph Traversal</strong> -- BFS from seed nodes up to max_depth, following edges weighted by relevance</li>
+  <li><strong>Flow Scoring</strong> -- compute relevance scores based on traversal depth, edge weight, and connectivity</li>
+  <li><strong>Temporal Filter</strong> -- if temporal_at is set, exclude entities not valid at that timestamp</li>
+  <li><strong>Relevance Decay</strong> -- apply time-based decay function to reduce scores of older content</li>
+  <li><strong>Token Budget</strong> -- greedy knapsack packing: select chunks by value-density (relevance / tokens) within the budget</li>
+  <li><strong>Format</strong> -- serialize chunks into the requested output format (raw, anthropic, openai)</li>
+</ol>
+
+<h3>Seed Strategies</h3>
+
+<table>
+  <thead><tr><th>Strategy</th><th>When Used</th></tr></thead>
+  <tbody>
+    <tr><td>Vector</td><td class="td-desc">Only <code>query</code> or <code>embedding</code> provided -- find seeds by vector similarity</td></tr>
+    <tr><td>Nodes</td><td class="td-desc">Only <code>seed_nodes</code> provided -- start from explicit entity keys</td></tr>
+    <tr><td>Both</td><td class="td-desc">Both vectors and seed_nodes provided -- union of both seed sets</td></tr>
+  </tbody>
+</table>
+
+<h3>Budget Presets</h3>
+
+<table>
+  <thead><tr><th>Preset</th><th>Aliases</th><th>Tokens</th></tr></thead>
+  <tbody>
+    <tr><td>small</td><td>4k</td><td class="td-desc">4,096</td></tr>
+    <tr><td>medium</td><td>8k</td><td class="td-desc">8,192</td></tr>
+    <tr><td>large</td><td>16k</td><td class="td-desc">16,384</td></tr>
+    <tr><td>xl</td><td>32k</td><td class="td-desc">32,768</td></tr>
+    <tr><td>xxl</td><td>128k</td><td class="td-desc">131,072</td></tr>
+  </tbody>
+</table>
+
+<h3>Decay Functions</h3>
+
+<table>
+  <thead><tr><th>Type</th><th>Parameters</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>none</td><td></td><td class="td-desc">No decay applied (default)</td></tr>
+    <tr><td>exponential</td><td>half_life_ms</td><td class="td-desc">Score halves every half_life_ms milliseconds</td></tr>
+    <tr><td>linear</td><td>max_age_ms</td><td class="td-desc">Score decreases linearly to zero at max_age_ms</td></tr>
+    <tr><td>step</td><td>cutoff_ms</td><td class="td-desc">Full score before cutoff, zero after</td></tr>
+    <tr><td>custom</td><td>breakpoints</td><td class="td-desc">User-defined piecewise decay curve</td></tr>
+  </tbody>
+</table>
+
+<h3>Output Formats</h3>
+
+<ul>
+  <li><strong>raw</strong> -- structured JSON with chunks, scores, and metadata</li>
+  <li><strong>anthropic</strong> -- formatted for Anthropic's Messages API (content blocks)</li>
+  <li><strong>openai</strong> -- formatted for OpenAI's Chat Completions API (system message)</li>
+</ul>
+
+<h3>EXPLAIN Mode</h3>
+
+<p>Set <code>"explain": true</code> to return the query execution plan without running the query. The response includes the seed strategy, traversal plan, budget allocation, and estimated token counts.</p>
+
+<h3>Response Structure</h3>
+
+<pre><code>{
+  "success": true,
+  "data": {
+    "chunks": [
+      {
+        "node_id": 42,
+        "content": "Alice is a senior engineer...",
+        "label": "Person",
+        "relevance_score": 0.95,
+        "depth": 0,
+        "token_count": 28,
+        "provenance": {
+          "source": "doc_001",
+          "confidence": 0.9,
+          "extraction_method": "LlmExtracted"
+        },
+        "relationships": [
+          {
+            "edge_label": "WORKS_ON",
+            "target_node_id": 43,
+            "target_name": "Weav",
+            "direction": "outgoing",
+            "weight": 1.0
+          }
+        ]
+      }
+    ],
+    "total_tokens": 256,
+    "budget_used": 0.0625,
+    "nodes_considered": 120,
+    "nodes_included": 8,
+    "query_time_us": 450
+  }
+}</code></pre>
+
+<a href="#getting-started" class="back-to-top">Back to top</a>
+</section>
+
+<!-- ============================================================ -->
+<!-- GRAPH ALGORITHMS -->
+<!-- ============================================================ -->
+
+<section class="doc-section" id="algorithms">
+<h2>Graph Algorithms</h2>
+
+<p>Weav provides 35+ graph algorithms, all accessible via <code>POST /v1/graphs/{graph}/algorithms/{algorithm}</code> with JSON parameters.</p>
+
+<div class="algo-grid">
+  <div class="algo-card">
+    <div class="algo-cat">Centrality (9)</div>
+    <ul>
+      <li>PageRank</li>
+      <li>Betweenness</li>
+      <li>Closeness</li>
+      <li>Degree</li>
+      <li>Eigenvector</li>
+      <li>HITS</li>
+      <li>Harmonic</li>
+      <li>Katz</li>
+      <li>ArticleRank</li>
+    </ul>
+  </div>
+  <div class="algo-card">
+    <div class="algo-cat">Community (3+)</div>
+    <ul>
+      <li>Louvain</li>
+      <li>Leiden</li>
+      <li>Label Propagation</li>
+      <li>Conductance metrics</li>
+    </ul>
+  </div>
+  <div class="algo-card">
+    <div class="algo-cat">Paths (5)</div>
+    <ul>
+      <li>BFS shortest path</li>
+      <li>Dijkstra</li>
+      <li>A*</li>
+      <li>Yen's K-shortest</li>
+      <li>Bellman-Ford</li>
+    </ul>
+  </div>
+  <div class="algo-card">
+    <div class="algo-cat">Structure (5)</div>
+    <ul>
+      <li>SCC (Tarjan's)</li>
+      <li>Topological Sort</li>
+      <li>Triangle Count</li>
+      <li>K-Core</li>
+      <li>K-1 Coloring</li>
+    </ul>
+  </div>
+  <div class="algo-card">
+    <div class="algo-cat">Embeddings (2)</div>
+    <ul>
+      <li>FastRP</li>
+      <li>Node2Vec</li>
+    </ul>
+  </div>
+  <div class="algo-card">
+    <div class="algo-cat">Similarity (3)</div>
+    <ul>
+      <li>Jaccard</li>
+      <li>Cosine</li>
+      <li>Overlap</li>
+      <li>(pairwise + all-pairs top-k)</li>
+    </ul>
+  </div>
+  <div class="algo-card">
+    <div class="algo-cat">Link Prediction (4)</div>
+    <ul>
+      <li>Adamic-Adar</li>
+      <li>Common Neighbors</li>
+      <li>Preferential Attachment</li>
+      <li>Resource Allocation</li>
+    </ul>
+  </div>
+  <div class="algo-card">
+    <div class="algo-cat">Flow &amp; Tree (3)</div>
+    <ul>
+      <li>Max Flow (Edmonds-Karp)</li>
+      <li>MST (Kruskal's)</li>
+      <li>Random Walk</li>
+    </ul>
+  </div>
+</div>
+
+<h3>Algorithm Parameters</h3>
+
+<details>
+  <summary>PageRank</summary>
+  <div class="details-content">
+    <p>Compute PageRank centrality scores for all nodes in the graph.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/pagerank</span>
+{
+  "damping": 0.85,        <span class="code-comment">// damping factor (default 0.85)</span>
+  "iterations": 20        <span class="code-comment">// max iterations (default 20)</span>
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Betweenness Centrality</summary>
+  <div class="details-content">
+    <p>Compute betweenness centrality -- how often a node lies on shortest paths between other nodes.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/betweenness</span>
+{}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Closeness Centrality</summary>
+  <div class="details-content">
+    <p>How close a node is to all other nodes (inverse of average shortest path).</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/closeness</span>
+{}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Degree Centrality</summary>
+  <div class="details-content">
+    <p>Centrality based on node degree (number of connections).</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/degree</span>
+{}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Eigenvector Centrality</summary>
+  <div class="details-content">
+    <p>Measures influence -- a node is important if connected to other important nodes.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/eigenvector</span>
+{
+  "iterations": 100       <span class="code-comment">// max iterations</span>
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>HITS (Hubs and Authorities)</summary>
+  <div class="details-content">
+    <p>Computes hub and authority scores for each node.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/hits</span>
+{
+  "iterations": 20
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Harmonic Centrality</summary>
+  <div class="details-content">
+    <p>Variant of closeness centrality that handles disconnected graphs.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/harmonic</span>
+{}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Katz Centrality</summary>
+  <div class="details-content">
+    <p>Centrality that considers the total number of walks between pairs of nodes, weighted by an attenuation factor.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/katz</span>
+{
+  "alpha": 0.01           <span class="code-comment">// attenuation factor</span>
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>ArticleRank</summary>
+  <div class="details-content">
+    <p>Variant of PageRank that reduces the influence of low-degree nodes.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/articlerank</span>
+{
+  "damping": 0.85,
+  "iterations": 20
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Louvain Communities</summary>
+  <div class="details-content">
+    <p>Community detection maximizing modularity.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/communities</span>
+{
+  "resolution": 1.0       <span class="code-comment">// higher = smaller communities</span>
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Leiden Communities</summary>
+  <div class="details-content">
+    <p>Improved community detection (refinement of Louvain) with guaranteed connected communities.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/leiden</span>
+{
+  "resolution": 1.0
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Label Propagation</summary>
+  <div class="details-content">
+    <p>Fast community detection by propagating labels through the graph.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/label_propagation</span>
+{
+  "iterations": 10
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Shortest Path (BFS)</summary>
+  <div class="details-content">
+    <p>Find the unweighted shortest path between two nodes.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/shortest_path</span>
+{
+  "source": 1,
+  "target": 42
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Dijkstra's Algorithm</summary>
+  <div class="details-content">
+    <p>Weighted shortest path using edge weights.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/dijkstra</span>
+{
+  "source": 1,
+  "target": 42
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>A* Search</summary>
+  <div class="details-content">
+    <p>Heuristic-guided shortest path search.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/astar</span>
+{
+  "source": 1,
+  "target": 42
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Yen's K-Shortest Paths</summary>
+  <div class="details-content">
+    <p>Find K shortest paths between two nodes.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/yen_k_shortest</span>
+{
+  "source": 1,
+  "target": 42,
+  "k": 3
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Bellman-Ford</summary>
+  <div class="details-content">
+    <p>Shortest path supporting negative edge weights. Detects negative cycles.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/bellman_ford</span>
+{
+  "source": 1,
+  "target": 42
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Strongly Connected Components (Tarjan's)</summary>
+  <div class="details-content">
+    <p>Find all strongly connected components in the graph.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/scc</span>
+{}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Topological Sort</summary>
+  <div class="details-content">
+    <p>Linear ordering of nodes in a DAG such that for every edge (u, v), u comes before v.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/topological_sort</span>
+{}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Triangle Count</summary>
+  <div class="details-content">
+    <p>Count the number of triangles each node participates in.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/triangle_count</span>
+{}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>K-Core Decomposition</summary>
+  <div class="details-content">
+    <p>Find the maximal subgraph where every node has at least K neighbors within the subgraph.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/k_core</span>
+{
+  "k": 3
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>K-1 Coloring</summary>
+  <div class="details-content">
+    <p>Assign colors to nodes such that no two adjacent nodes share a color (heuristic).</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/k1_coloring</span>
+{
+  "iterations": 20
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>FastRP Embeddings</summary>
+  <div class="details-content">
+    <p>Fast Random Projection node embeddings. Generates low-dimensional vectors capturing graph structure.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/fastrp</span>
+{
+  "dimensions": 128,
+  "iterations": 4
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Node2Vec Embeddings</summary>
+  <div class="details-content">
+    <p>Learn node embeddings via biased random walks.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/node2vec</span>
+{
+  "dimensions": 64,
+  "walk_length": 80,
+  "num_walks": 10,
+  "p": 1.0,              <span class="code-comment">// return parameter</span>
+  "q": 1.0               <span class="code-comment">// in-out parameter</span>
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Similarity (Jaccard / Cosine / Overlap)</summary>
+  <div class="details-content">
+    <p>Compute structural similarity between nodes based on their neighborhoods. Supports pairwise and all-pairs top-k modes.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/similarity</span>
+{
+  "metric": "jaccard",    <span class="code-comment">// "jaccard", "cosine", or "overlap"</span>
+  "source": 1,            <span class="code-comment">// for pairwise</span>
+  "target": 2,            <span class="code-comment">// for pairwise</span>
+  "top_k": 10             <span class="code-comment">// for all-pairs mode</span>
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Link Prediction</summary>
+  <div class="details-content">
+    <p>Predict missing edges. Metrics: Adamic-Adar, Common Neighbors, Preferential Attachment, Resource Allocation.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/link_prediction</span>
+{
+  "source": 1,
+  "target": 2,
+  "metric": "adamic_adar" <span class="code-comment">// or "common_neighbors", etc.</span>
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Max Flow (Edmonds-Karp)</summary>
+  <div class="details-content">
+    <p>Compute maximum flow between source and sink nodes using the Edmonds-Karp algorithm.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/max_flow</span>
+{
+  "source": 1,
+  "sink": 42
+}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Minimum Spanning Tree (Kruskal's)</summary>
+  <div class="details-content">
+    <p>Compute the minimum spanning tree of the graph.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/mst</span>
+{}</code></pre>
+  </div>
+</details>
+
+<details>
+  <summary>Random Walk</summary>
+  <div class="details-content">
+    <p>Perform a random walk starting from a node.</p>
+<pre><code><span class="code-comment"># POST /v1/graphs/{graph}/algorithms/random_walk</span>
+{
+  "start": 1,
+  "length": 20
+}</code></pre>
+  </div>
+</details>
+
+<a href="#getting-started" class="back-to-top">Back to top</a>
+</section>
+
+<!-- ============================================================ -->
+<!-- CYPHER QUERIES -->
+<!-- ============================================================ -->
+
+<section class="doc-section" id="cypher">
+<h2>Cypher Queries</h2>
+
+<p>Weav supports a subset of Cypher for pattern-matching graph queries. Submit Cypher queries via the HTTP API:</p>
+
+<pre><code>curl -X POST http://localhost:6382/v1/graphs/knowledge/cypher \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MATCH (n:Person)-[r:KNOWS]->(m:Person) RETURN n.name, m.name, r.since LIMIT 10"}'</code></pre>
+
+<h3>Supported Clauses</h3>
+
+<ul>
+  <li><code>MATCH</code> -- pattern matching with node labels and relationship types</li>
+  <li><code>WHERE</code> -- property filters with comparison operators</li>
+  <li><code>RETURN</code> -- specify output columns</li>
+  <li><code>LIMIT</code> -- restrict result count</li>
+  <li><code>ORDER BY</code> -- sort results</li>
+  <li><code>CREATE</code> -- create nodes and relationships</li>
+  <li><code>DELETE</code> -- delete matched patterns</li>
+  <li><code>SET</code> -- update properties</li>
+</ul>
+
+<h3>Examples</h3>
+
+<pre><code><span class="code-comment">-- Find all people who know each other</span>
+MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name
+
+<span class="code-comment">-- Find shortest path</span>
+MATCH path = shortestPath((a:Person {name: "Alice"})-[*..5]-(b:Person {name: "Bob"}))
+RETURN path
+
+<span class="code-comment">-- Create a relationship</span>
+MATCH (a:Person {name: "Alice"}), (b:Project {name: "Weav"})
+CREATE (a)-[:WORKS_ON {since: "2024"}]->(b)
+
+<span class="code-comment">-- Property filter</span>
+MATCH (n:Person) WHERE n.age > 25 RETURN n.name, n.age ORDER BY n.age DESC LIMIT 10</code></pre>
+
+<a href="#getting-started" class="back-to-top">Back to top</a>
+</section>
+
+<!-- ============================================================ -->
+<!-- AUTHENTICATION -->
+<!-- ============================================================ -->
+
+<section class="doc-section" id="auth">
+<h2>Authentication and Authorization</h2>
+
+<p>Weav supports three authentication methods. When auth is enabled but <code>require_auth</code> is false, unauthenticated connections receive default (full) permissions.</p>
+
+<h3>Auth Methods</h3>
+
+<table>
+  <thead><tr><th>Method</th><th>Protocol</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>Username + Password</td><td>RESP3, HTTP Basic</td><td class="td-desc">Per-user credentials with Argon2id hashing</td></tr>
+    <tr><td>Default Password</td><td>RESP3</td><td class="td-desc">Redis-compatible single-password AUTH command</td></tr>
+    <tr><td>API Keys</td><td>HTTP Bearer</td><td class="td-desc">API key tokens sent as Bearer authorization</td></tr>
+  </tbody>
+</table>
+
+<h3>Password Hashing</h3>
+<p>Passwords are hashed with Argon2id using a random salt. Plaintext passwords are never stored.</p>
+
+<h3>API Key Format</h3>
+<p>API keys use the format <code>wk_&lt;64 hex characters&gt;</code>. Keys are stored as SHA-256 hashes -- the raw key is never persisted.</p>
+
+<h3>HTTP Authentication</h3>
+<pre><code><span class="code-comment"># Basic auth (username:password)</span>
+curl -u admin:secret http://localhost:6382/v1/graphs
+
+<span class="code-comment"># Bearer token (API key)</span>
+curl -H "Authorization: Bearer wk_a1b2c3..." http://localhost:6382/v1/graphs</code></pre>
+
+<h3>Command Categories</h3>
+
+<table>
+  <thead><tr><th>Category</th><th>Commands</th></tr></thead>
+  <tbody>
+    <tr><td>+@connection</td><td class="td-desc">AUTH, PING, QUIT</td></tr>
+    <tr><td>+@read</td><td class="td-desc">GET, CONTEXT, SEARCH, EXPORT, SCHEMA GET, graph read operations</td></tr>
+    <tr><td>+@write</td><td class="td-desc">ADD, UPDATE, DELETE, IMPORT, INGEST, graph write operations</td></tr>
+    <tr><td>+@admin</td><td class="td-desc">ACL, CONFIG, SNAPSHOT, BACKUP, DROP, server admin operations</td></tr>
+    <tr><td>+@all</td><td class="td-desc">All command categories</td></tr>
+  </tbody>
+</table>
+
+<h3>Graph ACL Patterns</h3>
+<p>Graph-level access is controlled via glob patterns:</p>
+<ul>
+  <li><code>*</code> -- all graphs</li>
+  <li><code>app:*</code> -- graphs starting with "app:"</li>
+  <li><code>production</code> -- exact graph name match</li>
+</ul>
+
+<p>Permission levels: <code>None</code>, <code>Read</code>, <code>ReadWrite</code>, <code>Admin</code>.</p>
+
+<h3>ACL Commands (RESP3)</h3>
+
+<table>
+  <thead><tr><th>Command</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>AUTH &lt;password&gt;</td><td class="td-desc">Authenticate with default password</td></tr>
+    <tr><td>AUTH &lt;username&gt; &lt;password&gt;</td><td class="td-desc">Authenticate with username and password</td></tr>
+    <tr><td>ACL SETUSER &lt;username&gt; ...</td><td class="td-desc">Create or modify a user</td></tr>
+    <tr><td>ACL DELUSER &lt;username&gt;</td><td class="td-desc">Delete a user</td></tr>
+    <tr><td>ACL LIST</td><td class="td-desc">List all users</td></tr>
+    <tr><td>ACL GETUSER &lt;username&gt;</td><td class="td-desc">Get user details</td></tr>
+    <tr><td>ACL WHOAMI</td><td class="td-desc">Current authenticated user</td></tr>
+    <tr><td>ACL SAVE</td><td class="td-desc">Save ACL to file</td></tr>
+    <tr><td>ACL LOAD</td><td class="td-desc">Load ACL from file</td></tr>
+  </tbody>
+</table>
+
+<h3>Example Config</h3>
+
+<pre><code>[auth]
+enabled = true
+require_auth = true
+
+[[auth.users]]
+username = "admin"
+password = "admin_password"
+categories = ["+@all"]
+api_keys = ["wk_abc123..."]
+enabled = true
+
+  [[auth.users.graph_patterns]]
+  pattern = "*"
+  permission = "Admin"
+
+[[auth.users]]
+username = "analyst"
+password = "analyst_password"
+categories = ["+@connection", "+@read"]
+enabled = true
+
+  [[auth.users.graph_patterns]]
+  pattern = "public:*"
+  permission = "Read"
+
+  [[auth.users.graph_patterns]]
+  pattern = "analytics"
+  permission = "ReadWrite"</code></pre>
+
+<a href="#getting-started" class="back-to-top">Back to top</a>
+</section>
+
+<!-- ============================================================ -->
+<!-- PERSISTENCE -->
+<!-- ============================================================ -->
+
+<section class="doc-section" id="persistence">
+<h2>Persistence</h2>
+
+<p>Weav is an in-memory database with optional persistence via write-ahead log (WAL) and snapshots. Persistence is disabled by default.</p>
+
+<h3>Write-Ahead Log (WAL)</h3>
+<ul>
+  <li>Each WAL entry is length-prefixed, bincode-serialized, with a CRC32 checksum for corruption detection</li>
+  <li>The WAL records 10 operation types: graph create/drop, node add/update/delete, edge add/delete/invalidate, property changes, schema changes</li>
+  <li>Maximum WAL file size is configurable (default 256 MB); WAL compaction removes entries already covered by the latest snapshot</li>
+</ul>
+
+<h3>Sync Modes</h3>
+<table>
+  <thead><tr><th>Mode</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>Always</td><td class="td-desc">fsync after every write -- maximum durability, higher latency</td></tr>
+    <tr><td>EverySecond</td><td class="td-desc">fsync once per second -- good balance (default)</td></tr>
+    <tr><td>Never</td><td class="td-desc">OS-managed sync -- fastest, risk of data loss on crash</td></tr>
+  </tbody>
+</table>
+
+<h3>Snapshots</h3>
+<ul>
+  <li>Full-state bincode serialization of all graphs</li>
+  <li>Each snapshot includes a <code>.meta.json</code> sidecar with metadata (timestamp, graph list, entry counts, sequence number)</li>
+  <li>Configurable auto-snapshot interval (default: 3600 seconds)</li>
+  <li>Manual trigger via <code>POST /v1/snapshot</code></li>
+</ul>
+
+<h3>Recovery</h3>
+<p>On startup with persistence enabled, Weav:</p>
+<ol>
+  <li>Loads the latest valid snapshot from <code>data_dir</code></li>
+  <li>Replays all WAL entries with sequence numbers after the snapshot</li>
+  <li>Validates CRC32 checksums; corrupted entries are skipped with a warning</li>
+</ol>
+
+<h3>Commands</h3>
+<table>
+  <thead><tr><th>Endpoint</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>POST /v1/snapshot</td><td class="td-desc">Trigger immediate snapshot</td></tr>
+    <tr><td>POST /v1/backup</td><td class="td-desc">Snapshot + WAL compact in one call</td></tr>
+    <tr><td>POST /v1/wal/compact</td><td class="td-desc">Compact WAL (remove entries before latest snapshot)</td></tr>
+  </tbody>
+</table>
+
+<a href="#getting-started" class="back-to-top">Back to top</a>
+</section>
+
+<!-- ============================================================ -->
+<!-- SCHEMA -->
+<!-- ============================================================ -->
+
+<section class="doc-section" id="schema">
+<h2>Schema</h2>
+
+<p>Weav supports optional schema constraints on node and edge properties. Schemas are enforced at the engine level on every write operation.</p>
+
+<h3>Constraint Types</h3>
+
+<table>
+  <thead><tr><th>Constraint</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>PropertyType</td><td class="td-desc">Enforces a property data type (String, Int, Float, Bool, Timestamp)</td></tr>
+    <tr><td>PropertyRequired</td><td class="td-desc">Property must be present on every node/edge with the given label</td></tr>
+    <tr><td>PropertyUnique</td><td class="td-desc">Property value must be unique across all nodes/edges with the given label</td></tr>
+  </tbody>
+</table>
+
+<h3>Setting Schema Constraints</h3>
+
+<pre><code><span class="code-comment"># Set a type constraint: Person.age must be Int</span>
+curl -X POST http://localhost:6382/v1/graphs/knowledge/schema \
+  -H "Content-Type: application/json" \
+  -d '{
+    "label": "Person",
+    "target": "node",
+    "constraints": [
+      {"type": "property_type", "key": "age", "value_type": "Int"},
+      {"type": "required", "key": "name"},
+      {"type": "unique", "key": "email"}
+    ]
+  }'</code></pre>
+
+<h3>Getting Schema</h3>
+
+<pre><code>curl http://localhost:6382/v1/graphs/knowledge/schema</code></pre>
+
+<h3>Schema Inference</h3>
+<p>Automatically infer schema constraints from existing data:</p>
+
+<pre><code>curl -X POST http://localhost:6382/v1/graphs/knowledge/schema/infer</code></pre>
+
+<p>This analyzes all nodes and edges, detects consistent property types, and suggests constraints you can then apply.</p>
+
+<a href="#getting-started" class="back-to-top">Back to top</a>
+</section>
+
+<!-- ============================================================ -->
+<!-- MCP TOOLS -->
+<!-- ============================================================ -->
+
+<section class="doc-section" id="mcp-tools">
+<h2>MCP Tools</h2>
+
+<p>Weav provides a Model Context Protocol (MCP) server that exposes graph operations as tools for LLM agents. The MCP server communicates via stdio transport.</p>
+
+<h3>Connecting</h3>
+
+<p>Add Weav to your MCP client configuration (Claude Desktop, Cursor, etc.):</p>
+
+<pre><code>{
+  "mcpServers": {
+    "weav": {
+      "command": "weav-mcp",
+      "args": ["--host", "localhost", "--port", "6382"]
+    }
+  }
+}</code></pre>
+
+<h3>Available Tools</h3>
+
+<table>
+  <thead><tr><th>Tool</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>graph_list</td><td class="td-desc">List all graphs</td></tr>
+    <tr><td>graph_info</td><td class="td-desc">Get graph metadata (name, node count, edge count)</td></tr>
+    <tr><td>graph_create</td><td class="td-desc">Create a new graph</td></tr>
+    <tr><td>graph_drop</td><td class="td-desc">Drop a graph</td></tr>
+    <tr><td>node_add</td><td class="td-desc">Add a node with label and properties</td></tr>
+    <tr><td>node_get</td><td class="td-desc">Get a node by ID or entity key</td></tr>
+    <tr><td>node_update</td><td class="td-desc">Update node properties or embedding</td></tr>
+    <tr><td>node_delete</td><td class="td-desc">Delete a node and connected edges</td></tr>
+    <tr><td>edge_add</td><td class="td-desc">Add a directed edge between nodes</td></tr>
+    <tr><td>edge_get</td><td class="td-desc">Get an edge by ID</td></tr>
+    <tr><td>edge_delete</td><td class="td-desc">Delete an edge</td></tr>
+    <tr><td>search_nodes</td><td class="td-desc">Search nodes by property key-value</td></tr>
+    <tr><td>get_neighbors</td><td class="td-desc">Get all neighbors of a node</td></tr>
+    <tr><td>export_graph</td><td class="td-desc">Export graph as JSON</td></tr>
+    <tr><td>graph_stats</td><td class="td-desc">Basic graph statistics</td></tr>
+    <tr><td>detailed_stats</td><td class="td-desc">Degree distribution, memory, labels</td></tr>
+    <tr><td>server_info</td><td class="td-desc">Server version and graph count</td></tr>
+    <tr><td>context_query</td><td class="td-desc">Budget-aware context retrieval</td></tr>
+    <tr><td>vector_search</td><td class="td-desc">HNSW vector similarity search</td></tr>
+    <tr><td>run_algorithm</td><td class="td-desc">Execute graph algorithms</td></tr>
+    <tr><td>ingest</td><td class="td-desc">Ingest documents via extraction pipeline</td></tr>
+    <tr><td>graph_diff</td><td class="td-desc">Compare graph state between timestamps</td></tr>
+    <tr><td>community_summarize</td><td class="td-desc">Run community detection and generate summaries</td></tr>
+    <tr><td>community_search</td><td class="td-desc">Search community summaries via BM25</td></tr>
+    <tr><td>schema_set</td><td class="td-desc">Set schema constraints</td></tr>
+    <tr><td>schema_get</td><td class="td-desc">Get schema constraints</td></tr>
+    <tr><td>config_set</td><td class="td-desc">Set runtime configuration</td></tr>
+    <tr><td>snapshot</td><td class="td-desc">Trigger persistence snapshot</td></tr>
+  </tbody>
+</table>
+
+<a href="#getting-started" class="back-to-top">Back to top</a>
+</section>
+
+<!-- ============================================================ -->
+<!-- PYTHON SDK -->
+<!-- ============================================================ -->
+
+<section class="doc-section" id="python-sdk">
+<h2>Python SDK</h2>
+
+<p>The Python SDK provides synchronous (<code>WeavClient</code>) and asynchronous (<code>AsyncWeavClient</code>) HTTP clients. Built on <code>httpx</code>. Requires Python 3.10+.</p>
+
+<h3>Installation</h3>
+<pre><code>pip install weav</code></pre>
+
+<h3>Client Initialization</h3>
+
+<pre><code><span class="code-keyword">from</span> weav <span class="code-keyword">import</span> WeavClient, AsyncWeavClient
+
+<span class="code-comment"># Default connection (localhost:6382)</span>
+client = WeavClient()
+
+<span class="code-comment"># Custom host/port</span>
+client = WeavClient(host=<span class="code-string">"db.example.com"</span>, port=<span class="code-number">6382</span>)
+
+<span class="code-comment"># With API key auth</span>
+client = WeavClient(api_key=<span class="code-string">"wk_abc123..."</span>)
+
+<span class="code-comment"># With username/password auth</span>
+client = WeavClient(username=<span class="code-string">"admin"</span>, password=<span class="code-string">"secret"</span>)
+
+<span class="code-comment"># Context manager (auto-close)</span>
+<span class="code-keyword">with</span> WeavClient() <span class="code-keyword">as</span> client:
+    ...</code></pre>
+
+<h3>API Reference</h3>
+
+<h4>Graph Management</h4>
+<table>
+  <thead><tr><th>Method</th><th>Parameters</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td>create_graph</td><td>name: str</td><td class="td-desc">None</td></tr>
+    <tr><td>drop_graph</td><td>name: str</td><td class="td-desc">None</td></tr>
+    <tr><td>list_graphs</td><td></td><td class="td-desc">list[str]</td></tr>
+    <tr><td>graph_info</td><td>name: str</td><td class="td-desc">GraphInfo</td></tr>
+  </tbody>
+</table>
+
+<h4>Node Operations</h4>
+<table>
+  <thead><tr><th>Method</th><th>Parameters</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td>add_node</td><td>graph, label, properties?, embedding?, entity_key?</td><td class="td-desc">int (node_id)</td></tr>
+    <tr><td>get_node</td><td>graph, node_id</td><td class="td-desc">NodeInfo</td></tr>
+    <tr><td>update_node</td><td>graph, node_id, properties?, embedding?</td><td class="td-desc">None</td></tr>
+    <tr><td>delete_node</td><td>graph, node_id</td><td class="td-desc">None</td></tr>
+    <tr><td>bulk_add_nodes</td><td>graph, nodes: list[dict]</td><td class="td-desc">list[int]</td></tr>
+  </tbody>
+</table>
+
+<h4>Edge Operations</h4>
+<table>
+  <thead><tr><th>Method</th><th>Parameters</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td>add_edge</td><td>graph, source, target, label, weight?, provenance?</td><td class="td-desc">int (edge_id)</td></tr>
+    <tr><td>invalidate_edge</td><td>graph, edge_id</td><td class="td-desc">None</td></tr>
+    <tr><td>bulk_add_edges</td><td>graph, edges: list[dict]</td><td class="td-desc">list[int]</td></tr>
+  </tbody>
+</table>
+
+<h4>Context and Search</h4>
+<table>
+  <thead><tr><th>Method</th><th>Parameters</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td>context</td><td>graph, query?, embedding?, seed_nodes?, budget?, max_depth?, decay?, edge_labels?, temporal_at?, include_provenance?, limit?, sort_field?, sort_direction?, direction?</td><td class="td-desc">ContextResult</td></tr>
+    <tr><td>search_text</td><td>graph, query, limit?</td><td class="td-desc">dict</td></tr>
+    <tr><td>search_vector</td><td>graph, embedding, k?, labels?, properties?</td><td class="td-desc">dict</td></tr>
+  </tbody>
+</table>
+
+<h4>Algorithms and GraphRAG</h4>
+<table>
+  <thead><tr><th>Method</th><th>Parameters</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td>run_algorithm</td><td>graph, algorithm, **kwargs</td><td class="td-desc">dict</td></tr>
+    <tr><td>community_summarize</td><td>graph, algorithm?, resolution?</td><td class="td-desc">dict</td></tr>
+    <tr><td>community_summaries</td><td>graph</td><td class="td-desc">dict</td></tr>
+    <tr><td>community_search</td><td>graph, query, limit?</td><td class="td-desc">dict</td></tr>
+    <tr><td>merge_nodes</td><td>graph, source_id, target_id, conflict_policy?</td><td class="td-desc">dict</td></tr>
+    <tr><td>graph_diff</td><td>graph, from_timestamp, to_timestamp</td><td class="td-desc">dict</td></tr>
+  </tbody>
+</table>
+
+<h4>Import / Export</h4>
+<table>
+  <thead><tr><th>Method</th><th>Parameters</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td>import_csv</td><td>graph, csv_content: str</td><td class="td-desc">dict</td></tr>
+    <tr><td>export_csv</td><td>graph</td><td class="td-desc">str</td></tr>
+  </tbody>
+</table>
+
+<h4>Ingestion</h4>
+<table>
+  <thead><tr><th>Method</th><th>Parameters</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td>ingest</td><td>graph, content?, content_base64?, format?, document_id?, skip_extraction?, skip_dedup?, chunk_size?, entity_types?</td><td class="td-desc">IngestResult</td></tr>
+  </tbody>
+</table>
+
+<h3>Data Classes</h3>
+
+<pre><code><span class="code-keyword">from</span> weav <span class="code-keyword">import</span> ContextResult, ContextChunk, Provenance, NodeInfo, GraphInfo, IngestResult
+
+<span class="code-comment"># ContextResult fields:</span>
+<span class="code-comment">#   chunks: list[ContextChunk]</span>
+<span class="code-comment">#   total_tokens: int</span>
+<span class="code-comment">#   budget_used: float</span>
+<span class="code-comment">#   nodes_considered: int</span>
+<span class="code-comment">#   nodes_included: int</span>
+<span class="code-comment">#   query_time_us: int</span>
+
+<span class="code-comment"># ContextResult helper methods:</span>
+result.to_prompt()    <span class="code-comment"># -> str (text block for LLM prompts)</span>
+result.to_messages()  <span class="code-comment"># -> list[dict] (OpenAI-compatible messages)</span></code></pre>
+
+<h3>Usage Example</h3>
+
+<pre><code><span class="code-keyword">from</span> weav <span class="code-keyword">import</span> WeavClient
+
+<span class="code-keyword">with</span> WeavClient() <span class="code-keyword">as</span> client:
+    <span class="code-comment"># Build a knowledge graph</span>
+    client.create_graph(<span class="code-string">"research"</span>)
+
+    paper_id = client.add_node(<span class="code-string">"research"</span>, <span class="code-string">"Paper"</span>, {
+        <span class="code-string">"title"</span>: <span class="code-string">"Attention Is All You Need"</span>,
+        <span class="code-string">"year"</span>: <span class="code-number">2017</span>,
+    }, entity_key=<span class="code-string">"attention_paper"</span>)
+
+    author_id = client.add_node(<span class="code-string">"research"</span>, <span class="code-string">"Person"</span>, {
+        <span class="code-string">"name"</span>: <span class="code-string">"Ashish Vaswani"</span>,
+    }, entity_key=<span class="code-string">"vaswani"</span>)
+
+    client.add_edge(<span class="code-string">"research"</span>, author_id, paper_id, <span class="code-string">"AUTHORED"</span>)
+
+    <span class="code-comment"># Query context for an LLM</span>
+    result = client.context(
+        <span class="code-string">"research"</span>,
+        query=<span class="code-string">"transformer architecture"</span>,
+        budget=<span class="code-number">4096</span>,
+        max_depth=<span class="code-number">2</span>,
+    )
+    print(f<span class="code-string">"Included {result.nodes_included} nodes, {result.total_tokens} tokens"</span>)
+    print(result.to_prompt())
+
+    <span class="code-comment"># Run an algorithm</span>
+    pr = client.run_algorithm(<span class="code-string">"research"</span>, <span class="code-string">"pagerank"</span>, damping=<span class="code-number">0.85</span>)
+    print(pr)</code></pre>
+
+<h3>LangChain Integration</h3>
+
+<pre><code><span class="code-keyword">from</span> weav <span class="code-keyword">import</span> WeavLangChain
+
+retriever = WeavLangChain(graph=<span class="code-string">"knowledge"</span>, budget=<span class="code-number">8192</span>)
+docs = retriever.get_relevant_documents(<span class="code-string">"transformer attention"</span>)</code></pre>
+
+<h3>LlamaIndex Integration</h3>
+
+<pre><code><span class="code-keyword">from</span> weav <span class="code-keyword">import</span> WeavLlamaIndex
+
+retriever = WeavLlamaIndex(graph=<span class="code-string">"knowledge"</span>, budget=<span class="code-number">8192</span>)
+nodes = retriever.retrieve(<span class="code-string">"transformer attention"</span>)</code></pre>
+
+<a href="#getting-started" class="back-to-top">Back to top</a>
+</section>
+
+<!-- ============================================================ -->
+<!-- NODE.JS SDK -->
+<!-- ============================================================ -->
+
+<section class="doc-section" id="node-sdk">
+<h2>Node.js SDK</h2>
+
+<p>The Node.js SDK provides a TypeScript client with zero runtime dependencies. Uses the native <code>fetch</code> API. Requires Node.js 18+ or any runtime with global <code>fetch</code>. TypeScript 5.0+.</p>
+
+<h3>Installation</h3>
+<pre><code>npm install @weav/client</code></pre>
+
+<h3>Client Initialization</h3>
+
+<pre><code><span class="code-keyword">import</span> { WeavClient } <span class="code-keyword">from</span> <span class="code-string">'@weav/client'</span>;
+
+<span class="code-comment">// Default connection (localhost:6382)</span>
+<span class="code-keyword">const</span> client = <span class="code-keyword">new</span> WeavClient();
+
+<span class="code-comment">// Custom config</span>
+<span class="code-keyword">const</span> client = <span class="code-keyword">new</span> WeavClient({
+  host: <span class="code-string">'db.example.com'</span>,
+  port: <span class="code-number">6382</span>,
+  apiKey: <span class="code-string">'wk_abc123...'</span>,
+});
+
+<span class="code-comment">// With basic auth</span>
+<span class="code-keyword">const</span> client = <span class="code-keyword">new</span> WeavClient({
+  username: <span class="code-string">'admin'</span>,
+  password: <span class="code-string">'secret'</span>,
+});</code></pre>
+
+<h3>API Reference</h3>
+
+<p>All methods are async and return Promises. The SDK uses camelCase for all parameters (e.g. <code>nodeId</code>, <code>relevanceScore</code>, <code>tokenCount</code>).</p>
+
+<h4>Graph Management</h4>
+<table>
+  <thead><tr><th>Method</th><th>Parameters</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td>createGraph</td><td>name: string</td><td class="td-desc">Promise&lt;void&gt;</td></tr>
+    <tr><td>dropGraph</td><td>name: string</td><td class="td-desc">Promise&lt;void&gt;</td></tr>
+    <tr><td>listGraphs</td><td></td><td class="td-desc">Promise&lt;string[]&gt;</td></tr>
+    <tr><td>graphInfo</td><td>name: string</td><td class="td-desc">Promise&lt;GraphInfo&gt;</td></tr>
+    <tr><td>ping</td><td></td><td class="td-desc">Promise&lt;boolean&gt;</td></tr>
+  </tbody>
+</table>
+
+<h4>Node Operations</h4>
+<table>
+  <thead><tr><th>Method</th><th>Parameters</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td>addNode</td><td>graph, { label, properties?, embedding?, entityKey? }</td><td class="td-desc">Promise&lt;number&gt;</td></tr>
+    <tr><td>getNode</td><td>graph, nodeId</td><td class="td-desc">Promise&lt;NodeInfo&gt;</td></tr>
+    <tr><td>updateNode</td><td>graph, nodeId, { properties?, embedding? }</td><td class="td-desc">Promise&lt;void&gt;</td></tr>
+    <tr><td>deleteNode</td><td>graph, nodeId</td><td class="td-desc">Promise&lt;void&gt;</td></tr>
+    <tr><td>bulkAddNodes</td><td>graph, nodes: AddNodeParams[]</td><td class="td-desc">Promise&lt;number[]&gt;</td></tr>
+  </tbody>
+</table>
+
+<h4>Edge Operations</h4>
+<table>
+  <thead><tr><th>Method</th><th>Parameters</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td>addEdge</td><td>graph, { source, target, label, weight?, provenance? }</td><td class="td-desc">Promise&lt;number&gt;</td></tr>
+    <tr><td>invalidateEdge</td><td>graph, edgeId</td><td class="td-desc">Promise&lt;void&gt;</td></tr>
+    <tr><td>bulkAddEdges</td><td>graph, edges: AddEdgeParams[]</td><td class="td-desc">Promise&lt;number[]&gt;</td></tr>
+  </tbody>
+</table>
+
+<h4>Context and Search</h4>
+<table>
+  <thead><tr><th>Method</th><th>Parameters</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td>context</td><td>ContextParams</td><td class="td-desc">Promise&lt;ContextResult&gt;</td></tr>
+    <tr><td>searchText</td><td>graph, query, limit?</td><td class="td-desc">Promise&lt;Record&gt;</td></tr>
+    <tr><td>searchVector</td><td>graph, embedding, { k?, labels?, properties? }?</td><td class="td-desc">Promise&lt;Record&gt;</td></tr>
+    <tr><td>mergeNodes</td><td>graph, sourceId, targetId, conflictPolicy?</td><td class="td-desc">Promise&lt;Record&gt;</td></tr>
+  </tbody>
+</table>
+
+<h3>ContextParams</h3>
+
+<pre><code><span class="code-keyword">interface</span> ContextParams {
+  graph: <span class="code-keyword">string</span>;
+  query?: <span class="code-keyword">string</span>;
+  embedding?: <span class="code-keyword">number</span>[];
+  seedNodes?: <span class="code-keyword">string</span>[];
+  budget?: <span class="code-keyword">number</span>;         <span class="code-comment">// default 4096</span>
+  maxDepth?: <span class="code-keyword">number</span>;       <span class="code-comment">// default 3</span>
+  includeProvenance?: <span class="code-keyword">boolean</span>;
+  decay?: {
+    type: <span class="code-string">'exponential'</span> | <span class="code-string">'linear'</span> | <span class="code-string">'step'</span>;
+    halfLifeMs?: <span class="code-keyword">number</span>;
+    maxAgeMs?: <span class="code-keyword">number</span>;
+    cutoffMs?: <span class="code-keyword">number</span>;
+  };
+  edgeLabels?: <span class="code-keyword">string</span>[];
+  temporalAt?: <span class="code-keyword">number</span>;
+  limit?: <span class="code-keyword">number</span>;
+  sortField?: <span class="code-keyword">string</span>;
+  sortDirection?: <span class="code-string">'asc'</span> | <span class="code-string">'desc'</span>;
+  direction?: <span class="code-string">'outgoing'</span> | <span class="code-string">'incoming'</span> | <span class="code-string">'both'</span>;
+}</code></pre>
+
+<h3>Usage Example</h3>
+
+<pre><code><span class="code-keyword">import</span> { WeavClient } <span class="code-keyword">from</span> <span class="code-string">'@weav/client'</span>;
+
+<span class="code-keyword">const</span> client = <span class="code-keyword">new</span> WeavClient();
+
+<span class="code-comment">// Create graph and add data</span>
+<span class="code-keyword">await</span> client.createGraph(<span class="code-string">'knowledge'</span>);
+
+<span class="code-keyword">const</span> alice = <span class="code-keyword">await</span> client.addNode(<span class="code-string">'knowledge'</span>, {
+  label: <span class="code-string">'Person'</span>,
+  properties: { name: <span class="code-string">'Alice'</span>, role: <span class="code-string">'Engineer'</span> },
+  entityKey: <span class="code-string">'alice'</span>,
+});
+
+<span class="code-keyword">const</span> project = <span class="code-keyword">await</span> client.addNode(<span class="code-string">'knowledge'</span>, {
+  label: <span class="code-string">'Project'</span>,
+  properties: { name: <span class="code-string">'Weav'</span> },
+  entityKey: <span class="code-string">'weav'</span>,
+});
+
+<span class="code-keyword">await</span> client.addEdge(<span class="code-string">'knowledge'</span>, {
+  source: alice,
+  target: project,
+  label: <span class="code-string">'WORKS_ON'</span>,
+});
+
+<span class="code-comment">// Query context</span>
+<span class="code-keyword">const</span> result = <span class="code-keyword">await</span> client.context({
+  graph: <span class="code-string">'knowledge'</span>,
+  query: <span class="code-string">'what does alice work on'</span>,
+  budget: <span class="code-number">4096</span>,
+  maxDepth: <span class="code-number">3</span>,
+});
+
+console.log(<span class="code-string">`Included ${result.nodesIncluded} nodes`</span>);
+console.log(<span class="code-string">`Total tokens: ${result.totalTokens}`</span>);
+
+<span class="code-keyword">for</span> (<span class="code-keyword">const</span> chunk <span class="code-keyword">of</span> result.chunks) {
+  console.log(<span class="code-string">`[${chunk.label}] ${chunk.content} (score: ${chunk.relevanceScore})`</span>);
+}</code></pre>
+
+<h3>Helper Functions</h3>
+
+<pre><code><span class="code-keyword">import</span> { contextToPrompt, contextToMessages } <span class="code-keyword">from</span> <span class="code-string">'@weav/client'</span>;
+
+<span class="code-comment">// Format as text prompt</span>
+<span class="code-keyword">const</span> prompt = contextToPrompt(result);
+
+<span class="code-comment">// Format as OpenAI-compatible messages</span>
+<span class="code-keyword">const</span> messages = contextToMessages(result);</code></pre>
+
+<a href="#getting-started" class="back-to-top">Back to top</a>
+</section>
+
+<!-- ============================================================ -->
+<!-- OBSERVABILITY -->
+<!-- ============================================================ -->
+
+<section class="doc-section" id="observability">
+<h2>Observability</h2>
+
+<p>Weav exposes Prometheus metrics on <code>GET /metrics</code> (requires the <code>observability</code> feature). All metrics use the <code>weav_</code> prefix.</p>
+
+<h3>Metrics</h3>
+
+<table>
+  <thead><tr><th>Metric</th><th>Type</th><th>Labels</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td class="metric-name">weav_nodes_total</td><td>Gauge</td><td>graph</td><td class="td-desc">Total number of nodes per graph</td></tr>
+    <tr><td class="metric-name">weav_edges_total</td><td>Gauge</td><td>graph</td><td class="td-desc">Total number of edges per graph</td></tr>
+    <tr><td class="metric-name">weav_graphs_total</td><td>Gauge</td><td></td><td class="td-desc">Total number of graphs</td></tr>
+    <tr><td class="metric-name">weav_connections_active</td><td>Gauge</td><td></td><td class="td-desc">Active client connections</td></tr>
+    <tr><td class="metric-name">weav_query_duration_seconds</td><td>Histogram</td><td>type</td><td class="td-desc">Query latency distribution</td></tr>
+    <tr><td class="metric-name">weav_query_total</td><td>Counter</td><td>type, status</td><td class="td-desc">Total query count by type and status</td></tr>
+    <tr><td class="metric-name">weav_wal_writes_total</td><td>Counter</td><td>graph, operation</td><td class="td-desc">WAL write operations</td></tr>
+    <tr><td class="metric-name">weav_wal_bytes_written_total</td><td>Counter</td><td></td><td class="td-desc">Total bytes written to WAL</td></tr>
+    <tr><td class="metric-name">weav_wal_sync_duration_seconds</td><td>Histogram</td><td></td><td class="td-desc">WAL fsync latency</td></tr>
+    <tr><td class="metric-name">weav_snapshot_duration_seconds</td><td>Histogram</td><td></td><td class="td-desc">Snapshot save latency</td></tr>
+    <tr><td class="metric-name">weav_snapshot_size_bytes</td><td>Gauge</td><td></td><td class="td-desc">Size of the last snapshot</td></tr>
+    <tr><td class="metric-name">weav_vector_search_duration_seconds</td><td>Histogram</td><td>graph</td><td class="td-desc">Vector search latency</td></tr>
+    <tr><td class="metric-name">weav_vector_index_size</td><td>Gauge</td><td>graph</td><td class="td-desc">Number of vectors in the index</td></tr>
+    <tr><td class="metric-name">weav_token_budget_usage_ratio</td><td>Histogram</td><td>graph, strategy</td><td class="td-desc">Token budget utilization (0.0 to 1.0)</td></tr>
+    <tr><td class="metric-name">weav_token_budget_overflow_total</td><td>Counter</td><td>graph</td><td class="td-desc">Token budget overflow events</td></tr>
+    <tr><td class="metric-name">weav_ttl_expired_total</td><td>Counter</td><td>graph, entity_type</td><td class="td-desc">Entities expired by TTL sweep</td></tr>
+    <tr><td class="metric-name">weav_auth_attempts_total</td><td>Counter</td><td>result</td><td class="td-desc">Authentication attempts by outcome</td></tr>
+    <tr><td class="metric-name">weav_ingest_duration_seconds</td><td>Histogram</td><td>graph, format</td><td class="td-desc">Document ingestion latency</td></tr>
+    <tr><td class="metric-name">weav_ingest_documents_total</td><td>Counter</td><td>graph</td><td class="td-desc">Total documents ingested</td></tr>
+  </tbody>
+</table>
+
+<h3>Prometheus Scrape Config</h3>
+
+<pre><code><span class="code-comment"># prometheus.yml</span>
+scrape_configs:
+  - job_name: weav
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['localhost:6382']
+    metrics_path: /metrics</code></pre>
+
+<a href="#getting-started" class="back-to-top">Back to top</a>
+</section>
+
+<!-- ============================================================ -->
+<!-- ERROR REFERENCE -->
+<!-- ============================================================ -->
+
+<section class="doc-section" id="errors">
+<h2>Error Reference</h2>
+
+<p>All errors are returned as <code>WeavError</code> variants. In the HTTP API, errors are returned as JSON with <code>"success": false</code> and an <code>"error"</code> message.</p>
+
+<table>
+  <thead><tr><th>Error</th><th>HTTP Status</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td>GraphNotFound</td><td>404</td><td class="td-desc">The specified graph name does not exist</td></tr>
+    <tr><td>NodeNotFound</td><td>404</td><td class="td-desc">The specified node ID does not exist in the graph</td></tr>
+    <tr><td>EdgeNotFound</td><td>404</td><td class="td-desc">The specified edge ID does not exist</td></tr>
+    <tr><td>DuplicateNode</td><td>409</td><td class="td-desc">A node with this entity_key already exists</td></tr>
+    <tr><td>Conflict</td><td>409</td><td class="td-desc">Write conflict detected (concurrent modification)</td></tr>
+    <tr><td>TokenBudgetExceeded</td><td>400</td><td class="td-desc">Context requires more tokens than the specified budget</td></tr>
+    <tr><td>DimensionMismatch</td><td>400</td><td class="td-desc">Embedding vector dimensions do not match the graph config</td></tr>
+    <tr><td>ShardUnavailable</td><td>503</td><td class="td-desc">Target shard is temporarily unavailable</td></tr>
+    <tr><td>PersistenceError</td><td>500</td><td class="td-desc">WAL or snapshot operation failed</td></tr>
+    <tr><td>ProtocolError</td><td>400</td><td class="td-desc">Malformed RESP3 or gRPC message</td></tr>
+    <tr><td>QueryParseError</td><td>400</td><td class="td-desc">Invalid query syntax (Cypher, search, etc.)</td></tr>
+    <tr><td>CapacityExceeded</td><td>507</td><td class="td-desc">Graph or server has reached maximum capacity</td></tr>
+    <tr><td>InvalidConfig</td><td>400</td><td class="td-desc">Configuration validation failed</td></tr>
+    <tr><td>Internal</td><td>500</td><td class="td-desc">Unexpected internal error</td></tr>
+    <tr><td>AuthenticationRequired</td><td>401</td><td class="td-desc">Request requires authentication</td></tr>
+    <tr><td>AuthenticationFailed</td><td>401</td><td class="td-desc">Provided credentials are invalid</td></tr>
+    <tr><td>PermissionDenied</td><td>403</td><td class="td-desc">User does not have permission for this operation</td></tr>
+    <tr><td>ExtractionError</td><td>500</td><td class="td-desc">Entity extraction pipeline failed</td></tr>
+    <tr><td>DocumentParseError</td><td>400</td><td class="td-desc">Document could not be parsed (invalid format)</td></tr>
+    <tr><td>LlmError</td><td>502</td><td class="td-desc">LLM API call failed (provider error)</td></tr>
+    <tr><td>ExtractionNotEnabled</td><td>400</td><td class="td-desc">Extraction pipeline is not enabled in config</td></tr>
+  </tbody>
+</table>
+
+<a href="#getting-started" class="back-to-top">Back to top</a>
+</section>
+
+</div>
+</main>
+
+</div>
+
+<!-- JS: sidebar toggle + tab switching -->
+<script>
+(function() {
+  var toggle = document.getElementById('sidebarToggle');
+  var sidebar = document.getElementById('sidebar');
+
+  toggle.addEventListener('click', function() {
+    sidebar.classList.toggle('open');
+  });
+
+  // Close sidebar when clicking a link (mobile)
+  var links = sidebar.querySelectorAll('.sidebar-link');
+  for (var i = 0; i < links.length; i++) {
+    links[i].addEventListener('click', function() {
+      sidebar.classList.remove('open');
+    });
+  }
+
+  // Close sidebar when clicking outside (mobile)
+  document.addEventListener('click', function(e) {
+    if (sidebar.classList.contains('open') &&
+        !sidebar.contains(e.target) &&
+        !toggle.contains(e.target)) {
+      sidebar.classList.remove('open');
+    }
+  });
+
+  // Active sidebar link tracking
+  var sections = document.querySelectorAll('.doc-section');
+  var sidebarLinks = document.querySelectorAll('.sidebar-link');
+
+  function updateActive() {
+    var scrollPos = window.scrollY + 80;
+    var active = null;
+    for (var i = 0; i < sections.length; i++) {
+      if (sections[i].offsetTop <= scrollPos) {
+        active = sections[i].id;
+      }
+    }
+    for (var j = 0; j < sidebarLinks.length; j++) {
+      if (sidebarLinks[j].getAttribute('href') === '#' + active) {
+        sidebarLinks[j].classList.add('active');
+      } else {
+        sidebarLinks[j].classList.remove('active');
+      }
+    }
+  }
+
+  window.addEventListener('scroll', updateActive, { passive: true });
+  updateActive();
+})();
+
+function switchTab(btn, panelId) {
+  var container = btn.closest('.tabbed-code');
+  var tabs = container.querySelectorAll('.code-tab');
+  var panels = container.querySelectorAll('.tab-panel');
+  for (var i = 0; i < tabs.length; i++) {
+    tabs[i].classList.remove('active');
+  }
+  for (var j = 0; j < panels.length; j++) {
+    panels[j].classList.remove('active');
+  }
+  btn.classList.add('active');
+  document.getElementById(panelId).classList.add('active');
+}
+</script>
+
+</body>
+</html>
