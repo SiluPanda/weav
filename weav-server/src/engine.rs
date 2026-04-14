@@ -3,8 +3,8 @@
 //! Provides a thread-safe interface for executing commands against graphs.
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::SystemTime;
 
 use parking_lot::{Mutex, RwLock};
@@ -157,11 +157,7 @@ pub struct NodeImportanceScore {
     pub access: f32,
 }
 
-pub fn compute_node_importance(
-    gs: &GraphState,
-    node_id: NodeId,
-    now: u64,
-) -> NodeImportanceScore {
+pub fn compute_node_importance(gs: &GraphState, node_id: NodeId, now: u64) -> NodeImportanceScore {
     // 1. Degree centrality (structural importance): degree / max_degree
     let degree = gs.adjacency.neighbors_both(node_id, None).len() as f32;
     let max_degree = gs
@@ -246,8 +242,10 @@ impl Engine {
             (None, None)
         };
         let acl_store = if config.auth.enabled {
-            Some(weav_auth::acl::AclStore::from_config(&config.auth)
-                .expect("failed to initialize auth — check user password configuration"))
+            Some(
+                weav_auth::acl::AclStore::from_config(&config.auth)
+                    .expect("failed to initialize auth — check user password configuration"),
+            )
         } else {
             None
         };
@@ -274,9 +272,9 @@ impl Engine {
 
     /// Get a reference to the ACL store, returning an error if auth is not enabled.
     fn acl_store(&self) -> WeavResult<&weav_auth::acl::AclStore> {
-        self.acl_store.as_ref().ok_or_else(|| {
-            WeavError::Internal("auth not enabled".into())
-        })
+        self.acl_store
+            .as_ref()
+            .ok_or_else(|| WeavError::Internal("auth not enabled".into()))
     }
 
     /// Get the current timestamp in milliseconds since epoch.
@@ -301,7 +299,9 @@ impl Engine {
         let _ = gs.adjacency.remove_node(victim_id);
         gs.properties.remove_all_node_properties(victim_id);
         #[cfg(feature = "vector")]
-        { let _ = gs.vector_index.remove(victim_id); }
+        {
+            let _ = gs.vector_index.remove(victim_id);
+        }
         gs.text_index.remove_node(victim_id);
         gs.access_times.remove(&victim_id);
 
@@ -376,8 +376,7 @@ impl Engine {
                 crate::metrics::WAL_WRITES_TOTAL
                     .with_label_values(&[&graph_label, &op_label])
                     .inc();
-                crate::metrics::WAL_BYTES_WRITTEN
-                    .inc_by(4 + estimated_bytes);
+                crate::metrics::WAL_BYTES_WRITTEN.inc_by(4 + estimated_bytes);
             }
         }
         Ok(())
@@ -392,7 +391,9 @@ impl Engine {
             wal.sync()
                 .map_err(|e| WeavError::PersistenceError(format!("WAL sync failed: {e}")))?;
             #[cfg(feature = "observability")]
-            { crate::metrics::WAL_SYNC_DURATION.observe(start.elapsed().as_secs_f64()); }
+            {
+                crate::metrics::WAL_SYNC_DURATION.observe(start.elapsed().as_secs_f64());
+            }
         }
         Ok(())
     }
@@ -405,15 +406,20 @@ impl Engine {
     /// Try to acquire a connection slot. Returns Err if max_connections exceeded.
     pub fn try_acquire_connection(&self) -> WeavResult<()> {
         let max = self.config.server.max_connections as u64;
-        let current = self.active_connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let current = self
+            .active_connections
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if current >= max {
-            self.active_connections.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.active_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             return Err(WeavError::CapacityExceeded(format!(
                 "max connections ({max}) exceeded"
             )));
         }
         #[cfg(feature = "observability")]
-        { crate::metrics::CONNECTIONS_ACTIVE.set((current + 1) as i64); }
+        {
+            crate::metrics::CONNECTIONS_ACTIVE.set((current + 1) as i64);
+        }
         Ok(())
     }
 
@@ -421,18 +427,26 @@ impl Engine {
     pub fn release_connection(&self) {
         // Use compare-and-swap loop to prevent underflow
         loop {
-            let current = self.active_connections.load(std::sync::atomic::Ordering::Relaxed);
+            let current = self
+                .active_connections
+                .load(std::sync::atomic::Ordering::Relaxed);
             if current == 0 {
                 break;
             }
-            if self.active_connections.compare_exchange(
-                current,
-                current - 1,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            ).is_ok() {
+            if self
+                .active_connections
+                .compare_exchange(
+                    current,
+                    current - 1,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
                 #[cfg(feature = "observability")]
-                { crate::metrics::CONNECTIONS_ACTIVE.set((current - 1) as i64); }
+                {
+                    crate::metrics::CONNECTIONS_ACTIVE.set((current - 1) as i64);
+                }
                 break;
             }
         }
@@ -440,7 +454,8 @@ impl Engine {
 
     /// Return the current active connection count.
     pub fn active_connection_count(&self) -> u64 {
-        self.active_connections.load(std::sync::atomic::Ordering::Relaxed)
+        self.active_connections
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Sweep expired nodes and edges across all graphs.
@@ -452,7 +467,10 @@ impl Engine {
 
         let graph_arcs: Vec<(String, Arc<RwLock<GraphState>>)> = {
             let registry = self.graphs.read();
-            registry.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            registry
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
         };
 
         for (_graph_name, graph_arc) in &graph_arcs {
@@ -461,25 +479,26 @@ impl Engine {
             let mut gs = graph_arc.write();
 
             // Sweep expired nodes (those with _ttl_expires_at <= now)
-            let expired_nodes: Vec<NodeId> = gs.properties
-                .nodes_where("_ttl_expires_at", &|v| {
-                    match v {
-                        Value::Timestamp(ts) => *ts <= now,
-                        Value::Int(ts) => (*ts as u64) <= now,
-                        _ => false,
-                    }
+            let expired_nodes: Vec<NodeId> =
+                gs.properties.nodes_where("_ttl_expires_at", &|v| match v {
+                    Value::Timestamp(ts) => *ts <= now,
+                    Value::Int(ts) => (*ts as u64) <= now,
+                    _ => false,
                 });
 
             for node_id in &expired_nodes {
                 let _ = gs.adjacency.remove_node(*node_id);
                 gs.properties.remove_all_node_properties(*node_id);
                 #[cfg(feature = "vector")]
-                { let _ = gs.vector_index.remove(*node_id); }
+                {
+                    let _ = gs.vector_index.remove(*node_id);
+                }
             }
             total_expired += expired_nodes.len() as u64;
 
             // Sweep expired edges (those with valid_until <= now)
-            let expired_edges: Vec<EdgeId> = gs.adjacency
+            let expired_edges: Vec<EdgeId> = gs
+                .adjacency
                 .all_edges()
                 .filter(|(_, meta)| {
                     meta.temporal.valid_until != BiTemporal::OPEN
@@ -607,16 +626,21 @@ impl Engine {
                     if !ns.properties_json.is_empty() && ns.properties_json != "{}" {
                         // Try tagged Value deserialization first (full fidelity),
                         // fall back to json_val_to_value for legacy snapshots.
-                        if let Ok(props) = serde_json::from_str::<std::collections::HashMap<String, Value>>(&ns.properties_json) {
+                        if let Ok(props) = serde_json::from_str::<
+                            std::collections::HashMap<String, Value>,
+                        >(&ns.properties_json)
+                        {
                             for (k, v) in props {
                                 state.properties.set_node_property(ns.node_id, &k, v);
                             }
-                        } else if let Ok(props_val) = serde_json::from_str::<serde_json::Value>(&ns.properties_json)
+                        } else if let Ok(props_val) =
+                            serde_json::from_str::<serde_json::Value>(&ns.properties_json)
                             && let Some(obj) = props_val.as_object()
                         {
                             for (k, v) in obj {
                                 state.properties.set_node_property(
-                                    ns.node_id, k,
+                                    ns.node_id,
+                                    k,
                                     crate::http::json_val_to_value(v),
                                 );
                             }
@@ -624,7 +648,8 @@ impl Engine {
                     }
                     // Re-index text content for full-text search during restore
                     let all_props = state.properties.get_all_node_properties(ns.node_id);
-                    let text_content: String = all_props.iter()
+                    let text_content: String = all_props
+                        .iter()
                         .filter(|(k, _)| !k.starts_with('_'))
                         .filter_map(|(_, v)| v.as_str())
                         .collect::<Vec<_>>()
@@ -660,7 +685,9 @@ impl Engine {
                         token_cost: 0,
                     };
                     // Use add_edge_with_id to preserve the original edge ID from snapshot
-                    let _ = state.adjacency.add_edge_with_id(es.source, es.target, label_id, meta, es.edge_id);
+                    let _ = state
+                        .adjacency
+                        .add_edge_with_id(es.source, es.target, label_id, meta, es.edge_id);
                     if es.edge_id >= state.next_edge_id {
                         state.next_edge_id = es.edge_id + 1;
                         // Sync the adjacency store's internal edge ID counter
@@ -669,8 +696,11 @@ impl Engine {
                     // Restore edge properties from snapshot.
                     // Properties are serialized as serde-tagged Value enums, so we
                     // deserialize directly into HashMap<String, Value> for fidelity.
-                    if !es.properties_json.is_empty() && es.properties_json != "{}"
-                        && let Ok(props) = serde_json::from_str::<std::collections::HashMap<String, Value>>(&es.properties_json)
+                    if !es.properties_json.is_empty()
+                        && es.properties_json != "{}"
+                        && let Ok(props) = serde_json::from_str::<
+                            std::collections::HashMap<String, Value>,
+                        >(&es.properties_json)
                     {
                         for (k, v) in props {
                             state.properties.set_edge_property(es.edge_id, &k, v);
@@ -686,7 +716,8 @@ impl Engine {
         // Step 2: Replay WAL entries.
         // Set replaying flag to suppress WAL writes during recovery —
         // handle_* methods call append_wal which would otherwise double the WAL size.
-        self.replaying.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.replaying
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let mut replay_errors: u64 = 0;
         for entry in &result.wal_entries {
             match &entry.operation {
@@ -712,54 +743,132 @@ impl Engine {
                     }
                 }
                 WalOperation::NodeAdd {
-                    graph_id: _,
-                    node_id: _,
+                    graph_id,
+                    node_id,
                     label,
                     properties_json,
                     embedding,
                     entity_key,
+                    ttl_ms,
+                    created_at,
                 } => {
-                    // Find graph by ID - we need to find the name
-                    // For WAL replay, we use the graph_id to find the graph name
-                    let graph_name = {
-                        let registry = self.graphs.read();
-                        registry.values()
-                            .find_map(|arc| {
-                                let gs = arc.read();
-                                if gs.graph_id == entry.operation.graph_id_hint() {
-                                    Some(gs.name.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                    };
-                    if let Some(name) = graph_name {
-                        let mut props = Vec::new();
+                    let registry = self.graphs.read();
+                    let graph_arc = registry
+                        .values()
+                        .find(|arc| arc.read().graph_id == *graph_id)
+                        .cloned();
+                    drop(registry);
+                    if let Some(graph_arc) = graph_arc {
+                        let mut gs = graph_arc.write();
+                        if gs.adjacency.has_node(*node_id) {
+                            tracing::warn!(
+                                "WAL replay NodeAdd({node_id}) skipped: node already exists"
+                            );
+                            replay_errors += 1;
+                            continue;
+                        }
+
+                        gs.adjacency.add_node(*node_id);
+                        if *node_id >= gs.next_node_id {
+                            gs.next_node_id = *node_id + 1;
+                        }
+
+                        gs.properties.set_node_property(
+                            *node_id,
+                            "_label",
+                            Value::String(CompactString::from(label.as_str())),
+                        );
+                        match gs.interner.intern_label(label) {
+                            Ok(label_id) => {
+                                gs.properties.set_node_property(
+                                    *node_id,
+                                    "_label_id",
+                                    Value::Int(label_id as i64),
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!("WAL replay NodeAdd label intern failed: {e}");
+                                replay_errors += 1;
+                            }
+                        }
+
+                        if let Some(key) = entity_key {
+                            gs.properties.set_node_property(
+                                *node_id,
+                                "entity_key",
+                                Value::String(CompactString::from(key.as_str())),
+                            );
+                        }
+
                         if !properties_json.is_empty() && properties_json != "{}" {
                             // Try tagged Value deserialization first (full fidelity)
-                            if let Ok(tagged) = serde_json::from_str::<std::collections::HashMap<String, Value>>(properties_json) {
+                            if let Ok(tagged) = serde_json::from_str::<
+                                std::collections::HashMap<String, Value>,
+                            >(properties_json)
+                            {
                                 for (k, v) in tagged {
-                                    props.push((k, v));
+                                    gs.properties.set_node_property(*node_id, &k, v);
                                 }
-                            } else if let Ok(val) = serde_json::from_str::<serde_json::Value>(properties_json)
+                            } else if let Ok(val) =
+                                serde_json::from_str::<serde_json::Value>(properties_json)
                                 && let Some(obj) = val.as_object()
                             {
                                 for (k, v) in obj {
-                                    props.push((k.clone(), crate::http::json_val_to_value(v)));
+                                    gs.properties.set_node_property(
+                                        *node_id,
+                                        k,
+                                        crate::http::json_val_to_value(v),
+                                    );
                                 }
                             }
                         }
-                        let cmd = weav_query::parser::NodeAddCmd {
-                            graph: name,
-                            label: label.clone(),
-                            properties: props,
-                            embedding: embedding.clone(),
-                            entity_key: entity_key.clone(),
-                            ttl_ms: None,
-                        };
-                        if let Err(e) = self.handle_node_add(cmd) {
-                            tracing::warn!("WAL replay NodeAdd failed: {e}");
-                            replay_errors += 1;
+
+                        let temporal_origin = (*created_at).or_else(|| {
+                            (*ttl_ms)
+                                .or(gs.config.default_ttl_ms)
+                                .map(|_| Self::now_ms())
+                        });
+                        if let Some(ts) = temporal_origin {
+                            gs.properties.set_node_property(
+                                *node_id,
+                                "_created_at",
+                                Value::Timestamp(ts),
+                            );
+                            gs.properties.set_node_property(
+                                *node_id,
+                                "_tx_from",
+                                Value::Int(ts as i64),
+                            );
+                        }
+
+                        let effective_ttl = (*ttl_ms).or(gs.config.default_ttl_ms);
+                        if let (Some(ttl), Some(ts)) = (effective_ttl, temporal_origin) {
+                            gs.properties.set_node_property(
+                                *node_id,
+                                "_ttl_expires_at",
+                                Value::Timestamp(ts.saturating_add(ttl)),
+                            );
+                        }
+
+                        let all_props = gs.properties.get_all_node_properties(*node_id);
+                        let text_content: String = all_props
+                            .iter()
+                            .filter(|(k, _)| !k.starts_with('_'))
+                            .filter_map(|(_, v)| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        if !text_content.is_empty() {
+                            gs.text_index.index_node(*node_id, &text_content);
+                        }
+
+                        #[cfg(feature = "vector")]
+                        if let Some(vector) = embedding {
+                            if let Err(e) = gs.vector_index.insert(*node_id, vector) {
+                                tracing::warn!(
+                                    "WAL replay NodeAdd vector restore({node_id}) failed: {e}"
+                                );
+                                replay_errors += 1;
+                            }
                         }
                     }
                 }
@@ -769,7 +878,8 @@ impl Engine {
                     properties_json,
                 } => {
                     let registry = self.graphs.read();
-                    let graph_arc = registry.values()
+                    let graph_arc = registry
+                        .values()
                         .find(|arc| arc.read().graph_id == *graph_id)
                         .cloned();
                     drop(registry);
@@ -778,30 +888,46 @@ impl Engine {
                         if gs.adjacency.has_node(*node_id) {
                             if !properties_json.is_empty() && properties_json != "{}" {
                                 // Try tagged Value deserialization first (full fidelity)
-                                if let Ok(props) = serde_json::from_str::<std::collections::HashMap<String, Value>>(properties_json) {
+                                if let Ok(props) = serde_json::from_str::<
+                                    std::collections::HashMap<String, Value>,
+                                >(properties_json)
+                                {
                                     for (k, v) in props {
                                         gs.properties.set_node_property(*node_id, &k, v);
                                     }
-                                } else if let Ok(val) = serde_json::from_str::<serde_json::Value>(properties_json)
+                                } else if let Ok(val) =
+                                    serde_json::from_str::<serde_json::Value>(properties_json)
                                     && let Some(obj) = val.as_object()
                                 {
                                     for (k, v) in obj {
                                         gs.properties.set_node_property(
-                                            *node_id, k,
+                                            *node_id,
+                                            k,
                                             crate::http::json_val_to_value(v),
                                         );
                                     }
+                                }
+                                // Reindex text after WAL property replay
+                                let all_props = gs.properties.get_all_node_properties(*node_id);
+                                let text_content: String = all_props
+                                    .iter()
+                                    .filter(|(k, _)| !k.starts_with('_'))
+                                    .filter_map(|(_, v)| v.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
+                                if !text_content.is_empty() {
+                                    gs.text_index.index_node(*node_id, &text_content);
+                                } else {
+                                    gs.text_index.remove_node(*node_id);
                                 }
                             }
                         }
                     }
                 }
-                WalOperation::NodeDelete {
-                    graph_id,
-                    node_id,
-                } => {
+                WalOperation::NodeDelete { graph_id, node_id } => {
                     let registry = self.graphs.read();
-                    let graph_arc = registry.values()
+                    let graph_arc = registry
+                        .values()
                         .find(|arc| arc.read().graph_id == *graph_id)
                         .cloned();
                     drop(registry);
@@ -815,8 +941,11 @@ impl Engine {
                             gs.properties.remove_all_node_properties(*node_id);
                             #[cfg(feature = "vector")]
                             if let Err(e) = gs.vector_index.remove(*node_id) {
-                                tracing::warn!("WAL replay NodeDelete vector cleanup({node_id}) failed: {e}");
+                                tracing::warn!(
+                                    "WAL replay NodeDelete vector cleanup({node_id}) failed: {e}"
+                                );
                             }
+                            gs.text_index.remove_node(*node_id);
                         }
                     }
                 }
@@ -828,9 +957,12 @@ impl Engine {
                     label,
                     weight,
                     properties_json,
+                    valid_from,
+                    valid_until,
                 } => {
                     let registry = self.graphs.read();
-                    let graph_arc = registry.values()
+                    let graph_arc = registry
+                        .values()
                         .find(|arc| arc.read().graph_id == *graph_id)
                         .cloned();
                     drop(registry);
@@ -838,18 +970,38 @@ impl Engine {
                         let mut gs = graph_arc.write();
                         if let Ok(label_id) = gs.interner.intern_label(label) {
                             let now = Self::now_ms();
+                            let temporal = match (valid_from, valid_until) {
+                                (Some(vf), Some(vu)) => BiTemporal {
+                                    valid_from: *vf,
+                                    valid_until: *vu,
+                                    tx_from: *vf,
+                                    tx_until: BiTemporal::OPEN,
+                                },
+                                (Some(vf), None) => BiTemporal {
+                                    valid_from: *vf,
+                                    valid_until: BiTemporal::OPEN,
+                                    tx_from: *vf,
+                                    tx_until: BiTemporal::OPEN,
+                                },
+                                _ => BiTemporal::new_current(now),
+                            };
                             let meta = EdgeMeta {
                                 source: *source,
                                 target: *target,
                                 label: label_id,
-                                temporal: BiTemporal::new_current(now),
+                                temporal,
                                 provenance: None,
                                 weight: *weight,
                                 token_cost: 0,
                             };
                             // Use add_edge_with_id to preserve the original edge ID
-                            if let Err(e) = gs.adjacency.add_edge_with_id(*source, *target, label_id, meta, *edge_id) {
-                                tracing::warn!("WAL replay EdgeAdd({source}->{target}, id={edge_id}) failed: {e}");
+                            if let Err(e) = gs
+                                .adjacency
+                                .add_edge_with_id(*source, *target, label_id, meta, *edge_id)
+                            {
+                                tracing::warn!(
+                                    "WAL replay EdgeAdd({source}->{target}, id={edge_id}) failed: {e}"
+                                );
                                 replay_errors += 1;
                             }
                             // Ensure next_edge_id stays ahead of all replayed IDs
@@ -861,8 +1013,11 @@ impl Engine {
                             // Restore edge properties from WAL.
                             // Properties are serialized as serde-tagged Value enums, so we
                             // deserialize directly into HashMap<String, Value> for fidelity.
-                            if !properties_json.is_empty() && properties_json != "{}"
-                                && let Ok(props) = serde_json::from_str::<std::collections::HashMap<String, Value>>(properties_json)
+                            if !properties_json.is_empty()
+                                && properties_json != "{}"
+                                && let Ok(props) = serde_json::from_str::<
+                                    std::collections::HashMap<String, Value>,
+                                >(properties_json)
                             {
                                 for (k, v) in props {
                                     gs.properties.set_edge_property(*edge_id, &k, v);
@@ -877,7 +1032,8 @@ impl Engine {
                     timestamp,
                 } => {
                     let registry = self.graphs.read();
-                    let graph_arc = registry.values()
+                    let graph_arc = registry
+                        .values()
                         .find(|arc| arc.read().graph_id == *graph_id)
                         .cloned();
                     drop(registry);
@@ -889,12 +1045,10 @@ impl Engine {
                         }
                     }
                 }
-                WalOperation::EdgeDelete {
-                    graph_id,
-                    edge_id,
-                } => {
+                WalOperation::EdgeDelete { graph_id, edge_id } => {
                     let registry = self.graphs.read();
-                    let graph_arc = registry.values()
+                    let graph_arc = registry
+                        .values()
                         .find(|arc| arc.read().graph_id == *graph_id)
                         .cloned();
                     drop(registry);
@@ -904,6 +1058,7 @@ impl Engine {
                             tracing::warn!("WAL replay EdgeDelete({edge_id}) failed: {e}");
                             replay_errors += 1;
                         }
+                        gs.properties.remove_all_edge_properties(*edge_id);
                     }
                 }
                 WalOperation::VectorUpdate {
@@ -914,7 +1069,8 @@ impl Engine {
                     #[cfg(feature = "vector")]
                     {
                         let registry = self.graphs.read();
-                        let graph_arc = registry.values()
+                        let graph_arc = registry
+                            .values()
                             .find(|arc| arc.read().graph_id == *graph_id)
                             .cloned();
                         drop(registry);
@@ -928,7 +1084,9 @@ impl Engine {
                         }
                     }
                     #[cfg(not(feature = "vector"))]
-                    { let _ = (graph_id, node_id, vector); }
+                    {
+                        let _ = (graph_id, node_id, vector);
+                    }
                 }
                 WalOperation::Ingest { .. } => {
                     // Ingest WAL entries are metadata only; the actual data changes
@@ -938,7 +1096,8 @@ impl Engine {
         }
 
         // Clear replaying flag — normal WAL writes resume
-        self.replaying.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.replaying
+            .store(false, std::sync::atomic::Ordering::Relaxed);
 
         if replay_errors > 0 {
             tracing::warn!(
@@ -1048,16 +1207,14 @@ impl Engine {
             Command::Info => Ok(CommandResponse::Text(format!(
                 "weav-server v{} (graphs: {})",
                 env!("CARGO_PKG_VERSION"),
-                self.graphs
-                    .read()
-                    .len()
+                self.graphs.read().len()
             ))),
             Command::Stats(graph_name) => self.handle_stats(graph_name, identity),
             Command::Snapshot => self.handle_snapshot(),
             Command::GraphCreate(cmd) => self.handle_graph_create_authed(cmd, identity),
             Command::GraphDrop(name) => self.handle_graph_drop_authed(&name, identity),
             Command::GraphInfo(name) => self.handle_graph_info_authed(&name, identity),
-            Command::GraphList => self.handle_graph_list(),
+            Command::GraphList => self.handle_graph_list(identity),
             Command::NodeAdd(cmd) => self.handle_node_add_authed(cmd, identity),
             Command::NodeGet(cmd) => self.handle_node_get_authed(cmd, identity),
             Command::NodeUpdate(cmd) => self.handle_node_update_authed(cmd, identity),
@@ -1111,10 +1268,7 @@ impl Engine {
                         return Err(WeavError::AuthenticationRequired);
                     }
                     if let Some(id) = identity {
-                        self.check_authorization(
-                            &Command::Ingest(ingest_cmd.clone()),
-                            id,
-                        )?;
+                        self.check_authorization(&Command::Ingest(ingest_cmd.clone()), id)?;
                     }
                 }
                 // Defense-in-depth: verify write permission on the target graph.
@@ -1124,9 +1278,13 @@ impl Engine {
                     weav_auth::identity::GraphPermission::ReadWrite,
                 )?;
                 #[cfg(feature = "extract")]
-                { self.handle_ingest(ingest_cmd).await }
+                {
+                    self.handle_ingest(ingest_cmd).await
+                }
                 #[cfg(not(feature = "extract"))]
-                { Err(WeavError::ExtractionNotEnabled) }
+                {
+                    Err(WeavError::ExtractionNotEnabled)
+                }
             }
             other => self.execute_command(other, identity),
         }
@@ -1150,15 +1308,29 @@ impl Engine {
         // Classify the command.
         let category = match cmd {
             Command::Ping | Command::Info | Command::Auth { .. } => CommandCategory::Connection,
-            Command::NodeGet(_) | Command::EdgeGet(_) | Command::GraphInfo(_)
-            | Command::GraphList | Command::Stats(_) | Command::Context(_)
-            | Command::ConfigGet(_) | Command::AclWhoAmI
-            | Command::Search(_) | Command::SearchText(_) | Command::Neighbors(_)
-            | Command::SchemaGet(_) | Command::GraphCheck(_) => CommandCategory::Read,
-            Command::NodeAdd(_) | Command::NodeUpdate(_) | Command::NodeDelete(_)
-            | Command::EdgeAdd(_) | Command::EdgeDelete(_) | Command::EdgeInvalidate(_)
-            | Command::BulkInsertNodes(_) | Command::BulkInsertEdges(_)
-            | Command::Ingest(_) | Command::NodeMerge(_) => CommandCategory::Write,
+            Command::NodeGet(_)
+            | Command::EdgeGet(_)
+            | Command::GraphInfo(_)
+            | Command::GraphList
+            | Command::Stats(_)
+            | Command::Context(_)
+            | Command::ConfigGet(_)
+            | Command::AclWhoAmI
+            | Command::Search(_)
+            | Command::SearchText(_)
+            | Command::Neighbors(_)
+            | Command::SchemaGet(_)
+            | Command::GraphCheck(_) => CommandCategory::Read,
+            Command::NodeAdd(_)
+            | Command::NodeUpdate(_)
+            | Command::NodeDelete(_)
+            | Command::EdgeAdd(_)
+            | Command::EdgeDelete(_)
+            | Command::EdgeInvalidate(_)
+            | Command::BulkInsertNodes(_)
+            | Command::BulkInsertEdges(_)
+            | Command::Ingest(_)
+            | Command::NodeMerge(_) => CommandCategory::Write,
             Command::Cypher(c) => {
                 if c.query.trim_start().to_uppercase().starts_with("CREATE") {
                     CommandCategory::Write
@@ -1166,11 +1338,19 @@ impl Engine {
                     CommandCategory::Read
                 }
             }
-            Command::GraphCreate(_) | Command::GraphDrop(_) | Command::Snapshot
-            | Command::ConfigSet(_, _) | Command::AclSetUser(_) | Command::AclDelUser(_)
-            | Command::AclList | Command::AclGetUser(_) | Command::AclSave
-            | Command::AclLoad | Command::SchemaSet(_)
-            | Command::Backup(_) | Command::WalCompact
+            Command::GraphCreate(_)
+            | Command::GraphDrop(_)
+            | Command::Snapshot
+            | Command::ConfigSet(_, _)
+            | Command::AclSetUser(_)
+            | Command::AclDelUser(_)
+            | Command::AclList
+            | Command::AclGetUser(_)
+            | Command::AclSave
+            | Command::AclLoad
+            | Command::SchemaSet(_)
+            | Command::Backup(_)
+            | Command::WalCompact
             | Command::CreateIndex(_) => CommandCategory::Admin,
         };
 
@@ -1254,9 +1434,7 @@ impl Engine {
             weav_auth::identity::GraphPermission::ReadWrite => {
                 id.permissions.can_write_graph(graph_name)
             }
-            weav_auth::identity::GraphPermission::Read => {
-                id.permissions.can_read_graph(graph_name)
-            }
+            weav_auth::identity::GraphPermission::Read => id.permissions.can_read_graph(graph_name),
             weav_auth::identity::GraphPermission::None => true,
         };
         if !has_perm {
@@ -1287,8 +1465,9 @@ impl Engine {
             Command::SearchText(c) => Some(c.graph.clone()),
             Command::Neighbors(c) => Some(c.graph.clone()),
             Command::GraphCreate(c) => Some(c.name.clone()),
-            Command::GraphDrop(name) | Command::GraphInfo(name)
-            | Command::GraphCheck(name) => Some(name.clone()),
+            Command::GraphDrop(name) | Command::GraphInfo(name) | Command::GraphCheck(name) => {
+                Some(name.clone())
+            }
             Command::SchemaSet(c) => Some(c.graph.clone()),
             Command::SchemaGet(c) => Some(c.graph.clone()),
             Command::NodeMerge(c) => Some(c.graph.clone()),
@@ -1311,7 +1490,11 @@ impl Engine {
         cmd: weav_query::parser::GraphCreateCmd,
         identity: Option<&weav_auth::identity::SessionIdentity>,
     ) -> WeavResult<CommandResponse> {
-        self.check_permission(identity, &cmd.name, weav_auth::identity::GraphPermission::Admin)?;
+        self.check_permission(
+            identity,
+            &cmd.name,
+            weav_auth::identity::GraphPermission::Admin,
+        )?;
         self.handle_graph_create(cmd)
     }
 
@@ -1347,7 +1530,11 @@ impl Engine {
         cmd: weav_query::parser::NodeAddCmd,
         identity: Option<&weav_auth::identity::SessionIdentity>,
     ) -> WeavResult<CommandResponse> {
-        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::ReadWrite)?;
+        self.check_permission(
+            identity,
+            &cmd.graph,
+            weav_auth::identity::GraphPermission::ReadWrite,
+        )?;
         self.handle_node_add(cmd)
     }
 
@@ -1356,7 +1543,11 @@ impl Engine {
         cmd: weav_query::parser::NodeGetCmd,
         identity: Option<&weav_auth::identity::SessionIdentity>,
     ) -> WeavResult<CommandResponse> {
-        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::Read)?;
+        self.check_permission(
+            identity,
+            &cmd.graph,
+            weav_auth::identity::GraphPermission::Read,
+        )?;
         self.handle_node_get(cmd)
     }
 
@@ -1365,7 +1556,11 @@ impl Engine {
         cmd: weav_query::parser::NodeUpdateCmd,
         identity: Option<&weav_auth::identity::SessionIdentity>,
     ) -> WeavResult<CommandResponse> {
-        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::ReadWrite)?;
+        self.check_permission(
+            identity,
+            &cmd.graph,
+            weav_auth::identity::GraphPermission::ReadWrite,
+        )?;
         self.handle_node_update(cmd)
     }
 
@@ -1374,7 +1569,11 @@ impl Engine {
         cmd: weav_query::parser::NodeDeleteCmd,
         identity: Option<&weav_auth::identity::SessionIdentity>,
     ) -> WeavResult<CommandResponse> {
-        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::ReadWrite)?;
+        self.check_permission(
+            identity,
+            &cmd.graph,
+            weav_auth::identity::GraphPermission::ReadWrite,
+        )?;
         self.handle_node_delete(cmd)
     }
 
@@ -1383,7 +1582,11 @@ impl Engine {
         cmd: weav_query::parser::EdgeAddCmd,
         identity: Option<&weav_auth::identity::SessionIdentity>,
     ) -> WeavResult<CommandResponse> {
-        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::ReadWrite)?;
+        self.check_permission(
+            identity,
+            &cmd.graph,
+            weav_auth::identity::GraphPermission::ReadWrite,
+        )?;
         self.handle_edge_add(cmd)
     }
 
@@ -1392,7 +1595,11 @@ impl Engine {
         cmd: weav_query::parser::EdgeInvalidateCmd,
         identity: Option<&weav_auth::identity::SessionIdentity>,
     ) -> WeavResult<CommandResponse> {
-        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::ReadWrite)?;
+        self.check_permission(
+            identity,
+            &cmd.graph,
+            weav_auth::identity::GraphPermission::ReadWrite,
+        )?;
         self.handle_edge_invalidate(cmd)
     }
 
@@ -1401,7 +1608,11 @@ impl Engine {
         cmd: weav_query::parser::EdgeDeleteCmd,
         identity: Option<&weav_auth::identity::SessionIdentity>,
     ) -> WeavResult<CommandResponse> {
-        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::ReadWrite)?;
+        self.check_permission(
+            identity,
+            &cmd.graph,
+            weav_auth::identity::GraphPermission::ReadWrite,
+        )?;
         self.handle_edge_delete(cmd)
     }
 
@@ -1410,7 +1621,11 @@ impl Engine {
         cmd: weav_query::parser::EdgeGetCmd,
         identity: Option<&weav_auth::identity::SessionIdentity>,
     ) -> WeavResult<CommandResponse> {
-        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::Read)?;
+        self.check_permission(
+            identity,
+            &cmd.graph,
+            weav_auth::identity::GraphPermission::Read,
+        )?;
         self.handle_edge_get(cmd)
     }
 
@@ -1419,7 +1634,11 @@ impl Engine {
         cmd: weav_query::parser::BulkInsertNodesCmd,
         identity: Option<&weav_auth::identity::SessionIdentity>,
     ) -> WeavResult<CommandResponse> {
-        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::ReadWrite)?;
+        self.check_permission(
+            identity,
+            &cmd.graph,
+            weav_auth::identity::GraphPermission::ReadWrite,
+        )?;
         self.handle_bulk_insert_nodes(cmd)
     }
 
@@ -1428,7 +1647,11 @@ impl Engine {
         cmd: weav_query::parser::BulkInsertEdgesCmd,
         identity: Option<&weav_auth::identity::SessionIdentity>,
     ) -> WeavResult<CommandResponse> {
-        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::ReadWrite)?;
+        self.check_permission(
+            identity,
+            &cmd.graph,
+            weav_auth::identity::GraphPermission::ReadWrite,
+        )?;
         self.handle_bulk_insert_edges(cmd)
     }
 
@@ -1437,7 +1660,11 @@ impl Engine {
         query: weav_query::parser::ContextQuery,
         identity: Option<&weav_auth::identity::SessionIdentity>,
     ) -> WeavResult<CommandResponse> {
-        self.check_permission(identity, &query.graph, weav_auth::identity::GraphPermission::Read)?;
+        self.check_permission(
+            identity,
+            &query.graph,
+            weav_auth::identity::GraphPermission::Read,
+        )?;
         self.handle_context(query)
     }
 
@@ -1446,7 +1673,11 @@ impl Engine {
         cmd: weav_query::parser::NodeMergeCmd,
         identity: Option<&weav_auth::identity::SessionIdentity>,
     ) -> WeavResult<CommandResponse> {
-        self.check_permission(identity, &cmd.graph, weav_auth::identity::GraphPermission::ReadWrite)?;
+        self.check_permission(
+            identity,
+            &cmd.graph,
+            weav_auth::identity::GraphPermission::ReadWrite,
+        )?;
         self.handle_node_merge(cmd)
     }
 
@@ -1467,7 +1698,8 @@ impl Engine {
 
             // Compute label distribution
             let all_nodes = gs.adjacency.all_node_ids();
-            let mut label_counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+            let mut label_counts: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
             for nid in &all_nodes {
                 if let Some(label_val) = gs.properties.get_node_property(*nid, "_label") {
                     let label = label_val.as_str().unwrap_or("unknown").to_string();
@@ -1521,7 +1753,9 @@ impl Engine {
                 total_nodes += gs.adjacency.node_count();
                 total_edges += gs.adjacency.edge_count();
                 #[cfg(feature = "vector")]
-                { total_vectors += gs.vector_index.len(); }
+                {
+                    total_vectors += gs.vector_index.len();
+                }
             }
             Ok(CommandResponse::Text(format!(
                 "graphs={} total_nodes={} total_edges={} total_vectors={} engine=weav-server v{}",
@@ -1673,10 +1907,7 @@ impl Engine {
 
     // ── Search and neighbors commands ─────────────────────────────────────
 
-    fn handle_search(
-        &self,
-        cmd: weav_query::parser::SearchCmd,
-    ) -> WeavResult<CommandResponse> {
+    fn handle_search(&self, cmd: weav_query::parser::SearchCmd) -> WeavResult<CommandResponse> {
         let graph_arc = self.get_graph(&cmd.graph)?;
         let gs = graph_arc.read();
 
@@ -1685,14 +1916,12 @@ impl Engine {
             gs.properties.index.lookup(&cmd.key, &cmd.value)
         } else {
             let search_value = cmd.value.clone();
-            gs.properties.nodes_where(&cmd.key, &move |v| {
-                match v {
-                    Value::String(s) => s.as_str() == search_value,
-                    Value::Int(i) => i.to_string() == search_value,
-                    Value::Float(f) => f.to_string() == search_value,
-                    Value::Bool(b) => b.to_string() == search_value,
-                    _ => false,
-                }
+            gs.properties.nodes_where(&cmd.key, &move |v| match v {
+                Value::String(s) => s.as_str() == search_value,
+                Value::Int(i) => i.to_string() == search_value,
+                Value::Float(f) => f.to_string() == search_value,
+                Value::Bool(b) => b.to_string() == search_value,
+                _ => false,
             })
         };
 
@@ -1700,13 +1929,17 @@ impl Engine {
         let result_ids: Vec<u64> = matching.into_iter().take(limit).collect();
 
         // Build result strings: "node_id:label"
-        let results: Vec<String> = result_ids.iter().map(|&nid| {
-            let label = gs.properties
-                .get_node_property(nid, "_label")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            format!("{}:{}", nid, label)
-        }).collect();
+        let results: Vec<String> = result_ids
+            .iter()
+            .map(|&nid| {
+                let label = gs
+                    .properties
+                    .get_node_property(nid, "_label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                format!("{}:{}", nid, label)
+            })
+            .collect();
 
         Ok(CommandResponse::StringList(results))
     }
@@ -1731,13 +1964,17 @@ impl Engine {
         let results = gs.text_index.search(&cmd.query, limit);
 
         // Build result strings: "node_id:label:score"
-        let result_strings: Vec<String> = results.iter().map(|&(nid, score)| {
-            let label = gs.properties
-                .get_node_property(nid, "_label")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            format!("{}:{}:{:.4}", nid, label, score)
-        }).collect();
+        let result_strings: Vec<String> = results
+            .iter()
+            .map(|&(nid, score)| {
+                let label = gs
+                    .properties
+                    .get_node_property(nid, "_label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                format!("{}:{}:{:.4}", nid, label, score)
+            })
+            .collect();
 
         Ok(CommandResponse::StringList(result_strings))
     }
@@ -1755,38 +1992,43 @@ impl Engine {
             return Err(WeavError::NodeNotFound(cmd.node_id, gs.graph_id));
         }
 
-        let label_id = cmd.label.as_ref()
+        let label_id = cmd
+            .label
+            .as_ref()
             .and_then(|l| gs.interner.resolve_label_id(l));
 
         let neighbors = match cmd.direction {
-            Direction::Outgoing => {
-                gs.adjacency.neighbors_out(cmd.node_id, label_id)
-                    .into_iter()
-                    .map(|(nid, eid)| (nid, eid, Direction::Outgoing))
-                    .collect::<Vec<_>>()
-            }
-            Direction::Incoming => {
-                gs.adjacency.neighbors_in(cmd.node_id, label_id)
-                    .into_iter()
-                    .map(|(nid, eid)| (nid, eid, Direction::Incoming))
-                    .collect::<Vec<_>>()
-            }
-            Direction::Both => {
-                gs.adjacency.neighbors_both(cmd.node_id, label_id)
-            }
+            Direction::Outgoing => gs
+                .adjacency
+                .neighbors_out(cmd.node_id, label_id)
+                .into_iter()
+                .map(|(nid, eid)| (nid, eid, Direction::Outgoing))
+                .collect::<Vec<_>>(),
+            Direction::Incoming => gs
+                .adjacency
+                .neighbors_in(cmd.node_id, label_id)
+                .into_iter()
+                .map(|(nid, eid)| (nid, eid, Direction::Incoming))
+                .collect::<Vec<_>>(),
+            Direction::Both => gs.adjacency.neighbors_both(cmd.node_id, label_id),
         };
 
-        let results: Vec<String> = neighbors.iter().map(|&(nid, eid, ref dir)| {
-            let dir_str = match dir {
-                Direction::Outgoing => "OUT",
-                Direction::Incoming => "IN",
-                Direction::Both => "BOTH",
-            };
-            let edge_label = gs.adjacency.get_edge(eid)
-                .and_then(|e| gs.interner.resolve_label(e.label))
-                .unwrap_or("unknown");
-            format!("{}:{}:{}:{}", nid, eid, dir_str, edge_label)
-        }).collect();
+        let results: Vec<String> = neighbors
+            .iter()
+            .map(|&(nid, eid, ref dir)| {
+                let dir_str = match dir {
+                    Direction::Outgoing => "OUT",
+                    Direction::Incoming => "IN",
+                    Direction::Both => "BOTH",
+                };
+                let edge_label = gs
+                    .adjacency
+                    .get_edge(eid)
+                    .and_then(|e| gs.interner.resolve_label(e.label))
+                    .unwrap_or("unknown");
+                format!("{}:{}:{}:{}", nid, eid, dir_str, edge_label)
+            })
+            .collect();
 
         Ok(CommandResponse::StringList(results))
     }
@@ -1818,9 +2060,7 @@ impl Engine {
         };
 
         let graph_id = {
-            let mut id = self
-                .next_graph_id
-                .write();
+            let mut id = self.next_graph_id.write();
             let gid = *id;
             *id += 1;
             gid
@@ -1842,9 +2082,7 @@ impl Engine {
             access_times: HashMap::new(),
         };
 
-        let mut graphs = self
-            .graphs
-            .write();
+        let mut graphs = self.graphs.write();
 
         if graphs.contains_key(&cmd.name) {
             return Err(WeavError::Conflict(format!(
@@ -1861,31 +2099,41 @@ impl Engine {
         })?;
         graphs.insert(cmd.name, Arc::new(RwLock::new(graph_state)));
         #[cfg(feature = "observability")]
-        { crate::metrics::GRAPHS_TOTAL.set(graphs.len() as i64); }
+        {
+            crate::metrics::GRAPHS_TOTAL.set(graphs.len() as i64);
+        }
 
-        self.emit_event(&graph_name, EventKind::GraphCreated {
-            name: CompactString::from(&graph_name),
-        });
+        self.emit_event(
+            &graph_name,
+            EventKind::GraphCreated {
+                name: CompactString::from(&graph_name),
+            },
+        );
 
         Ok(CommandResponse::Ok)
     }
 
     fn handle_graph_drop(&self, name: &str) -> WeavResult<CommandResponse> {
-        let mut graphs = self
-            .graphs
-            .write();
+        let mut graphs = self.graphs.write();
         if !graphs.contains_key(name) {
             return Err(WeavError::GraphNotFound(name.to_string()));
         }
         // Write-ahead: WAL entry before in-memory mutation
-        self.append_wal(WalOperation::GraphDrop { name: name.to_string() })?;
+        self.append_wal(WalOperation::GraphDrop {
+            name: name.to_string(),
+        })?;
         graphs.remove(name);
         #[cfg(feature = "observability")]
-        { crate::metrics::GRAPHS_TOTAL.set(graphs.len() as i64); }
+        {
+            crate::metrics::GRAPHS_TOTAL.set(graphs.len() as i64);
+        }
 
-        self.emit_event(name, EventKind::GraphDropped {
-            name: CompactString::from(name),
-        });
+        self.emit_event(
+            name,
+            EventKind::GraphDropped {
+                name: CompactString::from(name),
+            },
+        );
 
         Ok(CommandResponse::Ok)
     }
@@ -1908,9 +2156,23 @@ impl Engine {
         }))
     }
 
-    fn handle_graph_list(&self) -> WeavResult<CommandResponse> {
+    fn handle_graph_list(
+        &self,
+        identity: Option<&weav_auth::identity::SessionIdentity>,
+    ) -> WeavResult<CommandResponse> {
         let registry = self.graphs.read();
-        let names: Vec<String> = registry.keys().cloned().collect();
+        let names: Vec<String> = if self.config.auth.enabled && self.config.auth.require_auth {
+            match identity {
+                Some(id) => registry
+                    .keys()
+                    .filter(|name| id.permissions.can_read_graph(name))
+                    .cloned()
+                    .collect(),
+                None => return Err(WeavError::AuthenticationRequired),
+            }
+        } else {
+            registry.keys().cloned().collect()
+        };
         Ok(CommandResponse::StringList(names))
     }
 
@@ -1979,19 +2241,17 @@ impl Engine {
 
     // ── Node commands ────────────────────────────────────────────────────
 
-    fn handle_node_add(
-        &self,
-        cmd: weav_query::parser::NodeAddCmd,
-    ) -> WeavResult<CommandResponse> {
+    fn handle_node_add(&self, cmd: weav_query::parser::NodeAddCmd) -> WeavResult<CommandResponse> {
         let graph_arc = self.get_graph(&cmd.graph)?;
         let mut gs = graph_arc.write();
 
         // ── Dedup: entity key (always-on, zero false positives) ─────────
         if let Some(ref key) = cmd.entity_key
-            && let Some(existing_id) = weav_graph::dedup::find_duplicate_by_key(
-                &gs.properties, "entity_key", key,
-            )
+            && let Some(existing_id) =
+                weav_graph::dedup::find_duplicate_by_key(&gs.properties, "entity_key", key)
         {
+            let graph_id = gs.graph_id;
+
             // Merge properties into existing node
             weav_graph::dedup::merge_properties(
                 &mut gs.properties,
@@ -2007,6 +2267,55 @@ impl Engine {
                 gs.vector_index.insert(existing_id, embedding)?;
             }
 
+            // WAL: persist property merge
+            let merged_props_json = serde_json::to_string(
+                &cmd.properties
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v))
+                    .collect::<std::collections::HashMap<_, _>>(),
+            )
+            .unwrap_or_default();
+            self.append_wal(WalOperation::NodeUpdate {
+                graph_id,
+                node_id: existing_id,
+                properties_json: merged_props_json,
+            })?;
+            #[cfg(feature = "vector")]
+            if let Some(ref embedding) = cmd.embedding {
+                self.append_wal(WalOperation::VectorUpdate {
+                    graph_id,
+                    node_id: existing_id,
+                    vector: embedding.clone(),
+                })?;
+            }
+
+            // CDC event
+            self.emit_event(
+                &cmd.graph,
+                EventKind::NodeUpdated {
+                    node_id: existing_id,
+                    properties: cmd
+                        .properties
+                        .iter()
+                        .map(|(k, v)| (CompactString::from(k.as_str()), v.clone()))
+                        .collect(),
+                },
+            );
+
+            // Reindex text after property merge
+            let all_props = gs.properties.get_all_node_properties(existing_id);
+            let text_content: String = all_props
+                .iter()
+                .filter(|(k, _)| !k.starts_with('_'))
+                .filter_map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !text_content.is_empty() {
+                gs.text_index.index_node(existing_id, &text_content);
+            } else {
+                gs.text_index.remove_node(existing_id);
+            }
+
             return Ok(CommandResponse::Integer(existing_id));
         }
 
@@ -2015,7 +2324,9 @@ impl Engine {
             && let Some(ref name_field) = dedup_cfg.name_field
         {
             // Extract the name value from the incoming properties
-            let name_value = cmd.properties.iter()
+            let name_value = cmd
+                .properties
+                .iter()
                 .find(|(k, _)| k == name_field)
                 .and_then(|(_, v)| v.as_str())
                 .map(|s| s.to_string());
@@ -2039,6 +2350,8 @@ impl Engine {
                     };
 
                     if label_matches {
+                        let graph_id = gs.graph_id;
+
                         weav_graph::dedup::merge_properties(
                             &mut gs.properties,
                             existing_id,
@@ -2050,6 +2363,55 @@ impl Engine {
                         if let Some(ref embedding) = cmd.embedding {
                             let _ = gs.vector_index.remove(existing_id);
                             gs.vector_index.insert(existing_id, embedding)?;
+                        }
+
+                        // WAL: persist property merge
+                        let merged_props_json = serde_json::to_string(
+                            &cmd.properties
+                                .iter()
+                                .map(|(k, v)| (k.as_str(), v))
+                                .collect::<std::collections::HashMap<_, _>>(),
+                        )
+                        .unwrap_or_default();
+                        self.append_wal(WalOperation::NodeUpdate {
+                            graph_id,
+                            node_id: existing_id,
+                            properties_json: merged_props_json,
+                        })?;
+                        #[cfg(feature = "vector")]
+                        if let Some(ref embedding) = cmd.embedding {
+                            self.append_wal(WalOperation::VectorUpdate {
+                                graph_id,
+                                node_id: existing_id,
+                                vector: embedding.clone(),
+                            })?;
+                        }
+
+                        // CDC event
+                        self.emit_event(
+                            &cmd.graph,
+                            EventKind::NodeUpdated {
+                                node_id: existing_id,
+                                properties: cmd
+                                    .properties
+                                    .iter()
+                                    .map(|(k, v)| (CompactString::from(k.as_str()), v.clone()))
+                                    .collect(),
+                            },
+                        );
+
+                        // Reindex text after property merge
+                        let all_props = gs.properties.get_all_node_properties(existing_id);
+                        let text_content: String = all_props
+                            .iter()
+                            .filter(|(k, _)| !k.starts_with('_'))
+                            .filter_map(|(_, v)| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        if !text_content.is_empty() {
+                            gs.text_index.index_node(existing_id, &text_content);
+                        } else {
+                            gs.text_index.remove_node(existing_id);
                         }
 
                         return Ok(CommandResponse::Integer(existing_id));
@@ -2074,6 +2436,8 @@ impl Engine {
                     &similarities,
                     dedup_cfg.vector_threshold,
                 ) {
+                    let graph_id = gs.graph_id;
+
                     weav_graph::dedup::merge_properties(
                         &mut gs.properties,
                         existing_id,
@@ -2083,6 +2447,52 @@ impl Engine {
 
                     let _ = gs.vector_index.remove(existing_id);
                     gs.vector_index.insert(existing_id, embedding)?;
+
+                    // WAL: persist property merge + vector update
+                    let merged_props_json = serde_json::to_string(
+                        &cmd.properties
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v))
+                            .collect::<std::collections::HashMap<_, _>>(),
+                    )
+                    .unwrap_or_default();
+                    self.append_wal(WalOperation::NodeUpdate {
+                        graph_id,
+                        node_id: existing_id,
+                        properties_json: merged_props_json,
+                    })?;
+                    self.append_wal(WalOperation::VectorUpdate {
+                        graph_id,
+                        node_id: existing_id,
+                        vector: embedding.clone(),
+                    })?;
+
+                    // CDC event
+                    self.emit_event(
+                        &cmd.graph,
+                        EventKind::NodeUpdated {
+                            node_id: existing_id,
+                            properties: cmd
+                                .properties
+                                .iter()
+                                .map(|(k, v)| (CompactString::from(k.as_str()), v.clone()))
+                                .collect(),
+                        },
+                    );
+
+                    // Reindex text after property merge
+                    let all_props = gs.properties.get_all_node_properties(existing_id);
+                    let text_content: String = all_props
+                        .iter()
+                        .filter(|(k, _)| !k.starts_with('_'))
+                        .filter_map(|(_, v)| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if !text_content.is_empty() {
+                        gs.text_index.index_node(existing_id, &text_content);
+                    } else {
+                        gs.text_index.remove_node(existing_id);
+                    }
 
                     return Ok(CommandResponse::Integer(existing_id));
                 }
@@ -2097,7 +2507,8 @@ impl Engine {
                 match gs.config.eviction_policy {
                     EvictionPolicy::LRU => {
                         // Find least recently used node
-                        let victim_id = gs.access_times
+                        let victim_id = gs
+                            .access_times
                             .iter()
                             .min_by_key(|&(_, ts)| *ts)
                             .map(|(&id, _)| id)
@@ -2109,7 +2520,8 @@ impl Engine {
                     }
                     _ => {
                         return Err(WeavError::CapacityExceeded(format!(
-                            "graph '{}' reached max_nodes limit ({})", cmd.graph, max
+                            "graph '{}' reached max_nodes limit ({})",
+                            cmd.graph, max
                         )));
                     }
                 }
@@ -2117,27 +2529,39 @@ impl Engine {
         }
 
         // ── Schema validation ────────────────────────────────────────────
-        gs.config.schema.validate_node_properties(&cmd.label, &cmd.properties)?;
+        gs.config
+            .schema
+            .validate_node_properties(&cmd.label, &cmd.properties)?;
 
         // Uniqueness constraint enforcement
-        for constraint in gs.config.schema.node_schemas
+        for constraint in gs
+            .config
+            .schema
+            .node_schemas
             .get(cmd.label.as_str())
             .map(|s| s.constraints.as_slice())
             .unwrap_or_default()
         {
             if let weav_core::schema::SchemaConstraint::PropertyUnique { property } = constraint {
-                if let Some((_, prop_val)) = cmd.properties.iter().find(|(k, _)| k == property.as_str()) {
+                if let Some((_, prop_val)) =
+                    cmd.properties.iter().find(|(k, _)| k == property.as_str())
+                {
                     if *prop_val != Value::Null {
                         let search_val = prop_val.clone();
-                        let existing = gs.properties.nodes_where(property.as_str(), &|v| *v == search_val);
+                        let existing = gs
+                            .properties
+                            .nodes_where(property.as_str(), &|v| *v == search_val);
                         // Filter to only nodes with the same label
-                        let duplicates: Vec<_> = existing.into_iter().filter(|&nid| {
-                            gs.properties
-                                .get_node_property(nid, "_label")
-                                .and_then(|v| v.as_str())
-                                .map(|l| l == cmd.label)
-                                .unwrap_or(false)
-                        }).collect();
+                        let duplicates: Vec<_> = existing
+                            .into_iter()
+                            .filter(|&nid| {
+                                gs.properties
+                                    .get_node_property(nid, "_label")
+                                    .and_then(|v| v.as_str())
+                                    .map(|l| l == cmd.label)
+                                    .unwrap_or(false)
+                            })
+                            .collect();
                         if !duplicates.is_empty() {
                             return Err(WeavError::Conflict(format!(
                                 "unique constraint violation: property '{}' value already exists on label '{}'",
@@ -2155,8 +2579,13 @@ impl Engine {
 
         // Write-ahead: WAL entry before in-memory mutation
         let props_json = serde_json::to_string(
-            &cmd.properties.iter().map(|(k, v)| (k.as_str(), v)).collect::<std::collections::HashMap<_, _>>()
-        ).unwrap_or_default();
+            &cmd.properties
+                .iter()
+                .map(|(k, v)| (k.as_str(), v))
+                .collect::<std::collections::HashMap<_, _>>(),
+        )
+        .unwrap_or_default();
+        let now = Self::now_ms();
         self.append_wal(WalOperation::NodeAdd {
             graph_id,
             node_id,
@@ -2164,6 +2593,8 @@ impl Engine {
             properties_json: props_json,
             embedding: cmd.embedding.clone(),
             entity_key: cmd.entity_key.clone(),
+            ttl_ms: cmd.ttl_ms,
+            created_at: Some(now),
         })?;
 
         // Apply in-memory mutation
@@ -2191,8 +2622,16 @@ impl Engine {
             gs.properties.set_node_property(node_id, k, v.clone());
         }
 
+        // Set temporal metadata for importance scoring and temporal queries
+        gs.properties
+            .set_node_property(node_id, "_created_at", Value::Timestamp(now));
+        gs.properties
+            .set_node_property(node_id, "_tx_from", Value::Int(now as i64));
+
         // Auto-index text content for full-text search
-        let text_content: String = cmd.properties.iter()
+        let text_content: String = cmd
+            .properties
+            .iter()
             .filter_map(|(_, v)| v.as_str())
             .collect::<Vec<_>>()
             .join(" ");
@@ -2208,7 +2647,7 @@ impl Engine {
         // Store TTL expiry timestamp — explicit TTL overrides graph default
         let effective_ttl = cmd.ttl_ms.or(gs.config.default_ttl_ms);
         if let Some(ttl_ms) = effective_ttl {
-            let expires_at = Self::now_ms() + ttl_ms;
+            let expires_at = now + ttl_ms;
             gs.properties.set_node_property(
                 node_id,
                 "_ttl_expires_at",
@@ -2224,13 +2663,18 @@ impl Engine {
                 .set(gs.adjacency.node_count() as i64);
         }
 
-        self.emit_event(&cmd.graph, EventKind::NodeCreated {
-            node_id,
-            label: CompactString::from(&cmd.label),
-            properties: cmd.properties.iter()
-                .map(|(k, v)| (CompactString::from(k.as_str()), v.clone()))
-                .collect(),
-        });
+        self.emit_event(
+            &cmd.graph,
+            EventKind::NodeCreated {
+                node_id,
+                label: CompactString::from(&cmd.label),
+                properties: cmd
+                    .properties
+                    .iter()
+                    .map(|(k, v)| (CompactString::from(k.as_str()), v.clone()))
+                    .collect(),
+            },
+        );
 
         // Record initial LRU access time for the new node.
         Self::record_access(&mut gs, node_id);
@@ -2238,10 +2682,7 @@ impl Engine {
         Ok(CommandResponse::Integer(node_id))
     }
 
-    fn handle_node_get(
-        &self,
-        cmd: weav_query::parser::NodeGetCmd,
-    ) -> WeavResult<CommandResponse> {
+    fn handle_node_get(&self, cmd: weav_query::parser::NodeGetCmd) -> WeavResult<CommandResponse> {
         let graph_arc = self.get_graph(&cmd.graph)?;
         let mut gs = graph_arc.write();
 
@@ -2313,8 +2754,11 @@ impl Engine {
         gs.adjacency.remove_node(cmd.node_id)?;
         gs.properties.remove_all_node_properties(cmd.node_id);
         #[cfg(feature = "vector")]
-        { gs.vector_index.remove(cmd.node_id)?; }
+        {
+            gs.vector_index.remove(cmd.node_id)?;
+        }
         gs.text_index.remove_node(cmd.node_id);
+        gs.access_times.remove(&cmd.node_id);
 
         // Update metrics
         #[cfg(feature = "observability")]
@@ -2327,9 +2771,12 @@ impl Engine {
                 .set(gs.adjacency.edge_count() as i64);
         }
 
-        self.emit_event(&cmd.graph, EventKind::NodeDeleted {
-            node_id: cmd.node_id,
-        });
+        self.emit_event(
+            &cmd.graph,
+            EventKind::NodeDeleted {
+                node_id: cmd.node_id,
+            },
+        );
 
         Ok(CommandResponse::Ok)
     }
@@ -2366,10 +2813,7 @@ impl Engine {
             .collect();
 
         for (key, src_val) in &source_props {
-            let target_has = gs
-                .properties
-                .get_node_property(cmd.target_id, key)
-                .cloned();
+            let target_has = gs.properties.get_node_property(cmd.target_id, key).cloned();
             match target_has {
                 None => {
                     // Target missing this property, always copy
@@ -2388,6 +2832,20 @@ impl Engine {
                     // "keep_target" and "merge" both keep target value on conflict
                 }
             }
+        }
+
+        let merged_target_props = gs.properties.get_all_node_properties(cmd.target_id);
+        let target_text_content: String = merged_target_props
+            .iter()
+            .filter(|(k, _)| !k.starts_with('_'))
+            .filter_map(|(_, v)| v.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !target_text_content.is_empty() {
+            gs.text_index
+                .index_node(cmd.target_id, &target_text_content);
+        } else {
+            gs.text_index.remove_node(cmd.target_id);
         }
 
         // 3. Re-link edges from source to target
@@ -2476,6 +2934,8 @@ impl Engine {
                 label: label_str,
                 weight: ei.weight,
                 properties_json: props_json,
+                valid_from: Some(ei.temporal.valid_from),
+                valid_until: Some(ei.temporal.valid_until),
             })?;
 
             gs.adjacency
@@ -2505,7 +2965,11 @@ impl Engine {
         gs.adjacency.remove_node(cmd.source_id)?;
         gs.properties.remove_all_node_properties(cmd.source_id);
         #[cfg(feature = "vector")]
-        { let _ = gs.vector_index.remove(cmd.source_id); }
+        {
+            let _ = gs.vector_index.remove(cmd.source_id);
+        }
+        gs.text_index.remove_node(cmd.source_id);
+        gs.access_times.remove(&cmd.source_id);
 
         // Update metrics
         #[cfg(feature = "observability")]
@@ -2527,13 +2991,19 @@ impl Engine {
             .map(|(k, v)| (CompactString::from(k), v.clone()))
             .collect();
 
-        self.emit_event(&cmd.graph, EventKind::NodeDeleted {
-            node_id: cmd.source_id,
-        });
-        self.emit_event(&cmd.graph, EventKind::NodeUpdated {
-            node_id: cmd.target_id,
-            properties: target_props,
-        });
+        self.emit_event(
+            &cmd.graph,
+            EventKind::NodeDeleted {
+                node_id: cmd.source_id,
+            },
+        );
+        self.emit_event(
+            &cmd.graph,
+            EventKind::NodeUpdated {
+                node_id: cmd.target_id,
+                properties: target_props,
+            },
+        );
 
         Ok(CommandResponse::Integer(cmd.target_id))
     }
@@ -2552,8 +3022,12 @@ impl Engine {
         // Write-ahead: WAL entry before in-memory mutation
         let graph_id = gs.graph_id;
         let props_json = serde_json::to_string(
-            &cmd.properties.iter().map(|(k, v)| (k.as_str(), v)).collect::<std::collections::HashMap<_, _>>()
-        ).unwrap_or_default();
+            &cmd.properties
+                .iter()
+                .map(|(k, v)| (k.as_str(), v))
+                .collect::<std::collections::HashMap<_, _>>(),
+        )
+        .unwrap_or_default();
         self.append_wal(WalOperation::NodeUpdate {
             graph_id,
             node_id: cmd.node_id,
@@ -2565,13 +3039,18 @@ impl Engine {
             gs.properties.set_node_property(cmd.node_id, k, v.clone());
         }
 
-        // Re-index text content for full-text search
-        let text_content: String = cmd.properties.iter()
+        // Re-index text content using ALL node properties (not just the delta)
+        let all_props = gs.properties.get_all_node_properties(cmd.node_id);
+        let text_content: String = all_props
+            .iter()
+            .filter(|(k, _)| !k.starts_with('_'))
             .filter_map(|(_, v)| v.as_str())
             .collect::<Vec<_>>()
             .join(" ");
         if !text_content.is_empty() {
             gs.text_index.index_node(cmd.node_id, &text_content);
+        } else {
+            gs.text_index.remove_node(cmd.node_id);
         }
 
         #[cfg(feature = "vector")]
@@ -2586,12 +3065,17 @@ impl Engine {
             gs.vector_index.insert(cmd.node_id, embedding)?;
         }
 
-        self.emit_event(&cmd.graph, EventKind::NodeUpdated {
-            node_id: cmd.node_id,
-            properties: cmd.properties.iter()
-                .map(|(k, v)| (CompactString::from(k.as_str()), v.clone()))
-                .collect(),
-        });
+        self.emit_event(
+            &cmd.graph,
+            EventKind::NodeUpdated {
+                node_id: cmd.node_id,
+                properties: cmd
+                    .properties
+                    .iter()
+                    .map(|(k, v)| (CompactString::from(k.as_str()), v.clone()))
+                    .collect(),
+            },
+        );
 
         Ok(CommandResponse::Ok)
     }
@@ -2603,16 +3087,38 @@ impl Engine {
         let graph_arc = self.get_graph(&cmd.graph)?;
         let mut gs = graph_arc.write();
 
+        // Enforce max_nodes capacity if configured
+        if let Some(max) = gs.config.max_nodes {
+            if gs.adjacency.node_count() + cmd.nodes.len() as u64 > max {
+                return Err(WeavError::CapacityExceeded(format!(
+                    "bulk insert of {} nodes would exceed max_nodes limit ({})",
+                    cmd.nodes.len(),
+                    max
+                )));
+            }
+        }
+
         let graph_id = gs.graph_id;
+        let now = Self::now_ms();
         let mut ids = Vec::with_capacity(cmd.nodes.len());
         for node_cmd in &cmd.nodes {
+            // Schema validation before mutation
+            gs.config
+                .schema
+                .validate_node_properties(&node_cmd.label, &node_cmd.properties)?;
+
             let node_id = gs.next_node_id;
             gs.next_node_id += 1;
 
             // Write-ahead: WAL entry before in-memory mutation
             let props_json = serde_json::to_string(
-                &node_cmd.properties.iter().map(|(k, v)| (k.as_str(), v)).collect::<std::collections::HashMap<_, _>>()
-            ).unwrap_or_default();
+                &node_cmd
+                    .properties
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v))
+                    .collect::<std::collections::HashMap<_, _>>(),
+            )
+            .unwrap_or_default();
             self.append_wal(WalOperation::NodeAdd {
                 graph_id,
                 node_id,
@@ -2620,6 +3126,8 @@ impl Engine {
                 properties_json: props_json,
                 embedding: node_cmd.embedding.clone(),
                 entity_key: node_cmd.entity_key.clone(),
+                ttl_ms: node_cmd.ttl_ms,
+                created_at: Some(now),
             })?;
 
             gs.adjacency.add_node(node_id);
@@ -2646,18 +3154,51 @@ impl Engine {
                 gs.properties.set_node_property(node_id, k, v.clone());
             }
 
+            // Set temporal metadata
+            gs.properties
+                .set_node_property(node_id, "_created_at", Value::Timestamp(now));
+            gs.properties
+                .set_node_property(node_id, "_tx_from", Value::Int(now as i64));
+
+            // Auto-index text content for full-text search
+            let text_content: String = node_cmd
+                .properties
+                .iter()
+                .filter_map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !text_content.is_empty() {
+                gs.text_index.index_node(node_id, &text_content);
+            }
+
+            // Store TTL expiry timestamp — explicit TTL overrides graph default
+            let effective_ttl = node_cmd.ttl_ms.or(gs.config.default_ttl_ms);
+            if let Some(ttl_ms) = effective_ttl {
+                let expires_at = now + ttl_ms;
+                gs.properties.set_node_property(
+                    node_id,
+                    "_ttl_expires_at",
+                    Value::Timestamp(expires_at),
+                );
+            }
+
             #[cfg(feature = "vector")]
             if let Some(ref embedding) = node_cmd.embedding {
                 gs.vector_index.insert(node_id, embedding)?;
             }
 
-            self.emit_event(&cmd.graph, EventKind::NodeCreated {
-                node_id,
-                label: CompactString::from(&node_cmd.label),
-                properties: node_cmd.properties.iter()
-                    .map(|(k, v)| (CompactString::from(k.as_str()), v.clone()))
-                    .collect(),
-            });
+            self.emit_event(
+                &cmd.graph,
+                EventKind::NodeCreated {
+                    node_id,
+                    label: CompactString::from(&node_cmd.label),
+                    properties: node_cmd
+                        .properties
+                        .iter()
+                        .map(|(k, v)| (CompactString::from(k.as_str()), v.clone()))
+                        .collect(),
+                },
+            );
 
             ids.push(node_id);
         }
@@ -2675,17 +3216,51 @@ impl Engine {
         let now = Self::now_ms();
         let graph_id = gs.graph_id;
 
+        // Enforce max_edges capacity if configured
+        if let Some(max) = gs.config.max_edges {
+            if gs.adjacency.edge_count() + cmd.edges.len() as u64 > max {
+                return Err(WeavError::CapacityExceeded(format!(
+                    "bulk insert of {} edges would exceed max_edges limit ({})",
+                    cmd.edges.len(),
+                    max
+                )));
+            }
+        }
+
         let mut ids = Vec::with_capacity(cmd.edges.len());
         for edge_cmd in &cmd.edges {
+            // Schema validation before mutation
+            gs.config
+                .schema
+                .validate_edge_properties(&edge_cmd.label, &edge_cmd.properties)?;
+
             let label_id = gs.interner.intern_label(&edge_cmd.label)?;
 
             // Pre-allocate edge ID for write-ahead logging
             let edge_id = gs.adjacency.allocate_edge_id();
 
+            // Compute temporal with TTL support
+            let effective_ttl = edge_cmd.ttl_ms.or(gs.config.default_ttl_ms);
+            let temporal = if let Some(ttl_ms) = effective_ttl {
+                BiTemporal {
+                    valid_from: now,
+                    valid_until: now + ttl_ms,
+                    tx_from: now,
+                    tx_until: BiTemporal::OPEN,
+                }
+            } else {
+                BiTemporal::new_current(now)
+            };
+
             // Serialize edge properties for WAL persistence
             let props_json = serde_json::to_string(
-                &edge_cmd.properties.iter().map(|(k, v)| (k.as_str(), v)).collect::<std::collections::HashMap<_, _>>()
-            ).unwrap_or_default();
+                &edge_cmd
+                    .properties
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v))
+                    .collect::<std::collections::HashMap<_, _>>(),
+            )
+            .unwrap_or_default();
 
             // Write-ahead: WAL entry before in-memory mutation
             self.append_wal(WalOperation::EdgeAdd {
@@ -2696,6 +3271,8 @@ impl Engine {
                 label: edge_cmd.label.clone(),
                 weight: edge_cmd.weight,
                 properties_json: props_json,
+                valid_from: Some(temporal.valid_from),
+                valid_until: Some(temporal.valid_until),
             })?;
 
             // Apply in-memory mutation
@@ -2703,25 +3280,34 @@ impl Engine {
                 source: edge_cmd.source,
                 target: edge_cmd.target,
                 label: label_id,
-                temporal: BiTemporal::new_current(now),
+                temporal,
                 provenance: None,
                 weight: edge_cmd.weight,
                 token_cost: 0,
             };
-            gs.adjacency.add_edge_with_id(edge_cmd.source, edge_cmd.target, label_id, meta, edge_id)?;
+            gs.adjacency.add_edge_with_id(
+                edge_cmd.source,
+                edge_cmd.target,
+                label_id,
+                meta,
+                edge_id,
+            )?;
 
             // Store edge properties
             for (k, v) in &edge_cmd.properties {
                 gs.properties.set_edge_property(edge_id, k, v.clone());
             }
 
-            self.emit_event(&cmd.graph, EventKind::EdgeCreated {
-                edge_id,
-                source: edge_cmd.source,
-                target: edge_cmd.target,
-                label: CompactString::from(&edge_cmd.label),
-                weight: edge_cmd.weight,
-            });
+            self.emit_event(
+                &cmd.graph,
+                EventKind::EdgeCreated {
+                    edge_id,
+                    source: edge_cmd.source,
+                    target: edge_cmd.target,
+                    label: CompactString::from(&edge_cmd.label),
+                    weight: edge_cmd.weight,
+                },
+            );
 
             ids.push(edge_id);
         }
@@ -2731,10 +3317,7 @@ impl Engine {
 
     // ── Edge commands ────────────────────────────────────────────────────
 
-    fn handle_edge_add(
-        &self,
-        cmd: weav_query::parser::EdgeAddCmd,
-    ) -> WeavResult<CommandResponse> {
+    fn handle_edge_add(&self, cmd: weav_query::parser::EdgeAddCmd) -> WeavResult<CommandResponse> {
         let graph_arc = self.get_graph(&cmd.graph)?;
         let mut gs = graph_arc.write();
 
@@ -2745,31 +3328,45 @@ impl Engine {
         if let Some(max) = gs.config.max_edges {
             if gs.adjacency.edge_count() >= max {
                 return Err(WeavError::CapacityExceeded(format!(
-                    "graph '{}' reached max_edges limit ({})", cmd.graph, max
+                    "graph '{}' reached max_edges limit ({})",
+                    cmd.graph, max
                 )));
             }
         }
 
         // ── Schema validation ────────────────────────────────────────────
-        gs.config.schema.validate_edge_properties(&cmd.label, &cmd.properties)?;
+        gs.config
+            .schema
+            .validate_edge_properties(&cmd.label, &cmd.properties)?;
 
         // Uniqueness constraint enforcement for edges
-        for constraint in gs.config.schema.edge_schemas
+        for constraint in gs
+            .config
+            .schema
+            .edge_schemas
             .get(cmd.label.as_str())
             .map(|s| s.constraints.as_slice())
             .unwrap_or_default()
         {
             if let weav_core::schema::SchemaConstraint::PropertyUnique { property } = constraint {
-                if let Some((_, prop_val)) = cmd.properties.iter().find(|(k, _)| k == property.as_str()) {
+                if let Some((_, prop_val)) =
+                    cmd.properties.iter().find(|(k, _)| k == property.as_str())
+                {
                     if *prop_val != Value::Null {
                         let search_val = prop_val.clone();
-                        let existing = gs.properties.edges_where(property.as_str(), &|v| *v == search_val);
+                        let existing = gs
+                            .properties
+                            .edges_where(property.as_str(), &|v| *v == search_val);
                         // Filter to only edges with the same label
-                        let duplicates: Vec<_> = existing.into_iter().filter(|&eid| {
-                            gs.adjacency.get_edge(eid)
-                                .map(|meta| meta.label == label_id)
-                                .unwrap_or(false)
-                        }).collect();
+                        let duplicates: Vec<_> = existing
+                            .into_iter()
+                            .filter(|&eid| {
+                                gs.adjacency
+                                    .get_edge(eid)
+                                    .map(|meta| meta.label == label_id)
+                                    .unwrap_or(false)
+                            })
+                            .collect();
                         if !duplicates.is_empty() {
                             return Err(WeavError::Conflict(format!(
                                 "unique constraint violation: property '{}' value already exists on edge label '{}'",
@@ -2787,21 +3384,14 @@ impl Engine {
 
         // Serialize edge properties for WAL persistence
         let props_json = serde_json::to_string(
-            &cmd.properties.iter().map(|(k, v)| (k.as_str(), v)).collect::<std::collections::HashMap<_, _>>()
-        ).unwrap_or_default();
+            &cmd.properties
+                .iter()
+                .map(|(k, v)| (k.as_str(), v))
+                .collect::<std::collections::HashMap<_, _>>(),
+        )
+        .unwrap_or_default();
 
-        // Write-ahead: WAL entry before in-memory mutation
-        self.append_wal(WalOperation::EdgeAdd {
-            graph_id,
-            edge_id,
-            source: cmd.source,
-            target: cmd.target,
-            label: cmd.label.clone(),
-            weight: cmd.weight,
-            properties_json: props_json,
-        })?;
-
-        // Apply in-memory mutation — explicit TTL overrides graph default
+        // Compute temporal before WAL write so temporal fields are persisted
         let effective_ttl = cmd.ttl_ms.or(gs.config.default_ttl_ms);
         let temporal = if let Some(ttl_ms) = effective_ttl {
             BiTemporal {
@@ -2813,6 +3403,19 @@ impl Engine {
         } else {
             BiTemporal::new_current(now)
         };
+
+        // Write-ahead: WAL entry before in-memory mutation
+        self.append_wal(WalOperation::EdgeAdd {
+            graph_id,
+            edge_id,
+            source: cmd.source,
+            target: cmd.target,
+            label: cmd.label.clone(),
+            weight: cmd.weight,
+            properties_json: props_json,
+            valid_from: Some(temporal.valid_from),
+            valid_until: Some(temporal.valid_until),
+        })?;
         let meta = EdgeMeta {
             source: cmd.source,
             target: cmd.target,
@@ -2822,7 +3425,8 @@ impl Engine {
             weight: cmd.weight,
             token_cost: 0,
         };
-        gs.adjacency.add_edge_with_id(cmd.source, cmd.target, label_id, meta, edge_id)?;
+        gs.adjacency
+            .add_edge_with_id(cmd.source, cmd.target, label_id, meta, edge_id)?;
 
         // Store edge properties
         for (k, v) in &cmd.properties {
@@ -2837,13 +3441,16 @@ impl Engine {
                 .set(gs.adjacency.edge_count() as i64);
         }
 
-        self.emit_event(&cmd.graph, EventKind::EdgeCreated {
-            edge_id,
-            source: cmd.source,
-            target: cmd.target,
-            label: CompactString::from(&cmd.label),
-            weight: cmd.weight,
-        });
+        self.emit_event(
+            &cmd.graph,
+            EventKind::EdgeCreated {
+                edge_id,
+                source: cmd.source,
+                target: cmd.target,
+                label: CompactString::from(&cmd.label),
+                weight: cmd.weight,
+            },
+        );
 
         Ok(CommandResponse::Integer(edge_id))
     }
@@ -2859,7 +3466,8 @@ impl Engine {
         let graph_id = gs.graph_id;
 
         // Verify edge exists before WAL write
-        gs.adjacency.get_edge(cmd.edge_id)
+        gs.adjacency
+            .get_edge(cmd.edge_id)
             .ok_or(WeavError::EdgeNotFound(cmd.edge_id))?;
 
         // Write-ahead: WAL entry before in-memory mutation
@@ -2871,9 +3479,12 @@ impl Engine {
 
         gs.adjacency.invalidate_edge(cmd.edge_id, now)?;
 
-        self.emit_event(&cmd.graph, EventKind::EdgeInvalidated {
-            edge_id: cmd.edge_id,
-        });
+        self.emit_event(
+            &cmd.graph,
+            EventKind::EdgeInvalidated {
+                edge_id: cmd.edge_id,
+            },
+        );
 
         Ok(CommandResponse::Ok)
     }
@@ -2888,7 +3499,8 @@ impl Engine {
         let graph_id = gs.graph_id;
 
         // Verify edge exists before WAL write
-        gs.adjacency.get_edge(cmd.edge_id)
+        gs.adjacency
+            .get_edge(cmd.edge_id)
             .ok_or(WeavError::EdgeNotFound(cmd.edge_id))?;
 
         // Write-ahead: WAL entry before in-memory mutation
@@ -2898,18 +3510,19 @@ impl Engine {
         })?;
 
         gs.adjacency.remove_edge(cmd.edge_id)?;
+        gs.properties.remove_all_edge_properties(cmd.edge_id);
 
-        self.emit_event(&cmd.graph, EventKind::EdgeDeleted {
-            edge_id: cmd.edge_id,
-        });
+        self.emit_event(
+            &cmd.graph,
+            EventKind::EdgeDeleted {
+                edge_id: cmd.edge_id,
+            },
+        );
 
         Ok(CommandResponse::Ok)
     }
 
-    fn handle_edge_get(
-        &self,
-        cmd: weav_query::parser::EdgeGetCmd,
-    ) -> WeavResult<CommandResponse> {
+    fn handle_edge_get(&self, cmd: weav_query::parser::EdgeGetCmd) -> WeavResult<CommandResponse> {
         let graph_arc = self.get_graph(&cmd.graph)?;
         let gs = graph_arc.read();
 
@@ -2934,17 +3547,13 @@ impl Engine {
     }
 
     fn handle_config_set(&self, key: String, value: String) -> WeavResult<CommandResponse> {
-        let mut config = self
-            .runtime_config
-            .write();
+        let mut config = self.runtime_config.write();
         config.insert(key, value);
         Ok(CommandResponse::Ok)
     }
 
     fn handle_config_get(&self, key: String) -> WeavResult<CommandResponse> {
-        let config = self
-            .runtime_config
-            .read();
+        let config = self.runtime_config.read();
         match config.get(&key) {
             Some(val) => Ok(CommandResponse::Text(val.clone())),
             None => Ok(CommandResponse::Null),
@@ -3029,8 +3638,8 @@ impl Engine {
         let graph_arc = self.get_graph(&cmd.graph)?;
         let gs = graph_arc.read();
 
-        let schema_json = serde_json::to_string_pretty(&gs.config.schema)
-            .unwrap_or_else(|_| "{}".to_string());
+        let schema_json =
+            serde_json::to_string_pretty(&gs.config.schema).unwrap_or_else(|_| "{}".to_string());
         Ok(CommandResponse::Text(schema_json))
     }
 
@@ -3050,7 +3659,9 @@ impl Engine {
             registry.values().cloned().collect()
         };
 
-        let wal_sequence = self.wal.as_ref()
+        let wal_sequence = self
+            .wal
+            .as_ref()
             .map(|w| w.lock().sequence_number())
             .unwrap_or(0);
 
@@ -3062,7 +3673,8 @@ impl Engine {
             let gs = graph_arc.read();
             let mut node_snapshots = Vec::new();
             for node_id in gs.adjacency.all_node_ids() {
-                let label = gs.properties
+                let label = gs
+                    .properties
                     .get_node_property(node_id, "_label")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown")
@@ -3070,23 +3682,28 @@ impl Engine {
 
                 let all_props = gs.properties.get_all_node_properties(node_id);
                 let props_json = {
+                    // Preserve temporal/TTL/group internal properties in snapshots;
+                    // _label and _label_id are handled separately by NodeSnapshot.label
+                    const PRESERVED_INTERNAL: &[&str] =
+                        &["_created_at", "_tx_from", "_ttl_expires_at", "_group_id"];
                     let filtered: std::collections::HashMap<&str, &Value> = all_props
                         .into_iter()
-                        .filter(|(k, _)| !k.starts_with('_'))
+                        .filter(|(k, _)| {
+                            !k.starts_with('_') || PRESERVED_INTERNAL.contains(&k.as_ref())
+                        })
                         .collect();
                     serde_json::to_string(&filtered).unwrap_or_default()
                 };
 
-                let entity_key = gs.properties
+                let entity_key = gs
+                    .properties
                     .get_node_property(node_id, "entity_key")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
                 // Retrieve embedding from vector index for snapshot persistence
                 #[cfg(feature = "vector")]
-                let embedding = gs.vector_index
-                    .get_vector(node_id)
-                    .map(|v| v.to_vec());
+                let embedding = gs.vector_index.get_vector(node_id).map(|v| v.to_vec());
                 #[cfg(not(feature = "vector"))]
                 let embedding: Option<Vec<f32>> = None;
 
@@ -3101,7 +3718,8 @@ impl Engine {
 
             let mut edge_snapshots = Vec::new();
             for (edge_id, meta) in gs.adjacency.all_edges() {
-                let label = gs.interner
+                let label = gs
+                    .interner
                     .resolve_label(meta.label)
                     .unwrap_or("unknown")
                     .to_string();
@@ -3109,9 +3727,8 @@ impl Engine {
                 // Serialize edge properties for snapshot persistence
                 let all_edge_props = gs.properties.get_all_edge_properties(edge_id);
                 let edge_props_json = {
-                    let props_map: std::collections::HashMap<&str, &Value> = all_edge_props
-                        .into_iter()
-                        .collect();
+                    let props_map: std::collections::HashMap<&str, &Value> =
+                        all_edge_props.into_iter().collect();
                     serde_json::to_string(&props_map).unwrap_or_default()
                 };
 
@@ -3154,7 +3771,8 @@ impl Engine {
             graphs: graph_snapshots,
         };
 
-        let _saved_path = snapshot_engine.save_snapshot(&full_snapshot)
+        let _saved_path = snapshot_engine
+            .save_snapshot(&full_snapshot)
             .map_err(|e| WeavError::Internal(format!("snapshot save failed: {e}")))?;
 
         #[cfg(feature = "observability")]
@@ -3259,15 +3877,18 @@ impl Engine {
                 .with_label_values(&[&graph_name])
                 .set(gs.vector_index.len() as i64);
 
-            let strategy = query.budget.as_ref().map_or("auto", |b| {
-                match &b.allocation {
+            let strategy = query
+                .budget
+                .as_ref()
+                .map_or("auto", |b| match &b.allocation {
                     weav_core::types::TokenAllocation::Auto => "auto",
                     weav_core::types::TokenAllocation::Proportional { .. } => "proportional",
                     weav_core::types::TokenAllocation::Priority(_) => "priority",
                     weav_core::types::TokenAllocation::DiversityAware { .. } => "mmr",
-                    weav_core::types::TokenAllocation::SubmodularFacilityLocation { .. } => "submodular",
-                }
-            });
+                    weav_core::types::TokenAllocation::SubmodularFacilityLocation { .. } => {
+                        "submodular"
+                    }
+                });
             crate::metrics::TOKEN_BUDGET_USAGE
                 .with_label_values(&[&graph_name, strategy])
                 .observe(result.budget_used as f64);
@@ -3310,11 +3931,9 @@ impl Engine {
         }
 
         // Sort by importance (lowest first)
-        candidates.sort_by(|a, b| {
-            a.1.partial_cmp(&b.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
+        let graph_id = gs.graph_id;
         let mut condensed = 0u64;
         for (victim_id, _) in &candidates {
             // Skip if already removed (neighbor of a previously condensed node)
@@ -3324,38 +3943,59 @@ impl Engine {
 
             let neighbors = gs.adjacency.neighbors_both(*victim_id, None);
             if neighbors.is_empty() {
+                // WAL: persist node deletion
+                self.append_wal(WalOperation::NodeDelete {
+                    graph_id,
+                    node_id: *victim_id,
+                })?;
                 // Isolated node -- just remove
                 let _ = gs.adjacency.remove_node(*victim_id);
                 gs.properties.remove_all_node_properties(*victim_id);
                 gs.text_index.remove_node(*victim_id);
                 #[cfg(feature = "vector")]
-                { let _ = gs.vector_index.remove(*victim_id); }
+                {
+                    let _ = gs.vector_index.remove(*victim_id);
+                }
                 gs.access_times.remove(victim_id);
                 condensed += 1;
+                self.emit_event(
+                    graph_name,
+                    EventKind::NodeDeleted {
+                        node_id: *victim_id,
+                    },
+                );
                 continue;
             }
 
             // Find best neighbor (highest importance)
             let best_neighbor = neighbors
                 .iter()
-                .map(|&(nbr, _, _)| {
-                    (nbr, compute_node_importance(&gs, nbr, now).importance)
-                })
-                .max_by(|a, b| {
-                    a.1.partial_cmp(&b.1)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+                .map(|&(nbr, _, _)| (nbr, compute_node_importance(&gs, nbr, now).importance))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(nid, _)| nid);
 
             if let Some(_target) = best_neighbor {
+                // WAL: persist node deletion
+                self.append_wal(WalOperation::NodeDelete {
+                    graph_id,
+                    node_id: *victim_id,
+                })?;
                 // Remove the victim node (cascades edges via AdjacencyStore::remove_node)
                 let _ = gs.adjacency.remove_node(*victim_id);
                 gs.properties.remove_all_node_properties(*victim_id);
                 gs.text_index.remove_node(*victim_id);
                 #[cfg(feature = "vector")]
-                { let _ = gs.vector_index.remove(*victim_id); }
+                {
+                    let _ = gs.vector_index.remove(*victim_id);
+                }
                 gs.access_times.remove(victim_id);
                 condensed += 1;
+                self.emit_event(
+                    graph_name,
+                    EventKind::NodeDeleted {
+                        node_id: *victim_id,
+                    },
+                );
             }
         }
 
@@ -3374,6 +4014,209 @@ impl Engine {
             "Condensed {} nodes (threshold: {})",
             condensed, importance_threshold
         )))
+    }
+
+    // ── Community summarize handler ──────────────────────────────────────
+
+    /// Run community detection and create summary nodes with WAL + CDC support.
+    ///
+    /// Removes any existing `_community_summary` nodes, runs the chosen community
+    /// detection algorithm, and creates a new summary node per community.
+    pub fn handle_community_summarize(
+        &self,
+        graph_name: &str,
+        algorithm: &str,
+        max_iterations: u32,
+        resolution: f32,
+    ) -> WeavResult<serde_json::Value> {
+        let graph_arc = self.get_graph(graph_name)?;
+        let mut gs = graph_arc.write();
+        let graph_id = gs.graph_id;
+
+        // Run community detection
+        let communities: std::collections::HashMap<u64, u64> = match algorithm {
+            "label_propagation" => {
+                weav_graph::traversal::label_propagation(&gs.adjacency, max_iterations)
+            }
+            _ => weav_graph::traversal::leiden_communities(
+                &gs.adjacency,
+                max_iterations,
+                resolution,
+                0.01,
+            ),
+        };
+
+        // Group nodes by community
+        let mut community_members: std::collections::HashMap<u64, Vec<u64>> =
+            std::collections::HashMap::new();
+        for (&node_id, &comm_id) in &communities {
+            community_members.entry(comm_id).or_default().push(node_id);
+        }
+
+        // Remove existing community summary nodes
+        let existing_summaries: Vec<u64> = gs
+            .adjacency
+            .all_node_ids()
+            .iter()
+            .filter(|&&nid| {
+                gs.properties
+                    .get_node_property(nid, "_label")
+                    .and_then(|v| v.as_str())
+                    == Some("_community_summary")
+            })
+            .copied()
+            .collect();
+
+        for &nid in &existing_summaries {
+            // WAL entry before in-memory mutation
+            self.append_wal(WalOperation::NodeDelete {
+                graph_id,
+                node_id: nid,
+            })?;
+
+            let _ = gs.adjacency.remove_node(nid);
+            gs.properties.remove_all_node_properties(nid);
+            gs.text_index.remove_node(nid);
+
+            self.emit_event(graph_name, EventKind::NodeDeleted { node_id: nid });
+        }
+
+        // Create summary nodes for each community
+        let mut summary_nodes: Vec<serde_json::Value> = Vec::new();
+        for (comm_id, members) in &community_members {
+            // Build summary text from member properties
+            let mut summary_parts: Vec<String> = Vec::new();
+            for &member_nid in members {
+                let label = gs
+                    .properties
+                    .get_node_property(member_nid, "_label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let name = gs
+                    .properties
+                    .get_node_property(member_nid, "name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let desc = gs
+                    .properties
+                    .get_node_property(member_nid, "description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !name.is_empty() {
+                    if !desc.is_empty() {
+                        summary_parts.push(format!("{label} '{name}': {desc}"));
+                    } else {
+                        summary_parts.push(format!("{label} '{name}'"));
+                    }
+                }
+            }
+            let summary_text = if summary_parts.is_empty() {
+                format!("Community {} with {} members", comm_id, members.len())
+            } else {
+                summary_parts.join("; ")
+            };
+
+            let node_id = gs.next_node_id;
+            gs.next_node_id += 1;
+
+            // Build properties map for WAL
+            let mut props_map = std::collections::HashMap::new();
+            props_map.insert("community_id", serde_json::Value::from(*comm_id as i64));
+            props_map.insert("summary", serde_json::Value::from(summary_text.as_str()));
+            props_map.insert(
+                "member_count",
+                serde_json::Value::from(members.len() as i64),
+            );
+            let member_ids_json: Vec<serde_json::Value> = members
+                .iter()
+                .map(|&id| serde_json::Value::from(id as i64))
+                .collect();
+            props_map.insert("member_node_ids", serde_json::Value::Array(member_ids_json));
+            let props_json = serde_json::to_string(&props_map).unwrap_or_default();
+
+            // WAL entry before in-memory mutation
+            self.append_wal(WalOperation::NodeAdd {
+                graph_id,
+                node_id,
+                label: "_community_summary".to_string(),
+                properties_json: props_json,
+                embedding: None,
+                entity_key: None,
+                ttl_ms: None,
+                created_at: None,
+            })?;
+
+            // Apply in-memory mutation
+            gs.adjacency.add_node(node_id);
+            gs.properties.set_node_property(
+                node_id,
+                "_label",
+                Value::String(CompactString::from("_community_summary")),
+            );
+            gs.properties
+                .set_node_property(node_id, "community_id", Value::Int(*comm_id as i64));
+            gs.properties.set_node_property(
+                node_id,
+                "summary",
+                Value::String(CompactString::from(summary_text.as_str())),
+            );
+            gs.properties.set_node_property(
+                node_id,
+                "member_count",
+                Value::Int(members.len() as i64),
+            );
+            let member_ids: Vec<Value> = members.iter().map(|&id| Value::Int(id as i64)).collect();
+            gs.properties
+                .set_node_property(node_id, "member_node_ids", Value::List(member_ids));
+
+            // Index the summary text for BM25 search
+            gs.text_index.index_node(node_id, &summary_text);
+
+            // CDC event after successful mutation
+            self.emit_event(
+                graph_name,
+                EventKind::NodeCreated {
+                    node_id,
+                    label: CompactString::from("_community_summary"),
+                    properties: vec![
+                        (
+                            CompactString::from("community_id"),
+                            Value::Int(*comm_id as i64),
+                        ),
+                        (
+                            CompactString::from("summary"),
+                            Value::String(CompactString::from(summary_text.as_str())),
+                        ),
+                        (
+                            CompactString::from("member_count"),
+                            Value::Int(members.len() as i64),
+                        ),
+                    ],
+                },
+            );
+
+            summary_nodes.push(serde_json::json!({
+                "node_id": node_id,
+                "community_id": comm_id,
+                "member_count": members.len(),
+                "summary": summary_text,
+            }));
+        }
+
+        // Update metrics
+        #[cfg(feature = "observability")]
+        {
+            crate::metrics::NODES_TOTAL
+                .with_label_values(&[graph_name])
+                .set(gs.adjacency.node_count() as i64);
+        }
+
+        Ok(serde_json::json!({
+            "algorithm": algorithm,
+            "community_count": community_members.len(),
+            "summaries": summary_nodes,
+            "removed_previous": existing_summaries.len(),
+        }))
     }
 
     // ── Ingest handler ────────────────────────────────────────────────────
@@ -3426,8 +4269,7 @@ impl Engine {
 
         // Run extraction pipeline.
         let result =
-            weav_extract::pipeline::run_pipeline(input_doc, &options, &self.config.extract)
-                .await?;
+            weav_extract::pipeline::run_pipeline(input_doc, &options, &self.config.extract).await?;
 
         // Write-ahead: WAL entry before in-memory mutation
         self.append_wal(WalOperation::Ingest {
@@ -3482,11 +4324,8 @@ impl Engine {
                 "_label",
                 Value::String(CompactString::from("chunk")),
             );
-            gs.properties.set_node_property(
-                node_id,
-                "_label_id",
-                Value::Int(label_id as i64),
-            );
+            gs.properties
+                .set_node_property(node_id, "_label_id", Value::Int(label_id as i64));
             gs.properties.set_node_property(
                 node_id,
                 "text",
@@ -3509,13 +4348,39 @@ impl Engine {
             );
 
             // Set temporal metadata.
-            gs.properties.set_node_property(node_id, "_tx_from", Value::Int(now as i64));
+            gs.properties
+                .set_node_property(node_id, "_tx_from", Value::Int(now as i64));
 
             // Insert embedding.
             #[cfg(feature = "vector")]
             if !cwe.embedding.is_empty() {
                 let _ = gs.vector_index.insert(node_id, &cwe.embedding);
             }
+
+            // WAL: persist chunk node for crash recovery.
+            let chunk_props = gs.properties.get_all_node_properties(node_id);
+            let chunk_props_json = serde_json::to_string(
+                &chunk_props
+                    .into_iter()
+                    .filter(|(k, _)| !k.starts_with('_'))
+                    .collect::<std::collections::HashMap<_, _>>(),
+            )
+            .unwrap_or_default();
+            let chunk_embedding = if cwe.embedding.is_empty() {
+                None
+            } else {
+                Some(cwe.embedding.clone())
+            };
+            self.append_wal(WalOperation::NodeAdd {
+                graph_id: gs.graph_id,
+                node_id,
+                label: "chunk".to_string(),
+                properties_json: chunk_props_json,
+                embedding: chunk_embedding,
+                entity_key: None,
+                ttl_ms: None,
+                created_at: Some(now),
+            })?;
         }
 
         // Build entity name -> node_id map for relationship linking.
@@ -3537,6 +4402,22 @@ impl Engine {
                     &entity.properties,
                     &ConflictPolicy::LastWriteWins,
                 );
+
+                // WAL: persist entity property merge for crash recovery.
+                let merged_props = gs.properties.get_all_node_properties(existing_id);
+                let merged_props_json = serde_json::to_string(
+                    &merged_props
+                        .into_iter()
+                        .filter(|(k, _)| !k.starts_with('_'))
+                        .collect::<std::collections::HashMap<_, _>>(),
+                )
+                .unwrap_or_default();
+                self.append_wal(WalOperation::NodeUpdate {
+                    graph_id: gs.graph_id,
+                    node_id: existing_id,
+                    properties_json: merged_props_json,
+                })?;
+
                 entity_node_map.insert(entity_key, existing_id);
                 entities_merged += 1;
                 continue;
@@ -3552,11 +4433,8 @@ impl Engine {
                 "_label",
                 Value::String(CompactString::from(&entity.entity_type)),
             );
-            gs.properties.set_node_property(
-                node_id,
-                "_label_id",
-                Value::Int(label_id as i64),
-            );
+            gs.properties
+                .set_node_property(node_id, "_label_id", Value::Int(label_id as i64));
             gs.properties.set_node_property(
                 node_id,
                 "entity_key",
@@ -3591,13 +4469,34 @@ impl Engine {
             }
 
             // Set temporal metadata.
-            gs.properties.set_node_property(node_id, "_tx_from", Value::Int(now as i64));
+            gs.properties
+                .set_node_property(node_id, "_tx_from", Value::Int(now as i64));
 
             // Insert embedding.
             #[cfg(feature = "vector")]
             if let Some(ref embedding) = ewe.embedding {
                 let _ = gs.vector_index.insert(node_id, embedding);
             }
+
+            // WAL: persist entity node for crash recovery.
+            let entity_props = gs.properties.get_all_node_properties(node_id);
+            let entity_props_json = serde_json::to_string(
+                &entity_props
+                    .into_iter()
+                    .filter(|(k, _)| !k.starts_with('_'))
+                    .collect::<std::collections::HashMap<_, _>>(),
+            )
+            .unwrap_or_default();
+            self.append_wal(WalOperation::NodeAdd {
+                graph_id: gs.graph_id,
+                node_id,
+                label: entity.entity_type.clone(),
+                properties_json: entity_props_json,
+                embedding: ewe.embedding.clone(),
+                entity_key: Some(entity_key.clone()),
+                ttl_ms: None,
+                created_at: Some(now),
+            })?;
 
             entity_node_map.insert(entity_key, node_id);
             entities_created += 1;
@@ -3627,8 +4526,28 @@ impl Engine {
                     weight: rel.weight,
                     token_cost: 0,
                 };
-                let _ = gs.adjacency.add_edge(src, tgt, label_id, edge_meta);
-                relationships_created += 1;
+                if let Ok(edge_id) = gs.adjacency.add_edge(src, tgt, label_id, edge_meta) {
+                    // WAL: persist relationship edge for crash recovery.
+                    let edge_props_json = serde_json::to_string(
+                        &rel.properties
+                            .iter()
+                            .map(|(k, v)| (k.as_str(), v))
+                            .collect::<std::collections::HashMap<_, _>>(),
+                    )
+                    .unwrap_or_default();
+                    self.append_wal(WalOperation::EdgeAdd {
+                        graph_id: gs.graph_id,
+                        edge_id,
+                        source: src,
+                        target: tgt,
+                        label: rel.relationship_type.clone(),
+                        weight: rel.weight,
+                        properties_json: edge_props_json,
+                        valid_from: Some(now),
+                        valid_until: None,
+                    })?;
+                    relationships_created += 1;
+                }
             }
         }
 
@@ -3659,12 +4578,23 @@ impl Engine {
         match result {
             Ok(identity) => {
                 #[cfg(feature = "observability")]
-                { crate::metrics::AUTH_ATTEMPTS_TOTAL.with_label_values(&["success"]).inc(); }
-                Ok(CommandResponse::Text(format!("OK (user: {})", identity.username)))
+                {
+                    crate::metrics::AUTH_ATTEMPTS_TOTAL
+                        .with_label_values(&["success"])
+                        .inc();
+                }
+                Ok(CommandResponse::Text(format!(
+                    "OK (user: {})",
+                    identity.username
+                )))
             }
             Err(e) => {
                 #[cfg(feature = "observability")]
-                { crate::metrics::AUTH_ATTEMPTS_TOTAL.with_label_values(&["failure"]).inc(); }
+                {
+                    crate::metrics::AUTH_ATTEMPTS_TOTAL
+                        .with_label_values(&["failure"])
+                        .inc();
+                }
                 Err(e)
             }
         }
@@ -3677,29 +4607,28 @@ impl Engine {
         let store = self.acl_store()?;
 
         // Get or create user.
-        let mut user = store.get_user(&cmd.username).unwrap_or_else(|| {
-            weav_auth::acl::AclUser {
+        let mut user = store
+            .get_user(&cmd.username)
+            .unwrap_or_else(|| weav_auth::acl::AclUser {
                 username: cmd.username.clone(),
                 password_hash: None,
                 enabled: true,
                 categories: weav_auth::identity::CommandCategorySet::all(),
                 graph_acl: Vec::new(),
                 api_key_hashes: Vec::new(),
-            }
-        });
+            });
 
         // Apply modifications.
         if let Some(pw) = &cmd.password {
-            user.password_hash = Some(
-                weav_auth::password::hash_password(pw)
-                    .map_err(WeavError::Internal)?,
-            );
+            user.password_hash =
+                Some(weav_auth::password::hash_password(pw).map_err(WeavError::Internal)?);
         }
         if let Some(enabled) = cmd.enabled {
             user.enabled = enabled;
         }
         if !cmd.categories.is_empty() {
-            user.categories = weav_auth::identity::CommandCategorySet::from_acl_strings(&cmd.categories);
+            user.categories =
+                weav_auth::identity::CommandCategorySet::from_acl_strings(&cmd.categories);
         }
         if !cmd.graph_patterns.is_empty() {
             user.graph_acl = cmd
@@ -3740,7 +4669,9 @@ impl Engine {
             Some(user) => {
                 let info = format!(
                     "user={} enabled={} has_password={}",
-                    user.username, user.enabled, user.password_hash.is_some()
+                    user.username,
+                    user.enabled,
+                    user.password_hash.is_some()
                 );
                 Ok(CommandResponse::Text(info))
             }
@@ -3789,10 +4720,7 @@ impl Engine {
 
     // ── Cypher query handlers ────────────────────────────────────────────
 
-    fn handle_cypher(
-        &self,
-        cmd: weav_query::parser::CypherCmd,
-    ) -> WeavResult<CommandResponse> {
+    fn handle_cypher(&self, cmd: weav_query::parser::CypherCmd) -> WeavResult<CommandResponse> {
         let trimmed = cmd.query.trim();
         let upper = trimmed.to_uppercase();
 
@@ -3808,11 +4736,7 @@ impl Engine {
         }
     }
 
-    fn execute_cypher_match(
-        &self,
-        graph: &str,
-        query: &str,
-    ) -> WeavResult<CommandResponse> {
+    fn execute_cypher_match(&self, graph: &str, query: &str) -> WeavResult<CommandResponse> {
         let upper = query.to_uppercase();
 
         // Detect relationship traversal: (n)-[r:TYPE]->(m) or (n)-[r]->(m)
@@ -3986,16 +4910,13 @@ impl Engine {
         ))
     }
 
-    fn execute_cypher_create(
-        &self,
-        graph: &str,
-        query: &str,
-    ) -> WeavResult<CommandResponse> {
+    fn execute_cypher_create(&self, graph: &str, query: &str) -> WeavResult<CommandResponse> {
         // Parse: CREATE (n:Label {key: 'value', ...})
-        let label = cypher_extract_label(query)
-            .ok_or_else(|| WeavError::QueryParseError(
+        let label = cypher_extract_label(query).ok_or_else(|| {
+            WeavError::QueryParseError(
                 "CREATE requires a node label: CREATE (n:Label {props})".into(),
-            ))?;
+            )
+        })?;
 
         let properties = cypher_extract_create_properties(query);
 
@@ -4123,13 +5044,23 @@ fn parse_where_expr(text: &str) -> CypherWhere {
     // Split by OR first (lower precedence)
     let or_parts = split_by_keyword(text, " OR ");
     if or_parts.len() > 1 {
-        return CypherWhere::Or(or_parts.into_iter().map(|p| parse_where_expr(p.trim())).collect());
+        return CypherWhere::Or(
+            or_parts
+                .into_iter()
+                .map(|p| parse_where_expr(p.trim()))
+                .collect(),
+        );
     }
 
     // Split by AND
     let and_parts = split_by_keyword(text, " AND ");
     if and_parts.len() > 1 {
-        return CypherWhere::And(and_parts.into_iter().map(|p| parse_where_expr(p.trim())).collect());
+        return CypherWhere::And(
+            and_parts
+                .into_iter()
+                .map(|p| parse_where_expr(p.trim()))
+                .collect(),
+        );
     }
 
     // Single condition
@@ -4160,7 +5091,10 @@ fn split_by_keyword<'a>(text: &'a str, keyword: &str) -> Vec<&'a str> {
             i += 1;
             continue;
         }
-        if !in_quote && i + kw_upper.len() <= upper.len() && upper[i..i + kw_upper.len()] == *kw_upper {
+        if !in_quote
+            && i + kw_upper.len() <= upper.len()
+            && upper[i..i + kw_upper.len()] == *kw_upper
+        {
             parts.push(&text[start..i]);
             start = i + keyword.len();
             i = start;
@@ -4180,32 +5114,52 @@ fn parse_single_condition(text: &str) -> CypherCondition {
     if upper.ends_with("IS NOT NULL") {
         let key_part = text[..text.len() - 11].trim();
         let key = strip_var_prefix(key_part);
-        return CypherCondition { key, op: CypherOp::IsNotNull, value: String::new() };
+        return CypherCondition {
+            key,
+            op: CypherOp::IsNotNull,
+            value: String::new(),
+        };
     }
     // IS NULL
     if upper.ends_with("IS NULL") {
         let key_part = text[..text.len() - 7].trim();
         let key = strip_var_prefix(key_part);
-        return CypherCondition { key, op: CypherOp::IsNull, value: String::new() };
+        return CypherCondition {
+            key,
+            op: CypherOp::IsNull,
+            value: String::new(),
+        };
     }
 
     // CONTAINS
     if let Some(pos) = find_keyword(&upper, " CONTAINS ") {
         let key = strip_var_prefix(text[..pos].trim());
         let val = extract_condition_value(text[pos + 10..].trim());
-        return CypherCondition { key, op: CypherOp::Contains, value: val };
+        return CypherCondition {
+            key,
+            op: CypherOp::Contains,
+            value: val,
+        };
     }
     // STARTS WITH
     if let Some(pos) = find_keyword(&upper, " STARTS WITH ") {
         let key = strip_var_prefix(text[..pos].trim());
         let val = extract_condition_value(text[pos + 13..].trim());
-        return CypherCondition { key, op: CypherOp::StartsWith, value: val };
+        return CypherCondition {
+            key,
+            op: CypherOp::StartsWith,
+            value: val,
+        };
     }
     // ENDS WITH
     if let Some(pos) = find_keyword(&upper, " ENDS WITH ") {
         let key = strip_var_prefix(text[..pos].trim());
         let val = extract_condition_value(text[pos + 11..].trim());
-        return CypherCondition { key, op: CypherOp::EndsWith, value: val };
+        return CypherCondition {
+            key,
+            op: CypherOp::EndsWith,
+            value: val,
+        };
     }
 
     // Comparison operators: <>, <=, >=, <, >, =
@@ -4223,12 +5177,20 @@ fn parse_single_condition(text: &str) -> CypherCondition {
         (CypherOp::Eq, (p, 1))
     } else {
         // Fallback: treat as equality with empty value
-        return CypherCondition { key: text.to_string(), op: CypherOp::Eq, value: String::new() };
+        return CypherCondition {
+            key: text.to_string(),
+            op: CypherOp::Eq,
+            value: String::new(),
+        };
     };
 
     let key = strip_var_prefix(text[..op_len.0].trim());
     let val = extract_condition_value(text[op_len.0 + op_len.1..].trim());
-    CypherCondition { key, op, value: val }
+    CypherCondition {
+        key,
+        op,
+        value: val,
+    }
 }
 
 /// Find a keyword in text (case-insensitive), not inside quotes.
@@ -4249,7 +5211,9 @@ fn strip_var_prefix(key_part: &str) -> String {
 fn extract_condition_value(val_part: &str) -> String {
     let trimmed = val_part.trim();
     // Handle quoted strings (can contain spaces)
-    if (trimmed.starts_with('\'') && trimmed.len() > 1) || (trimmed.starts_with('"') && trimmed.len() > 1) {
+    if (trimmed.starts_with('\'') && trimmed.len() > 1)
+        || (trimmed.starts_with('"') && trimmed.len() > 1)
+    {
         let quote = trimmed.as_bytes()[0] as char;
         if let Some(end) = trimmed[1..].find(quote) {
             return trimmed[1..1 + end].to_string();
@@ -4360,19 +5324,19 @@ fn cypher_compare_numeric(prop: &Value, value: &str, op: &CypherOp) -> bool {
 /// Aggregation function types for RETURN clauses.
 #[derive(Debug, Clone)]
 enum CypherAggregation {
-    Count(String),           // COUNT(n) or COUNT(n.prop)
-    CountDistinct(String),   // COUNT(DISTINCT n.prop)
-    Sum(String),             // SUM(n.prop)
-    Avg(String),             // AVG(n.prop)
-    Min(String),             // MIN(n.prop)
-    Max(String),             // MAX(n.prop)
-    Collect(String),         // COLLECT(n.prop)
+    Count(String),         // COUNT(n) or COUNT(n.prop)
+    CountDistinct(String), // COUNT(DISTINCT n.prop)
+    Sum(String),           // SUM(n.prop)
+    Avg(String),           // AVG(n.prop)
+    Min(String),           // MIN(n.prop)
+    Max(String),           // MAX(n.prop)
+    Collect(String),       // COLLECT(n.prop)
 }
 
 /// Parsed RETURN clause with optional aggregations.
 #[derive(Debug, Clone)]
 enum CypherReturn {
-    All,                            // RETURN n (raw results)
+    All,                                            // RETURN n (raw results)
     Aggregations(Vec<(String, CypherAggregation)>), // alias -> aggregation
 }
 
@@ -4567,7 +5531,8 @@ fn cypher_compute_aggregations(
                 if prop == "n" || prop == "*" || prop.is_empty() {
                     serde_json::json!(node_ids.len())
                 } else {
-                    let count = node_ids.iter()
+                    let count = node_ids
+                        .iter()
                         .filter(|&&nid| {
                             let v = gs.properties.get_node_property(nid, prop);
                             v.is_some() && !matches!(v, Some(Value::Null))
@@ -4630,7 +5595,9 @@ fn cypher_compute_aggregations(
                     }
                 }
                 match min_val {
-                    Some(v) if v.fract() == 0.0 && v.abs() < i64::MAX as f64 => serde_json::json!(v as i64),
+                    Some(v) if v.fract() == 0.0 && v.abs() < i64::MAX as f64 => {
+                        serde_json::json!(v as i64)
+                    }
                     Some(v) => serde_json::json!(v),
                     None => serde_json::Value::Null,
                 }
@@ -4645,7 +5612,9 @@ fn cypher_compute_aggregations(
                     }
                 }
                 match max_val {
-                    Some(v) if v.fract() == 0.0 && v.abs() < i64::MAX as f64 => serde_json::json!(v as i64),
+                    Some(v) if v.fract() == 0.0 && v.abs() < i64::MAX as f64 => {
+                        serde_json::json!(v as i64)
+                    }
                     Some(v) => serde_json::json!(v),
                     None => serde_json::Value::Null,
                 }
@@ -4714,10 +5683,7 @@ fn cypher_extract_id_lookup(query: &str) -> Option<u64> {
     let val_part = after_where[eq_pos + 1..].trim();
 
     // Parse the numeric ID
-    let id_str = val_part
-        .split_whitespace()
-        .next()
-        .unwrap_or(val_part);
+    let id_str = val_part.split_whitespace().next().unwrap_or(val_part);
     id_str.parse::<u64>().ok()
 }
 
@@ -4755,7 +5721,11 @@ fn cypher_parse_relationship(query: &str) -> Option<CypherRelationship> {
             .find(|c: char| c.is_whitespace() || c == ']')
             .unwrap_or(after.len());
         let lbl = after[..end].trim();
-        if lbl.is_empty() { None } else { Some(lbl.to_string()) }
+        if lbl.is_empty() {
+            None
+        } else {
+            Some(lbl.to_string())
+        }
     } else {
         None
     };
@@ -4847,7 +5817,9 @@ fn cypher_extract_create_properties(query: &str) -> Vec<(String, Value)> {
     for pair in inside.split(',') {
         let pair = pair.trim();
         if let Some(colon) = pair.find(':') {
-            let key = pair[..colon].trim().trim_matches(|c: char| c == '\'' || c == '"');
+            let key = pair[..colon]
+                .trim()
+                .trim_matches(|c: char| c == '\'' || c == '"');
             let val_str = pair[colon + 1..].trim();
 
             let value = if (val_str.starts_with('\'') && val_str.ends_with('\''))
@@ -4880,6 +5852,8 @@ fn cypher_extract_create_properties(query: &str) -> Vec<(String, Value)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use weav_persist::recovery::RecoveryResult;
+    use weav_persist::wal::{WalEntry, WalOperation};
     use weav_query::parser;
 
     fn make_engine() -> Engine {
@@ -4891,21 +5865,37 @@ mod tests {
         engine.execute_command(cmd, None).unwrap();
     }
 
+    fn wal_entry(seq: u64, operation: WalOperation) -> WalEntry {
+        WalEntry {
+            seq,
+            timestamp: seq,
+            shard_id: 0,
+            operation,
+            checksum: 0,
+        }
+    }
+
+    fn props_json(entries: Vec<(&str, Value)>) -> String {
+        serde_json::to_string(
+            &entries
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect::<std::collections::HashMap<_, _>>(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn test_ping() {
         let engine = make_engine();
-        let resp = engine
-            .execute_command(Command::Ping, None)
-            .unwrap();
+        let resp = engine.execute_command(Command::Ping, None).unwrap();
         assert!(matches!(resp, CommandResponse::Pong));
     }
 
     #[test]
     fn test_info() {
         let engine = make_engine();
-        let resp = engine
-            .execute_command(Command::Info, None)
-            .unwrap();
+        let resp = engine.execute_command(Command::Info, None).unwrap();
         match resp {
             CommandResponse::Text(t) => assert!(t.contains("weav-server")),
             _ => panic!("expected Text response"),
@@ -5024,8 +6014,7 @@ mod tests {
         .unwrap();
         engine.execute_command(cmd, None).unwrap();
 
-        let cmd =
-            parser::parse_command("NODE GET \"g\" WHERE entity_key = \"bob-key\"").unwrap();
+        let cmd = parser::parse_command("NODE GET \"g\" WHERE entity_key = \"bob-key\"").unwrap();
         let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::NodeInfo(info) => {
@@ -5073,20 +6062,18 @@ mod tests {
         create_test_graph(&engine, "g");
 
         // Add two nodes.
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "A"}"#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "A"}"#)
+                .unwrap();
         let r1 = engine.execute_command(cmd, None).unwrap();
         let n1 = match r1 {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
 
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "B"}"#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "B"}"#)
+                .unwrap();
         let r2 = engine.execute_command(cmd, None).unwrap();
         let n2 = match r2 {
             CommandResponse::Integer(id) => id,
@@ -5121,10 +6108,7 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "g");
 
-        let cmd = parser::parse_command(
-            r#"EDGE ADD TO "g" FROM 1 TO 2 LABEL "knows""#,
-        )
-        .unwrap();
+        let cmd = parser::parse_command(r#"EDGE ADD TO "g" FROM 1 TO 2 LABEL "knows""#).unwrap();
         assert!(engine.execute_command(cmd, None).is_err());
     }
 
@@ -5134,30 +6118,25 @@ mod tests {
         create_test_graph(&engine, "g");
 
         // Add two nodes and an edge.
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "g" LABEL "a" PROPERTIES {"name": "X"}"#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "g" LABEL "a" PROPERTIES {"name": "X"}"#).unwrap();
         let r1 = engine.execute_command(cmd, None).unwrap();
         let n1 = match r1 {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
 
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "g" LABEL "b" PROPERTIES {"name": "Y"}"#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "g" LABEL "b" PROPERTIES {"name": "Y"}"#).unwrap();
         let r2 = engine.execute_command(cmd, None).unwrap();
         let n2 = match r2 {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
 
-        let cmd = parser::parse_command(&format!(
-            r#"EDGE ADD TO "g" FROM {n1} TO {n2} LABEL "rel""#,
-        ))
-        .unwrap();
+        let cmd =
+            parser::parse_command(&format!(r#"EDGE ADD TO "g" FROM {n1} TO {n2} LABEL "rel""#,))
+                .unwrap();
         let resp = engine.execute_command(cmd, None).unwrap();
         let edge_id = match resp {
             CommandResponse::Integer(id) => id,
@@ -5165,8 +6144,7 @@ mod tests {
         };
 
         // Invalidate the edge.
-        let cmd =
-            parser::parse_command(&format!("EDGE INVALIDATE \"g\" {edge_id}")).unwrap();
+        let cmd = parser::parse_command(&format!("EDGE INVALIDATE \"g\" {edge_id}")).unwrap();
         engine.execute_command(cmd, None).unwrap();
     }
 
@@ -5231,10 +6209,8 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "kg");
 
-        let cmd = parser::parse_command(
-            r#"CONTEXT "test" FROM "kg" SEEDS NODES ["nonexistent"]"#,
-        )
-        .unwrap();
+        let cmd = parser::parse_command(r#"CONTEXT "test" FROM "kg" SEEDS NODES ["nonexistent"]"#)
+            .unwrap();
         let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::Context(result) => {
@@ -5248,10 +6224,7 @@ mod tests {
     #[test]
     fn test_context_query_graph_not_found() {
         let engine = make_engine();
-        let cmd = parser::parse_command(
-            r#"CONTEXT "test" FROM "nope" SEEDS NODES ["x"]"#,
-        )
-        .unwrap();
+        let cmd = parser::parse_command(r#"CONTEXT "test" FROM "nope" SEEDS NODES ["x"]"#).unwrap();
         assert!(engine.execute_command(cmd, None).is_err());
     }
 
@@ -5262,9 +6235,18 @@ mod tests {
         let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::Text(t) => {
-                assert!(t.contains("graphs="), "stats should contain graphs count: {t}");
-                assert!(t.contains("total_nodes="), "stats should contain total_nodes: {t}");
-                assert!(t.contains("engine=weav-server"), "stats should contain engine name: {t}");
+                assert!(
+                    t.contains("graphs="),
+                    "stats should contain graphs count: {t}"
+                );
+                assert!(
+                    t.contains("total_nodes="),
+                    "stats should contain total_nodes: {t}"
+                );
+                assert!(
+                    t.contains("engine=weav-server"),
+                    "stats should contain engine name: {t}"
+                );
             }
             _ => panic!("expected Text"),
         }
@@ -5278,7 +6260,8 @@ mod tests {
         // Add a node so we have label distribution
         let cmd = parser::parse_command(
             r#"NODE ADD TO "sg" LABEL "person" PROPERTIES {"name": "Alice"}"#,
-        ).unwrap();
+        )
+        .unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         let cmd = parser::parse_command("STATS \"sg\"").unwrap();
@@ -5287,7 +6270,10 @@ mod tests {
             CommandResponse::Text(t) => {
                 assert!(t.contains("graph=sg"), "should contain graph name: {t}");
                 assert!(t.contains("nodes="), "should contain nodes: {t}");
-                assert!(t.contains("labels={"), "should contain label distribution: {t}");
+                assert!(
+                    t.contains("labels={"),
+                    "should contain label distribution: {t}"
+                );
                 assert!(t.contains("avg_degree="), "should contain avg_degree: {t}");
                 assert!(t.contains("person:"), "should list person label: {t}");
             }
@@ -5315,10 +6301,9 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "g");
 
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "Alice"}"#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "Alice"}"#)
+                .unwrap();
         let resp = engine.execute_command(cmd, None).unwrap();
         let node_id = match resp {
             CommandResponse::Integer(id) => id,
@@ -5340,10 +6325,7 @@ mod tests {
             CommandResponse::NodeInfo(info) => {
                 let name = info.properties.iter().find(|(k, _)| k == "name");
                 assert!(name.is_some());
-                assert_eq!(
-                    name.unwrap().1.as_str(),
-                    Some("Alice Updated")
-                );
+                assert_eq!(name.unwrap().1.as_str(), Some("Alice Updated"));
                 assert!(info.properties.iter().any(|(k, _)| k == "age"));
             }
             _ => panic!("expected NodeInfo"),
@@ -5355,10 +6337,7 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "g");
 
-        let cmd = parser::parse_command(
-            r#"NODE UPDATE "g" 999 PROPERTIES {"name": "X"}"#,
-        )
-        .unwrap();
+        let cmd = parser::parse_command(r#"NODE UPDATE "g" 999 PROPERTIES {"name": "X"}"#).unwrap();
         assert!(engine.execute_command(cmd, None).is_err());
     }
 
@@ -5483,19 +6462,15 @@ mod tests {
         create_test_graph(&engine, "g");
 
         // Add two nodes.
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "g" LABEL "a" PROPERTIES {"name": "X"}"#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "g" LABEL "a" PROPERTIES {"name": "X"}"#).unwrap();
         let n1 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
 
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "g" LABEL "b" PROPERTIES {"name": "Y"}"#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "g" LABEL "b" PROPERTIES {"name": "Y"}"#).unwrap();
         let n2 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -5532,19 +6507,15 @@ mod tests {
         create_test_graph(&engine, "g");
 
         // Add two nodes.
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "g" LABEL "a" PROPERTIES {"name": "X"}"#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "g" LABEL "a" PROPERTIES {"name": "X"}"#).unwrap();
         let n1 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
 
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "g" LABEL "b" PROPERTIES {"name": "Y"}"#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "g" LABEL "b" PROPERTIES {"name": "Y"}"#).unwrap();
         let n2 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -5579,10 +6550,9 @@ mod tests {
     #[test]
     fn test_node_add_nonexistent_graph() {
         let engine = make_engine();
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "no_such_graph" LABEL "x" PROPERTIES {"a": 1}"#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "no_such_graph" LABEL "x" PROPERTIES {"a": 1}"#)
+                .unwrap();
         assert!(engine.execute_command(cmd, None).is_err());
     }
 
@@ -5622,7 +6592,8 @@ mod tests {
 
     #[test]
     fn test_sync_wal_with_persistence() {
-        let tmp_dir = std::env::temp_dir().join(format!("weav_wal_sync_test_{}", std::process::id()));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("weav_wal_sync_test_{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
 
         let mut config = WeavConfig::default();
@@ -5665,19 +6636,15 @@ mod tests {
         create_test_graph(&engine, "g");
 
         // Add nodes.
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "g" LABEL "a" PROPERTIES {"name": "N1"}"#,
-        )
-        .unwrap();
+        let cmd = parser::parse_command(r#"NODE ADD TO "g" LABEL "a" PROPERTIES {"name": "N1"}"#)
+            .unwrap();
         let n1 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
 
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "g" LABEL "b" PROPERTIES {"name": "N2"}"#,
-        )
-        .unwrap();
+        let cmd = parser::parse_command(r#"NODE ADD TO "g" LABEL "b" PROPERTIES {"name": "N2"}"#)
+            .unwrap();
         let n2 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -5769,19 +6736,17 @@ mod tests {
         create_test_graph(&engine, "g");
 
         // Add two nodes without entity_key
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "Alice"}"#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "Alice"}"#)
+                .unwrap();
         let id1 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
 
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "Alice"}"#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "g" LABEL "person" PROPERTIES {"name": "Alice"}"#)
+                .unwrap();
         let id2 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -5801,7 +6766,10 @@ mod tests {
         let cmd = Command::NodeAdd(parser::NodeAddCmd {
             graph: "g".to_string(),
             label: "person".to_string(),
-            properties: vec![("name".to_string(), Value::String(CompactString::from("Alice")))],
+            properties: vec![(
+                "name".to_string(),
+                Value::String(CompactString::from("Alice")),
+            )],
             embedding: Some(vec![1.0, 0.0, 0.0, 0.0]),
             entity_key: Some("alice".to_string()),
             ttl_ms: None,
@@ -5815,7 +6783,10 @@ mod tests {
         let cmd = Command::NodeAdd(parser::NodeAddCmd {
             graph: "g".to_string(),
             label: "person".to_string(),
-            properties: vec![("name".to_string(), Value::String(CompactString::from("Alice")))],
+            properties: vec![(
+                "name".to_string(),
+                Value::String(CompactString::from("Alice")),
+            )],
             embedding: Some(vec![0.0, 1.0, 0.0, 0.0]),
             entity_key: Some("alice".to_string()),
             ttl_ms: None,
@@ -5835,6 +6806,139 @@ mod tests {
                 assert_eq!(info.node_count, 1);
             }
             _ => panic!("expected GraphInfo"),
+        }
+    }
+
+    #[test]
+    fn test_wal_replay_preserves_node_id_and_follow_up_updates() {
+        let engine = make_engine();
+        let recovery = RecoveryResult {
+            snapshots_loaded: 0,
+            wal_entries_replayed: 3,
+            graphs_recovered: 0,
+            errors: vec![],
+            snapshot: None,
+            wal_entries: vec![
+                wal_entry(
+                    1,
+                    WalOperation::GraphCreate {
+                        name: "wal_node_restore".into(),
+                        config_json: "{}".into(),
+                    },
+                ),
+                wal_entry(
+                    2,
+                    WalOperation::NodeAdd {
+                        graph_id: 1,
+                        node_id: 42,
+                        label: "Person".into(),
+                        properties_json: props_json(vec![(
+                            "name",
+                            Value::String(CompactString::from("Alice")),
+                        )]),
+                        embedding: None,
+                        entity_key: Some("alice".into()),
+                        ttl_ms: None,
+                        created_at: Some(1_000),
+                    },
+                ),
+                wal_entry(
+                    3,
+                    WalOperation::NodeUpdate {
+                        graph_id: 1,
+                        node_id: 42,
+                        properties_json: props_json(vec![(
+                            "city",
+                            Value::String(CompactString::from("NYC")),
+                        )]),
+                    },
+                ),
+            ],
+        };
+
+        engine.recover(recovery).unwrap();
+
+        let graph_arc = engine.get_graph("wal_node_restore").unwrap();
+        let gs = graph_arc.read();
+        assert!(
+            gs.adjacency.has_node(42),
+            "replay should restore the original node ID"
+        );
+        assert_eq!(
+            gs.next_node_id, 43,
+            "allocator should advance past replayed IDs"
+        );
+        assert_eq!(
+            gs.properties
+                .get_node_property(42, "entity_key")
+                .and_then(|v| v.as_str()),
+            Some("alice")
+        );
+        assert_eq!(
+            gs.properties
+                .get_node_property(42, "name")
+                .and_then(|v| v.as_str()),
+            Some("Alice")
+        );
+        assert_eq!(
+            gs.properties
+                .get_node_property(42, "city")
+                .and_then(|v| v.as_str()),
+            Some("NYC")
+        );
+    }
+
+    #[test]
+    fn test_wal_replay_restores_ttl_from_original_creation_time() {
+        let engine = make_engine();
+        let recovery = RecoveryResult {
+            snapshots_loaded: 0,
+            wal_entries_replayed: 2,
+            graphs_recovered: 0,
+            errors: vec![],
+            snapshot: None,
+            wal_entries: vec![
+                wal_entry(
+                    1,
+                    WalOperation::GraphCreate {
+                        name: "wal_ttl_restore".into(),
+                        config_json: "{}".into(),
+                    },
+                ),
+                wal_entry(
+                    2,
+                    WalOperation::NodeAdd {
+                        graph_id: 1,
+                        node_id: 1,
+                        label: "Session".into(),
+                        properties_json: props_json(vec![(
+                            "token",
+                            Value::String(CompactString::from("abc123")),
+                        )]),
+                        embedding: None,
+                        entity_key: None,
+                        ttl_ms: Some(250),
+                        created_at: Some(1_000),
+                    },
+                ),
+            ],
+        };
+
+        engine.recover(recovery).unwrap();
+
+        let graph_arc = engine.get_graph("wal_ttl_restore").unwrap();
+        let gs = graph_arc.read();
+        match gs.properties.get_node_property(1, "_created_at") {
+            Some(Value::Timestamp(ts)) => assert_eq!(*ts, 1_000),
+            other => panic!("expected _created_at timestamp, got {:?}", other),
+        }
+        match gs.properties.get_node_property(1, "_tx_from") {
+            Some(Value::Int(ts)) => assert_eq!(*ts, 1_000),
+            other => panic!("expected _tx_from int, got {:?}", other),
+        }
+        match gs.properties.get_node_property(1, "_ttl_expires_at") {
+            Some(Value::Timestamp(ts)) => assert_eq!(*ts, 1_250),
+            other => panic!("expected original TTL expiry, got {:?}", other),
         }
     }
 
@@ -5870,7 +6974,10 @@ mod tests {
         // Creating the same graph again should return Conflict.
         let cmd = parser::parse_command("GRAPH CREATE \"dup_test\"").unwrap();
         let result = engine.execute_command(cmd, None);
-        assert!(result.is_err(), "duplicate GRAPH CREATE should return an error");
+        assert!(
+            result.is_err(),
+            "duplicate GRAPH CREATE should return an error"
+        );
         let err = result.unwrap_err();
         assert!(
             matches!(err, WeavError::Conflict(_)),
@@ -5902,10 +7009,9 @@ mod tests {
         create_test_graph(&engine, "edge_test");
 
         // Try to add an edge referencing node IDs that do not exist.
-        let cmd = parser::parse_command(
-            r#"EDGE ADD TO "edge_test" FROM 9990 TO 9991 LABEL "link""#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"EDGE ADD TO "edge_test" FROM 9990 TO 9991 LABEL "link""#)
+                .unwrap();
         let result = engine.execute_command(cmd, None);
         assert!(
             result.is_err(),
@@ -5937,7 +7043,10 @@ mod tests {
         let engine = make_engine();
         let cmd = parser::parse_command("GRAPH INFO \"nonexistent\"").unwrap();
         let result = engine.execute_command(cmd, None);
-        assert!(result.is_err(), "GRAPH INFO for nonexistent graph should fail");
+        assert!(
+            result.is_err(),
+            "GRAPH INFO for nonexistent graph should fail"
+        );
         let err = result.unwrap_err();
         assert!(
             matches!(err, WeavError::GraphNotFound(_)),
@@ -5949,7 +7058,7 @@ mod tests {
     // ── Authorization enforcement tests ─────────────────────────────────
 
     fn make_auth_engine() -> Engine {
-        use weav_core::config::{AuthConfig, UserConfig, GraphPatternConfig};
+        use weav_core::config::{AuthConfig, GraphPatternConfig, UserConfig};
         let mut config = WeavConfig::default();
         config.auth = AuthConfig {
             enabled: true,
@@ -5995,9 +7104,11 @@ mod tests {
         Engine::new(config)
     }
 
-    fn auth_identity(engine: &Engine, username: &str, password: &str)
-        -> weav_auth::identity::SessionIdentity
-    {
+    fn auth_identity(
+        engine: &Engine,
+        username: &str,
+        password: &str,
+    ) -> weav_auth::identity::SessionIdentity {
         engine
             .acl_store()
             .unwrap()
@@ -6110,10 +7221,7 @@ mod tests {
 
         // Reader has +@read but not +@write category, so NodeAdd should fail
         let reader_id = auth_identity(&engine, "reader", "reader_pass");
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "shared" LABEL "doc""#,
-        )
-        .unwrap();
+        let cmd = parser::parse_command(r#"NODE ADD TO "shared" LABEL "doc""#).unwrap();
         let result = engine.execute_command(cmd, Some(&reader_id));
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -6133,12 +7241,12 @@ mod tests {
 
         // Writer with "app:*" pattern and ReadWrite permission can write
         let writer_id = auth_identity(&engine, "writer", "writer_pass");
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "app:users" LABEL "user""#,
-        )
-        .unwrap();
+        let cmd = parser::parse_command(r#"NODE ADD TO "app:users" LABEL "user""#).unwrap();
         let result = engine.execute_command(cmd, Some(&writer_id));
-        assert!(result.is_ok(), "writer should be able to add nodes to app:users");
+        assert!(
+            result.is_ok(),
+            "writer should be able to add nodes to app:users"
+        );
     }
 
     #[test]
@@ -6150,10 +7258,7 @@ mod tests {
 
         // Writer with "app:*" pattern cannot write to "secret"
         let writer_id = auth_identity(&engine, "writer", "writer_pass");
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "secret" LABEL "doc""#,
-        )
-        .unwrap();
+        let cmd = parser::parse_command(r#"NODE ADD TO "secret" LABEL "doc""#).unwrap();
         let result = engine.execute_command(cmd, Some(&writer_id));
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -6182,7 +7287,7 @@ mod tests {
     fn test_auth_admin_three_tier_graph_create_requires_admin() {
         // This test verifies the critical fix: Admin operations on a graph
         // require Admin-level graph permission, not just ReadWrite.
-        use weav_core::config::{AuthConfig, UserConfig, GraphPatternConfig};
+        use weav_core::config::{AuthConfig, GraphPatternConfig, UserConfig};
         let mut config = WeavConfig::default();
         config.auth = AuthConfig {
             enabled: true,
@@ -6215,10 +7320,17 @@ mod tests {
         // Graph create requires Admin graph permission, so this must fail.
         let cmd = parser::parse_command("GRAPH CREATE \"mydb\"").unwrap();
         let result = engine.execute_command(cmd, Some(&id));
-        assert!(result.is_err(), "readwrite graph perm should not allow graph create");
+        assert!(
+            result.is_err(),
+            "readwrite graph perm should not allow graph create"
+        );
         match result.unwrap_err() {
             WeavError::PermissionDenied(msg) => {
-                assert!(msg.contains("admin access"), "should mention admin access, got: {}", msg);
+                assert!(
+                    msg.contains("admin access"),
+                    "should mention admin access, got: {}",
+                    msg
+                );
             }
             other => panic!("expected PermissionDenied, got: {:?}", other),
         }
@@ -6226,7 +7338,7 @@ mod tests {
 
     #[test]
     fn test_auth_admin_three_tier_graph_drop_requires_admin() {
-        use weav_core::config::{AuthConfig, UserConfig, GraphPatternConfig};
+        use weav_core::config::{AuthConfig, GraphPatternConfig, UserConfig};
         let mut config = WeavConfig::default();
         config.auth = AuthConfig {
             enabled: true,
@@ -6260,20 +7372,33 @@ mod tests {
         let engine = Engine::new(config);
 
         // Superadmin creates the graph
-        let super_id = engine.acl_store().unwrap()
-            .authenticate("superadmin", "pass").unwrap();
+        let super_id = engine
+            .acl_store()
+            .unwrap()
+            .authenticate("superadmin", "pass")
+            .unwrap();
         let cmd = parser::parse_command("GRAPH CREATE \"todrop\"").unwrap();
         engine.execute_command(cmd, Some(&super_id)).unwrap();
 
         // User with only ReadWrite graph permission cannot drop it
-        let rw_id = engine.acl_store().unwrap()
-            .authenticate("rw_only", "pass").unwrap();
+        let rw_id = engine
+            .acl_store()
+            .unwrap()
+            .authenticate("rw_only", "pass")
+            .unwrap();
         let cmd = parser::parse_command("GRAPH DROP \"todrop\"").unwrap();
         let result = engine.execute_command(cmd, Some(&rw_id));
-        assert!(result.is_err(), "readwrite graph perm should not allow graph drop");
+        assert!(
+            result.is_err(),
+            "readwrite graph perm should not allow graph drop"
+        );
         match result.unwrap_err() {
             WeavError::PermissionDenied(msg) => {
-                assert!(msg.contains("admin access"), "should mention admin access, got: {}", msg);
+                assert!(
+                    msg.contains("admin access"),
+                    "should mention admin access, got: {}",
+                    msg
+                );
             }
             other => panic!("expected PermissionDenied, got: {:?}", other),
         }
@@ -6298,19 +7423,25 @@ mod tests {
             "anything",
             weav_auth::identity::GraphPermission::Admin,
         );
-        assert!(result.is_ok(), "check_permission should pass when auth disabled");
+        assert!(
+            result.is_ok(),
+            "check_permission should pass when auth disabled"
+        );
     }
 
     #[test]
     fn test_check_permission_no_identity_auth_enabled() {
         let engine = make_auth_engine();
-        let result = engine.check_permission(
-            None,
-            "test",
-            weav_auth::identity::GraphPermission::Read,
+        let result =
+            engine.check_permission(None, "test", weav_auth::identity::GraphPermission::Read);
+        assert!(
+            result.is_err(),
+            "check_permission with no identity should fail when auth required"
         );
-        assert!(result.is_err(), "check_permission with no identity should fail when auth required");
-        assert!(matches!(result.unwrap_err(), WeavError::AuthenticationRequired));
+        assert!(matches!(
+            result.unwrap_err(),
+            WeavError::AuthenticationRequired
+        ));
     }
 
     #[test]
@@ -6366,9 +7497,9 @@ mod tests {
 
         // Reader cannot add edges
         let reader_id = auth_identity(&engine, "reader", "reader_pass");
-        let cmd = parser::parse_command(
-            &format!(r#"EDGE ADD TO "shared" FROM {n1} TO {n2} LABEL "link""#),
-        )
+        let cmd = parser::parse_command(&format!(
+            r#"EDGE ADD TO "shared" FROM {n1} TO {n2} LABEL "link""#
+        ))
         .unwrap();
         let result = engine.execute_command(cmd, Some(&reader_id));
         assert!(result.is_err(), "reader should not be able to add edges");
@@ -6385,7 +7516,10 @@ mod tests {
         let reader_id = auth_identity(&engine, "reader", "reader_pass");
         let cmd = Command::Stats(Some("secret".into()));
         let result = engine.execute_command(cmd, Some(&reader_id));
-        assert!(result.is_err(), "reader should not see stats for inaccessible graph");
+        assert!(
+            result.is_err(),
+            "reader should not see stats for inaccessible graph"
+        );
     }
 
     #[test]
@@ -6407,7 +7541,8 @@ mod tests {
         // Execute a few commands
         let cmd = parser::parse_command(
             r#"NODE ADD TO "metrics_g" LABEL "person" PROPERTIES {"name": "Alice"}"#,
-        ).unwrap();
+        )
+        .unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         let cmd = parser::parse_command("PING").unwrap();
@@ -6417,7 +7552,10 @@ mod tests {
         let node_add_ok = crate::metrics::QUERY_TOTAL
             .with_label_values(&["node_add", "ok"])
             .get();
-        assert!(node_add_ok >= 1, "node_add ok count should be >= 1, got {node_add_ok}");
+        assert!(
+            node_add_ok >= 1,
+            "node_add ok count should be >= 1, got {node_add_ok}"
+        );
 
         let ping_ok = crate::metrics::QUERY_TOTAL
             .with_label_values(&["ping", "ok"])
@@ -6428,7 +7566,10 @@ mod tests {
         let duration_count = crate::metrics::QUERY_DURATION
             .with_label_values(&["node_add"])
             .get_sample_count();
-        assert!(duration_count >= 1, "duration should have at least 1 observation");
+        assert!(
+            duration_count >= 1,
+            "duration should have at least 1 observation"
+        );
     }
 
     #[test]
@@ -6436,9 +7577,8 @@ mod tests {
         let cmd = parser::parse_command("PING").unwrap();
         assert_eq!(cmd.type_name(), "ping");
 
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "g" LABEL "x" PROPERTIES {"k": "v"}"#,
-        ).unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "g" LABEL "x" PROPERTIES {"k": "v"}"#).unwrap();
         assert_eq!(cmd.type_name(), "node_add");
 
         let cmd = parser::parse_command("GRAPH LIST").unwrap();
@@ -6455,7 +7595,8 @@ mod tests {
         // Add a node first
         let cmd = parser::parse_command(
             r#"NODE ADD TO "emb_g" LABEL "entity" PROPERTIES {"name": "test"}"#,
-        ).unwrap();
+        )
+        .unwrap();
         let node_id = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -6468,13 +7609,18 @@ mod tests {
             properties: vec![("updated".to_string(), Value::Bool(true))],
             embedding: Some(vec![1.0; 1536]),
         };
-        engine.execute_command(Command::NodeUpdate(update_cmd), None).unwrap();
+        engine
+            .execute_command(Command::NodeUpdate(update_cmd), None)
+            .unwrap();
 
         // Verify the embedding is searchable via context query
         let graph_arc = engine.get_graph("emb_g").unwrap();
         let gs = graph_arc.read();
         let results = gs.vector_index.search(&vec![1.0; 1536], 1, None).unwrap();
-        assert!(!results.is_empty(), "embedding should be searchable after update");
+        assert!(
+            !results.is_empty(),
+            "embedding should be searchable after update"
+        );
         assert_eq!(results[0].0, node_id);
     }
 
@@ -6487,7 +7633,10 @@ mod tests {
         let cmd = Command::NodeAdd(parser::NodeAddCmd {
             graph: "ttl_g".to_string(),
             label: "temp".to_string(),
-            properties: vec![("name".to_string(), Value::String(CompactString::from("ephemeral")))],
+            properties: vec![(
+                "name".to_string(),
+                Value::String(CompactString::from("ephemeral")),
+            )],
             embedding: None,
             entity_key: None,
             ttl_ms: Some(1), // 1ms TTL — will expire almost immediately
@@ -6501,7 +7650,10 @@ mod tests {
         let cmd = Command::NodeAdd(parser::NodeAddCmd {
             graph: "ttl_g".to_string(),
             label: "perm".to_string(),
-            properties: vec![("name".to_string(), Value::String(CompactString::from("permanent")))],
+            properties: vec![(
+                "name".to_string(),
+                Value::String(CompactString::from("permanent")),
+            )],
             embedding: None,
             entity_key: None,
             ttl_ms: None,
@@ -6516,13 +7668,22 @@ mod tests {
 
         // Sweep should remove the expired node
         let expired = engine.sweep_ttl();
-        assert!(expired >= 1, "at least 1 expired entity should be removed, got {expired}");
+        assert!(
+            expired >= 1,
+            "at least 1 expired entity should be removed, got {expired}"
+        );
 
         // Expired node should be gone
         let graph_arc = engine.get_graph("ttl_g").unwrap();
         let gs = graph_arc.read();
-        assert!(!gs.adjacency.has_node(node_id), "expired node should be removed");
-        assert!(gs.adjacency.has_node(perm_id), "permanent node should remain");
+        assert!(
+            !gs.adjacency.has_node(node_id),
+            "expired node should be removed"
+        );
+        assert!(
+            gs.adjacency.has_node(perm_id),
+            "permanent node should remain"
+        );
     }
 
     #[test]
@@ -6531,16 +7692,16 @@ mod tests {
         create_test_graph(&engine, "ttl_e");
 
         // Add two nodes
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "ttl_e" LABEL "a" PROPERTIES {"name": "A"}"#,
-        ).unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "ttl_e" LABEL "a" PROPERTIES {"name": "A"}"#)
+                .unwrap();
         let n1 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "ttl_e" LABEL "b" PROPERTIES {"name": "B"}"#,
-        ).unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "ttl_e" LABEL "b" PROPERTIES {"name": "B"}"#)
+                .unwrap();
         let n2 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -6578,7 +7739,11 @@ mod tests {
         // Permanent edge should remain
         let graph_arc = engine.get_graph("ttl_e").unwrap();
         let gs = graph_arc.read();
-        assert_eq!(gs.adjacency.edge_count(), 1, "only permanent edge should remain");
+        assert_eq!(
+            gs.adjacency.edge_count(),
+            1,
+            "only permanent edge should remain"
+        );
     }
 
     #[test]
@@ -6590,9 +7755,8 @@ mod tests {
 
         // Sweep on engine with graph but no TTL nodes
         create_test_graph(&engine, "no_ttl");
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "no_ttl" LABEL "x" PROPERTIES {"k": "v"}"#,
-        ).unwrap();
+        let cmd = parser::parse_command(r#"NODE ADD TO "no_ttl" LABEL "x" PROPERTIES {"k": "v"}"#)
+            .unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         let expired = engine.sweep_ttl();
@@ -6604,10 +7768,8 @@ mod tests {
         use weav_persist::recovery::RecoveryResult;
 
         // Step 1: Create engine with persistence enabled, add edge with properties.
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "weav_edge_props_snap_{}",
-            std::process::id()
-        ));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("weav_edge_props_snap_{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
 
         let mut config = WeavConfig::default();
@@ -6621,7 +7783,10 @@ mod tests {
         let cmd = Command::NodeAdd(parser::NodeAddCmd {
             graph: "ep_graph".to_string(),
             label: "person".to_string(),
-            properties: vec![("name".to_string(), Value::String(CompactString::from("Alice")))],
+            properties: vec![(
+                "name".to_string(),
+                Value::String(CompactString::from("Alice")),
+            )],
             embedding: None,
             entity_key: None,
             ttl_ms: None,
@@ -6633,7 +7798,10 @@ mod tests {
         let cmd = Command::NodeAdd(parser::NodeAddCmd {
             graph: "ep_graph".to_string(),
             label: "person".to_string(),
-            properties: vec![("name".to_string(), Value::String(CompactString::from("Bob")))],
+            properties: vec![(
+                "name".to_string(),
+                Value::String(CompactString::from("Bob")),
+            )],
             embedding: None,
             entity_key: None,
             ttl_ms: None,
@@ -6651,7 +7819,10 @@ mod tests {
             label: "KNOWS".to_string(),
             weight: 0.9,
             properties: vec![
-                ("since".to_string(), Value::String(CompactString::from("2020"))),
+                (
+                    "since".to_string(),
+                    Value::String(CompactString::from("2020")),
+                ),
                 ("strength".to_string(), Value::Float(0.85)),
             ],
             ttl_ms: None,
@@ -6681,7 +7852,10 @@ mod tests {
 
         // Load the snapshot file manually.
         let snap_engine = weav_persist::snapshot::SnapshotEngine::new(tmp_dir.clone());
-        let latest = snap_engine.latest_snapshot().unwrap().expect("snapshot should exist");
+        let latest = snap_engine
+            .latest_snapshot()
+            .unwrap()
+            .expect("snapshot should exist");
         let snapshot = snap_engine.load_snapshot(&latest).unwrap();
 
         let recovery = RecoveryResult {
@@ -6701,15 +7875,24 @@ mod tests {
         // Edge should exist with original ID.
         assert_eq!(gs.adjacency.edge_count(), 1, "edge should be restored");
         let recovered_edge = gs.adjacency.get_edge(edge_id);
-        assert!(recovered_edge.is_some(), "edge should have same ID after recovery");
+        assert!(
+            recovered_edge.is_some(),
+            "edge should have same ID after recovery"
+        );
 
         // Edge properties should be restored.
         let since = gs.properties.get_edge_property(edge_id, "since");
-        assert!(since.is_some(), "edge property 'since' should survive snapshot roundtrip");
+        assert!(
+            since.is_some(),
+            "edge property 'since' should survive snapshot roundtrip"
+        );
         assert_eq!(since.unwrap().as_str(), Some("2020"));
 
         let strength = gs.properties.get_edge_property(edge_id, "strength");
-        assert!(strength.is_some(), "edge property 'strength' should survive snapshot roundtrip");
+        assert!(
+            strength.is_some(),
+            "edge property 'strength' should survive snapshot roundtrip"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
@@ -6719,10 +7902,8 @@ mod tests {
         use weav_persist::recovery::RecoveryResult;
 
         // Step 1: Create engine, add nodes + edges, capture edge IDs.
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "weav_edge_id_recovery_{}",
-            std::process::id()
-        ));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("weav_edge_id_recovery_{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
 
         let mut config = WeavConfig::default();
@@ -6738,7 +7919,10 @@ mod tests {
             let cmd = Command::NodeAdd(parser::NodeAddCmd {
                 graph: "eid_graph".to_string(),
                 label: "person".to_string(),
-                properties: vec![("name".to_string(), Value::String(CompactString::from(*name)))],
+                properties: vec![(
+                    "name".to_string(),
+                    Value::String(CompactString::from(*name)),
+                )],
                 embedding: None,
                 entity_key: None,
                 ttl_ms: None,
@@ -6782,7 +7966,10 @@ mod tests {
         let engine2 = Engine::new(config.clone());
 
         let snap_engine = weav_persist::snapshot::SnapshotEngine::new(tmp_dir.clone());
-        let latest = snap_engine.latest_snapshot().unwrap().expect("snapshot should exist");
+        let latest = snap_engine
+            .latest_snapshot()
+            .unwrap()
+            .expect("snapshot should exist");
         let snapshot = snap_engine.load_snapshot(&latest).unwrap();
 
         let recovery = RecoveryResult {
@@ -6877,10 +8064,7 @@ mod tests {
     fn test_value_types_survive_snapshot_roundtrip() {
         use weav_persist::recovery::RecoveryResult;
 
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "weav_value_types_{}",
-            std::process::id()
-        ));
+        let tmp_dir = std::env::temp_dir().join(format!("weav_value_types_{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
 
         let mut config = WeavConfig::default();
@@ -6895,7 +8079,10 @@ mod tests {
             graph: "vt_graph".to_string(),
             label: "entity".to_string(),
             properties: vec![
-                ("name".to_string(), Value::String(CompactString::from("test"))),
+                (
+                    "name".to_string(),
+                    Value::String(CompactString::from("test")),
+                ),
                 ("count".to_string(), Value::Int(42)),
                 ("score".to_string(), Value::Float(3.14)),
                 ("active".to_string(), Value::Bool(true)),
@@ -6914,7 +8101,10 @@ mod tests {
         // Recover into new engine
         let engine2 = Engine::new(config.clone());
         let snap_engine = weav_persist::snapshot::SnapshotEngine::new(tmp_dir.clone());
-        let latest = snap_engine.latest_snapshot().unwrap().expect("snapshot should exist");
+        let latest = snap_engine
+            .latest_snapshot()
+            .unwrap()
+            .expect("snapshot should exist");
         let snapshot = snap_engine.load_snapshot(&latest).unwrap();
 
         let recovery = RecoveryResult {
@@ -6936,7 +8126,11 @@ mod tests {
 
         // String
         let name = gs.properties.get_node_property(nid, "name");
-        assert_eq!(name.unwrap().as_str(), Some("test"), "String should survive");
+        assert_eq!(
+            name.unwrap().as_str(),
+            Some("test"),
+            "String should survive"
+        );
 
         // Int
         let count = gs.properties.get_node_property(nid, "count");
@@ -6952,7 +8146,10 @@ mod tests {
 
         // Timestamp — this was the bug! Previously lost during recovery
         let created = gs.properties.get_node_property(nid, "created");
-        assert!(created.is_some(), "Timestamp should survive snapshot roundtrip");
+        assert!(
+            created.is_some(),
+            "Timestamp should survive snapshot roundtrip"
+        );
         match created.unwrap() {
             Value::Timestamp(ts) => assert_eq!(*ts, 1700000000000),
             other => panic!("expected Timestamp, got {:?}", other),
@@ -6992,7 +8189,10 @@ mod tests {
         let graph_arc = engine.get_graph("ttl_default_g").unwrap();
         let gs = graph_arc.read();
         let ttl_prop = gs.properties.get_node_property(node_id, "_ttl_expires_at");
-        assert!(ttl_prop.is_some(), "node should have TTL from graph default");
+        assert!(
+            ttl_prop.is_some(),
+            "node should have TTL from graph default"
+        );
 
         // Sweep should remove it (1ms TTL already expired)
         drop(gs);
@@ -7009,7 +8209,8 @@ mod tests {
         // Add some data
         let cmd = parser::parse_command(
             r#"NODE ADD TO "info_g" LABEL "person" PROPERTIES {"name": "Alice"}"#,
-        ).unwrap();
+        )
+        .unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         let cmd = Command::GraphInfo("info_g".to_string());
@@ -7079,25 +8280,37 @@ mod tests {
         engine.execute_command(cmd, None).unwrap();
 
         // Add two nodes
-        let n1 = match engine.execute_command(Command::NodeAdd(parser::NodeAddCmd {
-            graph: "edge_limited".to_string(),
-            label: "a".to_string(),
-            properties: vec![],
-            embedding: None,
-            entity_key: None,
-            ttl_ms: None,
-        }), None).unwrap() {
+        let n1 = match engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "edge_limited".to_string(),
+                    label: "a".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
-        let n2 = match engine.execute_command(Command::NodeAdd(parser::NodeAddCmd {
-            graph: "edge_limited".to_string(),
-            label: "b".to_string(),
-            properties: vec![],
-            embedding: None,
-            entity_key: None,
-            ttl_ms: None,
-        }), None).unwrap() {
+        let n2 = match engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "edge_limited".to_string(),
+                    label: "b".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
@@ -7136,23 +8349,24 @@ mod tests {
         // Add nodes with searchable properties
         let cmd = parser::parse_command(
             r#"NODE ADD TO "sg" LABEL "person" PROPERTIES {"name": "Alice", "role": "engineer"}"#,
-        ).unwrap();
+        )
+        .unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         let cmd = parser::parse_command(
             r#"NODE ADD TO "sg" LABEL "person" PROPERTIES {"name": "Bob", "role": "designer"}"#,
-        ).unwrap();
+        )
+        .unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         let cmd = parser::parse_command(
             r#"NODE ADD TO "sg" LABEL "person" PROPERTIES {"name": "Charlie", "role": "engineer"}"#,
-        ).unwrap();
+        )
+        .unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         // Search by role = "engineer" — should find 2
-        let cmd = parser::parse_command(
-            r#"SEARCH "sg" WHERE role = "engineer""#,
-        ).unwrap();
+        let cmd = parser::parse_command(r#"SEARCH "sg" WHERE role = "engineer""#).unwrap();
         let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::StringList(results) => {
@@ -7170,25 +8384,25 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "ng");
 
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "ng" LABEL "person" PROPERTIES {"name": "A"}"#,
-        ).unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "ng" LABEL "person" PROPERTIES {"name": "A"}"#)
+                .unwrap();
         let n1 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
 
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "ng" LABEL "person" PROPERTIES {"name": "B"}"#,
-        ).unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "ng" LABEL "person" PROPERTIES {"name": "B"}"#)
+                .unwrap();
         let n2 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
 
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "ng" LABEL "person" PROPERTIES {"name": "C"}"#,
-        ).unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "ng" LABEL "person" PROPERTIES {"name": "C"}"#)
+                .unwrap();
         let n3 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -7197,25 +8411,30 @@ mod tests {
         // Add edges: n1->n2, n1->n3
         let cmd = parser::parse_command(&format!(
             r#"EDGE ADD TO "ng" FROM {n1} TO {n2} LABEL "knows""#,
-        )).unwrap();
+        ))
+        .unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         let cmd = parser::parse_command(&format!(
             r#"EDGE ADD TO "ng" FROM {n1} TO {n3} LABEL "likes""#,
-        )).unwrap();
+        ))
+        .unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         // Get all neighbors of n1 (default BOTH direction)
-        let cmd = parser::parse_command(&format!(
-            r#"NEIGHBORS "ng" {n1}"#,
-        )).unwrap();
+        let cmd = parser::parse_command(&format!(r#"NEIGHBORS "ng" {n1}"#,)).unwrap();
         let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::StringList(results) => {
                 assert_eq!(results.len(), 2, "n1 should have 2 neighbors");
                 for r in &results {
                     let parts: Vec<&str> = r.split(':').collect();
-                    assert_eq!(parts.len(), 4, "format should be nid:eid:DIR:label, got {}", r);
+                    assert_eq!(
+                        parts.len(),
+                        4,
+                        "format should be nid:eid:DIR:label, got {}",
+                        r
+                    );
                 }
             }
             _ => panic!("expected StringList"),
@@ -7227,17 +8446,15 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "nd");
 
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "nd" LABEL "x" PROPERTIES {"v": "1"}"#,
-        ).unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "nd" LABEL "x" PROPERTIES {"v": "1"}"#).unwrap();
         let n1 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
 
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "nd" LABEL "x" PROPERTIES {"v": "2"}"#,
-        ).unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "nd" LABEL "x" PROPERTIES {"v": "2"}"#).unwrap();
         let n2 = match engine.execute_command(cmd, None).unwrap() {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -7246,13 +8463,12 @@ mod tests {
         // Edge from n1 -> n2
         let cmd = parser::parse_command(&format!(
             r#"EDGE ADD TO "nd" FROM {n1} TO {n2} LABEL "link""#,
-        )).unwrap();
+        ))
+        .unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         // DIRECTION OUT from n1: should see n2
-        let cmd = parser::parse_command(&format!(
-            r#"NEIGHBORS "nd" {n1} DIRECTION OUT"#,
-        )).unwrap();
+        let cmd = parser::parse_command(&format!(r#"NEIGHBORS "nd" {n1} DIRECTION OUT"#,)).unwrap();
         let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::StringList(results) => {
@@ -7263,9 +8479,7 @@ mod tests {
         }
 
         // DIRECTION OUT from n2: should be empty
-        let cmd = parser::parse_command(&format!(
-            r#"NEIGHBORS "nd" {n2} DIRECTION OUT"#,
-        )).unwrap();
+        let cmd = parser::parse_command(&format!(r#"NEIGHBORS "nd" {n2} DIRECTION OUT"#,)).unwrap();
         let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::StringList(results) => {
@@ -7331,7 +8545,11 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         let expired = engine.sweep_ttl();
         // Both nodes and the edge should expire (graph default applies to all)
-        assert!(expired >= 1, "edge with inherited TTL should be expired, got {}", expired);
+        assert!(
+            expired >= 1,
+            "edge with inherited TTL should be expired, got {}",
+            expired
+        );
     }
 
     #[test]
@@ -7341,13 +8559,12 @@ mod tests {
 
         let cmd = parser::parse_command(
             r#"NODE ADD TO "empty_s" LABEL "item" PROPERTIES {"color": "red"}"#,
-        ).unwrap();
+        )
+        .unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         // Search for a value that doesn't match
-        let cmd = parser::parse_command(
-            r#"SEARCH "empty_s" WHERE color = "blue""#,
-        ).unwrap();
+        let cmd = parser::parse_command(r#"SEARCH "empty_s" WHERE color = "blue""#).unwrap();
         let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::StringList(results) => {
@@ -7365,12 +8582,14 @@ mod tests {
         // Add nodes with distinct labels
         let cmd = parser::parse_command(
             r#"NODE ADD TO "enh_info" LABEL "person" PROPERTIES {"name": "X"}"#,
-        ).unwrap();
+        )
+        .unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         let cmd = parser::parse_command(
             r#"NODE ADD TO "enh_info" LABEL "company" PROPERTIES {"name": "Y"}"#,
-        ).unwrap();
+        )
+        .unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         let cmd = Command::GraphInfo("enh_info".to_string());
@@ -7379,8 +8598,11 @@ mod tests {
             CommandResponse::GraphInfo(info) => {
                 assert_eq!(info.node_count, 2);
                 assert_eq!(info.vector_count, 0);
-                assert!(info.label_count >= 2,
-                    "should have at least 2 labels, got {}", info.label_count);
+                assert!(
+                    info.label_count >= 2,
+                    "should have at least 2 labels, got {}",
+                    info.label_count
+                );
             }
             _ => panic!("expected GraphInfo"),
         }
@@ -7388,8 +8610,7 @@ mod tests {
 
     #[test]
     fn test_replaying_flag_suppresses_wal() {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "weav_replay_test_{}", std::process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!("weav_replay_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp_dir);
 
         let mut config = WeavConfig::default();
@@ -7400,24 +8621,38 @@ mod tests {
         // Normal operation: create a graph (writes to WAL)
         create_test_graph(&engine, "pre_replay");
 
-        let seq_before = engine.wal.as_ref()
-            .expect("WAL should be present").lock().sequence_number();
+        let seq_before = engine
+            .wal
+            .as_ref()
+            .expect("WAL should be present")
+            .lock()
+            .sequence_number();
         assert!(seq_before > 0, "should have WAL entries from graph create");
 
         // Set replaying flag
-        engine.replaying.store(true, std::sync::atomic::Ordering::Relaxed);
+        engine
+            .replaying
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Create another graph — this should NOT write to WAL
         let cmd = parser::parse_command("GRAPH CREATE \"during_replay\"").unwrap();
         engine.execute_command(cmd, None).unwrap();
 
-        let seq_after = engine.wal.as_ref()
-            .expect("WAL should still be present").lock().sequence_number();
-        assert_eq!(seq_before, seq_after,
-            "WAL should not grow while replaying flag is set");
+        let seq_after = engine
+            .wal
+            .as_ref()
+            .expect("WAL should still be present")
+            .lock()
+            .sequence_number();
+        assert_eq!(
+            seq_before, seq_after,
+            "WAL should not grow while replaying flag is set"
+        );
 
         // Clear replaying flag
-        engine.replaying.store(false, std::sync::atomic::Ordering::Relaxed);
+        engine
+            .replaying
+            .store(false, std::sync::atomic::Ordering::Relaxed);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
@@ -7429,10 +8664,7 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "sg");
 
-        let cmd = parser::parse_command(
-            r#"SCHEMA SET "sg" node "Person" type "age" int"#,
-        )
-        .unwrap();
+        let cmd = parser::parse_command(r#"SCHEMA SET "sg" node "Person" type "age" int"#).unwrap();
         let resp = engine.execute_command(cmd, None).unwrap();
         assert!(matches!(resp, CommandResponse::Ok));
 
@@ -7453,10 +8685,8 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "sbi");
 
-        let cmd = parser::parse_command(
-            r#"SCHEMA SET "sbi" node "Person" type "age" int"#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"SCHEMA SET "sbi" node "Person" type "age" int"#).unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         let cmd = Command::NodeAdd(parser::NodeAddCmd {
@@ -7479,10 +8709,8 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "sav");
 
-        let cmd = parser::parse_command(
-            r#"SCHEMA SET "sav" node "Person" type "age" int"#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"SCHEMA SET "sav" node "Person" type "age" int"#).unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         let cmd = Command::NodeAdd(parser::NodeAddCmd {
@@ -7505,10 +8733,8 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "srm");
 
-        let cmd = parser::parse_command(
-            r#"SCHEMA SET "srm" node "Person" required "name""#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"SCHEMA SET "srm" node "Person" required "name""#).unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         let cmd = Command::NodeAdd(parser::NodeAddCmd {
@@ -7528,10 +8754,7 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "su");
 
-        let cmd = parser::parse_command(
-            r#"SCHEMA SET "su" node "Person" unique "email""#,
-        )
-        .unwrap();
+        let cmd = parser::parse_command(r#"SCHEMA SET "su" node "Person" unique "email""#).unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         let cmd = Command::NodeAdd(parser::NodeAddCmd {
@@ -7580,19 +8803,14 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "ste");
 
-        let cmd = parser::parse_command(
-            r#"SCHEMA SET "ste" edge "KNOWS" type "strength" float"#,
-        )
-        .unwrap();
+        let cmd = parser::parse_command(r#"SCHEMA SET "ste" edge "KNOWS" type "strength" float"#)
+            .unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         let cmd = Command::NodeAdd(parser::NodeAddCmd {
             graph: "ste".into(),
             label: "Person".into(),
-            properties: vec![(
-                "name".into(),
-                Value::String(CompactString::new("Alice")),
-            )],
+            properties: vec![("name".into(), Value::String(CompactString::new("Alice")))],
             embedding: None,
             entity_key: None,
             ttl_ms: None,
@@ -7604,10 +8822,7 @@ mod tests {
         let cmd = Command::NodeAdd(parser::NodeAddCmd {
             graph: "ste".into(),
             label: "Person".into(),
-            properties: vec![(
-                "name".into(),
-                Value::String(CompactString::new("Bob")),
-            )],
+            properties: vec![("name".into(), Value::String(CompactString::new("Bob")))],
             embedding: None,
             entity_key: None,
             ttl_ms: None,
@@ -7662,10 +8877,8 @@ mod tests {
     #[test]
     fn test_schema_set_nonexistent_graph() {
         let engine = make_engine();
-        let cmd = parser::parse_command(
-            r#"SCHEMA SET "nonexistent" node "Person" type "age" int"#,
-        )
-        .unwrap();
+        let cmd = parser::parse_command(r#"SCHEMA SET "nonexistent" node "Person" type "age" int"#)
+            .unwrap();
         let result = engine.execute_command(cmd, None);
         assert!(result.is_err());
     }
@@ -7692,10 +8905,8 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "sudl");
 
-        let cmd = parser::parse_command(
-            r#"SCHEMA SET "sudl" node "Person" unique "email""#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"SCHEMA SET "sudl" node "Person" unique "email""#).unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         let cmd = Command::NodeAdd(parser::NodeAddCmd {
@@ -7730,16 +8941,12 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "smc");
 
-        let cmd = parser::parse_command(
-            r#"SCHEMA SET "smc" node "Person" required "name""#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"SCHEMA SET "smc" node "Person" required "name""#).unwrap();
         engine.execute_command(cmd, None).unwrap();
 
-        let cmd = parser::parse_command(
-            r#"SCHEMA SET "smc" node "Person" type "age" int"#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"SCHEMA SET "smc" node "Person" type "age" int"#).unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         let cmd = Command::NodeAdd(parser::NodeAddCmd {
@@ -7911,7 +9118,10 @@ mod tests {
         let mut gc = weav_core::config::GraphConfig::default();
         gc.max_nodes = Some(2);
         // Default eviction_policy is NoEviction
-        assert_eq!(gc.eviction_policy, weav_core::config::EvictionPolicy::NoEviction);
+        assert_eq!(
+            gc.eviction_policy,
+            weav_core::config::EvictionPolicy::NoEviction
+        );
         let cmd = Command::GraphCreate(parser::GraphCreateCmd {
             name: "no_evict".to_string(),
             config: Some(gc),
@@ -7958,11 +9168,12 @@ mod tests {
         let cmd = Command::NodeAdd(parser::NodeAddCmd {
             graph: "ft".to_string(),
             label: "doc".to_string(),
-            properties: vec![
-                ("content".to_string(), Value::String(CompactString::from(
+            properties: vec![(
+                "content".to_string(),
+                Value::String(CompactString::from(
                     "Rust programming language systems performance",
-                ))),
-            ],
+                )),
+            )],
             embedding: None,
             entity_key: None,
             ttl_ms: None,
@@ -7975,11 +9186,12 @@ mod tests {
         let cmd = Command::NodeAdd(parser::NodeAddCmd {
             graph: "ft".to_string(),
             label: "doc".to_string(),
-            properties: vec![
-                ("content".to_string(), Value::String(CompactString::from(
+            properties: vec![(
+                "content".to_string(),
+                Value::String(CompactString::from(
                     "Python scripting language for data science",
-                ))),
-            ],
+                )),
+            )],
             embedding: None,
             entity_key: None,
             ttl_ms: None,
@@ -7992,11 +9204,12 @@ mod tests {
         let cmd = Command::NodeAdd(parser::NodeAddCmd {
             graph: "ft".to_string(),
             label: "doc".to_string(),
-            properties: vec![
-                ("content".to_string(), Value::String(CompactString::from(
+            properties: vec![(
+                "content".to_string(),
+                Value::String(CompactString::from(
                     "Rust compiler and borrow checker design",
-                ))),
-            ],
+                )),
+            )],
             embedding: None,
             entity_key: None,
             ttl_ms: None,
@@ -8015,12 +9228,24 @@ mod tests {
         let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::StringList(results) => {
-                assert!(!results.is_empty(), "should find results for 'rust language'");
-                let result_ids: Vec<u64> = results.iter()
+                assert!(
+                    !results.is_empty(),
+                    "should find results for 'rust language'"
+                );
+                let result_ids: Vec<u64> = results
+                    .iter()
                     .filter_map(|s| s.split(':').next()?.parse::<u64>().ok())
                     .collect();
-                assert!(result_ids.contains(&id1), "node {} should be in results", id1);
-                assert!(result_ids.contains(&id3), "node {} should be in results", id3);
+                assert!(
+                    result_ids.contains(&id1),
+                    "node {} should be in results",
+                    id1
+                );
+                assert!(
+                    result_ids.contains(&id3),
+                    "node {} should be in results",
+                    id3
+                );
                 // Node 1 should rank first (has both "rust" and "language")
                 assert_eq!(result_ids[0], id1, "node with both terms should rank first");
             }
@@ -8052,11 +9277,10 @@ mod tests {
         let cmd = Command::NodeAdd(parser::NodeAddCmd {
             graph: "ftdel".to_string(),
             label: "doc".to_string(),
-            properties: vec![
-                ("content".to_string(), Value::String(CompactString::from(
-                    "unique searchable content here",
-                ))),
-            ],
+            properties: vec![(
+                "content".to_string(),
+                Value::String(CompactString::from("unique searchable content here")),
+            )],
             embedding: None,
             entity_key: None,
             ttl_ms: None,
@@ -8094,7 +9318,10 @@ mod tests {
         let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::StringList(results) => {
-                assert!(results.is_empty(), "deleted node should not appear in search");
+                assert!(
+                    results.is_empty(),
+                    "deleted node should not appear in search"
+                );
             }
             _ => panic!("expected StringList response"),
         }
@@ -8127,10 +9354,8 @@ mod tests {
         create_test_graph(&engine, "uq_dup");
 
         // Set unique constraint on email for Person
-        let cmd = parser::parse_command(
-            r#"SCHEMA SET "uq_dup" node "Person" unique "email""#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"SCHEMA SET "uq_dup" node "Person" unique "email""#).unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         // First insert succeeds
@@ -8176,10 +9401,8 @@ mod tests {
         create_test_graph(&engine, "uq_labels");
 
         // Unique constraint only on Person label
-        let cmd = parser::parse_command(
-            r#"SCHEMA SET "uq_labels" node "Person" unique "email""#,
-        )
-        .unwrap();
+        let cmd = parser::parse_command(r#"SCHEMA SET "uq_labels" node "Person" unique "email""#)
+            .unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         // Add Person with email
@@ -8216,10 +9439,8 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "uq_null");
 
-        let cmd = parser::parse_command(
-            r#"SCHEMA SET "uq_null" node "Person" unique "email""#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"SCHEMA SET "uq_null" node "Person" unique "email""#).unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         // First node with null email
@@ -8262,34 +9483,36 @@ mod tests {
         engine.execute_command(cmd, None).unwrap();
 
         // Add two nodes
-        let n1 = match engine.execute_command(
-            Command::NodeAdd(parser::NodeAddCmd {
-                graph: "euq".into(),
-                label: "Person".into(),
-                properties: vec![],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }),
-            None,
-        )
-        .unwrap()
+        let n1 = match engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "euq".into(),
+                    label: "Person".into(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
         {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
-        let n2 = match engine.execute_command(
-            Command::NodeAdd(parser::NodeAddCmd {
-                graph: "euq".into(),
-                label: "Person".into(),
-                properties: vec![],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }),
-            None,
-        )
-        .unwrap()
+        let n2 = match engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "euq".into(),
+                    label: "Person".into(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
         {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -8302,10 +9525,7 @@ mod tests {
             target: n2,
             label: "KNOWS".into(),
             weight: 1.0,
-            properties: vec![(
-                "ref_id".into(),
-                Value::String(CompactString::new("abc123")),
-            )],
+            properties: vec![("ref_id".into(), Value::String(CompactString::new("abc123")))],
             ttl_ms: None,
         });
         assert!(engine.execute_command(cmd, None).is_ok());
@@ -8317,10 +9537,7 @@ mod tests {
             target: n1,
             label: "KNOWS".into(),
             weight: 1.0,
-            properties: vec![(
-                "ref_id".into(),
-                Value::String(CompactString::new("abc123")),
-            )],
+            properties: vec![("ref_id".into(), Value::String(CompactString::new("abc123")))],
             ttl_ms: None,
         });
         let result = engine.execute_command(cmd, None);
@@ -8341,45 +9558,41 @@ mod tests {
         create_test_graph(&engine, "nm_basic");
 
         // Add source node with properties
-        let n1 = match engine.execute_command(
-            Command::NodeAdd(parser::NodeAddCmd {
-                graph: "nm_basic".into(),
-                label: "Person".into(),
-                properties: vec![
-                    (
-                        "name".into(),
-                        Value::String(CompactString::new("Alice")),
-                    ),
-                    ("age".into(), Value::Int(30)),
-                ],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }),
-            None,
-        )
-        .unwrap()
+        let n1 = match engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "nm_basic".into(),
+                    label: "Person".into(),
+                    properties: vec![
+                        ("name".into(), Value::String(CompactString::new("Alice"))),
+                        ("age".into(), Value::Int(30)),
+                    ],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
         {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
 
         // Add target node with different properties
-        let n2 = match engine.execute_command(
-            Command::NodeAdd(parser::NodeAddCmd {
-                graph: "nm_basic".into(),
-                label: "Person".into(),
-                properties: vec![(
-                    "city".into(),
-                    Value::String(CompactString::new("NYC")),
-                )],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }),
-            None,
-        )
-        .unwrap()
+        let n2 = match engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "nm_basic".into(),
+                    label: "Person".into(),
+                    properties: vec![("city".into(), Value::String(CompactString::new("NYC")))],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
         {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -8430,61 +9643,58 @@ mod tests {
         create_test_graph(&engine, "nm_edges");
 
         // Create three nodes: n1 (source), n2 (target), n3 (neighbor)
-        let n1 = match engine.execute_command(
-            Command::NodeAdd(parser::NodeAddCmd {
-                graph: "nm_edges".into(),
-                label: "Person".into(),
-                properties: vec![(
-                    "name".into(),
-                    Value::String(CompactString::new("Source")),
-                )],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }),
-            None,
-        )
-        .unwrap()
+        let n1 = match engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "nm_edges".into(),
+                    label: "Person".into(),
+                    properties: vec![("name".into(), Value::String(CompactString::new("Source")))],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
         {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
 
-        let n2 = match engine.execute_command(
-            Command::NodeAdd(parser::NodeAddCmd {
-                graph: "nm_edges".into(),
-                label: "Person".into(),
-                properties: vec![(
-                    "name".into(),
-                    Value::String(CompactString::new("Target")),
-                )],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }),
-            None,
-        )
-        .unwrap()
+        let n2 = match engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "nm_edges".into(),
+                    label: "Person".into(),
+                    properties: vec![("name".into(), Value::String(CompactString::new("Target")))],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
         {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
 
-        let n3 = match engine.execute_command(
-            Command::NodeAdd(parser::NodeAddCmd {
-                graph: "nm_edges".into(),
-                label: "Person".into(),
-                properties: vec![(
-                    "name".into(),
-                    Value::String(CompactString::new("Neighbor")),
-                )],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }),
-            None,
-        )
-        .unwrap()
+        let n3 = match engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "nm_edges".into(),
+                    label: "Person".into(),
+                    properties: vec![(
+                        "name".into(),
+                        Value::String(CompactString::new("Neighbor")),
+                    )],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
         {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -8534,41 +9744,43 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "nm_ks");
 
-        let n1 = match engine.execute_command(
-            Command::NodeAdd(parser::NodeAddCmd {
-                graph: "nm_ks".into(),
-                label: "Person".into(),
-                properties: vec![(
-                    "name".into(),
-                    Value::String(CompactString::new("SourceName")),
-                )],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }),
-            None,
-        )
-        .unwrap()
+        let n1 = match engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "nm_ks".into(),
+                    label: "Person".into(),
+                    properties: vec![(
+                        "name".into(),
+                        Value::String(CompactString::new("SourceName")),
+                    )],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
         {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
 
-        let n2 = match engine.execute_command(
-            Command::NodeAdd(parser::NodeAddCmd {
-                graph: "nm_ks".into(),
-                label: "Person".into(),
-                properties: vec![(
-                    "name".into(),
-                    Value::String(CompactString::new("TargetName")),
-                )],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }),
-            None,
-        )
-        .unwrap()
+        let n2 = match engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "nm_ks".into(),
+                    label: "Person".into(),
+                    properties: vec![(
+                        "name".into(),
+                        Value::String(CompactString::new("TargetName")),
+                    )],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
         {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -8597,10 +9809,7 @@ mod tests {
                     .iter()
                     .find(|(k, _)| k == "name")
                     .map(|(_, v)| v.clone());
-                assert_eq!(
-                    name,
-                    Some(Value::String(CompactString::new("SourceName")))
-                );
+                assert_eq!(name, Some(Value::String(CompactString::new("SourceName"))));
             }
             _ => panic!("expected NodeInfo"),
         }
@@ -8611,41 +9820,43 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "nm_kt");
 
-        let n1 = match engine.execute_command(
-            Command::NodeAdd(parser::NodeAddCmd {
-                graph: "nm_kt".into(),
-                label: "Person".into(),
-                properties: vec![(
-                    "name".into(),
-                    Value::String(CompactString::new("SourceName")),
-                )],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }),
-            None,
-        )
-        .unwrap()
+        let n1 = match engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "nm_kt".into(),
+                    label: "Person".into(),
+                    properties: vec![(
+                        "name".into(),
+                        Value::String(CompactString::new("SourceName")),
+                    )],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
         {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
         };
 
-        let n2 = match engine.execute_command(
-            Command::NodeAdd(parser::NodeAddCmd {
-                graph: "nm_kt".into(),
-                label: "Person".into(),
-                properties: vec![(
-                    "name".into(),
-                    Value::String(CompactString::new("TargetName")),
-                )],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }),
-            None,
-        )
-        .unwrap()
+        let n2 = match engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "nm_kt".into(),
+                    label: "Person".into(),
+                    properties: vec![(
+                        "name".into(),
+                        Value::String(CompactString::new("TargetName")),
+                    )],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
         {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -8674,13 +9885,93 @@ mod tests {
                     .iter()
                     .find(|(k, _)| k == "name")
                     .map(|(_, v)| v.clone());
-                assert_eq!(
-                    name,
-                    Some(Value::String(CompactString::new("TargetName")))
-                );
+                assert_eq!(name, Some(Value::String(CompactString::new("TargetName"))));
             }
             _ => panic!("expected NodeInfo"),
         }
+    }
+
+    #[test]
+    fn test_node_merge_reindexes_target_and_removes_source_from_text_index() {
+        let engine = make_engine();
+        create_test_graph(&engine, "nm_text");
+
+        let source_id = match engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "nm_text".into(),
+                    label: "Doc".into(),
+                    properties: vec![
+                        (
+                            "title".into(),
+                            Value::String(CompactString::from("Source document")),
+                        ),
+                        (
+                            "description".into(),
+                            Value::String(CompactString::from("Quantum widgets overview")),
+                        ),
+                    ],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let target_id = match engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "nm_text".into(),
+                    label: "Doc".into(),
+                    properties: vec![(
+                        "title".into(),
+                        Value::String(CompactString::from("Target document")),
+                    )],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let graph_arc = engine.get_graph("nm_text").unwrap();
+        {
+            let gs = graph_arc.read();
+            let hits = gs.text_index.search("quantum", 10);
+            assert!(
+                hits.iter().any(|(nid, _)| *nid == source_id),
+                "source should be indexed before merge"
+            );
+        }
+
+        let cmd = Command::NodeMerge(parser::NodeMergeCmd {
+            graph: "nm_text".into(),
+            source_id,
+            target_id,
+            conflict_policy: "keep_target".into(),
+        });
+        engine.execute_command(cmd, None).unwrap();
+
+        let gs = graph_arc.read();
+        let hits = gs.text_index.search("quantum", 10);
+        assert!(
+            hits.iter().any(|(nid, _)| *nid == target_id),
+            "merged target should be searchable by inherited text"
+        );
+        assert!(
+            !hits.iter().any(|(nid, _)| *nid == source_id),
+            "deleted source should be removed from the text index"
+        );
     }
 
     #[test]
@@ -8688,18 +9979,19 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "nm_ne");
 
-        let n1 = match engine.execute_command(
-            Command::NodeAdd(parser::NodeAddCmd {
-                graph: "nm_ne".into(),
-                label: "Person".into(),
-                properties: vec![],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }),
-            None,
-        )
-        .unwrap()
+        let n1 = match engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "nm_ne".into(),
+                    label: "Person".into(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
         {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -8720,18 +10012,19 @@ mod tests {
         let engine = make_engine();
         create_test_graph(&engine, "nm_self");
 
-        let n1 = match engine.execute_command(
-            Command::NodeAdd(parser::NodeAddCmd {
-                graph: "nm_self".into(),
-                label: "Person".into(),
-                properties: vec![],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }),
-            None,
-        )
-        .unwrap()
+        let n1 = match engine
+            .execute_command(
+                Command::NodeAdd(parser::NodeAddCmd {
+                    graph: "nm_self".into(),
+                    label: "Person".into(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
         {
             CommandResponse::Integer(id) => id,
             _ => panic!("expected Integer"),
@@ -8761,9 +10054,7 @@ mod tests {
         let cmd = Command::NodeAdd(parser::NodeAddCmd {
             graph: "cdc_nc".into(),
             label: "Person".into(),
-            properties: vec![
-                ("name".into(), Value::String(CompactString::new("Alice"))),
-            ],
+            properties: vec![("name".into(), Value::String(CompactString::new("Alice")))],
             embedding: None,
             entity_key: None,
             ttl_ms: None,
@@ -8775,7 +10066,11 @@ mod tests {
         assert!(events.len() >= 2);
         let node_event = &events[0]; // newest first
         match &node_event.kind {
-            weav_core::events::EventKind::NodeCreated { node_id, label, properties } => {
+            weav_core::events::EventKind::NodeCreated {
+                node_id,
+                label,
+                properties,
+            } => {
                 assert_eq!(*node_id, 1);
                 assert_eq!(label.as_str(), "Person");
                 assert_eq!(properties.len(), 1);
@@ -8826,7 +10121,13 @@ mod tests {
         let events = engine.recent_events(10);
         let edge_event = &events[0]; // newest first
         match &edge_event.kind {
-            weav_core::events::EventKind::EdgeCreated { edge_id, source, target, label, weight } => {
+            weav_core::events::EventKind::EdgeCreated {
+                edge_id,
+                source,
+                target,
+                label,
+                weight,
+            } => {
                 assert!(*edge_id > 0);
                 assert_eq!(*source, 1);
                 assert_eq!(*target, 2);
@@ -8975,16 +10276,17 @@ mod tests {
         let cmd = Command::NodeUpdate(parser::NodeUpdateCmd {
             graph: "cdc_nu".into(),
             node_id: 1,
-            properties: vec![
-                ("age".into(), Value::Int(30)),
-            ],
+            properties: vec![("age".into(), Value::Int(30))],
             embedding: None,
         });
         engine.execute_command(cmd, None).unwrap();
 
         let events = engine.recent_events(10);
         match &events[0].kind {
-            weav_core::events::EventKind::NodeUpdated { node_id, properties } => {
+            weav_core::events::EventKind::NodeUpdated {
+                node_id,
+                properties,
+            } => {
                 assert_eq!(*node_id, 1);
                 assert_eq!(properties.len(), 1);
                 assert_eq!(properties[0].0.as_str(), "age");
@@ -9414,10 +10716,8 @@ mod tests {
         create_test_graph(&engine, "wc_g");
 
         // Add a node to produce WAL entries.
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "wc_g" LABEL "item" PROPERTIES {"x": 1}"#,
-        )
-        .unwrap();
+        let cmd = parser::parse_command(r#"NODE ADD TO "wc_g" LABEL "item" PROPERTIES {"x": 1}"#)
+            .unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         // Execute WAL COMPACT command.
@@ -9500,16 +10800,14 @@ mod tests {
         create_test_graph(&engine, "recover_g");
 
         // Add nodes.
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "recover_g" LABEL "item" PROPERTIES {"k": "v1"}"#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "recover_g" LABEL "item" PROPERTIES {"k": "v1"}"#)
+                .unwrap();
         engine.execute_command(cmd, None).unwrap();
 
-        let cmd = parser::parse_command(
-            r#"NODE ADD TO "recover_g" LABEL "item" PROPERTIES {"k": "v2"}"#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"NODE ADD TO "recover_g" LABEL "item" PROPERTIES {"k": "v2"}"#)
+                .unwrap();
         engine.execute_command(cmd, None).unwrap();
 
         // Snapshot + compact.
@@ -9862,9 +11160,9 @@ mod tests {
                 gs.properties.set_node_property(
                     i,
                     "name",
-                    weav_core::types::Value::String(compact_str::CompactString::from(
-                        format!("Leaf{i}"),
-                    )),
+                    weav_core::types::Value::String(compact_str::CompactString::from(format!(
+                        "Leaf{i}"
+                    ))),
                 );
                 let meta = weav_graph::adjacency::EdgeMeta {
                     source: 1,
@@ -10019,7 +11317,10 @@ mod tests {
                         graph: "cypher_g".to_string(),
                         label: "Person".to_string(),
                         properties: vec![
-                            ("name".to_string(), Value::String(CompactString::from(*name))),
+                            (
+                                "name".to_string(),
+                                Value::String(CompactString::from(*name)),
+                            ),
                             ("age".to_string(), Value::Int(*age)),
                         ],
                         embedding: None,
@@ -10050,7 +11351,11 @@ mod tests {
                 None,
             )
             .unwrap();
-        let london_id = if let CommandResponse::Integer(nid) = resp { nid } else { panic!("expected Integer") };
+        let london_id = if let CommandResponse::Integer(nid) = resp {
+            nid
+        } else {
+            panic!("expected Integer")
+        };
 
         let (alice, bob, charlie) = (ids[0], ids[1], ids[2]);
         // Add edges: Alice KNOWS Bob, Bob KNOWS Charlie
@@ -10091,8 +11396,7 @@ mod tests {
         let engine = make_engine();
         let _ids = setup_cypher_graph(&engine);
 
-        let cmd =
-            parser::parse_command(r#"CYPHER "cypher_g" MATCH (n:Person) RETURN n"#).unwrap();
+        let cmd = parser::parse_command(r#"CYPHER "cypher_g" MATCH (n:Person) RETURN n"#).unwrap();
         let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::Text(json_str) => {
@@ -10157,9 +11461,10 @@ mod tests {
         let engine = make_engine();
         let (alice_id, _, _, _) = setup_cypher_graph(&engine);
 
-        let cmd = parser::parse_command(
-            &format!(r#"CYPHER "cypher_g" MATCH (n) WHERE id(n) = {} RETURN n"#, alice_id),
-        )
+        let cmd = parser::parse_command(&format!(
+            r#"CYPHER "cypher_g" MATCH (n) WHERE id(n) = {} RETURN n"#,
+            alice_id
+        ))
         .unwrap();
         let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
@@ -10196,10 +11501,7 @@ mod tests {
                         assert_eq!(info.label, "Person");
                         let name_prop = info.properties.iter().find(|(k, _)| k == "name");
                         assert!(name_prop.is_some());
-                        assert_eq!(
-                            name_prop.unwrap().1.as_str(),
-                            Some("Eve")
-                        );
+                        assert_eq!(name_prop.unwrap().1.as_str(), Some("Eve"));
                     }
                     _ => panic!("expected NodeInfo response"),
                 }
@@ -10222,10 +11524,7 @@ mod tests {
         let engine = make_engine();
         let _ids = setup_cypher_graph(&engine);
 
-        let cmd = parser::parse_command(
-            r#"CYPHER "cypher_g" MATCH (n:Robot) RETURN n"#,
-        )
-        .unwrap();
+        let cmd = parser::parse_command(r#"CYPHER "cypher_g" MATCH (n:Robot) RETURN n"#).unwrap();
         let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::Text(json_str) => {
@@ -10242,13 +11541,16 @@ mod tests {
         let _ids = setup_cypher_graph(&engine);
 
         // Match without label filter
-        let cmd =
-            parser::parse_command(r#"CYPHER "cypher_g" MATCH (n) RETURN n"#).unwrap();
+        let cmd = parser::parse_command(r#"CYPHER "cypher_g" MATCH (n) RETURN n"#).unwrap();
         let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::Text(json_str) => {
                 let results: Vec<serde_json::Value> = serde_json::from_str(&json_str).unwrap();
-                assert_eq!(results.len(), 4, "should find all 4 nodes (3 Person + 1 City)");
+                assert_eq!(
+                    results.len(),
+                    4,
+                    "should find all 4 nodes (3 Person + 1 City)"
+                );
             }
             _ => panic!("expected Text response"),
         }
@@ -10447,10 +11749,9 @@ mod tests {
         let _ids = setup_cypher_graph(&engine);
 
         // City nodes have no 'age' property
-        let cmd = parser::parse_command(
-            r#"CYPHER "cypher_g" MATCH (n) WHERE n.age IS NULL RETURN n"#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"CYPHER "cypher_g" MATCH (n) WHERE n.age IS NULL RETURN n"#)
+                .unwrap();
         let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::Text(json_str) => {
@@ -10487,10 +11788,9 @@ mod tests {
         let engine = make_engine();
         let _ids = setup_cypher_graph(&engine);
 
-        let cmd = parser::parse_command(
-            r#"CYPHER "cypher_g" MATCH (n:Person) RETURN COUNT(n) AS total"#,
-        )
-        .unwrap();
+        let cmd =
+            parser::parse_command(r#"CYPHER "cypher_g" MATCH (n:Person) RETURN COUNT(n) AS total"#)
+                .unwrap();
         let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::Text(json_str) => {
@@ -10653,10 +11953,8 @@ mod tests {
         let engine = make_engine();
         let _ids = setup_cypher_graph(&engine);
 
-        let cmd = parser::parse_command(
-            r#"CYPHER "cypher_g" MATCH (n:Person) RETURN n LIMIT 2"#,
-        )
-        .unwrap();
+        let cmd = parser::parse_command(r#"CYPHER "cypher_g" MATCH (n:Person) RETURN n LIMIT 2"#)
+            .unwrap();
         let resp = engine.execute_command(cmd, None).unwrap();
         match resp {
             CommandResponse::Text(json_str) => {

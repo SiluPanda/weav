@@ -42,6 +42,8 @@ pub enum WalOperation {
         properties_json: String,
         embedding: Option<Vec<f32>>,
         entity_key: Option<String>,
+        ttl_ms: Option<u64>,
+        created_at: Option<u64>,
     },
     NodeUpdate {
         graph_id: GraphId,
@@ -60,6 +62,8 @@ pub enum WalOperation {
         label: String,
         weight: f32,
         properties_json: String,
+        valid_from: Option<u64>,
+        valid_until: Option<u64>,
     },
     EdgeInvalidate {
         graph_id: GraphId,
@@ -495,6 +499,8 @@ mod tests {
                         properties_json: r#"{"name":"Alice"}"#.into(),
                         embedding: Some(vec![1.0, 2.0, 3.0]),
                         entity_key: Some("alice".into()),
+                        ttl_ms: None,
+                        created_at: None,
                     },
                 )
                 .unwrap();
@@ -635,6 +641,8 @@ mod tests {
                 properties_json: "{}".into(),
                 embedding: None,
                 entity_key: None,
+                ttl_ms: None,
+                created_at: None,
             },
             WalOperation::NodeUpdate {
                 graph_id: 1,
@@ -653,6 +661,8 @@ mod tests {
                 label: "KNOWS".into(),
                 weight: 0.9,
                 properties_json: "{}".into(),
+                valid_from: None,
+                valid_until: None,
             },
             WalOperation::EdgeInvalidate {
                 graph_id: 1,
@@ -722,6 +732,8 @@ mod tests {
                     properties_json: "{}".into(),
                     embedding: None,
                     entity_key: None,
+                    ttl_ms: None,
+                    created_at: None,
                 },
             )
             .unwrap();
@@ -799,6 +811,8 @@ mod tests {
                     properties_json: r#"{"k":"v"}"#.into(),
                     embedding: Some(vec![0.5]),
                     entity_key: None,
+                    ttl_ms: None,
+                    created_at: None,
                 },
             )
             .unwrap();
@@ -880,6 +894,8 @@ mod tests {
                 properties_json: r#"{"name":"Alice"}"#.into(),
                 embedding: Some(vec![1.0, 2.0]),
                 entity_key: None,
+                ttl_ms: None,
+                created_at: None,
             };
             let op_bytes = bincode::serialize(&op).unwrap();
             let correct_checksum = compute_checksum(&op_bytes);
@@ -993,6 +1009,8 @@ mod tests {
             properties_json: "{}".into(),
             embedding: None,
             entity_key: None,
+            ttl_ms: None,
+            created_at: None,
         };
         assert_eq!(op.graph_id_hint(), 5);
 
@@ -1020,6 +1038,8 @@ mod tests {
             label: "KNOWS".into(),
             weight: 1.0,
             properties_json: "{}".into(),
+            valid_from: None,
+            valid_until: None,
         };
         assert_eq!(op.graph_id_hint(), 3);
 

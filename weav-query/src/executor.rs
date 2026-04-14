@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use weav_core::error::WeavError;
 use weav_core::shard::StringInterner;
-use weav_core::types::{BiTemporal, Direction, NodeId, Provenance, Timestamp};
+use weav_core::types::{BiTemporal, Direction, NodeId, Provenance, Timestamp, Value};
 
 use weav_graph::adjacency::AdjacencyStore;
 use weav_graph::properties::PropertyStore;
@@ -271,13 +271,19 @@ pub fn execute_context_query(
         // Build temporal metadata from node properties if available
         let temporal = {
             let valid_from = properties
-                .get_node_property(node_id, "_valid_from")
-                .and_then(|v| v.as_int())
-                .map(|i| i as u64);
+                .get_node_property(node_id, "_tx_from")
+                .and_then(|v| match v {
+                    Value::Int(i) => Some(*i as u64),
+                    Value::Timestamp(t) => Some(*t),
+                    _ => None,
+                });
             let valid_until = properties
-                .get_node_property(node_id, "_valid_until")
-                .and_then(|v| v.as_int())
-                .map(|i| i as u64);
+                .get_node_property(node_id, "_ttl_expires_at")
+                .and_then(|v| match v {
+                    Value::Int(i) => Some(*i as u64),
+                    Value::Timestamp(t) => Some(*t),
+                    _ => None,
+                });
             let tx_from = properties
                 .get_node_property(node_id, "_tx_from")
                 .and_then(|v| v.as_int())
@@ -383,16 +389,25 @@ pub fn execute_context_query(
     if let Some(ts) = query.temporal_at {
         chunks.retain(|chunk| {
             // Check if node has temporal metadata that's valid at the timestamp
-            if let Some(valid_from) = properties.get_node_property(chunk.node_id, "_valid_from") {
-                if let Some(vf) = valid_from.as_int() {
-                    if (vf as u64) > ts {
+            if let Some(valid_from) = properties.get_node_property(chunk.node_id, "_tx_from") {
+                let vf = match valid_from {
+                    Value::Int(i) => Some(*i as u64),
+                    Value::Timestamp(t) => Some(*t),
+                    _ => None,
+                };
+                if let Some(vf) = vf {
+                    if vf > ts {
                         return false;
                     }
                 }
             }
-            if let Some(valid_until) = properties.get_node_property(chunk.node_id, "_valid_until") {
-                if let Some(vu) = valid_until.as_int() {
-                    let vu = vu as u64;
+            if let Some(valid_until) = properties.get_node_property(chunk.node_id, "_ttl_expires_at") {
+                let vu = match valid_until {
+                    Value::Int(i) => Some(*i as u64),
+                    Value::Timestamp(t) => Some(*t),
+                    _ => None,
+                };
+                if let Some(vu) = vu {
                     if vu != u64::MAX && ts >= vu {
                         return false;
                     }
@@ -766,10 +781,18 @@ pub fn execute_context_query(
         };
 
         let temporal = {
-            let valid_from = properties.get_node_property(node_id, "_valid_from")
-                .and_then(|v| v.as_int()).map(|i| i as u64);
-            let valid_until = properties.get_node_property(node_id, "_valid_until")
-                .and_then(|v| v.as_int()).map(|i| i as u64);
+            let valid_from = properties.get_node_property(node_id, "_tx_from")
+                .and_then(|v| match v {
+                    Value::Int(i) => Some(*i as u64),
+                    Value::Timestamp(t) => Some(*t),
+                    _ => None,
+                });
+            let valid_until = properties.get_node_property(node_id, "_ttl_expires_at")
+                .and_then(|v| match v {
+                    Value::Int(i) => Some(*i as u64),
+                    Value::Timestamp(t) => Some(*t),
+                    _ => None,
+                });
             let tx_from = properties.get_node_property(node_id, "_tx_from")
                 .and_then(|v| v.as_int()).map(|i| i as u64);
             let tx_until = properties.get_node_property(node_id, "_tx_until")
@@ -849,14 +872,23 @@ pub fn execute_context_query(
     // ── Step 4: Temporal filter ──────────────────────────────────────────
     if let Some(ts) = query.temporal_at {
         chunks.retain(|chunk| {
-            if let Some(valid_from) = properties.get_node_property(chunk.node_id, "_valid_from") {
-                if let Some(vf) = valid_from.as_int() {
-                    if (vf as u64) > ts { return false; }
+            if let Some(valid_from) = properties.get_node_property(chunk.node_id, "_tx_from") {
+                let vf = match valid_from {
+                    Value::Int(i) => Some(*i as u64),
+                    Value::Timestamp(t) => Some(*t),
+                    _ => None,
+                };
+                if let Some(vf) = vf {
+                    if vf > ts { return false; }
                 }
             }
-            if let Some(valid_until) = properties.get_node_property(chunk.node_id, "_valid_until") {
-                if let Some(vu) = valid_until.as_int() {
-                    let vu = vu as u64;
+            if let Some(valid_until) = properties.get_node_property(chunk.node_id, "_ttl_expires_at") {
+                let vu = match valid_until {
+                    Value::Int(i) => Some(*i as u64),
+                    Value::Timestamp(t) => Some(*t),
+                    _ => None,
+                };
+                if let Some(vu) = vu {
                     if vu != u64::MAX && ts >= vu { return false; }
                 }
             }
@@ -1926,10 +1958,10 @@ mod tests {
         // Create nodes with temporal metadata to test sorting by recency.
         let (adj, mut props, vec_index, text_index, token_counter, interner) = setup_test_stores();
 
-        // Give nodes valid_from timestamps: Alice=1000, Bob=3000, Rust=2000
-        props.set_node_property(1, "_valid_from", Value::Int(1000));
-        props.set_node_property(2, "_valid_from", Value::Int(3000));
-        props.set_node_property(3, "_valid_from", Value::Int(2000));
+        // Give nodes tx_from timestamps: Alice=1000, Bob=3000, Rust=2000
+        props.set_node_property(1, "_tx_from", Value::Int(1000));
+        props.set_node_property(2, "_tx_from", Value::Int(3000));
+        props.set_node_property(3, "_tx_from", Value::Int(2000));
 
         // Query with SORT BY RECENCY ASC (oldest first)
         let query_asc = ContextQuery {
@@ -2137,7 +2169,7 @@ mod tests {
         let props: Vec<(&str, &Value)> = vec![
             ("_label", &v1),
             ("_created_at", &v2),
-            ("_valid_from", &v3),
+            ("_tx_from", &v3),
         ];
 
         let content = build_content(&props);
@@ -2152,11 +2184,11 @@ mod tests {
         // temporal_at=0 should filter out all nodes created after timestamp 0.
         let (adj, mut props, vec_index, text_index, token_counter, interner) = setup_test_stores();
 
-        // Set _valid_from on all nodes to timestamps > 0
-        props.set_node_property(1, "_valid_from", Value::Int(1000));
-        props.set_node_property(2, "_valid_from", Value::Int(2000));
-        props.set_node_property(3, "_valid_from", Value::Int(3000));
-        props.set_node_property(4, "_valid_from", Value::Int(4000));
+        // Set _tx_from on all nodes to timestamps > 0
+        props.set_node_property(1, "_tx_from", Value::Int(1000));
+        props.set_node_property(2, "_tx_from", Value::Int(2000));
+        props.set_node_property(3, "_tx_from", Value::Int(3000));
+        props.set_node_property(4, "_tx_from", Value::Int(4000));
 
         let query = ContextQuery {
             query_text: Some("test".to_string()),
@@ -2192,10 +2224,10 @@ mod tests {
         // temporal_at=u64::MAX-1 should allow all nodes through (since their valid_from < MAX-1).
         let (adj, mut props, vec_index, text_index, token_counter, interner) = setup_test_stores();
 
-        // Set _valid_from on nodes to various timestamps
-        props.set_node_property(1, "_valid_from", Value::Int(1000));
-        props.set_node_property(2, "_valid_from", Value::Int(2000));
-        props.set_node_property(3, "_valid_from", Value::Int(3000));
+        // Set _tx_from on nodes to various timestamps
+        props.set_node_property(1, "_tx_from", Value::Int(1000));
+        props.set_node_property(2, "_tx_from", Value::Int(2000));
+        props.set_node_property(3, "_tx_from", Value::Int(3000));
 
         let query = ContextQuery {
             query_text: Some("test".to_string()),

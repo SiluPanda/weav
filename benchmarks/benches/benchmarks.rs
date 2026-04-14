@@ -435,6 +435,8 @@ fn bench_persistence(c: &mut Criterion) {
                             properties_json: format!(r#"{{"name":"node_{}"}}"#, i),
                             embedding: None,
                             entity_key: Some(format!("key_{}", i)),
+                            ttl_ms: None,
+                            created_at: None,
                         },
                     )
                     .unwrap();

@@ -211,6 +211,10 @@ impl PropertyStore {
         }
     }
 
+    pub fn remove_all_edge_properties(&mut self, edge_id: EdgeId) {
+        self.edge_overflow.remove(&edge_id);
+    }
+
     pub fn set_node_properties_batch(&mut self, node: NodeId, props: Vec<(String, Value)>) {
         for (key, value) in props {
             self.set_node_property(node, &key, value);

@@ -214,6 +214,8 @@ mod tests {
                     properties_json: "{}".into(),
                     embedding: None,
                     entity_key: None,
+                    ttl_ms: None,
+                    created_at: None,
                 },
             )
             .unwrap();
@@ -321,6 +323,8 @@ mod tests {
                         properties_json: "{}".into(),
                         embedding: None,
                         entity_key: None,
+                        ttl_ms: None,
+                        created_at: None,
                     },
                 )
                 .unwrap();
@@ -396,6 +400,8 @@ mod tests {
                     properties_json: "{}".into(),
                     embedding: None,
                     entity_key: None,
+                    ttl_ms: None,
+                    created_at: None,
                 },
             )
             .unwrap();
@@ -479,6 +485,8 @@ mod tests {
                     properties_json: "{}".into(),
                     embedding: None,
                     entity_key: None,
+                    ttl_ms: None,
+                    created_at: None,
                 },
             )
             .unwrap();
@@ -521,6 +529,8 @@ mod tests {
                     properties_json: "{}".into(),
                     embedding: None,
                     entity_key: None,
+                    ttl_ms: None,
+                    created_at: None,
                 },
             )
             .unwrap();
@@ -615,6 +625,8 @@ mod tests {
                     properties_json: "{}".into(),
                     embedding: None,
                     entity_key: None,
+                    ttl_ms: None,
+                    created_at: None,
                 };
                 let op_bytes = bincode::serialize(&op).unwrap();
                 let checksum = compute_checksum(&op_bytes);
@@ -754,6 +766,8 @@ mod tests {
                     properties_json: "{}".into(),
                     embedding: None,
                     entity_key: None,
+                    ttl_ms: None,
+                    created_at: None,
                 },
             )
             .unwrap();
@@ -768,6 +782,8 @@ mod tests {
                     properties_json: "{}".into(),
                     embedding: None,
                     entity_key: None,
+                    ttl_ms: None,
+                    created_at: None,
                 },
             )
             .unwrap();
@@ -781,6 +797,8 @@ mod tests {
                     label: "REL".into(),
                     weight: 1.0,
                     properties_json: "{}".into(),
+                    valid_from: None,
+                    valid_until: None,
                 },
             )
             .unwrap();

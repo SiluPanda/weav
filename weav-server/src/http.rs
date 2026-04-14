@@ -17,9 +17,9 @@ use tower_http::timeout::TimeoutLayer;
 
 use weav_core::types::{DecayFunction, Direction, TokenBudget, Value};
 use weav_query::parser::{
-    Command, ContextQuery, CypherCmd, EdgeAddCmd, EdgeDeleteCmd, EdgeFilterConfig,
-    EdgeInvalidateCmd, GraphCreateCmd, NodeAddCmd, NodeDeleteCmd, NodeGetCmd, NodeUpdateCmd,
-    BulkInsertNodesCmd, BulkInsertEdgesCmd, SeedStrategy, SortDirection, SortField, SortOrder,
+    BulkInsertEdgesCmd, BulkInsertNodesCmd, Command, ContextQuery, CypherCmd, EdgeAddCmd,
+    EdgeDeleteCmd, EdgeFilterConfig, EdgeInvalidateCmd, GraphCreateCmd, NodeAddCmd, NodeDeleteCmd,
+    NodeGetCmd, NodeUpdateCmd, SeedStrategy, SortDirection, SortField, SortOrder,
 };
 
 use crate::engine::{CommandResponse, Engine};
@@ -290,12 +290,12 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         // Schema inference from data.
         .route("/v1/graphs/{graph}/schema/infer", post(infer_schema))
         // GNN neighbor sampling.
-        .route("/v1/graphs/{graph}/sample/neighbors", post(sample_neighbors))
-        // Detailed graph statistics.
         .route(
-            "/v1/graphs/{graph}/stats/detailed",
-            get(get_detailed_stats),
+            "/v1/graphs/{graph}/sample/neighbors",
+            post(sample_neighbors),
         )
+        // Detailed graph statistics.
+        .route("/v1/graphs/{graph}/stats/detailed", get(get_detailed_stats))
         // Node search by property.
         .route("/v1/graphs/{graph}/search", get(search_nodes))
         // Full-text search with BM25 scoring.
@@ -311,10 +311,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             post(run_algorithm),
         )
         // Temporal query.
-        .route(
-            "/v1/graphs/{graph}/temporal",
-            post(temporal_query),
-        )
+        .route("/v1/graphs/{graph}/temporal", post(temporal_query))
         // Graph temporal diff.
         .route("/v1/graphs/{graph}/diff", post(graph_diff))
         // Community summary storage and search (GraphRAG).
@@ -331,30 +328,18 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             post(community_search),
         )
         // Node history.
-        .route(
-            "/v1/graphs/{graph}/nodes/{id}/history",
-            get(node_history),
-        )
+        .route("/v1/graphs/{graph}/nodes/{id}/history", get(node_history))
         // Node importance scoring.
         .route(
             "/v1/graphs/{graph}/nodes/{id}/importance",
             get(get_node_importance),
         )
         // Top-N nodes by importance.
-        .route(
-            "/v1/graphs/{graph}/importance",
-            get(get_graph_importance),
-        )
+        .route("/v1/graphs/{graph}/importance", get(get_graph_importance))
         // Graph condensation.
-        .route(
-            "/v1/graphs/{graph}/condense",
-            post(condense_graph),
-        )
+        .route("/v1/graphs/{graph}/condense", post(condense_graph))
         // Cypher query.
-        .route(
-            "/v1/graphs/{graph}/cypher",
-            post(cypher_query),
-        );
+        .route("/v1/graphs/{graph}/cypher", post(cypher_query));
 
     // Feature-gated routes: ingest (extract), vector search, CSV, prometheus.
     #[cfg(feature = "extract")]
@@ -373,7 +358,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
 
     router
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB
-        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(30)))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(30),
+        ))
         .with_state(engine)
 }
 
@@ -433,8 +421,8 @@ fn extract_identity(
 }
 
 /// Extract group_id from X-Group-Id header for multi-tenancy.
-/// When set, node operations store it as `_group_id` property,
-/// and search/query operations filter results to the specified group.
+/// When set, node-add operations store it as `_group_id` property.
+/// Read-side filtering is NOT automatic — callers must filter by `_group_id` in queries.
 fn extract_group_id(headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-group-id")
@@ -457,7 +445,14 @@ async fn get_graph_schema(
     headers: HeaderMap,
     Path(graph): Path<String>,
 ) -> impl IntoResponse {
-    let _identity = extract_identity(&engine, &headers);
+    let identity = extract_identity(&engine, &headers);
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::Read,
+    ) {
+        return weav_error_to_response(e).into_response();
+    }
     let graph_arc = match engine.get_graph(&graph) {
         Ok(g) => g,
         Err(e) => return weav_error_to_response(e).into_response(),
@@ -468,7 +463,8 @@ async fn get_graph_schema(
     let mut node_labels: std::collections::HashMap<String, std::collections::HashSet<String>> =
         std::collections::HashMap::new();
     for nid in gs.adjacency.all_node_ids() {
-        let label = gs.properties
+        let label = gs
+            .properties
             .get_node_property(nid, "_label")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
@@ -485,16 +481,19 @@ async fn get_graph_schema(
     let mut edge_labels: std::collections::HashMap<String, Vec<(String, String)>> =
         std::collections::HashMap::new();
     for (_, meta) in gs.adjacency.all_edges() {
-        let label = gs.interner
+        let label = gs
+            .interner
             .resolve_label(meta.label)
             .unwrap_or("unknown")
             .to_string();
-        let src_label = gs.properties
+        let src_label = gs
+            .properties
             .get_node_property(meta.source, "_label")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
-        let tgt_label = gs.properties
+        let tgt_label = gs
+            .properties
             .get_node_property(meta.target, "_label")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
@@ -507,24 +506,30 @@ async fn get_graph_schema(
     }
 
     // Format output
-    let node_types: Vec<serde_json::Value> = node_labels.iter().map(|(label, keys)| {
-        let mut sorted_keys: Vec<&String> = keys.iter().collect();
-        sorted_keys.sort();
-        serde_json::json!({
-            "label": label,
-            "count": gs.properties.nodes_where("_label", &|v| v.as_str() == Some(label)).len(),
-            "properties": sorted_keys,
+    let node_types: Vec<serde_json::Value> = node_labels
+        .iter()
+        .map(|(label, keys)| {
+            let mut sorted_keys: Vec<&String> = keys.iter().collect();
+            sorted_keys.sort();
+            serde_json::json!({
+                "label": label,
+                "count": gs.properties.nodes_where("_label", &|v| v.as_str() == Some(label)).len(),
+                "properties": sorted_keys,
+            })
         })
-    }).collect();
+        .collect();
 
-    let edge_types: Vec<serde_json::Value> = edge_labels.iter().map(|(label, pairs)| {
-        serde_json::json!({
-            "label": label,
-            "connections": pairs.iter().map(|(s, t)| {
-                serde_json::json!({"from": s, "to": t})
-            }).collect::<Vec<_>>(),
+    let edge_types: Vec<serde_json::Value> = edge_labels
+        .iter()
+        .map(|(label, pairs)| {
+            serde_json::json!({
+                "label": label,
+                "connections": pairs.iter().map(|(s, t)| {
+                    serde_json::json!({"from": s, "to": t})
+                }).collect::<Vec<_>>(),
+            })
         })
-    }).collect();
+        .collect();
 
     (
         StatusCode::OK,
@@ -533,7 +538,8 @@ async fn get_graph_schema(
             "node_types": node_types,
             "edge_types": edge_types,
         }))),
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// Search nodes by property key/value.
@@ -544,7 +550,14 @@ async fn search_nodes(
     Path(graph): Path<String>,
     Query(params): Query<SearchParams>,
 ) -> impl IntoResponse {
-    let _identity = extract_identity(&engine, &headers);
+    let identity = extract_identity(&engine, &headers);
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::Read,
+    ) {
+        return weav_error_to_response(e).into_response();
+    }
     let graph_arc = match engine.get_graph(&graph) {
         Ok(g) => g,
         Err(e) => return weav_error_to_response(e).into_response(),
@@ -558,36 +571,39 @@ async fn search_nodes(
         gs.properties.index.lookup(&params.key, &params.value)
     } else {
         let value_clone = params.value.clone();
-        gs.properties.nodes_where(&params.key, &move |v| {
-            match v {
-                Value::String(s) => s.as_str() == value_clone,
-                Value::Int(i) => i.to_string() == value_clone,
-                Value::Float(f) => f.to_string() == value_clone,
-                Value::Bool(b) => b.to_string() == value_clone,
-                _ => false,
-            }
+        gs.properties.nodes_where(&params.key, &move |v| match v {
+            Value::String(s) => s.as_str() == value_clone,
+            Value::Int(i) => i.to_string() == value_clone,
+            Value::Float(f) => f.to_string() == value_clone,
+            Value::Bool(b) => b.to_string() == value_clone,
+            _ => false,
         })
     };
 
-    let results: Vec<serde_json::Value> = matching_nodes.iter().take(limit).map(|&nid| {
-        let label = gs.properties
-            .get_node_property(nid, "_label")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        let props = gs.properties.get_all_node_properties(nid);
-        let mut props_map = serde_json::Map::new();
-        for (k, v) in props {
-            if !k.starts_with('_') {
-                props_map.insert(k.to_string(), value_to_json(v));
+    let results: Vec<serde_json::Value> = matching_nodes
+        .iter()
+        .take(limit)
+        .map(|&nid| {
+            let label = gs
+                .properties
+                .get_node_property(nid, "_label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let props = gs.properties.get_all_node_properties(nid);
+            let mut props_map = serde_json::Map::new();
+            for (k, v) in props {
+                if !k.starts_with('_') {
+                    props_map.insert(k.to_string(), value_to_json(v));
+                }
             }
-        }
-        serde_json::json!({
-            "node_id": nid,
-            "label": label,
-            "properties": props_map,
+            serde_json::json!({
+                "node_id": nid,
+                "label": label,
+                "properties": props_map,
+            })
         })
-    }).collect();
+        .collect();
 
     (
         StatusCode::OK,
@@ -596,7 +612,8 @@ async fn search_nodes(
             "total": matching_nodes.len(),
             "limit": limit,
         }))),
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// Full-text search using BM25 scoring.
@@ -607,7 +624,14 @@ async fn search_text(
     Path(graph): Path<String>,
     Query(params): Query<TextSearchParams>,
 ) -> impl IntoResponse {
-    let _identity = extract_identity(&engine, &headers);
+    let identity = extract_identity(&engine, &headers);
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::Read,
+    ) {
+        return weav_error_to_response(e).into_response();
+    }
     let graph_arc = match engine.get_graph(&graph) {
         Ok(g) => g,
         Err(e) => return weav_error_to_response(e).into_response(),
@@ -617,26 +641,30 @@ async fn search_text(
     let limit = params.limit.unwrap_or(20) as usize;
     let results = gs.text_index.search(&params.query, limit);
 
-    let matches: Vec<serde_json::Value> = results.iter().map(|&(nid, score)| {
-        let label = gs.properties
-            .get_node_property(nid, "_label")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        let props = gs.properties.get_all_node_properties(nid);
-        let mut props_map = serde_json::Map::new();
-        for (k, v) in props {
-            if !k.starts_with('_') {
-                props_map.insert(k.to_string(), value_to_json(v));
+    let matches: Vec<serde_json::Value> = results
+        .iter()
+        .map(|&(nid, score)| {
+            let label = gs
+                .properties
+                .get_node_property(nid, "_label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let props = gs.properties.get_all_node_properties(nid);
+            let mut props_map = serde_json::Map::new();
+            for (k, v) in props {
+                if !k.starts_with('_') {
+                    props_map.insert(k.to_string(), value_to_json(v));
+                }
             }
-        }
-        serde_json::json!({
-            "node_id": nid,
-            "label": label,
-            "score": score,
-            "properties": props_map,
+            serde_json::json!({
+                "node_id": nid,
+                "label": label,
+                "score": score,
+                "properties": props_map,
+            })
         })
-    }).collect();
+        .collect();
 
     (
         StatusCode::OK,
@@ -645,7 +673,8 @@ async fn search_text(
             "total": results.len(),
             "limit": limit,
         }))),
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// Vector similarity search with optional label/property filtering.
@@ -658,7 +687,14 @@ async fn search_vector(
     Path(graph): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let _identity = extract_identity(&engine, &headers);
+    let identity = extract_identity(&engine, &headers);
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::Read,
+    ) {
+        return weav_error_to_response(e).into_response();
+    }
     let graph_arc = match engine.get_graph(&graph) {
         Ok(g) => g,
         Err(e) => return weav_error_to_response(e).into_response(),
@@ -667,28 +703,41 @@ async fn search_vector(
 
     let embedding = match body.get("embedding").and_then(|v| v.as_array()) {
         Some(arr) => {
-            let vec: Vec<f32> = arr.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
+            let vec: Vec<f32> = arr
+                .iter()
+                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                .collect();
             if vec.len() != arr.len() {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(ApiResponse::<()>::err("embedding must be array of numbers".to_string())),
-                ).into_response();
+                    Json(ApiResponse::<()>::err(
+                        "embedding must be array of numbers".to_string(),
+                    )),
+                )
+                    .into_response();
             }
             vec
         }
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<()>::err("missing required field: embedding".to_string())),
-            ).into_response();
+                Json(ApiResponse::<()>::err(
+                    "missing required field: embedding".to_string(),
+                )),
+            )
+                .into_response();
         }
     };
 
     let k = body.get("k").and_then(|v| v.as_u64()).unwrap_or(10) as u16;
-    let filter_labels: Option<Vec<String>> = body.get("labels").and_then(|v| v.as_array()).map(|arr| {
-        arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
-    });
-    let filter_props: Option<serde_json::Map<String, serde_json::Value>> = body.get("properties").and_then(|v| v.as_object()).cloned();
+    let filter_labels: Option<Vec<String>> =
+        body.get("labels").and_then(|v| v.as_array()).map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        });
+    let filter_props: Option<serde_json::Map<String, serde_json::Value>> =
+        body.get("properties").and_then(|v| v.as_object()).cloned();
 
     let has_filter = filter_labels.is_some() || filter_props.is_some();
 
@@ -702,7 +751,8 @@ async fn search_vector(
             &|node_id: u64| {
                 // Label filter
                 if let Some(labels) = filter_labels_ref {
-                    let node_label = gs_ref.properties
+                    let node_label = gs_ref
+                        .properties
                         .get_node_property(node_id, "_label")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
@@ -734,27 +784,31 @@ async fn search_vector(
 
     match search_result {
         Ok(results) => {
-            let matches: Vec<serde_json::Value> = results.iter().map(|&(nid, dist)| {
-                let label = gs.properties
-                    .get_node_property(nid, "_label")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                let props = gs.properties.get_all_node_properties(nid);
-                let mut props_map = serde_json::Map::new();
-                for (k, v) in props {
-                    if !k.starts_with('_') {
-                        props_map.insert(k.to_string(), value_to_json(v));
+            let matches: Vec<serde_json::Value> = results
+                .iter()
+                .map(|&(nid, dist)| {
+                    let label = gs
+                        .properties
+                        .get_node_property(nid, "_label")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let props = gs.properties.get_all_node_properties(nid);
+                    let mut props_map = serde_json::Map::new();
+                    for (k, v) in props {
+                        if !k.starts_with('_') {
+                            props_map.insert(k.to_string(), value_to_json(v));
+                        }
                     }
-                }
-                serde_json::json!({
-                    "node_id": nid,
-                    "label": label,
-                    "distance": dist,
-                    "similarity": 1.0 - dist as f64,
-                    "properties": props_map,
+                    serde_json::json!({
+                        "node_id": nid,
+                        "label": label,
+                        "distance": dist,
+                        "similarity": 1.0 - dist as f64,
+                        "properties": props_map,
+                    })
                 })
-            }).collect();
+                .collect();
 
             (
                 StatusCode::OK,
@@ -764,7 +818,8 @@ async fn search_vector(
                     "k": k,
                     "filtered": has_filter,
                 }))),
-            ).into_response()
+            )
+                .into_response()
         }
         Err(e) => weav_error_to_response(e).into_response(),
     }
@@ -777,7 +832,14 @@ async fn export_graph(
     headers: HeaderMap,
     Path(graph): Path<String>,
 ) -> impl IntoResponse {
-    let _identity = extract_identity(&engine, &headers);
+    let identity = extract_identity(&engine, &headers);
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::Read,
+    ) {
+        return weav_error_to_response(e).into_response();
+    }
     let graph_arc = match engine.get_graph(&graph) {
         Ok(g) => g,
         Err(e) => return weav_error_to_response(e).into_response(),
@@ -785,60 +847,72 @@ async fn export_graph(
     let gs = graph_arc.read();
 
     // Export all nodes
-    let nodes: Vec<serde_json::Value> = gs.adjacency.all_node_ids().iter().map(|&nid| {
-        let label = gs.properties
-            .get_node_property(nid, "_label")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        let entity_key = gs.properties
-            .get_node_property(nid, "entity_key")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let props = gs.properties.get_all_node_properties(nid);
-        let mut props_map = serde_json::Map::new();
-        for (k, v) in props {
-            if !k.starts_with('_') && k != "entity_key" {
-                props_map.insert(k.to_string(), value_to_json(v));
+    let nodes: Vec<serde_json::Value> = gs
+        .adjacency
+        .all_node_ids()
+        .iter()
+        .map(|&nid| {
+            let label = gs
+                .properties
+                .get_node_property(nid, "_label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let entity_key = gs
+                .properties
+                .get_node_property(nid, "entity_key")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let props = gs.properties.get_all_node_properties(nid);
+            let mut props_map = serde_json::Map::new();
+            for (k, v) in props {
+                if !k.starts_with('_') && k != "entity_key" {
+                    props_map.insert(k.to_string(), value_to_json(v));
+                }
             }
-        }
-        let mut node = serde_json::json!({
-            "node_id": nid,
-            "label": label,
-            "properties": props_map,
-        });
-        if let Some(key) = entity_key {
-            node["entity_key"] = serde_json::Value::String(key);
-        }
-        #[cfg(feature = "vector")]
-        if let Some(vec) = gs.vector_index.get_vector(nid) {
-            node["embedding"] = serde_json::json!(vec);
-        }
-        node
-    }).collect();
+            let mut node = serde_json::json!({
+                "node_id": nid,
+                "label": label,
+                "properties": props_map,
+            });
+            if let Some(key) = entity_key {
+                node["entity_key"] = serde_json::Value::String(key);
+            }
+            #[cfg(feature = "vector")]
+            if let Some(vec) = gs.vector_index.get_vector(nid) {
+                node["embedding"] = serde_json::json!(vec);
+            }
+            node
+        })
+        .collect();
 
     // Export all edges
-    let edges: Vec<serde_json::Value> = gs.adjacency.all_edges().map(|(eid, meta)| {
-        let label = gs.interner
-            .resolve_label(meta.label)
-            .unwrap_or("unknown")
-            .to_string();
-        let edge_props = gs.properties.get_all_edge_properties(eid);
-        let mut props_map = serde_json::Map::new();
-        for (k, v) in edge_props {
-            props_map.insert(k.to_string(), value_to_json(v));
-        }
-        serde_json::json!({
-            "edge_id": eid,
-            "source": meta.source,
-            "target": meta.target,
-            "label": label,
-            "weight": meta.weight,
-            "valid_from": meta.temporal.valid_from,
-            "valid_until": meta.temporal.valid_until,
-            "properties": props_map,
+    let edges: Vec<serde_json::Value> = gs
+        .adjacency
+        .all_edges()
+        .map(|(eid, meta)| {
+            let label = gs
+                .interner
+                .resolve_label(meta.label)
+                .unwrap_or("unknown")
+                .to_string();
+            let edge_props = gs.properties.get_all_edge_properties(eid);
+            let mut props_map = serde_json::Map::new();
+            for (k, v) in edge_props {
+                props_map.insert(k.to_string(), value_to_json(v));
+            }
+            serde_json::json!({
+                "edge_id": eid,
+                "source": meta.source,
+                "target": meta.target,
+                "label": label,
+                "weight": meta.weight,
+                "valid_from": meta.temporal.valid_from,
+                "valid_until": meta.temporal.valid_until,
+                "properties": props_map,
+            })
         })
-    }).collect();
+        .collect();
 
     (
         StatusCode::OK,
@@ -849,7 +923,8 @@ async fn export_graph(
             "nodes": nodes,
             "edges": edges,
         }))),
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// Import a graph from JSON (same format as export).
@@ -880,9 +955,19 @@ async fn import_graph(
     // Import nodes
     if let Some(nodes) = body.get("nodes").and_then(|v| v.as_array()) {
         for node_json in nodes {
-            let label = node_json.get("label").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-            let entity_key = node_json.get("entity_key").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let old_id = node_json.get("node_id").and_then(|v| v.as_u64()).unwrap_or(0);
+            let label = node_json
+                .get("label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let entity_key = node_json
+                .get("entity_key")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let old_id = node_json
+                .get("node_id")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
 
             let properties = if let Some(props) = node_json.get("properties") {
                 json_to_props(props)
@@ -892,7 +977,9 @@ async fn import_graph(
 
             let embedding = node_json.get("embedding").and_then(|v| {
                 v.as_array().map(|arr| {
-                    arr.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect::<Vec<f32>>()
+                    arr.iter()
+                        .filter_map(|x| x.as_f64().map(|f| f as f32))
+                        .collect::<Vec<f32>>()
                 })
             });
 
@@ -919,14 +1006,27 @@ async fn import_graph(
     // Import edges (remap source/target IDs)
     if let Some(edges) = body.get("edges").and_then(|v| v.as_array()) {
         for edge_json in edges {
-            let old_source = edge_json.get("source").and_then(|v| v.as_u64()).unwrap_or(0);
-            let old_target = edge_json.get("target").and_then(|v| v.as_u64()).unwrap_or(0);
+            let old_source = edge_json
+                .get("source")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let old_target = edge_json
+                .get("target")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
 
             let source = id_map.get(&old_source).copied().unwrap_or(old_source);
             let target = id_map.get(&old_target).copied().unwrap_or(old_target);
 
-            let label = edge_json.get("label").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-            let weight = edge_json.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            let label = edge_json
+                .get("label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let weight = edge_json
+                .get("weight")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0) as f32;
 
             let properties = if let Some(props) = edge_json.get("properties") {
                 json_to_props(props)
@@ -1083,7 +1183,14 @@ async fn export_csv(
     headers: HeaderMap,
     Path(graph): Path<String>,
 ) -> impl IntoResponse {
-    let _identity = extract_identity(&engine, &headers);
+    let identity = extract_identity(&engine, &headers);
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::Read,
+    ) {
+        return weav_error_to_response(e).into_response();
+    }
     let graph_arc = match engine.get_graph(&graph) {
         Ok(g) => g,
         Err(e) => return weav_error_to_response(e).into_response(),
@@ -1170,7 +1277,14 @@ async fn export_dot(
     headers: HeaderMap,
     Path(graph): Path<String>,
 ) -> impl IntoResponse {
-    let _identity = extract_identity(&engine, &headers);
+    let identity = extract_identity(&engine, &headers);
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::Read,
+    ) {
+        return weav_error_to_response(e).into_response();
+    }
     let graph_arc = match engine.get_graph(&graph) {
         Ok(g) => g,
         Err(e) => return weav_error_to_response(e).into_response(),
@@ -1205,10 +1319,7 @@ async fn export_dot(
 
     // Edges
     for (eid, meta) in gs.adjacency.all_edges() {
-        let edge_label = gs
-            .interner
-            .resolve_label(meta.label)
-            .unwrap_or("unknown");
+        let edge_label = gs.interner.resolve_label(meta.label).unwrap_or("unknown");
         let edge_label_escaped = edge_label.replace('"', "\\\"");
         dot.push_str(&format!(
             "  n{} -> n{} [label=\"{}\" id=\"e{}\"];\n",
@@ -1238,7 +1349,14 @@ async fn temporal_query(
     Path(graph): Path<String>,
     Json(body): Json<TemporalQueryRequest>,
 ) -> impl IntoResponse {
-    let _identity = extract_identity(&engine, &headers);
+    let identity = extract_identity(&engine, &headers);
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::Read,
+    ) {
+        return weav_error_to_response(e).into_response();
+    }
     let graph_arc = match engine.get_graph(&graph) {
         Ok(g) => g,
         Err(e) => return weav_error_to_response(e).into_response(),
@@ -1428,7 +1546,14 @@ async fn graph_diff(
     Path(graph): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let _identity = extract_identity(&engine, &headers);
+    let identity = extract_identity(&engine, &headers);
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::Read,
+    ) {
+        return weav_error_to_response(e).into_response();
+    }
     let graph_arc = match engine.get_graph(&graph) {
         Ok(g) => g,
         Err(e) => return weav_error_to_response(e).into_response(),
@@ -1440,8 +1565,11 @@ async fn graph_diff(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<()>::err("missing required field: from_timestamp".to_string())),
-            ).into_response();
+                Json(ApiResponse::<()>::err(
+                    "missing required field: from_timestamp".to_string(),
+                )),
+            )
+                .into_response();
         }
     };
     let to_ts = match body.get("to_timestamp").and_then(|v| v.as_u64()) {
@@ -1449,16 +1577,22 @@ async fn graph_diff(
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<()>::err("missing required field: to_timestamp".to_string())),
-            ).into_response();
+                Json(ApiResponse::<()>::err(
+                    "missing required field: to_timestamp".to_string(),
+                )),
+            )
+                .into_response();
         }
     };
 
     if from_ts >= to_ts {
         return (
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<()>::err("from_timestamp must be less than to_timestamp".to_string())),
-        ).into_response();
+            Json(ApiResponse::<()>::err(
+                "from_timestamp must be less than to_timestamp".to_string(),
+            )),
+        )
+            .into_response();
     }
 
     let mut added_edges: Vec<u64> = Vec::new();
@@ -1539,7 +1673,8 @@ async fn graph_diff(
                 "active_at_end": nodes_at_end.len(),
             },
         }))),
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// Run community detection and store summaries as synthetic nodes.
@@ -1550,106 +1685,32 @@ async fn community_summarize(
     Path(graph): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let _identity = extract_identity(&engine, &headers);
-    let graph_arc = match engine.get_graph(&graph) {
-        Ok(g) => g,
-        Err(e) => return weav_error_to_response(e).into_response(),
-    };
-    let mut gs = graph_arc.write();
-
-    let algorithm = body.get("algorithm").and_then(|v| v.as_str()).unwrap_or("leiden");
-    let max_iterations = body.get("max_iterations").and_then(|v| v.as_u64()).unwrap_or(10) as u32;
-    let resolution = body.get("resolution").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
-
-    // Run community detection
-    let communities: std::collections::HashMap<u64, u64> = match algorithm {
-        "label_propagation" => weav_graph::traversal::label_propagation(&gs.adjacency, max_iterations),
-        _ => weav_graph::traversal::leiden_communities(&gs.adjacency, max_iterations, resolution, 0.01),
-    };
-
-    // Group nodes by community
-    let mut community_members: std::collections::HashMap<u64, Vec<u64>> = std::collections::HashMap::new();
-    for (&node_id, &comm_id) in &communities {
-        community_members.entry(comm_id).or_default().push(node_id);
+    let identity = extract_identity(&engine, &headers);
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::ReadWrite,
+    ) {
+        return weav_error_to_response(e).into_response();
     }
 
-    // Remove existing community summary nodes
-    let existing_summaries: Vec<u64> = gs.adjacency.all_node_ids().iter()
-        .filter(|&&nid| {
-            gs.properties
-                .get_node_property(nid, "_label")
-                .and_then(|v| v.as_str())
-                == Some("_community_summary")
-        })
-        .copied()
-        .collect();
-    for nid in &existing_summaries {
-        let _ = gs.adjacency.remove_node(*nid);
+    let algorithm = body
+        .get("algorithm")
+        .and_then(|v| v.as_str())
+        .unwrap_or("leiden");
+    let max_iterations = body
+        .get("max_iterations")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10) as u32;
+    let resolution = body
+        .get("resolution")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0) as f32;
+
+    match engine.handle_community_summarize(&graph, algorithm, max_iterations, resolution) {
+        Ok(result) => (StatusCode::OK, Json(ApiResponse::ok(result))).into_response(),
+        Err(e) => weav_error_to_response(e).into_response(),
     }
-
-    // Create summary nodes for each community
-    let mut summary_nodes: Vec<serde_json::Value> = Vec::new();
-    for (comm_id, members) in &community_members {
-        // Build summary text from member properties
-        let mut summary_parts: Vec<String> = Vec::new();
-        for &member_nid in members {
-            let label = gs.properties
-                .get_node_property(member_nid, "_label")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let name = gs.properties
-                .get_node_property(member_nid, "name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let desc = gs.properties
-                .get_node_property(member_nid, "description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if !name.is_empty() {
-                if !desc.is_empty() {
-                    summary_parts.push(format!("{label} '{name}': {desc}"));
-                } else {
-                    summary_parts.push(format!("{label} '{name}'"));
-                }
-            }
-        }
-        let summary_text = if summary_parts.is_empty() {
-            format!("Community {} with {} members", comm_id, members.len())
-        } else {
-            summary_parts.join("; ")
-        };
-
-        let node_id = gs.next_node_id;
-        gs.next_node_id += 1;
-        gs.adjacency.add_node(node_id);
-        gs.properties.set_node_property(node_id, "_label", Value::String(compact_str::CompactString::from("_community_summary")));
-        gs.properties.set_node_property(node_id, "community_id", Value::Int(*comm_id as i64));
-        gs.properties.set_node_property(node_id, "summary", Value::String(compact_str::CompactString::from(summary_text.as_str())));
-        gs.properties.set_node_property(node_id, "member_count", Value::Int(members.len() as i64));
-
-        let member_ids: Vec<Value> = members.iter().map(|&id| Value::Int(id as i64)).collect();
-        gs.properties.set_node_property(node_id, "member_node_ids", Value::List(member_ids));
-
-        // Index the summary text for BM25 search
-        gs.text_index.index_node(node_id, &summary_text);
-
-        summary_nodes.push(serde_json::json!({
-            "node_id": node_id,
-            "community_id": comm_id,
-            "member_count": members.len(),
-            "summary": summary_text,
-        }));
-    }
-
-    (
-        StatusCode::OK,
-        Json(ApiResponse::ok(serde_json::json!({
-            "algorithm": algorithm,
-            "community_count": community_members.len(),
-            "summaries": summary_nodes,
-            "removed_previous": existing_summaries.len(),
-        }))),
-    ).into_response()
 }
 
 /// Retrieve stored community summaries.
@@ -1659,14 +1720,24 @@ async fn community_summaries(
     headers: HeaderMap,
     Path(graph): Path<String>,
 ) -> impl IntoResponse {
-    let _identity = extract_identity(&engine, &headers);
+    let identity = extract_identity(&engine, &headers);
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::Read,
+    ) {
+        return weav_error_to_response(e).into_response();
+    }
     let graph_arc = match engine.get_graph(&graph) {
         Ok(g) => g,
         Err(e) => return weav_error_to_response(e).into_response(),
     };
     let gs = graph_arc.read();
 
-    let summaries: Vec<serde_json::Value> = gs.adjacency.all_node_ids().iter()
+    let summaries: Vec<serde_json::Value> = gs
+        .adjacency
+        .all_node_ids()
+        .iter()
         .filter(|&&nid| {
             gs.properties
                 .get_node_property(nid, "_label")
@@ -1694,7 +1765,8 @@ async fn community_summaries(
             "summaries": summaries,
             "total": summaries.len(),
         }))),
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// Search across community summaries (global search for GraphRAG).
@@ -1706,7 +1778,14 @@ async fn community_search(
     Path(graph): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let _identity = extract_identity(&engine, &headers);
+    let identity = extract_identity(&engine, &headers);
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::Read,
+    ) {
+        return weav_error_to_response(e).into_response();
+    }
     let graph_arc = match engine.get_graph(&graph) {
         Ok(g) => g,
         Err(e) => return weav_error_to_response(e).into_response(),
@@ -1717,7 +1796,10 @@ async fn community_search(
     let limit = body.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
     // Collect all community summary node IDs
-    let summary_nids: Vec<u64> = gs.adjacency.all_node_ids().iter()
+    let summary_nids: Vec<u64> = gs
+        .adjacency
+        .all_node_ids()
+        .iter()
         .filter(|&&nid| {
             gs.properties
                 .get_node_property(nid, "_label")
@@ -1731,7 +1813,8 @@ async fn community_search(
         // Use BM25 text search and filter to community summaries
         let search_results = gs.text_index.search(query_text, limit * 5);
         let summary_set: std::collections::HashSet<u64> = summary_nids.into_iter().collect();
-        search_results.iter()
+        search_results
+            .iter()
             .filter(|&&(nid, _)| summary_set.contains(&nid))
             .take(limit)
             .map(|&(nid, score)| {
@@ -1751,7 +1834,8 @@ async fn community_search(
             .collect()
     } else {
         // No query text -- return all summaries up to limit
-        summary_nids.iter()
+        summary_nids
+            .iter()
             .take(limit)
             .map(|&nid| {
                 let props = gs.properties.get_all_node_properties(nid);
@@ -1775,7 +1859,8 @@ async fn community_search(
             "matches": results,
             "total": results.len(),
         }))),
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// Node history: return all temporal versions of a node's data.
@@ -1785,7 +1870,14 @@ async fn node_history(
     headers: HeaderMap,
     Path((graph, node_id)): Path<(String, u64)>,
 ) -> impl IntoResponse {
-    let _identity = extract_identity(&engine, &headers);
+    let identity = extract_identity(&engine, &headers);
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::Read,
+    ) {
+        return weav_error_to_response(e).into_response();
+    }
     let graph_arc = match engine.get_graph(&graph) {
         Ok(g) => g,
         Err(e) => return weav_error_to_response(e).into_response(),
@@ -1898,7 +1990,14 @@ async fn get_node_importance(
     headers: HeaderMap,
     Path((graph, node_id)): Path<(String, u64)>,
 ) -> impl IntoResponse {
-    let _identity = extract_identity(&engine, &headers);
+    let identity = extract_identity(&engine, &headers);
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::Read,
+    ) {
+        return weav_error_to_response(e).into_response();
+    }
     let graph_arc = match engine.get_graph(&graph) {
         Ok(g) => g,
         Err(e) => return weav_error_to_response(e).into_response(),
@@ -1945,7 +2044,14 @@ async fn get_graph_importance(
     Path(graph): Path<String>,
     Query(params): Query<ImportanceParams>,
 ) -> impl IntoResponse {
-    let _identity = extract_identity(&engine, &headers);
+    let identity = extract_identity(&engine, &headers);
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::Read,
+    ) {
+        return weav_error_to_response(e).into_response();
+    }
     let graph_arc = match engine.get_graph(&graph) {
         Ok(g) => g,
         Err(e) => return weav_error_to_response(e).into_response(),
@@ -2010,7 +2116,14 @@ async fn condense_graph(
     Path(graph): Path<String>,
     Json(body): Json<CondenseRequest>,
 ) -> impl IntoResponse {
-    let _identity = extract_identity(&engine, &headers);
+    let identity = extract_identity(&engine, &headers);
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::ReadWrite,
+    ) {
+        return weav_error_to_response(e).into_response();
+    }
     match engine.handle_condense(&graph, body.importance_threshold) {
         Ok(CommandResponse::Text(msg)) => (
             StatusCode::OK,
@@ -2022,7 +2135,9 @@ async fn condense_graph(
             .into_response(),
         Ok(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+            Json(ApiResponse::<()>::err(
+                "unexpected response type".to_string(),
+            )),
         )
             .into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
@@ -2057,7 +2172,9 @@ async fn cypher_query(
             .into_response(),
         Ok(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+            Json(ApiResponse::<()>::err(
+                "unexpected response type".to_string(),
+            )),
         )
             .into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
@@ -2069,8 +2186,14 @@ async fn metrics_handler() -> impl IntoResponse {
     use prometheus::Encoder;
     let encoder = prometheus::TextEncoder::new();
     let mut buffer = Vec::new();
-    encoder.encode(&crate::metrics::REGISTRY.gather(), &mut buffer).unwrap();
-    (StatusCode::OK, [("content-type", "text/plain; version=0.0.4")], buffer)
+    encoder
+        .encode(&crate::metrics::REGISTRY.gather(), &mut buffer)
+        .unwrap();
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4")],
+        buffer,
+    )
 }
 
 async fn create_graph(
@@ -2084,11 +2207,7 @@ async fn create_graph(
         config: None,
     });
     match engine.execute_command(cmd, identity.as_ref()) {
-        Ok(_) => (
-            StatusCode::CREATED,
-            Json(ApiResponse::<()>::ok_empty()),
-        )
-            .into_response(),
+        Ok(_) => (StatusCode::CREATED, Json(ApiResponse::<()>::ok_empty())).into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
     }
 }
@@ -2101,7 +2220,9 @@ async fn list_graphs(State(engine): State<Arc<Engine>>, headers: HeaderMap) -> i
         }
         Ok(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+            Json(ApiResponse::<()>::err(
+                "unexpected response type".to_string(),
+            )),
         )
             .into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
@@ -2130,7 +2251,9 @@ async fn get_graph_info(
             .into_response(),
         Ok(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+            Json(ApiResponse::<()>::err(
+                "unexpected response type".to_string(),
+            )),
         )
             .into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
@@ -2151,7 +2274,9 @@ async fn check_graph(
         }
         Ok(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+            Json(ApiResponse::<()>::err(
+                "unexpected response type".to_string(),
+            )),
         )
             .into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
@@ -2179,14 +2304,18 @@ async fn get_detailed_stats(
                 Ok(val) => (StatusCode::OK, Json(ApiResponse::ok(val))).into_response(),
                 Err(_) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiResponse::<()>::err("failed to serialize stats".to_string())),
+                    Json(ApiResponse::<()>::err(
+                        "failed to serialize stats".to_string(),
+                    )),
                 )
                     .into_response(),
             }
         }
         Ok(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+            Json(ApiResponse::<()>::err(
+                "unexpected response type".to_string(),
+            )),
         )
             .into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
@@ -2220,7 +2349,10 @@ async fn add_node(
         Vec::new()
     };
     if let Some(ref gid) = group_id {
-        properties.push(("_group_id".to_string(), Value::String(compact_str::CompactString::from(gid.as_str()))));
+        properties.push((
+            "_group_id".to_string(),
+            Value::String(compact_str::CompactString::from(gid.as_str())),
+        ));
     }
 
     let cmd = Command::NodeAdd(NodeAddCmd {
@@ -2240,7 +2372,9 @@ async fn add_node(
             .into_response(),
         Ok(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+            Json(ApiResponse::<()>::err(
+                "unexpected response type".to_string(),
+            )),
         )
             .into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
@@ -2274,7 +2408,9 @@ async fn get_node(
         }
         Ok(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+            Json(ApiResponse::<()>::err(
+                "unexpected response type".to_string(),
+            )),
         )
             .into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
@@ -2287,10 +2423,7 @@ async fn delete_node(
     Path((graph, id)): Path<(String, u64)>,
 ) -> impl IntoResponse {
     let identity = extract_identity(&engine, &headers);
-    let cmd = Command::NodeDelete(NodeDeleteCmd {
-        graph,
-        node_id: id,
-    });
+    let cmd = Command::NodeDelete(NodeDeleteCmd { graph, node_id: id });
 
     match engine.execute_command(cmd, identity.as_ref()) {
         Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
@@ -2366,10 +2499,7 @@ async fn get_node_neighbors(
 
     (
         StatusCode::OK,
-        Json(ApiResponse::ok(NeighborsResponse {
-            node_id,
-            neighbors,
-        })),
+        Json(ApiResponse::ok(NeighborsResponse { node_id, neighbors })),
     )
         .into_response()
 }
@@ -2405,7 +2535,9 @@ async fn add_edge(
             .into_response(),
         Ok(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+            Json(ApiResponse::<()>::err(
+                "unexpected response type".to_string(),
+            )),
         )
             .into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
@@ -2418,10 +2550,7 @@ async fn invalidate_edge(
     Path((graph, id)): Path<(String, u64)>,
 ) -> impl IntoResponse {
     let identity = extract_identity(&engine, &headers);
-    let cmd = Command::EdgeInvalidate(EdgeInvalidateCmd {
-        graph,
-        edge_id: id,
-    });
+    let cmd = Command::EdgeInvalidate(EdgeInvalidateCmd { graph, edge_id: id });
 
     match engine.execute_command(cmd, identity.as_ref()) {
         Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
@@ -2453,7 +2582,7 @@ async fn get_edge(
         Some(m) => m,
         None => {
             return weav_error_to_response(weav_core::error::WeavError::EdgeNotFound(id))
-                .into_response()
+                .into_response();
         }
     };
 
@@ -2491,10 +2620,7 @@ async fn delete_edge(
     Path((graph, id)): Path<(String, u64)>,
 ) -> impl IntoResponse {
     let identity = extract_identity(&engine, &headers);
-    let cmd = Command::EdgeDelete(EdgeDeleteCmd {
-        graph,
-        edge_id: id,
-    });
+    let cmd = Command::EdgeDelete(EdgeDeleteCmd { graph, edge_id: id });
 
     match engine.execute_command(cmd, identity.as_ref()) {
         Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
@@ -2502,10 +2628,7 @@ async fn delete_edge(
     }
 }
 
-async fn snapshot(
-    State(engine): State<Arc<Engine>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn snapshot(State(engine): State<Arc<Engine>>, headers: HeaderMap) -> impl IntoResponse {
     let identity = extract_identity(&engine, &headers);
     match engine.execute_command(Command::Snapshot, identity.as_ref()) {
         Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
@@ -2529,10 +2652,7 @@ async fn backup(
     }
 }
 
-async fn wal_compact(
-    State(engine): State<Arc<Engine>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn wal_compact(State(engine): State<Arc<Engine>>, headers: HeaderMap) -> impl IntoResponse {
     let identity = extract_identity(&engine, &headers);
     match engine.execute_command(Command::WalCompact, identity.as_ref()) {
         Ok(CommandResponse::Text(msg)) => {
@@ -2543,10 +2663,7 @@ async fn wal_compact(
     }
 }
 
-async fn server_info(
-    State(engine): State<Arc<Engine>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn server_info(State(engine): State<Arc<Engine>>, headers: HeaderMap) -> impl IntoResponse {
     let identity = extract_identity(&engine, &headers);
     match engine.execute_command(Command::Info, identity.as_ref()) {
         Ok(CommandResponse::Text(text)) => {
@@ -2554,7 +2671,9 @@ async fn server_info(
         }
         Ok(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+            Json(ApiResponse::<()>::err(
+                "unexpected response type".to_string(),
+            )),
         )
             .into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
@@ -2614,18 +2733,19 @@ async fn bulk_add_nodes(
         })
         .collect();
 
-    let cmd = Command::BulkInsertNodes(BulkInsertNodesCmd {
-        graph,
-        nodes,
-    });
+    let cmd = Command::BulkInsertNodes(BulkInsertNodesCmd { graph, nodes });
 
     match engine.execute_command(cmd, identity.as_ref()) {
-        Ok(CommandResponse::IntegerList(ids)) => {
-            (StatusCode::CREATED, Json(ApiResponse::ok(BulkNodeIdsResponse { node_ids: ids }))).into_response()
-        }
+        Ok(CommandResponse::IntegerList(ids)) => (
+            StatusCode::CREATED,
+            Json(ApiResponse::ok(BulkNodeIdsResponse { node_ids: ids })),
+        )
+            .into_response(),
         Ok(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+            Json(ApiResponse::<()>::err(
+                "unexpected response type".to_string(),
+            )),
         )
             .into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
@@ -2660,18 +2780,19 @@ async fn bulk_add_edges(
         })
         .collect();
 
-    let cmd = Command::BulkInsertEdges(BulkInsertEdgesCmd {
-        graph,
-        edges,
-    });
+    let cmd = Command::BulkInsertEdges(BulkInsertEdgesCmd { graph, edges });
 
     match engine.execute_command(cmd, identity.as_ref()) {
-        Ok(CommandResponse::IntegerList(ids)) => {
-            (StatusCode::CREATED, Json(ApiResponse::ok(BulkEdgeIdsResponse { edge_ids: ids }))).into_response()
-        }
+        Ok(CommandResponse::IntegerList(ids)) => (
+            StatusCode::CREATED,
+            Json(ApiResponse::ok(BulkEdgeIdsResponse { edge_ids: ids })),
+        )
+            .into_response(),
         Ok(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+            Json(ApiResponse::<()>::err(
+                "unexpected response type".to_string(),
+            )),
         )
             .into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
@@ -2707,15 +2828,19 @@ async fn context_query(
     };
 
     // Parse decay.
-    let decay = body.decay.and_then(|d| {
-        match d.decay_type.to_lowercase().as_str() {
-            "exponential" => d.half_life_ms.map(|ms| DecayFunction::Exponential { half_life_ms: ms }),
-            "linear" => d.max_age_ms.map(|ms| DecayFunction::Linear { max_age_ms: ms }),
+    let decay = body
+        .decay
+        .and_then(|d| match d.decay_type.to_lowercase().as_str() {
+            "exponential" => d
+                .half_life_ms
+                .map(|ms| DecayFunction::Exponential { half_life_ms: ms }),
+            "linear" => d
+                .max_age_ms
+                .map(|ms| DecayFunction::Linear { max_age_ms: ms }),
             "step" => d.cutoff_ms.map(|ms| DecayFunction::Step { cutoff_ms: ms }),
             "none" => Some(DecayFunction::None),
             _ => None,
-        }
-    });
+        });
 
     // Parse sort.
     let sort = body.sort_field.and_then(|field_str| {
@@ -2729,16 +2854,17 @@ async fn context_query(
             Some("asc") => SortDirection::Asc,
             _ => SortDirection::Desc,
         };
-        Some(SortOrder { field, direction: dir })
+        Some(SortOrder {
+            field,
+            direction: dir,
+        })
     });
 
     // Parse edge filter from edge_labels.
-    let edge_filter = body.edge_labels.map(|labels| {
-        EdgeFilterConfig {
-            labels: Some(labels),
-            min_weight: None,
-            min_confidence: None,
-        }
+    let edge_filter = body.edge_labels.map(|labels| EdgeFilterConfig {
+        labels: Some(labels),
+        min_weight: None,
+        min_confidence: None,
     });
 
     // Resolve budget: preset overrides explicit budget.
@@ -2773,7 +2899,9 @@ async fn context_query(
         }
         Ok(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+            Json(ApiResponse::<()>::err(
+                "unexpected response type".to_string(),
+            )),
         )
             .into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
@@ -2881,7 +3009,9 @@ async fn ingest(
             .into_response(),
         Ok(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()>::err("unexpected response type".to_string())),
+            Json(ApiResponse::<()>::err(
+                "unexpected response type".to_string(),
+            )),
         )
             .into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
@@ -2914,9 +3044,7 @@ pub fn json_val_to_value(v: &serde_json::Value) -> Value {
                 Value::Null
             }
         }
-        serde_json::Value::String(s) => {
-            Value::String(compact_str::CompactString::from(s.as_str()))
-        }
+        serde_json::Value::String(s) => Value::String(compact_str::CompactString::from(s.as_str())),
         serde_json::Value::Array(arr) => {
             if arr.iter().all(|v| v.is_number()) {
                 let floats: Vec<f32> = arr
@@ -2932,7 +3060,12 @@ pub fn json_val_to_value(v: &serde_json::Value) -> Value {
         serde_json::Value::Object(map) => {
             let pairs: Vec<(compact_str::CompactString, Value)> = map
                 .iter()
-                .map(|(k, v)| (compact_str::CompactString::from(k.as_str()), json_val_to_value(v)))
+                .map(|(k, v)| {
+                    (
+                        compact_str::CompactString::from(k.as_str()),
+                        json_val_to_value(v),
+                    )
+                })
                 .collect();
             Value::Map(pairs)
         }
@@ -3096,7 +3229,14 @@ async fn infer_schema(
     headers: HeaderMap,
     Path(graph): Path<String>,
 ) -> impl IntoResponse {
-    let _identity = extract_identity(&engine, &headers);
+    let identity = extract_identity(&engine, &headers);
+    if let Err(e) = engine.check_permission(
+        identity.as_ref(),
+        &graph,
+        weav_auth::identity::GraphPermission::Read,
+    ) {
+        return weav_error_to_response(e).into_response();
+    }
     let graph_arc = match engine.get_graph(&graph) {
         Ok(g) => g,
         Err(e) => return weav_error_to_response(e).into_response(),
@@ -3105,12 +3245,15 @@ async fn infer_schema(
 
     // Collect node type info
     let all_nodes = gs.adjacency.all_node_ids();
-    let mut label_props: std::collections::HashMap<String, std::collections::HashMap<String, (String, u64, u64, std::collections::HashSet<String>)>> =
-        std::collections::HashMap::new();
+    let mut label_props: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, (String, u64, u64, std::collections::HashSet<String>)>,
+    > = std::collections::HashMap::new();
     let mut label_counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
 
     for &nid in &all_nodes {
-        let label = gs.properties
+        let label = gs
+            .properties
             .get_node_property(nid, "_label")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
@@ -3120,7 +3263,9 @@ async fn infer_schema(
         let props = gs.properties.get_all_node_properties(nid);
         let entry = label_props.entry(label).or_default();
         for (key, value) in props {
-            if key.starts_with('_') { continue; }
+            if key.starts_with('_') {
+                continue;
+            }
             let type_name = match value {
                 weav_core::types::Value::String(_) => "String",
                 weav_core::types::Value::Int(_) => "Int",
@@ -3132,65 +3277,96 @@ async fn infer_schema(
                 weav_core::types::Value::Bytes(_) => "Bytes",
                 weav_core::types::Value::Timestamp(_) => "Timestamp",
                 weav_core::types::Value::Null => "Null",
-            }.to_string();
+            }
+            .to_string();
             let val_str = format!("{:?}", value);
-            let e = entry.entry(key.to_string()).or_insert_with(|| (type_name.clone(), 0, 0, std::collections::HashSet::new()));
+            let e = entry
+                .entry(key.to_string())
+                .or_insert_with(|| (type_name.clone(), 0, 0, std::collections::HashSet::new()));
             e.1 += 1; // present count
             e.3.insert(val_str); // unique values
         }
     }
 
-    let node_types: Vec<serde_json::Value> = label_counts.iter().map(|(label, count)| {
-        let props = label_props.get(label);
-        let properties: Vec<serde_json::Value> = props.map(|p| {
-            p.iter().map(|(key, (type_name, present, _, uniq_vals))| {
-                let total = *count;
-                let null_rate = 1.0 - (*present as f64 / total as f64);
-                serde_json::json!({
-                    "key": key,
-                    "type": type_name,
-                    "required": null_rate == 0.0,
-                    "unique": uniq_vals.len() as u64 == *present,
-                    "null_rate": (null_rate * 1000.0).round() / 1000.0,
+    let node_types: Vec<serde_json::Value> = label_counts
+        .iter()
+        .map(|(label, count)| {
+            let props = label_props.get(label);
+            let properties: Vec<serde_json::Value> = props
+                .map(|p| {
+                    p.iter()
+                        .map(|(key, (type_name, present, _, uniq_vals))| {
+                            let total = *count;
+                            let null_rate = 1.0 - (*present as f64 / total as f64);
+                            serde_json::json!({
+                                "key": key,
+                                "type": type_name,
+                                "required": null_rate == 0.0,
+                                "unique": uniq_vals.len() as u64 == *present,
+                                "null_rate": (null_rate * 1000.0).round() / 1000.0,
+                            })
+                        })
+                        .collect()
                 })
-            }).collect()
-        }).unwrap_or_default();
-        serde_json::json!({
-            "label": label,
-            "count": count,
-            "properties": properties,
+                .unwrap_or_default();
+            serde_json::json!({
+                "label": label,
+                "count": count,
+                "properties": properties,
+            })
         })
-    }).collect();
+        .collect();
 
     // Collect edge type info
-    let mut edge_types: std::collections::HashMap<String, (u64, std::collections::HashSet<String>, std::collections::HashSet<String>)> =
-        std::collections::HashMap::new();
+    let mut edge_types: std::collections::HashMap<
+        String,
+        (
+            u64,
+            std::collections::HashSet<String>,
+            std::collections::HashSet<String>,
+        ),
+    > = std::collections::HashMap::new();
     for (_, meta) in gs.adjacency.all_edges() {
-        let label = gs.interner.resolve_label(meta.label).unwrap_or("unknown").to_string();
-        let src_label = gs.properties
+        let label = gs
+            .interner
+            .resolve_label(meta.label)
+            .unwrap_or("unknown")
+            .to_string();
+        let src_label = gs
+            .properties
             .get_node_property(meta.source, "_label")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
-        let tgt_label = gs.properties
+        let tgt_label = gs
+            .properties
             .get_node_property(meta.target, "_label")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
-        let e = edge_types.entry(label).or_insert_with(|| (0, std::collections::HashSet::new(), std::collections::HashSet::new()));
+        let e = edge_types.entry(label).or_insert_with(|| {
+            (
+                0,
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+            )
+        });
         e.0 += 1;
         e.1.insert(src_label);
         e.2.insert(tgt_label);
     }
 
-    let edge_type_list: Vec<serde_json::Value> = edge_types.iter().map(|(label, (count, src, tgt))| {
-        serde_json::json!({
-            "label": label,
-            "count": count,
-            "source_labels": src.iter().collect::<Vec<_>>(),
-            "target_labels": tgt.iter().collect::<Vec<_>>(),
+    let edge_type_list: Vec<serde_json::Value> = edge_types
+        .iter()
+        .map(|(label, (count, src, tgt))| {
+            serde_json::json!({
+                "label": label,
+                "count": count,
+                "source_labels": src.iter().collect::<Vec<_>>(),
+                "target_labels": tgt.iter().collect::<Vec<_>>(),
+            })
         })
-    }).collect();
+        .collect();
 
     // Suggest indexes for properties that are unique and required (good lookup candidates).
     let mut suggested_indexes: Vec<String> = Vec::new();
@@ -3216,7 +3392,8 @@ async fn infer_schema(
             "total_nodes": all_nodes.len(),
             "total_edges": gs.adjacency.edge_count(),
         }))),
-    ).into_response()
+    )
+        .into_response()
 }
 
 // ─── GNN Neighbor Sampling ──────────────────────────────────────────────────
@@ -3253,12 +3430,15 @@ async fn sample_neighbors(
                     "missing required field: seed_nodes (array of node IDs)".to_string(),
                 )),
             )
-                .into_response()
+                .into_response();
         }
     };
 
     let num_neighbors: Vec<usize> = match body.get("num_neighbors").and_then(|v| v.as_array()) {
-        Some(arr) => arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect(),
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_u64().map(|n| n as usize))
+            .collect(),
         None => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -3266,18 +3446,14 @@ async fn sample_neighbors(
                     "missing required field: num_neighbors (array of fan-out per hop)".to_string(),
                 )),
             )
-                .into_response()
+                .into_response();
         }
     };
 
     let seed = body.get("seed").and_then(|v| v.as_u64()).unwrap_or(42);
 
-    let result = weav_graph::traversal::neighbor_sample(
-        &gs.adjacency,
-        &seed_nodes,
-        &num_neighbors,
-        seed,
-    );
+    let result =
+        weav_graph::traversal::neighbor_sample(&gs.adjacency, &seed_nodes, &num_neighbors, seed);
 
     let num_nodes = result.node_ids.len();
     let num_edges = result.edge_index.0.len();
@@ -3330,10 +3506,7 @@ async fn run_algorithm(
 
     match algorithm.as_str() {
         "pagerank" => {
-            let damping = body
-                .get("damping")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.85) as f32;
+            let damping = body.get("damping").and_then(|v| v.as_f64()).unwrap_or(0.85) as f32;
             let iterations = body
                 .get("iterations")
                 .and_then(|v| v.as_u64())
@@ -3384,9 +3557,17 @@ async fn run_algorithm(
                     score: s.score as f64,
                 })
                 .collect();
-            scores.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            scores.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
 
-            (StatusCode::OK, Json(ApiResponse::ok(PageRankResponse { scores }))).into_response()
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(PageRankResponse { scores })),
+            )
+                .into_response()
         }
 
         "betweenness" => {
@@ -3399,7 +3580,11 @@ async fn run_algorithm(
                 .map(|(node_id, score)| AlgoNodeScore { node_id, score })
                 .collect();
 
-            (StatusCode::OK, Json(ApiResponse::ok(BetweennessResponse { scores }))).into_response()
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(BetweennessResponse { scores })),
+            )
+                .into_response()
         }
 
         "communities" => {
@@ -3416,7 +3601,8 @@ async fn run_algorithm(
                 std::collections::HashMap::new();
             for (&node_id, &comm_id) in &community_map {
                 if let Some(ref labels) = node_label_filter {
-                    let matches = gs.properties
+                    let matches = gs
+                        .properties
                         .get_node_property(node_id, "_label")
                         .and_then(|v| v.as_str())
                         .map(|l| labels.contains(l))
@@ -3456,7 +3642,7 @@ async fn run_algorithm(
                             "missing required field: source".to_string(),
                         )),
                     )
-                        .into_response()
+                        .into_response();
                 }
             };
             let target = match body.get("target").and_then(|v| v.as_u64()) {
@@ -3468,13 +3654,10 @@ async fn run_algorithm(
                             "missing required field: target".to_string(),
                         )),
                     )
-                        .into_response()
+                        .into_response();
                 }
             };
-            let max_depth = body
-                .get("max_depth")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(10) as u8;
+            let max_depth = body.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(10) as u8;
 
             let path =
                 weav_graph::traversal::shortest_path(&gs.adjacency, source, target, max_depth);
@@ -3525,16 +3708,25 @@ async fn run_algorithm(
                 .into_iter()
                 .map(|(node_id, score)| AlgoNodeScore { node_id, score })
                 .collect();
-            (StatusCode::OK, Json(ApiResponse::ok(BetweennessResponse { scores }))).into_response()
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(BetweennessResponse { scores })),
+            )
+                .into_response()
         }
 
         "label_propagation" => {
-            let iterations = body.get("iterations").and_then(|v| v.as_u64()).unwrap_or(100) as u32;
+            let iterations = body
+                .get("iterations")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100) as u32;
             let label_map = weav_graph::traversal::label_propagation(&gs.adjacency, iterations);
-            let mut groups: std::collections::HashMap<u64, Vec<u64>> = std::collections::HashMap::new();
+            let mut groups: std::collections::HashMap<u64, Vec<u64>> =
+                std::collections::HashMap::new();
             for (&node_id, &label) in &label_map {
                 if let Some(ref labels) = node_label_filter {
-                    let matches = gs.properties
+                    let matches = gs
+                        .properties
                         .get_node_property(node_id, "_label")
                         .and_then(|v| v.as_str())
                         .map(|l| labels.contains(l))
@@ -3546,20 +3738,35 @@ async fn run_algorithm(
                 groups.entry(label).or_default().push(node_id);
             }
             let mut communities: Vec<Vec<u64>> = groups.into_values().collect();
-            for c in &mut communities { c.sort(); }
+            for c in &mut communities {
+                c.sort();
+            }
             communities.sort_by_key(|c| std::cmp::Reverse(c.len()));
             let modularity = compute_modularity(&gs.adjacency, &label_map);
-            (StatusCode::OK, Json(ApiResponse::ok(CommunitiesResponse { communities, modularity }))).into_response()
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(CommunitiesResponse {
+                    communities,
+                    modularity,
+                })),
+            )
+                .into_response()
         }
 
         "leiden" => {
-            let resolution = body.get("resolution").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            let resolution = body
+                .get("resolution")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0) as f32;
             let gamma = body.get("gamma").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;
-            let community_map = weav_graph::traversal::leiden_communities(&gs.adjacency, 100, resolution, gamma);
-            let mut groups: std::collections::HashMap<u64, Vec<u64>> = std::collections::HashMap::new();
+            let community_map =
+                weav_graph::traversal::leiden_communities(&gs.adjacency, 100, resolution, gamma);
+            let mut groups: std::collections::HashMap<u64, Vec<u64>> =
+                std::collections::HashMap::new();
             for (&node_id, &comm_id) in &community_map {
                 if let Some(ref labels) = node_label_filter {
-                    let matches = gs.properties
+                    let matches = gs
+                        .properties
                         .get_node_property(node_id, "_label")
                         .and_then(|v| v.as_str())
                         .map(|l| labels.contains(l))
@@ -3571,90 +3778,183 @@ async fn run_algorithm(
                 groups.entry(comm_id).or_default().push(node_id);
             }
             let mut communities: Vec<Vec<u64>> = groups.into_values().collect();
-            for c in &mut communities { c.sort(); }
+            for c in &mut communities {
+                c.sort();
+            }
             communities.sort_by_key(|c| std::cmp::Reverse(c.len()));
             let modularity = compute_modularity(&gs.adjacency, &community_map);
-            (StatusCode::OK, Json(ApiResponse::ok(CommunitiesResponse { communities, modularity }))).into_response()
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(CommunitiesResponse {
+                    communities,
+                    modularity,
+                })),
+            )
+                .into_response()
         }
 
         "triangle_count" => {
             let filter = weav_graph::traversal::EdgeFilter::none();
             let result = weav_graph::traversal::triangle_count(&gs.adjacency, &filter);
-            let per_node: Vec<TriangleNodeInfo> = result.per_node.iter()
-                .map(|&(node_id, triangles, clustering_coefficient)| TriangleNodeInfo { node_id, triangles, clustering_coefficient })
+            let per_node: Vec<TriangleNodeInfo> = result
+                .per_node
+                .iter()
+                .map(
+                    |&(node_id, triangles, clustering_coefficient)| TriangleNodeInfo {
+                        node_id,
+                        triangles,
+                        clustering_coefficient,
+                    },
+                )
                 .collect();
-            (StatusCode::OK, Json(ApiResponse::ok(TriangleCountResponse { total_triangles: result.total_triangles, per_node }))).into_response()
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(TriangleCountResponse {
+                    total_triangles: result.total_triangles,
+                    per_node,
+                })),
+            )
+                .into_response()
         }
 
         "scc" => {
             let sccs = weav_graph::traversal::tarjan_scc(&gs.adjacency);
             let mut components: Vec<Vec<u64>> = sccs;
-            for c in &mut components { c.sort(); }
+            for c in &mut components {
+                c.sort();
+            }
             components.sort_by_key(|c| std::cmp::Reverse(c.len()));
             let count = components.len();
-            (StatusCode::OK, Json(ApiResponse::ok(ComponentsResponse { components, count }))).into_response()
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(ComponentsResponse { components, count })),
+            )
+                .into_response()
         }
 
-        "topological_sort" => {
-            match weav_graph::traversal::topological_sort(&gs.adjacency) {
-                Ok(order) => (StatusCode::OK, Json(ApiResponse::ok(TopologicalSortResponse { order }))).into_response(),
-                Err(e) => weav_error_to_response(e).into_response(),
-            }
-        }
+        "topological_sort" => match weav_graph::traversal::topological_sort(&gs.adjacency) {
+            Ok(order) => (
+                StatusCode::OK,
+                Json(ApiResponse::ok(TopologicalSortResponse { order })),
+            )
+                .into_response(),
+            Err(e) => weav_error_to_response(e).into_response(),
+        },
 
         "degree" => {
             let all_nodes = gs.adjacency.all_node_ids();
             let n = all_nodes.len();
             let divisor = if n > 1 { (n - 1) as f64 } else { 1.0 };
-            let mut scores: Vec<AlgoNodeScore> = all_nodes.iter()
+            let mut scores: Vec<AlgoNodeScore> = all_nodes
+                .iter()
                 .map(|&nid| {
                     let deg = gs.adjacency.neighbors_both(nid, None).len();
-                    AlgoNodeScore { node_id: nid, score: deg as f64 / divisor }
+                    AlgoNodeScore {
+                        node_id: nid,
+                        score: deg as f64 / divisor,
+                    }
                 })
                 .collect();
-            scores.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-            (StatusCode::OK, Json(ApiResponse::ok(PageRankResponse { scores }))).into_response()
+            scores.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(PageRankResponse { scores })),
+            )
+                .into_response()
         }
 
         "eigenvector" => {
-            let max_iter = body.get("iterations").and_then(|v| v.as_u64()).unwrap_or(100) as u32;
-            let tolerance = body.get("tolerance").and_then(|v| v.as_f64()).unwrap_or(1e-6);
-            let result = weav_graph::traversal::eigenvector_centrality(&gs.adjacency, max_iter, tolerance);
-            let scores: Vec<AlgoNodeScore> = result.into_iter()
+            let max_iter = body
+                .get("iterations")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100) as u32;
+            let tolerance = body
+                .get("tolerance")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1e-6);
+            let result =
+                weav_graph::traversal::eigenvector_centrality(&gs.adjacency, max_iter, tolerance);
+            let scores: Vec<AlgoNodeScore> = result
+                .into_iter()
                 .map(|(node_id, score)| AlgoNodeScore { node_id, score })
                 .collect();
-            (StatusCode::OK, Json(ApiResponse::ok(PageRankResponse { scores }))).into_response()
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(PageRankResponse { scores })),
+            )
+                .into_response()
         }
 
         "hits" => {
-            let max_iter = body.get("iterations").and_then(|v| v.as_u64()).unwrap_or(100) as u32;
-            let tolerance = body.get("tolerance").and_then(|v| v.as_f64()).unwrap_or(1e-6);
-            let (auth_scores, hub_scores) = weav_graph::traversal::hits(&gs.adjacency, max_iter, tolerance);
-            let authorities: Vec<AlgoNodeScore> = auth_scores.into_iter()
+            let max_iter = body
+                .get("iterations")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100) as u32;
+            let tolerance = body
+                .get("tolerance")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1e-6);
+            let (auth_scores, hub_scores) =
+                weav_graph::traversal::hits(&gs.adjacency, max_iter, tolerance);
+            let authorities: Vec<AlgoNodeScore> = auth_scores
+                .into_iter()
                 .map(|(node_id, score)| AlgoNodeScore { node_id, score })
                 .collect();
-            let hubs: Vec<AlgoNodeScore> = hub_scores.into_iter()
+            let hubs: Vec<AlgoNodeScore> = hub_scores
+                .into_iter()
                 .map(|(node_id, score)| AlgoNodeScore { node_id, score })
                 .collect();
-            (StatusCode::OK, Json(ApiResponse::ok(HitsResponse { authorities, hubs }))).into_response()
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(HitsResponse { authorities, hubs })),
+            )
+                .into_response()
         }
 
         "fastrp" => {
-            let dim = body.get("embedding_dim").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
+            let dim = body
+                .get("embedding_dim")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(128) as usize;
             let iterations = body.get("iterations").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
-            let norm = body.get("normalization_strength").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            let norm = body
+                .get("normalization_strength")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0);
             let seed = body.get("seed").and_then(|v| v.as_u64()).unwrap_or(42);
-            let embeddings = weav_graph::traversal::fastrp_embeddings(&gs.adjacency, dim, iterations, norm, seed);
+            let embeddings = weav_graph::traversal::fastrp_embeddings(
+                &gs.adjacency,
+                dim,
+                iterations,
+                norm,
+                seed,
+            );
             let mut results: Vec<FastRPEmbedding> = embeddings
                 .into_iter()
-                .map(|(nid, emb)| FastRPEmbedding { node_id: nid, embedding: emb })
+                .map(|(nid, emb)| FastRPEmbedding {
+                    node_id: nid,
+                    embedding: emb,
+                })
                 .collect();
             results.sort_by_key(|e| e.node_id);
-            (StatusCode::OK, Json(ApiResponse::ok(FastRPResponse { embeddings: results }))).into_response()
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(FastRPResponse {
+                    embeddings: results,
+                })),
+            )
+                .into_response()
         }
 
         "similarity" => {
-            let metric_str = body.get("metric").and_then(|v| v.as_str()).unwrap_or("jaccard");
+            let metric_str = body
+                .get("metric")
+                .and_then(|v| v.as_str())
+                .unwrap_or("jaccard");
             let node_a = body.get("node_a").and_then(|v| v.as_u64());
             let node_b = body.get("node_b").and_then(|v| v.as_u64());
 
@@ -3665,9 +3965,17 @@ async fn run_algorithm(
                     "overlap" => weav_graph::traversal::overlap_similarity(&gs.adjacency, a, b),
                     _ => weav_graph::traversal::jaccard_similarity(&gs.adjacency, a, b),
                 };
-                (StatusCode::OK, Json(ApiResponse::ok(SimilarityResponse {
-                    pairs: vec![SimilarityPair { node_a: a, node_b: b, similarity: score }],
-                }))).into_response()
+                (
+                    StatusCode::OK,
+                    Json(ApiResponse::ok(SimilarityResponse {
+                        pairs: vec![SimilarityPair {
+                            node_a: a,
+                            node_b: b,
+                            similarity: score,
+                        }],
+                    })),
+                )
+                    .into_response()
             } else {
                 // All-pairs similarity
                 let top_k = body.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
@@ -3676,44 +3984,86 @@ async fn run_algorithm(
                     "overlap" => weav_graph::traversal::SimilarityMetric::Overlap,
                     _ => weav_graph::traversal::SimilarityMetric::Jaccard,
                 };
-                let results = weav_graph::traversal::all_pairs_similarity(&gs.adjacency, metric, top_k);
-                let pairs: Vec<SimilarityPair> = results.into_iter()
-                    .map(|(a, b, s)| SimilarityPair { node_a: a, node_b: b, similarity: s })
+                let results =
+                    weav_graph::traversal::all_pairs_similarity(&gs.adjacency, metric, top_k);
+                let pairs: Vec<SimilarityPair> = results
+                    .into_iter()
+                    .map(|(a, b, s)| SimilarityPair {
+                        node_a: a,
+                        node_b: b,
+                        similarity: s,
+                    })
                     .collect();
-                (StatusCode::OK, Json(ApiResponse::ok(SimilarityResponse { pairs }))).into_response()
+                (
+                    StatusCode::OK,
+                    Json(ApiResponse::ok(SimilarityResponse { pairs })),
+                )
+                    .into_response()
             }
         }
 
         "link_prediction" => {
-            let metric_str = body.get("metric").and_then(|v| v.as_str()).unwrap_or("adamic_adar");
+            let metric_str = body
+                .get("metric")
+                .and_then(|v| v.as_str())
+                .unwrap_or("adamic_adar");
             let node_a = body.get("node_a").and_then(|v| v.as_u64());
             let node_b = body.get("node_b").and_then(|v| v.as_u64());
 
             if let (Some(a), Some(b)) = (node_a, node_b) {
                 // Pairwise link prediction
                 let score = match metric_str {
-                    "common_neighbors" => weav_graph::traversal::common_neighbors_count(&gs.adjacency, a, b) as f64,
-                    "preferential_attachment" => weav_graph::traversal::preferential_attachment(&gs.adjacency, a, b),
-                    "resource_allocation" => weav_graph::traversal::resource_allocation(&gs.adjacency, a, b),
+                    "common_neighbors" => {
+                        weav_graph::traversal::common_neighbors_count(&gs.adjacency, a, b) as f64
+                    }
+                    "preferential_attachment" => {
+                        weav_graph::traversal::preferential_attachment(&gs.adjacency, a, b)
+                    }
+                    "resource_allocation" => {
+                        weav_graph::traversal::resource_allocation(&gs.adjacency, a, b)
+                    }
                     _ => weav_graph::traversal::adamic_adar(&gs.adjacency, a, b),
                 };
-                (StatusCode::OK, Json(ApiResponse::ok(SimilarityResponse {
-                    pairs: vec![SimilarityPair { node_a: a, node_b: b, similarity: score }],
-                }))).into_response()
+                (
+                    StatusCode::OK,
+                    Json(ApiResponse::ok(SimilarityResponse {
+                        pairs: vec![SimilarityPair {
+                            node_a: a,
+                            node_b: b,
+                            similarity: score,
+                        }],
+                    })),
+                )
+                    .into_response()
             } else {
                 // Top-K link predictions
                 let top_k = body.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
                 let metric = match metric_str {
-                    "common_neighbors" => weav_graph::traversal::LinkPredictionMetric::CommonNeighbors,
-                    "preferential_attachment" => weav_graph::traversal::LinkPredictionMetric::PreferentialAttachment,
-                    "resource_allocation" => weav_graph::traversal::LinkPredictionMetric::ResourceAllocation,
+                    "common_neighbors" => {
+                        weav_graph::traversal::LinkPredictionMetric::CommonNeighbors
+                    }
+                    "preferential_attachment" => {
+                        weav_graph::traversal::LinkPredictionMetric::PreferentialAttachment
+                    }
+                    "resource_allocation" => {
+                        weav_graph::traversal::LinkPredictionMetric::ResourceAllocation
+                    }
                     _ => weav_graph::traversal::LinkPredictionMetric::AdamicAdar,
                 };
                 let results = weav_graph::traversal::predict_links(&gs.adjacency, metric, top_k);
-                let pairs: Vec<SimilarityPair> = results.into_iter()
-                    .map(|(a, b, s)| SimilarityPair { node_a: a, node_b: b, similarity: s })
+                let pairs: Vec<SimilarityPair> = results
+                    .into_iter()
+                    .map(|(a, b, s)| SimilarityPair {
+                        node_a: a,
+                        node_b: b,
+                        similarity: s,
+                    })
                     .collect();
-                (StatusCode::OK, Json(ApiResponse::ok(SimilarityResponse { pairs }))).into_response()
+                (
+                    StatusCode::OK,
+                    Json(ApiResponse::ok(SimilarityResponse { pairs })),
+                )
+                    .into_response()
             }
         }
 
@@ -3723,25 +4073,47 @@ async fn run_algorithm(
                 None => {
                     return (
                         StatusCode::BAD_REQUEST,
-                        Json(ApiResponse::<()>::err("missing required field: start".to_string())),
-                    ).into_response();
+                        Json(ApiResponse::<()>::err(
+                            "missing required field: start".to_string(),
+                        )),
+                    )
+                        .into_response();
                 }
             };
             let length = body.get("length").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
             let seed = body.get("seed").and_then(|v| v.as_u64()).unwrap_or(42);
             let walk = weav_graph::traversal::random_walk(&gs.adjacency, start, length, seed);
             let walk_len = walk.len();
-            (StatusCode::OK, Json(ApiResponse::ok(RandomWalkResponse { walk, length: walk_len }))).into_response()
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(RandomWalkResponse {
+                    walk,
+                    length: walk_len,
+                })),
+            )
+                .into_response()
         }
 
         "k_core" => {
             let decomposition = weav_graph::traversal::k_core_decomposition(&gs.adjacency);
             let max_core = decomposition.values().copied().max().unwrap_or(0);
-            let mut cores: Vec<KCoreNode> = decomposition.into_iter()
-                .map(|(node_id, core_number)| KCoreNode { node_id, core_number })
+            let mut cores: Vec<KCoreNode> = decomposition
+                .into_iter()
+                .map(|(node_id, core_number)| KCoreNode {
+                    node_id,
+                    core_number,
+                })
                 .collect();
-            cores.sort_by(|a, b| b.core_number.cmp(&a.core_number).then(a.node_id.cmp(&b.node_id)));
-            (StatusCode::OK, Json(ApiResponse::ok(KCoreResponse { cores, max_core }))).into_response()
+            cores.sort_by(|a, b| {
+                b.core_number
+                    .cmp(&a.core_number)
+                    .then(a.node_id.cmp(&b.node_id))
+            });
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(KCoreResponse { cores, max_core })),
+            )
+                .into_response()
         }
 
         "max_flow" => {
@@ -3750,8 +4122,11 @@ async fn run_algorithm(
                 None => {
                     return (
                         StatusCode::BAD_REQUEST,
-                        Json(ApiResponse::<()>::err("missing required field: source".to_string())),
-                    ).into_response();
+                        Json(ApiResponse::<()>::err(
+                            "missing required field: source".to_string(),
+                        )),
+                    )
+                        .into_response();
                 }
             };
             let sink = match body.get("sink").and_then(|v| v.as_u64()) {
@@ -3759,24 +4134,35 @@ async fn run_algorithm(
                 None => {
                     return (
                         StatusCode::BAD_REQUEST,
-                        Json(ApiResponse::<()>::err("missing required field: sink".to_string())),
-                    ).into_response();
+                        Json(ApiResponse::<()>::err(
+                            "missing required field: sink".to_string(),
+                        )),
+                    )
+                        .into_response();
                 }
             };
             match weav_graph::traversal::max_flow(&gs.adjacency, source, sink) {
                 Ok(result) => {
-                    let flow_edges: Vec<serde_json::Value> = result.flow_edges.iter().map(|fe| {
-                        serde_json::json!({
-                            "source": fe.source,
-                            "target": fe.target,
-                            "flow": fe.flow,
-                            "capacity": fe.capacity,
+                    let flow_edges: Vec<serde_json::Value> = result
+                        .flow_edges
+                        .iter()
+                        .map(|fe| {
+                            serde_json::json!({
+                                "source": fe.source,
+                                "target": fe.target,
+                                "flow": fe.flow,
+                                "capacity": fe.capacity,
+                            })
                         })
-                    }).collect();
-                    (StatusCode::OK, Json(ApiResponse::ok(MaxFlowResponse {
-                        max_flow: result.max_flow,
-                        flow_edges,
-                    }))).into_response()
+                        .collect();
+                    (
+                        StatusCode::OK,
+                        Json(ApiResponse::ok(MaxFlowResponse {
+                            max_flow: result.max_flow,
+                            flow_edges,
+                        })),
+                    )
+                        .into_response()
                 }
                 Err(e) => weav_error_to_response(e).into_response(),
             }
@@ -3784,20 +4170,28 @@ async fn run_algorithm(
 
         "mst" => {
             let result = weav_graph::traversal::minimum_spanning_tree(&gs.adjacency);
-            let edges: Vec<serde_json::Value> = result.edges.iter().map(|e| {
-                serde_json::json!({
-                    "source": e.source,
-                    "target": e.target,
-                    "edge_id": e.edge_id,
-                    "weight": e.weight,
+            let edges: Vec<serde_json::Value> = result
+                .edges
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "source": e.source,
+                        "target": e.target,
+                        "edge_id": e.edge_id,
+                        "weight": e.weight,
+                    })
                 })
-            }).collect();
+                .collect();
             let edge_count = edges.len();
-            (StatusCode::OK, Json(ApiResponse::ok(MstResponse {
-                edges,
-                total_weight: result.total_weight,
-                edge_count,
-            }))).into_response()
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(MstResponse {
+                    edges,
+                    total_weight: result.total_weight,
+                    edge_count,
+                })),
+            )
+                .into_response()
         }
 
         "wcc" => {
@@ -3809,10 +4203,16 @@ async fn run_algorithm(
                 groups.entry(comp_id).or_default().push(node_id);
             }
             let mut components: Vec<Vec<u64>> = groups.into_values().collect();
-            for c in &mut components { c.sort(); }
+            for c in &mut components {
+                c.sort();
+            }
             components.sort_by_key(|c| std::cmp::Reverse(c.len()));
             let count = components.len();
-            (StatusCode::OK, Json(ApiResponse::ok(ComponentsResponse { components, count }))).into_response()
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(ComponentsResponse { components, count })),
+            )
+                .into_response()
         }
 
         "harmonic" => {
@@ -3822,32 +4222,63 @@ async fn run_algorithm(
                 .into_iter()
                 .map(|(node_id, score)| AlgoNodeScore { node_id, score })
                 .collect();
-            (StatusCode::OK, Json(ApiResponse::ok(PageRankResponse { scores }))).into_response()
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(PageRankResponse { scores })),
+            )
+                .into_response()
         }
 
         "katz" => {
             let alpha = body.get("alpha").and_then(|v| v.as_f64()).unwrap_or(0.1);
             let beta = body.get("beta").and_then(|v| v.as_f64()).unwrap_or(1.0);
-            let max_iter = body.get("iterations").and_then(|v| v.as_u64()).unwrap_or(100) as u32;
-            let tolerance = body.get("tolerance").and_then(|v| v.as_f64()).unwrap_or(1e-6);
-            let result = weav_graph::traversal::katz_centrality(&gs.adjacency, alpha, beta, max_iter, tolerance);
+            let max_iter = body
+                .get("iterations")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100) as u32;
+            let tolerance = body
+                .get("tolerance")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1e-6);
+            let result = weav_graph::traversal::katz_centrality(
+                &gs.adjacency,
+                alpha,
+                beta,
+                max_iter,
+                tolerance,
+            );
             let scores: Vec<AlgoNodeScore> = result
                 .into_iter()
                 .map(|(node_id, score)| AlgoNodeScore { node_id, score })
                 .collect();
-            (StatusCode::OK, Json(ApiResponse::ok(PageRankResponse { scores }))).into_response()
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(PageRankResponse { scores })),
+            )
+                .into_response()
         }
 
         "article_rank" => {
             let damping = body.get("damping").and_then(|v| v.as_f64()).unwrap_or(0.85) as f32;
-            let max_iter = body.get("iterations").and_then(|v| v.as_u64()).unwrap_or(20) as u32;
-            let tolerance = body.get("tolerance").and_then(|v| v.as_f64()).unwrap_or(1e-6);
-            let result = weav_graph::traversal::article_rank(&gs.adjacency, damping, max_iter, tolerance);
+            let max_iter = body
+                .get("iterations")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(20) as u32;
+            let tolerance = body
+                .get("tolerance")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1e-6);
+            let result =
+                weav_graph::traversal::article_rank(&gs.adjacency, damping, max_iter, tolerance);
             let scores: Vec<AlgoNodeScore> = result
                 .into_iter()
                 .map(|(node_id, score)| AlgoNodeScore { node_id, score })
                 .collect();
-            (StatusCode::OK, Json(ApiResponse::ok(PageRankResponse { scores }))).into_response()
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(PageRankResponse { scores })),
+            )
+                .into_response()
         }
 
         "bellman_ford" => {
@@ -3856,8 +4287,11 @@ async fn run_algorithm(
                 None => {
                     return (
                         StatusCode::BAD_REQUEST,
-                        Json(ApiResponse::<()>::err("missing required field: source".to_string())),
-                    ).into_response()
+                        Json(ApiResponse::<()>::err(
+                            "missing required field: source".to_string(),
+                        )),
+                    )
+                        .into_response();
                 }
             };
             match weav_graph::traversal::bellman_ford(&gs.adjacency, source) {
@@ -3866,39 +4300,57 @@ async fn run_algorithm(
                         .into_iter()
                         .map(|(node_id, score)| AlgoNodeScore { node_id, score })
                         .collect();
-                    (StatusCode::OK, Json(ApiResponse::ok(PageRankResponse { scores }))).into_response()
+                    (
+                        StatusCode::OK,
+                        Json(ApiResponse::ok(PageRankResponse { scores })),
+                    )
+                        .into_response()
                 }
                 Err(e) => weav_error_to_response(e).into_response(),
             }
         }
 
         "k1_coloring" | "graph_coloring" => {
-            let max_iter = body.get("iterations").and_then(|v| v.as_u64()).unwrap_or(100) as u32;
+            let max_iter = body
+                .get("iterations")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100) as u32;
             let result = weav_graph::traversal::k1_coloring(&gs.adjacency, max_iter);
-            let mut colors: Vec<serde_json::Value> = result.colors
+            let mut colors: Vec<serde_json::Value> = result
+                .colors
                 .iter()
                 .map(|(&nid, &color)| serde_json::json!({"node_id": nid, "color": color}))
                 .collect();
             colors.sort_by_key(|v| v["node_id"].as_u64());
-            (StatusCode::OK, Json(ApiResponse::ok(serde_json::json!({
-                "num_colors": result.num_colors,
-                "conflicts": result.conflicts,
-                "colors": colors,
-            })))).into_response()
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(serde_json::json!({
+                    "num_colors": result.num_colors,
+                    "conflicts": result.conflicts,
+                    "colors": colors,
+                }))),
+            )
+                .into_response()
         }
 
         "conductance" => {
             // Compute communities first, then conductance per community
-            let community_map = weav_graph::traversal::modularity_communities(&gs.adjacency, 100, 1.0);
-            let conductances = weav_graph::traversal::all_community_conductance(&gs.adjacency, &community_map);
+            let community_map =
+                weav_graph::traversal::modularity_communities(&gs.adjacency, 100, 1.0);
+            let conductances =
+                weav_graph::traversal::all_community_conductance(&gs.adjacency, &community_map);
             let results: Vec<serde_json::Value> = conductances
                 .iter()
                 .map(|&(comm_id, cond)| serde_json::json!({"community_id": comm_id, "conductance": cond}))
                 .collect();
-            (StatusCode::OK, Json(ApiResponse::ok(serde_json::json!({
-                "community_count": results.len(),
-                "conductances": results,
-            })))).into_response()
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(serde_json::json!({
+                    "community_count": results.len(),
+                    "conductances": results,
+                }))),
+            )
+                .into_response()
         }
 
         "clustering_coefficient" => {
@@ -3907,7 +4359,11 @@ async fn run_algorithm(
                 .into_iter()
                 .map(|(node_id, score)| AlgoNodeScore { node_id, score })
                 .collect();
-            (StatusCode::OK, Json(ApiResponse::ok(PageRankResponse { scores }))).into_response()
+            (
+                StatusCode::OK,
+                Json(ApiResponse::ok(PageRankResponse { scores })),
+            )
+                .into_response()
         }
 
         _ => (
@@ -4060,10 +4516,13 @@ mod tests {
 
         // Create graph via engine directly.
         engine
-            .execute_command(Command::GraphCreate(GraphCreateCmd {
-                name: "info_g".to_string(),
-                config: None,
-            }), None)
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "info_g".to_string(),
+                    config: None,
+                }),
+                None,
+            )
             .unwrap();
 
         let req = Request::builder()
@@ -4094,10 +4553,13 @@ mod tests {
         let app = build_router(engine.clone());
 
         engine
-            .execute_command(Command::GraphCreate(GraphCreateCmd {
-                name: "drop_me".to_string(),
-                config: None,
-            }), None)
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "drop_me".to_string(),
+                    config: None,
+                }),
+                None,
+            )
             .unwrap();
 
         let req = Request::builder()
@@ -4115,10 +4577,13 @@ mod tests {
         let app = build_router(engine.clone());
 
         engine
-            .execute_command(Command::GraphCreate(GraphCreateCmd {
-                name: "ng".to_string(),
-                config: None,
-            }), None)
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "ng".to_string(),
+                    config: None,
+                }),
+                None,
+            )
             .unwrap();
 
         // Add node.
@@ -4154,22 +4619,28 @@ mod tests {
         let app = build_router(engine.clone());
 
         engine
-            .execute_command(Command::GraphCreate(GraphCreateCmd {
-                name: "dg".to_string(),
-                config: None,
-            }), None)
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "dg".to_string(),
+                    config: None,
+                }),
+                None,
+            )
             .unwrap();
 
         // Add and then delete a node.
         let add_resp = engine
-            .execute_command(Command::NodeAdd(NodeAddCmd {
-                graph: "dg".to_string(),
-                label: "x".to_string(),
-                properties: vec![],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }), None)
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "dg".to_string(),
+                    label: "x".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
             .unwrap();
         let node_id = match add_resp {
             CommandResponse::Integer(id) => id,
@@ -4191,22 +4662,28 @@ mod tests {
         let app = build_router(engine.clone());
 
         engine
-            .execute_command(Command::GraphCreate(GraphCreateCmd {
-                name: "eg".to_string(),
-                config: None,
-            }), None)
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "eg".to_string(),
+                    config: None,
+                }),
+                None,
+            )
             .unwrap();
 
         // Add two nodes via engine.
         let n1 = match engine
-            .execute_command(Command::NodeAdd(NodeAddCmd {
-                graph: "eg".to_string(),
-                label: "a".to_string(),
-                properties: vec![],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }), None)
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "eg".to_string(),
+                    label: "a".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
             .unwrap()
         {
             CommandResponse::Integer(id) => id,
@@ -4214,14 +4691,17 @@ mod tests {
         };
 
         let n2 = match engine
-            .execute_command(Command::NodeAdd(NodeAddCmd {
-                graph: "eg".to_string(),
-                label: "b".to_string(),
-                properties: vec![],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }), None)
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "eg".to_string(),
+                    label: "b".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
             .unwrap()
         {
             CommandResponse::Integer(id) => id,
@@ -4253,21 +4733,27 @@ mod tests {
         let app = build_router(engine.clone());
 
         engine
-            .execute_command(Command::GraphCreate(GraphCreateCmd {
-                name: "ig".to_string(),
-                config: None,
-            }), None)
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "ig".to_string(),
+                    config: None,
+                }),
+                None,
+            )
             .unwrap();
 
         let n1 = match engine
-            .execute_command(Command::NodeAdd(NodeAddCmd {
-                graph: "ig".to_string(),
-                label: "a".to_string(),
-                properties: vec![],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }), None)
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "ig".to_string(),
+                    label: "a".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
             .unwrap()
         {
             CommandResponse::Integer(id) => id,
@@ -4275,14 +4761,17 @@ mod tests {
         };
 
         let n2 = match engine
-            .execute_command(Command::NodeAdd(NodeAddCmd {
-                graph: "ig".to_string(),
-                label: "b".to_string(),
-                properties: vec![],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }), None)
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "ig".to_string(),
+                    label: "b".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
             .unwrap()
         {
             CommandResponse::Integer(id) => id,
@@ -4290,15 +4779,18 @@ mod tests {
         };
 
         let eid = match engine
-            .execute_command(Command::EdgeAdd(EdgeAddCmd {
-                graph: "ig".to_string(),
-                source: n1,
-                target: n2,
-                label: "link".to_string(),
-                weight: 1.0,
-                properties: vec![],
-                ttl_ms: None,
-            }), None)
+            .execute_command(
+                Command::EdgeAdd(EdgeAddCmd {
+                    graph: "ig".to_string(),
+                    source: n1,
+                    target: n2,
+                    label: "link".to_string(),
+                    weight: 1.0,
+                    properties: vec![],
+                    ttl_ms: None,
+                }),
+                None,
+            )
             .unwrap()
         {
             CommandResponse::Integer(id) => id,
@@ -4320,24 +4812,30 @@ mod tests {
         let app = build_router(engine.clone());
 
         engine
-            .execute_command(Command::GraphCreate(GraphCreateCmd {
-                name: "ug".to_string(),
-                config: None,
-            }), None)
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "ug".to_string(),
+                    config: None,
+                }),
+                None,
+            )
             .unwrap();
 
         let add_resp = engine
-            .execute_command(Command::NodeAdd(NodeAddCmd {
-                graph: "ug".to_string(),
-                label: "person".to_string(),
-                properties: vec![(
-                    "name".to_string(),
-                    Value::String(compact_str::CompactString::from("Alice")),
-                )],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }), None)
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "ug".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![(
+                        "name".to_string(),
+                        Value::String(compact_str::CompactString::from("Alice")),
+                    )],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
             .unwrap();
         let node_id = match add_resp {
             CommandResponse::Integer(id) => id,
@@ -4348,7 +4846,9 @@ mod tests {
             .method("PUT")
             .uri(format!("/v1/graphs/ug/nodes/{node_id}"))
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"properties": {"name": "Alice Updated", "age": 30}}"#))
+            .body(Body::from(
+                r#"{"properties": {"name": "Alice Updated", "age": 30}}"#,
+            ))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -4360,10 +4860,13 @@ mod tests {
         let app = build_router(engine.clone());
 
         engine
-            .execute_command(Command::GraphCreate(GraphCreateCmd {
-                name: "bg".to_string(),
-                config: None,
-            }), None)
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "bg".to_string(),
+                    config: None,
+                }),
+                None,
+            )
             .unwrap();
 
         let req = Request::builder()
@@ -4388,21 +4891,27 @@ mod tests {
         let app = build_router(engine.clone());
 
         engine
-            .execute_command(Command::GraphCreate(GraphCreateCmd {
-                name: "beg".to_string(),
-                config: None,
-            }), None)
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "beg".to_string(),
+                    config: None,
+                }),
+                None,
+            )
             .unwrap();
 
         let n1 = match engine
-            .execute_command(Command::NodeAdd(NodeAddCmd {
-                graph: "beg".to_string(),
-                label: "a".to_string(),
-                properties: vec![],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }), None)
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "beg".to_string(),
+                    label: "a".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
             .unwrap()
         {
             CommandResponse::Integer(id) => id,
@@ -4410,14 +4919,17 @@ mod tests {
         };
 
         let n2 = match engine
-            .execute_command(Command::NodeAdd(NodeAddCmd {
-                graph: "beg".to_string(),
-                label: "b".to_string(),
-                properties: vec![],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }), None)
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "beg".to_string(),
+                    label: "b".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
             .unwrap()
         {
             CommandResponse::Integer(id) => id,
@@ -4458,10 +4970,13 @@ mod tests {
         let app = build_router(engine.clone());
 
         engine
-            .execute_command(Command::GraphCreate(GraphCreateCmd {
-                name: "dng".to_string(),
-                config: None,
-            }), None)
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "dng".to_string(),
+                    config: None,
+                }),
+                None,
+            )
             .unwrap();
 
         let req = Request::builder()
@@ -4483,7 +4998,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let text = std::str::from_utf8(&bytes).unwrap();
         // The metrics endpoint should return text (even if empty, it's valid prometheus output).
         assert!(text.is_ascii());
@@ -4495,10 +5012,13 @@ mod tests {
         let app = build_router(engine.clone());
 
         engine
-            .execute_command(Command::GraphCreate(GraphCreateCmd {
-                name: "nullg".to_string(),
-                config: None,
-            }), None)
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "nullg".to_string(),
+                    config: None,
+                }),
+                None,
+            )
             .unwrap();
 
         // Post a node with a null property value.
@@ -4535,25 +5055,31 @@ mod tests {
         let app = build_router(engine.clone());
 
         engine
-            .execute_command(Command::GraphCreate(GraphCreateCmd {
-                name: "upg".to_string(),
-                config: None,
-            }), None)
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "upg".to_string(),
+                    config: None,
+                }),
+                None,
+            )
             .unwrap();
 
         // Add a node.
         let add_resp = engine
-            .execute_command(Command::NodeAdd(NodeAddCmd {
-                graph: "upg".to_string(),
-                label: "person".to_string(),
-                properties: vec![(
-                    "name".to_string(),
-                    Value::String(compact_str::CompactString::from("Alice")),
-                )],
-                embedding: None,
-                entity_key: None,
-                ttl_ms: None,
-            }), None)
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "upg".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![(
+                        "name".to_string(),
+                        Value::String(compact_str::CompactString::from("Alice")),
+                    )],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
             .unwrap();
         let node_id = match add_resp {
             CommandResponse::Integer(id) => id,
@@ -4565,7 +5091,9 @@ mod tests {
             .method("PUT")
             .uri(format!("/v1/graphs/upg/nodes/{node_id}"))
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"properties": {"name": "Bob", "city": "LA"}}"#))
+            .body(Body::from(
+                r#"{"properties": {"name": "Bob", "city": "LA"}}"#,
+            ))
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -4588,25 +5116,31 @@ mod tests {
         let app = build_router(engine.clone());
 
         engine
-            .execute_command(Command::GraphCreate(GraphCreateCmd {
-                name: "cg".to_string(),
-                config: None,
-            }), None)
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "cg".to_string(),
+                    config: None,
+                }),
+                None,
+            )
             .unwrap();
 
         // Add a node with entity_key.
         engine
-            .execute_command(Command::NodeAdd(NodeAddCmd {
-                graph: "cg".to_string(),
-                label: "person".to_string(),
-                properties: vec![(
-                    "name".to_string(),
-                    Value::String(compact_str::CompactString::from("Alice")),
-                )],
-                embedding: None,
-                entity_key: Some("alice".to_string()),
-                ttl_ms: None,
-            }), None)
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "cg".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![(
+                        "name".to_string(),
+                        Value::String(compact_str::CompactString::from("Alice")),
+                    )],
+                    embedding: None,
+                    entity_key: Some("alice".to_string()),
+                    ttl_ms: None,
+                }),
+                None,
+            )
             .unwrap();
 
         let body = serde_json::json!({
@@ -4633,7 +5167,7 @@ mod tests {
     // ─── Auth tests ─────────────────────────────────────────────────────────
 
     fn make_authed_app() -> (Router, Arc<Engine>) {
-        use weav_core::config::{AuthConfig, UserConfig, GraphPatternConfig};
+        use weav_core::config::{AuthConfig, GraphPatternConfig, UserConfig};
         let mut config = WeavConfig::default();
         config.auth = AuthConfig {
             enabled: true,
@@ -5242,7 +5776,10 @@ mod tests {
         let communities = json["data"]["communities"].as_array().unwrap();
         assert!(!communities.is_empty());
         // Total nodes across all communities should be 3.
-        let total: usize = communities.iter().map(|c| c.as_array().unwrap().len()).sum();
+        let total: usize = communities
+            .iter()
+            .map(|c| c.as_array().unwrap().len())
+            .sum();
         assert_eq!(total, 3);
         // Modularity should be a finite number.
         assert!(json["data"]["modularity"].as_f64().unwrap().is_finite());
@@ -5394,7 +5931,12 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let json = body_to_json(resp.into_body()).await;
         assert_eq!(json["success"], false);
-        assert!(json["error"].as_str().unwrap().contains("unknown algorithm"));
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains("unknown algorithm")
+        );
     }
 
     #[tokio::test]
@@ -6364,10 +6906,7 @@ mod tests {
                 Command::NodeAdd(NodeAddCmd {
                     graph: "dotspec".to_string(),
                     label: "Person".to_string(),
-                    properties: vec![(
-                        "name".to_string(),
-                        Value::String("Dr. \"Smith\"".into()),
-                    )],
+                    properties: vec![("name".to_string(), Value::String("Dr. \"Smith\"".into()))],
                     embedding: None,
                     entity_key: None,
                     ttl_ms: None,
@@ -6485,9 +7024,7 @@ mod tests {
             .method("POST")
             .uri("/v1/graphs/cypher_http/cypher")
             .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"query": "MATCH (n:Person) RETURN n"}"#,
-            ))
+            .body(Body::from(r#"{"query": "MATCH (n:Person) RETURN n"}"#))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -6538,9 +7075,7 @@ mod tests {
             .method("POST")
             .uri("/v1/graphs/no_such_graph/cypher")
             .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"query": "MATCH (n) RETURN n"}"#,
-            ))
+            .body(Body::from(r#"{"query": "MATCH (n) RETURN n"}"#))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -7083,7 +7618,10 @@ mod tests {
                         graph: "infer_g".to_string(),
                         label: "Person".to_string(),
                         properties: vec![
-                            ("name".to_string(), Value::String(compact_str::CompactString::from(*name))),
+                            (
+                                "name".to_string(),
+                                Value::String(compact_str::CompactString::from(*name)),
+                            ),
                             ("age".to_string(), Value::Int(*age)),
                         ],
                         embedding: None,
@@ -7102,7 +7640,10 @@ mod tests {
                     graph: "infer_g".to_string(),
                     label: "City".to_string(),
                     properties: vec![
-                        ("name".to_string(), Value::String(compact_str::CompactString::from("London"))),
+                        (
+                            "name".to_string(),
+                            Value::String(compact_str::CompactString::from("London")),
+                        ),
                         ("population".to_string(), Value::Int(9000000)),
                     ],
                     embedding: None,
@@ -7158,7 +7699,10 @@ mod tests {
         // Check suggested_indexes includes unique+required properties
         let indexes = data["suggested_indexes"].as_array().unwrap();
         let idx_strs: Vec<&str> = indexes.iter().map(|v| v.as_str().unwrap()).collect();
-        assert!(idx_strs.contains(&"Person.name"), "Person.name should be suggested");
+        assert!(
+            idx_strs.contains(&"Person.name"),
+            "Person.name should be suggested"
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,986 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Weav — Investor Deck</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500&display=swap');
+
+  :root {
+    --bg: #fafaf9;
+    --surface: #ffffff;
+    --border: #e8e5e1;
+    --border-light: #f0eee9;
+    --text: #1a1a1a;
+    --text-secondary: #525252;
+    --text-tertiary: #8a8a8a;
+    --accent: #1a1a1a;
+    --ink: #0a0a0a;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    overflow: hidden;
+    height: 100vh;
+    width: 100vw;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  .slide-container {
+    width: 100vw;
+    height: 100vh;
+    position: relative;
+  }
+
+  .slide {
+    display: none;
+    width: 100%;
+    height: 100%;
+    padding: 56px 80px 60px;
+    flex-direction: column;
+    justify-content: center;
+    position: relative;
+    animation: fadeIn 0.35s ease;
+    overflow: hidden;
+  }
+  .slide.active { display: flex; }
+
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  /* Nav */
+  .nav {
+    position: fixed;
+    bottom: 24px;
+    right: 36px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    z-index: 100;
+    font-size: 12px;
+    color: var(--text-tertiary);
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .nav button {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    width: 32px; height: 32px;
+    border-radius: 6px;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px;
+    transition: all 0.15s;
+  }
+  .nav button:hover {
+    background: var(--border-light);
+    color: var(--text);
+  }
+
+  .progress {
+    position: fixed; top: 0; left: 0; height: 1px;
+    background: var(--text);
+    transition: width 0.4s ease;
+    z-index: 200;
+  }
+
+  /* Typography */
+  .serif { font-family: 'Instrument Serif', Georgia, serif; }
+  .mono { font-family: 'JetBrains Mono', monospace; }
+
+  h1 {
+    font-family: 'Instrument Serif', Georgia, serif;
+    font-size: 54px;
+    font-weight: 400;
+    letter-spacing: -1px;
+    line-height: 1.1;
+    margin-bottom: 16px;
+    color: var(--ink);
+  }
+  h1.hero { font-size: 72px; letter-spacing: -2px; }
+
+  h2 {
+    font-family: 'Instrument Serif', Georgia, serif;
+    font-size: 36px;
+    font-weight: 400;
+    letter-spacing: -0.5px;
+    line-height: 1.15;
+    margin-bottom: 12px;
+    color: var(--ink);
+  }
+
+  h3 {
+    font-family: 'DM Sans', sans-serif;
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: 0;
+    margin-bottom: 6px;
+    color: var(--text);
+  }
+
+  .label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--text-tertiary);
+    margin-bottom: 10px;
+  }
+
+  p { font-size: 14px; line-height: 1.6; color: var(--text-secondary); }
+
+  .subtitle {
+    font-size: 17px;
+    color: var(--text-secondary);
+    line-height: 1.55;
+    max-width: 620px;
+    font-weight: 400;
+  }
+
+  em.serif {
+    font-family: 'Instrument Serif', Georgia, serif;
+    font-style: italic;
+    font-weight: 400;
+  }
+
+  .big-num {
+    font-family: 'Instrument Serif', Georgia, serif;
+    font-size: 40px;
+    font-weight: 400;
+    color: var(--ink);
+    letter-spacing: -1px;
+  }
+
+  /* Layout */
+  .g2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .g3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+  .g4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 14px; }
+  .split { display: flex; gap: 40px; align-items: flex-start; }
+  .split > * { flex: 1; }
+
+  .card {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 18px;
+    background: var(--surface);
+  }
+  .card p { font-size: 13px; line-height: 1.5; }
+
+  .stat-card {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px;
+    background: var(--surface);
+    text-align: center;
+  }
+  .stat-label {
+    font-size: 11px;
+    color: var(--text-tertiary);
+    font-weight: 500;
+    margin-top: 2px;
+  }
+
+  /* Lists */
+  ul.clean { list-style: none; padding: 0; }
+  ul.clean li {
+    padding: 6px 0;
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+    border-bottom: 1px solid var(--border-light);
+    display: flex; align-items: flex-start; gap: 10px;
+  }
+  ul.clean li:last-child { border-bottom: none; }
+  ul.clean li::before {
+    content: '';
+    width: 4px; height: 4px;
+    border-radius: 50%;
+    background: var(--text-tertiary);
+    flex-shrink: 0;
+    margin-top: 7px;
+  }
+  ul.check li::before {
+    content: '\2713';
+    background: none;
+    color: var(--text-secondary);
+    font-size: 11px;
+    width: auto;
+    margin-top: 1px;
+  }
+
+  /* Table */
+  .tbl {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  .tbl th {
+    text-align: left;
+    padding: 8px 10px;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--text-tertiary);
+    border-bottom: 1px solid var(--text);
+  }
+  .tbl td {
+    padding: 7px 10px;
+    border-bottom: 1px solid var(--border-light);
+    color: var(--text-secondary);
+  }
+  .tbl tr:last-child td { border-bottom: none; }
+  .tbl .hl { color: var(--ink); font-weight: 600; }
+  .tbl .yes { color: var(--text); font-weight: 500; }
+  .tbl .no { color: var(--text-tertiary); }
+  .tbl .part { color: var(--text-secondary); }
+
+  /* Code */
+  .code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    background: #f5f4f1;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 16px;
+    line-height: 1.6;
+    color: var(--text-secondary);
+  }
+  .code .k { color: var(--ink); font-weight: 500; }
+  .code .s { color: #6b7280; }
+  .code .c { color: #a1a1aa; }
+
+  /* Steps */
+  .step {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 14px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    background: var(--surface);
+  }
+  .step.em {
+    border-color: var(--text);
+    color: var(--text);
+  }
+
+  /* Tags */
+  .tag {
+    display: inline-block;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    font-weight: 500;
+    padding: 3px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-secondary);
+    margin-right: 4px;
+  }
+
+  blockquote {
+    border-left: 2px solid var(--text);
+    padding-left: 20px;
+    font-family: 'Instrument Serif', Georgia, serif;
+    font-style: italic;
+    font-size: 16px;
+    line-height: 1.55;
+    color: var(--text-secondary);
+    margin: 16px 0;
+    max-width: 700px;
+  }
+
+  .footnote {
+    position: absolute;
+    bottom: 24px;
+    left: 80px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    color: var(--text-tertiary);
+  }
+
+  .sp { height: 16px; }
+  .sp-sm { height: 8px; }
+  .sp-lg { height: 28px; }
+
+  .dimmer { color: var(--text-tertiary); }
+
+  .rule { border: none; border-top: 1px solid var(--border); margin: 16px 0; }
+
+  @media print {
+    .slide { display: flex !important; page-break-after: always; height: 100vh; }
+    .nav, .progress { display: none; }
+    body { overflow: visible; }
+  }
+</style>
+</head>
+<body>
+
+<div class="progress" id="progress"></div>
+<div class="slide-container">
+
+<!-- ====== 1. TITLE ====== -->
+<div class="slide active" id="s1">
+  <div class="label">Confidential &mdash; March 2026</div>
+  <h1 class="hero">weav</h1>
+  <p class="subtitle">
+    The in-memory context graph database for AI agents, GraphRAG, and LLM applications. Graph + Vector + RAG in a single sub-millisecond engine.
+  </p>
+  <div class="sp-lg"></div>
+  <div>
+    <span class="tag">Rust</span>
+    <span class="tag">In-Memory</span>
+    <span class="tag">MCP Native</span>
+    <span class="tag">RESP3 / gRPC / HTTP</span>
+    <span class="tag">1,340+ Tests</span>
+  </div>
+</div>
+
+<!-- ====== 2. PROBLEM ====== -->
+<div class="slide" id="s2">
+  <div class="label">01 &mdash; Problem</div>
+  <h2>AI applications are starving<br>for <em class="serif">structured context</em></h2>
+  <div class="sp"></div>
+  <div class="g2">
+    <div>
+      <ul class="clean">
+        <li>Vector databases return similar chunks but have no concept of relationships between facts</li>
+        <li>Graph databases understand relationships but weren't built for LLM token windows or embedding search</li>
+        <li>Every RAG pipeline stitches together 3-5 tools with brittle glue code</li>
+        <li>40-60% of RAG implementations never reach production due to retrieval quality and governance gaps</li>
+      </ul>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom: 10px;">
+        <h3>The Latency Tax</h3>
+        <p>AI agents chain 5-10 tool calls per query. Each external DB call adds 50-150ms. That's 500ms-1.5s of pure network overhead before the LLM even thinks.</p>
+      </div>
+      <div class="card">
+        <h3>The Context Gap</h3>
+        <p>LLMs without graph grounding: 16.7% accuracy on complex queries. With graph context: 56.2%. A 3.4x improvement left on the table.</p>
+      </div>
+    </div>
+  </div>
+  <div class="footnote">Sources: FalkorDB/Diffbot KG-LM Benchmark, Deloitte Agentic AI Report 2026</div>
+</div>
+
+<!-- ====== 3. MARKET ====== -->
+<div class="slide" id="s3">
+  <div class="label">02 &mdash; Market</div>
+  <h2>Three converging markets. <em class="serif">One product.</em></h2>
+  <div class="sp"></div>
+  <div class="g3">
+    <div class="stat-card">
+      <div class="big-num">$3.6B</div>
+      <div class="stat-label">Graph Database Market, 2026</div>
+      <p style="font-size: 11px; margin-top: 4px;" class="dimmer">28% CAGR &mdash; Fortune Business Insights</p>
+    </div>
+    <div class="stat-card">
+      <div class="big-num">$4.1B</div>
+      <div class="stat-label">Vector Database Market, 2026</div>
+      <p style="font-size: 11px; margin-top: 4px;" class="dimmer">23% CAGR &mdash; SNS Insider</p>
+    </div>
+    <div class="stat-card">
+      <div class="big-num">$480B</div>
+      <div class="stat-label">Global AI Spending, 2026</div>
+      <p style="font-size: 11px; margin-top: 4px;" class="dimmer">33% growth YoY &mdash; Market Clarity</p>
+    </div>
+  </div>
+  <div class="sp"></div>
+  <div class="g2">
+    <div class="card">
+      <h3>The Convergence</h3>
+      <p>Neo4j added vectors. Pinecone published research on "Vectors and Graphs: Better Together." The industry agrees AI needs both. Nobody has unified them in a single in-memory engine.</p>
+    </div>
+    <div class="card">
+      <h3>The Timing</h3>
+      <p>Microsoft's GraphRAG paper proved 72-83% comprehensiveness gains. MCP hit 97M monthly installs. Enterprise GenAI spend grew from $1.7B (2023) to $37B (2025). The infrastructure layer is being built now.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 4. PRODUCT ====== -->
+<div class="slide" id="s4">
+  <div class="label">03 &mdash; Product</div>
+  <h2>What is Weav?</h2>
+  <div class="sp-sm"></div>
+  <p>A single Rust binary that gives AI applications sub-millisecond access to a context graph &mdash; combining knowledge graph storage, vector search, full-text retrieval, and token-aware context assembly in one process.</p>
+  <div class="sp"></div>
+  <div class="g4">
+    <div class="card">
+      <h3>Graph Store</h3>
+      <p>Property graph with labeled nodes and edges. SmallVec adjacency. Bi-temporal tracking. 38+ algorithms.</p>
+    </div>
+    <div class="card">
+      <h3>Vector Index</h3>
+      <p>HNSW via USearch. Cosine, L2, dot-product. Quantization (f32/f16/i8). Up to 4096 dimensions.</p>
+    </div>
+    <div class="card">
+      <h3>Text Search</h3>
+      <p>BM25 auto-indexing. Property indexes with O(1) lookup. Full-text over community summaries.</p>
+    </div>
+    <div class="card">
+      <h3>Context Engine</h3>
+      <p>Token-budgeted retrieval. Flow-score relevance. Triple-fusion RRF. EXPLAIN queries.</p>
+    </div>
+  </div>
+  <div class="sp"></div>
+  <div class="g3">
+    <div class="stat-card">
+      <div class="big-num" style="font-size: 32px;">52+</div>
+      <div class="stat-label">HTTP Endpoints</div>
+    </div>
+    <div class="stat-card">
+      <div class="big-num" style="font-size: 32px;">28</div>
+      <div class="stat-label">MCP Tools</div>
+    </div>
+    <div class="stat-card">
+      <div class="big-num" style="font-size: 32px;">3</div>
+      <div class="stat-label">Protocols</div>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 5. CONTEXT ====== -->
+<div class="slide" id="s5">
+  <div class="label">04 &mdash; Core Innovation</div>
+  <h2>The <em class="serif">CONTEXT</em> command</h2>
+  <div class="sp-sm"></div>
+  <p>One API call. Eight stages. Token-budgeted context assembly that fits directly into an LLM prompt.</p>
+  <div class="sp"></div>
+  <div class="split">
+    <div>
+      <div class="code">
+<span class="k">POST</span> /v1/context
+{
+  <span class="s">"graph"</span>: <span class="s">"company-kb"</span>,
+  <span class="s">"query_embedding"</span>: [0.12, ...],
+  <span class="s">"seeds"</span>: [<span class="s">"entity:product-v2"</span>],
+  <span class="s">"budget"</span>: 8192,
+  <span class="s">"max_depth"</span>: 3,
+  <span class="s">"decay"</span>: <span class="s">"exponential"</span>
+}
+
+<span class="c">// Returns ranked context chunks</span>
+<span class="c">// that fit within 8192 tokens,</span>
+<span class="c">// with provenance + relevance scores</span>
+      </div>
+    </div>
+    <div>
+      <div style="display: flex; flex-direction: column; gap: 4px;">
+        <div class="step">1. Vector Search</div>
+        <div class="step">2. Entity Lookup</div>
+        <div class="step em">3. Graph Traversal</div>
+        <div class="step em">4. Flow Scoring</div>
+        <div class="step">5. Temporal Filter</div>
+        <div class="step">6. Relevance Decay</div>
+        <div class="step em">7. Token Budget</div>
+        <div class="step em">8. Format Context</div>
+      </div>
+      <p style="font-size: 11px; margin-top: 10px;" class="dimmer">No other database offers a single-call, token-aware context assembly primitive.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 6. ARCHITECTURE ====== -->
+<div class="slide" id="s6">
+  <div class="label">05 &mdash; Architecture</div>
+  <h2>Designed for <em class="serif">in-memory speed</em></h2>
+  <div class="sp"></div>
+  <div class="g2">
+    <div>
+      <h3 style="margin-bottom: 6px;">Single-Process, Multi-Protocol</h3>
+      <ul class="clean">
+        <li><strong>Rust</strong> &mdash; no GC pauses, no JVM overhead, predictable p99 latency</li>
+        <li><strong>Thread-per-core</strong> with keyspace sharding. Per-graph RwLocks for concurrent reads</li>
+        <li><strong>String interning</strong> &mdash; labels and property keys as u16 IDs, not heap strings</li>
+        <li><strong>SmallVec adjacency</strong> &mdash; first 8 neighbors stack-allocated</li>
+        <li><strong>11 modular crates</strong> with zero cyclic dependencies</li>
+      </ul>
+    </div>
+    <div>
+      <h3 style="margin-bottom: 6px;">Protocol Stack</h3>
+      <table class="tbl">
+        <tbody>
+          <tr><td class="hl">RESP3</td><td>Port 6380</td><td class="dimmer">Redis-compatible</td></tr>
+          <tr><td class="hl">gRPC</td><td>Port 6381</td><td class="dimmer">Protobuf / tonic</td></tr>
+          <tr><td class="hl">HTTP</td><td>Port 6382</td><td class="dimmer">REST / JSON / Axum</td></tr>
+          <tr><td class="hl">MCP</td><td>stdio</td><td class="dimmer">28 tools / JSON-RPC</td></tr>
+        </tbody>
+      </table>
+      <div class="sp"></div>
+      <h3 style="margin-bottom: 6px;">Build</h3>
+      <table class="tbl">
+        <tbody>
+          <tr><td>LTO</td><td class="dimmer">Thin LTO, codegen-units=1</td></tr>
+          <tr><td>Optimization</td><td class="dimmer">opt-level=3, panic=abort</td></tr>
+          <tr><td>Feature gates</td><td class="dimmer">80% smaller minimal binary</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 7. AI-NATIVE ====== -->
+<div class="slide" id="s7">
+  <div class="label">06 &mdash; AI-Native Capabilities</div>
+  <h2>Built for how <em class="serif">AI actually works</em></h2>
+  <div class="sp"></div>
+  <div class="g2">
+    <div class="card" style="margin-bottom: 10px;">
+      <h3>Token Budget Enforcement</h3>
+      <p>Greedy knapsack algorithm packs context by value-density within your token limit. Proportional, priority, and auto allocation.</p>
+    </div>
+    <div class="card" style="margin-bottom: 10px;">
+      <h3>LLM-Powered Ingestion</h3>
+      <p>PDF, DOCX, CSV, text. Semantic chunking, embeddings, entity extraction, deduplication. 8+ LLM providers.</p>
+    </div>
+    <div class="card" style="margin-bottom: 10px;">
+      <h3>GraphRAG Built In</h3>
+      <p>Leiden / Label Propagation community detection generates BM25-searchable summaries. No separate pipeline.</p>
+    </div>
+    <div class="card" style="margin-bottom: 10px;">
+      <h3>Triple-Fusion Retrieval</h3>
+      <p>Vector + BM25 + graph traversal, fused via RRF. State-of-the-art retrieval in one process.</p>
+    </div>
+    <div class="card">
+      <h3>Bi-Temporal Tracking</h3>
+      <p>Every fact records real-world validity and database transaction time. Point-in-time queries and audit trails.</p>
+    </div>
+    <div class="card">
+      <h3>Entity Resolution</h3>
+      <p>Jaro-Winkler fuzzy match + vector similarity + exact key. N-gram blocking. Three conflict policies.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 8. ALGORITHMS ====== -->
+<div class="slide" id="s8">
+  <div class="label">07 &mdash; Algorithms</div>
+  <h2>38+ graph algorithms, <em class="serif">in-memory</em></h2>
+  <div class="sp-sm"></div>
+  <p>Comprehensive library matching Neo4j GDS breadth &mdash; without the JVM, plugin fees, or latency.</p>
+  <div class="sp"></div>
+  <div class="g3">
+    <div class="card"><h3>Centrality (9)</h3><p>PageRank, Betweenness, Closeness, Degree, Eigenvector, HITS, Harmonic, Katz, ArticleRank</p></div>
+    <div class="card"><h3>Community (3+)</h3><p>Louvain, Leiden, Label Propagation + conductance metrics</p></div>
+    <div class="card"><h3>Paths (5)</h3><p>BFS, Dijkstra, A*, Yen's K-shortest, Bellman-Ford</p></div>
+    <div class="card"><h3>Structure (5)</h3><p>SCC (Tarjan), Topological Sort, Triangle Count, K-Core, K-1 Coloring</p></div>
+    <div class="card"><h3>Embeddings (2)</h3><p>FastRP, Node2Vec &mdash; structural embeddings</p></div>
+    <div class="card"><h3>Similarity (3)</h3><p>Jaccard, Cosine, Overlap &mdash; pairwise and top-k</p></div>
+    <div class="card"><h3>Link Prediction (4)</h3><p>Adamic-Adar, Common Neighbors, Preferential Attachment, Resource Allocation</p></div>
+    <div class="card"><h3>Flow &amp; Tree</h3><p>Max Flow (Edmonds-Karp), MST (Kruskal's), Random Walk</p></div>
+    <div class="card"><h3>Analysis</h3><p>Clustering Coefficient, WCC, Graph Check</p></div>
+  </div>
+</div>
+
+<!-- ====== 9. MCP ====== -->
+<div class="slide" id="s9">
+  <div class="label">08 &mdash; Distribution</div>
+  <h2>MCP: the universal <em class="serif">agent interface</em></h2>
+  <div class="sp"></div>
+  <div class="split">
+    <div>
+      <p>Anthropic's Model Context Protocol is the standard for how AI agents connect to tools. Weav ships 28 MCP tools &mdash; any compatible agent can use it as memory and context layer with zero integration code.</p>
+      <div class="sp"></div>
+      <div class="g2" style="max-width: 360px;">
+        <div class="stat-card">
+          <div class="big-num" style="font-size: 28px;">97M+</div>
+          <div class="stat-label">Monthly MCP installs</div>
+        </div>
+        <div class="stat-card">
+          <div class="big-num" style="font-size: 28px;">10K+</div>
+          <div class="stat-label">Active MCP servers</div>
+        </div>
+      </div>
+      <div class="sp"></div>
+      <p style="font-size: 12px;"><strong>Adopted by:</strong> Claude, ChatGPT, Gemini, Copilot, Cursor, VS Code</p>
+      <p style="font-size: 12px;" class="dimmer">Donated to Linux Foundation, Dec 2025. Co-founded by Anthropic, Block, OpenAI.</p>
+    </div>
+    <div>
+      <div class="code">
+context_retrieve  <span class="c">// context assembly</span>
+node_add          <span class="c">// create entities</span>
+edge_add          <span class="c">// create relationships</span>
+search_nodes      <span class="c">// property search</span>
+get_neighbors     <span class="c">// traverse graph</span>
+ingest            <span class="c">// LLM-powered ingestion</span>
+graph_stats       <span class="c">// analytics</span>
+community_search  <span class="c">// GraphRAG summaries</span>
+graph_diff        <span class="c">// temporal comparison</span>
+node_merge        <span class="c">// entity resolution</span>
+schema_set        <span class="c">// schema enforcement</span>
+graph_export      <span class="c">// CSV/JSON/DOT export</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 10. COMPETITION ====== -->
+<div class="slide" id="s10">
+  <div class="label">09 &mdash; Competitive Landscape</div>
+  <h2>The market is fragmented. <em class="serif">Weav unifies it.</em></h2>
+  <div class="sp"></div>
+  <table class="tbl">
+    <thead>
+      <tr><th>Capability</th><th>Neo4j</th><th>Pinecone</th><th>FalkorDB</th><th>pgvector</th><th class="hl">Weav</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Graph algorithms</td><td class="yes">35+ (GDS plugin)</td><td class="no">None</td><td class="yes">Cypher</td><td class="no">None</td><td class="hl">38+ built-in</td></tr>
+      <tr><td>Vector search</td><td class="part">Bolt-on</td><td class="yes">Core</td><td class="part">Limited</td><td class="yes">HNSW</td><td class="hl">Native HNSW</td></tr>
+      <tr><td>Token budget</td><td class="no">No</td><td class="no">No</td><td class="no">No</td><td class="no">No</td><td class="hl">Knapsack packing</td></tr>
+      <tr><td>LLM ingestion</td><td class="no">No</td><td class="no">No</td><td class="no">No</td><td class="no">No</td><td class="hl">8+ providers</td></tr>
+      <tr><td>MCP tools</td><td class="part">MCP server</td><td class="no">No</td><td class="no">No</td><td class="no">No</td><td class="hl">28 tools</td></tr>
+      <tr><td>In-memory</td><td class="no">JVM / disk</td><td class="part">Cloud</td><td class="yes">Redis-based</td><td class="no">Disk</td><td class="hl">Rust / zero-GC</td></tr>
+      <tr><td>Bi-temporal</td><td class="no">No</td><td class="no">No</td><td class="no">No</td><td class="no">No</td><td class="hl">Native</td></tr>
+      <tr><td>GraphRAG</td><td class="part">External</td><td class="no">No</td><td class="part">External</td><td class="no">No</td><td class="hl">Built-in</td></tr>
+      <tr><td>Entity resolution</td><td class="part">Manual</td><td class="no">No</td><td class="no">No</td><td class="no">No</td><td class="hl">Fuzzy + vector</td></tr>
+      <tr><td>Single binary</td><td class="no">JVM + plugins</td><td class="no">SaaS only</td><td class="part">Docker</td><td class="part">Extension</td><td class="hl">Single binary</td></tr>
+    </tbody>
+  </table>
+  <div class="sp"></div>
+  <p class="dimmer" style="font-size: 11px;">Neo4j: $2B valuation, $200M+ ARR. Pinecone: exploring sale at $2B+. FalkorDB: $3M seed. pgvector: free OSS, commoditizing vector-only products.</p>
+</div>
+
+<!-- ====== 11. WHY NOW ====== -->
+<div class="slide" id="s11">
+  <div class="label">10 &mdash; Timing</div>
+  <h2>Why <em class="serif">now</em></h2>
+  <div class="sp"></div>
+  <div class="g2">
+    <div>
+      <div class="card" style="margin-bottom: 10px;">
+        <h3>GraphRAG just proved itself</h3>
+        <p>Microsoft's paper showed 72-83% comprehensiveness gains. Enterprise adoption accelerating in healthcare, finance, legal. Tooling is production-ready but not yet commoditized.</p>
+      </div>
+      <div class="card" style="margin-bottom: 10px;">
+        <h3>Agentic AI is going production</h3>
+        <p>Gartner named multi-agent systems a top 2026 trend. Deloitte says companies with 40%+ AI in production will double in 6 months. Agents need memory infrastructure.</p>
+      </div>
+      <div class="card">
+        <h3>Vector DBs getting commoditized</h3>
+        <p>pgvector achieves 471 QPS at 99% recall on 50M vectors. $6K/month Pinecone replaced by $300/month Postgres. Vector-only is not a moat. Graph + vector + context is.</p>
+      </div>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom: 10px;">
+        <h3>MCP created distribution</h3>
+        <p>97M monthly installs. Adopted by OpenAI, Google, Anthropic. Donated to Linux Foundation. Weav's 28 MCP tools slot directly into this ecosystem.</p>
+      </div>
+      <div class="card" style="margin-bottom: 10px;">
+        <h3>Data readiness is the bottleneck</h3>
+        <p>MIT Technology Review: companies delay AI not from model shortcomings but because they lack data architectures that deliver business context. Only 4 in 10 say their data management is ready.</p>
+      </div>
+      <div class="card">
+        <h3>Capital is flowing</h3>
+        <p>AI captured 61% of all global VC in 2025: $258.7B. Cognee ($7.5M), Interloom ($16.5M), Zep ($3.3M) &mdash; AI memory/knowledge layer is a funded category.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 12. MATURITY ====== -->
+<div class="slide" id="s12">
+  <div class="label">11 &mdash; Product Maturity</div>
+  <h2>This is a <em class="serif">working system</em></h2>
+  <div class="sp"></div>
+  <div class="g4">
+    <div class="stat-card"><div class="big-num" style="font-size: 32px;">1,340+</div><div class="stat-label">Passing tests</div></div>
+    <div class="stat-card"><div class="big-num" style="font-size: 32px;">11</div><div class="stat-label">Rust crates</div></div>
+    <div class="stat-card"><div class="big-num" style="font-size: 32px;">2</div><div class="stat-label">SDKs</div></div>
+    <div class="stat-card"><div class="big-num" style="font-size: 32px;">45+</div><div class="stat-label">Commands</div></div>
+  </div>
+  <div class="sp"></div>
+  <div class="g2">
+    <div>
+      <h3 style="margin-bottom: 6px;">Production Features</h3>
+      <ul class="clean check">
+        <li>WAL + snapshots with CRC32 checksums</li>
+        <li>3-tier auth (ACL + API keys + Argon2id)</li>
+        <li>TLS encryption for all protocols</li>
+        <li>18+ Prometheus metrics</li>
+        <li>LRU eviction with memory limits</li>
+        <li>CDC event streaming (SSE)</li>
+        <li>Schema enforcement (type, required, unique)</li>
+        <li>Multi-tenancy via X-Group-Id</li>
+      </ul>
+    </div>
+    <div>
+      <h3 style="margin-bottom: 6px;">Developer Experience</h3>
+      <ul class="clean check">
+        <li>TOML config with WEAV_* env overrides</li>
+        <li>Interactive REPL CLI</li>
+        <li>Redis protocol compatibility (RESP3)</li>
+        <li>LangChain and LlamaIndex retrievers</li>
+        <li>EXPLAIN queries for debugging</li>
+        <li>CSV, JSON, DOT graph export</li>
+        <li>Feature-gated builds (80% smaller)</li>
+        <li>Docker + CI/CD pipeline</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 13. DX ====== -->
+<div class="slide" id="s13">
+  <div class="label">12 &mdash; Developer Experience</div>
+  <h2>Redis simple. <em class="serif">AI powerful.</em></h2>
+  <div class="sp"></div>
+  <div class="g2">
+    <div>
+      <h3 style="margin-bottom: 6px;">Get started in 30 seconds</h3>
+      <div class="code">
+<span class="c"># Start</span>
+<span class="k">./weav-server</span>
+
+<span class="c"># Create a graph</span>
+<span class="k">curl</span> -X POST localhost:6382/v1/graphs \
+  -d '{"name": "my-kb"}'
+
+<span class="c"># Ingest a document</span>
+<span class="k">curl</span> -X POST localhost:6382/v1/ingest \
+  -d '{"graph": "my-kb",
+       "content": "Rust is a systems...",
+       "source": "docs/intro.md"}'
+
+<span class="c"># Retrieve context for your LLM</span>
+<span class="k">curl</span> -X POST localhost:6382/v1/context \
+  -d '{"graph": "my-kb",
+       "seeds": ["rust-lang"],
+       "budget": 4096}'
+      </div>
+    </div>
+    <div>
+      <h3 style="margin-bottom: 6px;">Python SDK</h3>
+      <div class="code">
+<span class="k">from</span> weav <span class="k">import</span> WeavClient
+
+client = WeavClient()
+client.create_graph(<span class="s">"my-kb"</span>)
+
+<span class="c"># Ingest a document</span>
+result = client.ingest(
+    graph=<span class="s">"my-kb"</span>,
+    content=open(<span class="s">"report.pdf"</span>).read(),
+    source=<span class="s">"Q4 Report"</span>
+)
+
+<span class="c"># Get context for your prompt</span>
+ctx = client.context(
+    graph=<span class="s">"my-kb"</span>,
+    query_embedding=embeddings,
+    budget=8192
+)
+
+<span class="c"># Ready for LLM consumption</span>
+prompt = ctx.to_prompt()
+
+<span class="c"># LangChain compatible</span>
+<span class="k">from</span> weav <span class="k">import</span> WeavLangChain
+retriever = WeavLangChain(client, <span class="s">"my-kb"</span>)
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 14. GTM ====== -->
+<div class="slide" id="s14">
+  <div class="label">13 &mdash; Go-to-Market</div>
+  <h2>Bottom-up adoption. <em class="serif">Top-down expansion.</em></h2>
+  <div class="sp"></div>
+  <div class="g2">
+    <div>
+      <h3 style="margin-bottom: 8px;">Phase 1: Developer Adoption</h3>
+      <div class="card" style="margin-bottom: 8px;">
+        <h3>Open-Source Core</h3>
+        <p>Full-featured OSS database. PLG adoption for AI tools runs at 4x the rate of traditional SaaS.</p>
+      </div>
+      <div class="card" style="margin-bottom: 8px;">
+        <h3>MCP Marketplace</h3>
+        <p>Weav shows up in every Claude, ChatGPT, Cursor, and VS Code tool registry. Discovery through the agent ecosystem.</p>
+      </div>
+      <div class="card">
+        <h3>Framework Integration</h3>
+        <p>Python + Node.js SDKs. LangChain + LlamaIndex retrievers. Drop-in RAG replacement.</p>
+      </div>
+    </div>
+    <div>
+      <h3 style="margin-bottom: 8px;">Phase 2: Enterprise</h3>
+      <div class="card" style="margin-bottom: 8px;">
+        <h3>Weav Cloud</h3>
+        <p>Managed, auto-scaling. SSO, audit logs, dedicated tenancy, SLA guarantees. Usage-based pricing.</p>
+      </div>
+      <div class="card" style="margin-bottom: 8px;">
+        <h3>Enterprise License</h3>
+        <p>Self-hosted with compliance certifications, multi-region, priority support. For regulated industries.</p>
+      </div>
+      <div class="card">
+        <h3>Target Segments</h3>
+        <p>AI-native startups building agents. Enterprise AI teams productionizing RAG. DevTools companies embedding context intelligence.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 15. BUSINESS MODEL ====== -->
+<div class="slide" id="s15">
+  <div class="label">14 &mdash; Business Model</div>
+  <h2>Open-core with <em class="serif">usage-based cloud</em></h2>
+  <div class="sp"></div>
+  <div class="g3">
+    <div class="card">
+      <h3>Community (Free)</h3>
+      <p>Full database engine. All algorithms. Vector + graph + text. All protocols. MCP tools. LLM ingestion. Persistence. SDKs.</p>
+      <hr class="rule">
+      <p class="dimmer" style="font-size: 11px;">Goal: maximum adoption</p>
+    </div>
+    <div class="card" style="border-color: var(--text);">
+      <h3>Weav Cloud</h3>
+      <p>Managed deployment. Auto-scaling. Monitoring. Team management. Usage-based pricing (queries + storage + compute).</p>
+      <hr class="rule">
+      <p class="dimmer" style="font-size: 11px;">Comparable: Neptune $0.10/NCU-hr, AuraDB $65/GB/mo</p>
+    </div>
+    <div class="card">
+      <h3>Enterprise</h3>
+      <p>Self-hosted or VPC. SSO/SAML. Compliance. Multi-region. Dedicated support. Custom SLAs.</p>
+      <hr class="rule">
+      <p class="dimmer" style="font-size: 11px;">Target ACV: $50K-250K</p>
+    </div>
+  </div>
+  <div class="sp"></div>
+  <blockquote>
+    Redis grew to a $1.1B valuation serving general workloads with a single-process, in-memory architecture. Weav applies the same philosophy to the specific, high-value AI context workload &mdash; a market that didn't exist when Redis was founded.
+  </blockquote>
+</div>
+
+<!-- ====== 16. COMPARABLES ====== -->
+<div class="slide" id="s16">
+  <div class="label">15 &mdash; Comparables</div>
+  <h2>Category-defining companies <em class="serif">start here</em></h2>
+  <div class="sp"></div>
+  <table class="tbl">
+    <thead>
+      <tr><th>Company</th><th>Category</th><th>Raised</th><th>Valuation</th><th>Signal</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="hl">Neo4j</td><td>Graph database</td><td>$581M</td><td>$2B+</td><td>Graph DB is a proven $2B+ category</td></tr>
+      <tr><td class="hl">Pinecone</td><td>Vector database</td><td>$138M</td><td>$750M</td><td>Exploring $2B+ sale; vector-only commoditizing</td></tr>
+      <tr><td class="hl">Qdrant</td><td>Vector search</td><td>$96.5M</td><td>Series B</td><td>Composable search infra gets funded</td></tr>
+      <tr><td class="hl">Weaviate</td><td>Hybrid search</td><td>$67.7M</td><td>$200M</td><td>Hybrid search commands premium</td></tr>
+      <tr><td class="hl">FalkorDB</td><td>In-memory graph</td><td>$3M</td><td>Seed</td><td>Closest competitor, validates niche</td></tr>
+      <tr><td class="hl">Cognee</td><td>AI memory</td><td>&euro;7.5M</td><td>Seed</td><td>AI memory layer is a funded category</td></tr>
+      <tr><td class="hl">Interloom</td><td>Agent knowledge</td><td>&euro;14.2M</td><td>Seed</td><td>$16.5M seeds for agent context infra</td></tr>
+    </tbody>
+  </table>
+  <div class="sp"></div>
+  <p class="dimmer" style="font-size: 11px;">AI startup seed valuations carry a 42% premium over non-AI. Median pre-money at seed: $17.9M. Series A post-money: $45-55M.</p>
+</div>
+
+<!-- ====== 17. VISION ====== -->
+<div class="slide" id="s17">
+  <div class="label">16 &mdash; Vision</div>
+  <h2>The default <em class="serif">context layer</em> for AI</h2>
+  <div class="sp"></div>
+  <div class="split">
+    <div>
+      <p style="font-size: 15px; line-height: 1.6; max-width: 460px;">
+        Every AI application &mdash; every agent, copilot, and enterprise RAG deployment &mdash; needs a place to store, connect, and retrieve structured context.
+      </p>
+      <div class="sp"></div>
+      <p style="font-size: 15px; line-height: 1.6; max-width: 460px;">
+        Today that's 3-5 tools held together with glue code. Weav replaces the entire stack with one database, one API call, one binary.
+      </p>
+      <div class="sp"></div>
+      <p style="font-size: 15px; line-height: 1.6; max-width: 460px;">
+        We're building the <em class="serif">context database</em> &mdash; a new category defined by AI workloads that didn't exist three years ago, serving a market growing 28-33% annually.
+      </p>
+    </div>
+    <div>
+      <div class="card" style="border-color: var(--text);">
+        <h3 style="font-size: 18px; font-family: 'Instrument Serif', serif; font-weight: 400; margin-bottom: 14px;">The Context Database</h3>
+        <table class="tbl" style="margin: 0;">
+          <tbody>
+            <tr><td class="hl">Graph</td><td class="dimmer">Entities, relationships, structure</td></tr>
+            <tr><td class="hl">Vectors</td><td class="dimmer">Semantic similarity, embeddings</td></tr>
+            <tr><td class="hl">Text</td><td class="dimmer">BM25 keyword matching</td></tr>
+            <tr><td class="hl">Temporal</td><td class="dimmer">Point-in-time knowledge</td></tr>
+            <tr><td class="hl">Budget</td><td class="dimmer">Token-aware context packing</td></tr>
+            <tr><td class="hl">MCP</td><td class="dimmer">Universal agent interface</td></tr>
+          </tbody>
+        </table>
+        <hr class="rule">
+        <p class="dimmer" style="font-size: 11px; text-align: center;">One database. One API call. One binary.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 18. CLOSE ====== -->
+<div class="slide" id="s18">
+  <div style="max-width: 640px;">
+    <div class="label">17</div>
+    <h1>The AI context layer<br><em class="serif">starts here.</em></h1>
+    <div class="sp"></div>
+    <p style="font-size: 15px; line-height: 1.6;">
+      Graph databases: $3.6B market. Vector databases: $4B market. AI infrastructure received $109B in VC last year. Weav is the unified engine at the intersection of all three.
+    </p>
+    <div class="sp-lg"></div>
+    <table class="tbl" style="max-width: 400px;">
+      <tbody>
+        <tr><td class="dimmer">Category</td><td class="hl">Context Database</td></tr>
+        <tr><td class="dimmer">Stage</td><td class="hl">Pre-Seed / Seed</td></tr>
+        <tr><td class="dimmer">Stack</td><td class="hl">Rust, In-Memory</td></tr>
+      </tbody>
+    </table>
+    <div class="sp-lg"></div>
+    <p class="dimmer" style="font-size: 11px;">weav &mdash; Confidential &mdash; March 2026</p>
+  </div>
+</div>
+
+</div>
+
+<div class="nav">
+  <button onclick="prevSlide()">&#8592;</button>
+  <span id="slideNum">1 / 18</span>
+  <button onclick="nextSlide()">&#8594;</button>
+</div>
+
+<script>
+  let current = 1;
+  const total = 18;
+  function showSlide(n) {
+    document.querySelectorAll('.slide').forEach(s => s.classList.remove('active'));
+    const s = document.getElementById('s' + n);
+    if (s) {
+      s.classList.add('active');
+      document.getElementById('slideNum').textContent = n + ' / ' + total;
+      document.getElementById('progress').style.width = ((n / total) * 100) + '%';
+    }
+  }
+  function nextSlide() { if (current < total) { current++; showSlide(current); } }
+  function prevSlide() { if (current > 1) { current--; showSlide(current); } }
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'Enter') { e.preventDefault(); nextSlide(); }
+    if (e.key === 'ArrowLeft' || e.key === 'Backspace') { e.preventDefault(); prevSlide(); }
+    if (e.key === 'Home') { current = 1; showSlide(current); }
+    if (e.key === 'End') { current = total; showSlide(current); }
+  });
+  let tx = 0;
+  document.addEventListener('touchstart', e => { tx = e.touches[0].clientX; });
+  document.addEventListener('touchend', e => {
+    const d = tx - e.changedTouches[0].clientX;
+    if (Math.abs(d) > 50) { d > 0 ? nextSlide() : prevSlide(); }
+  });
+  showSlide(1);
+</script>
+</body>
+</html>
