@@ -1,16 +1,7 @@
 
-<table align="center"><tr><td><pre>
-   ,_,
-  (O,O)
-  (   )
-   " "
-
-/-/-/-/-/-/-/-\
-\-\-\-\-\-\-\-/
-/-/-/-/-/-/-/-\
-
-   WEAV
-</pre></td></tr></table>
+<p align="center">
+  <samp>,_,<br>(O,O)<br>(   )<br>" "<br><br>/-/-/-/-/-/-/-\<br>\-\-\-\-\-\-\-/<br>/-/-/-/-/-/-/-\<br><br>WEAV</samp>
+</p>
 
 <h1 align="center">weav</h1>
 
