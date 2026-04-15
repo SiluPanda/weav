@@ -1,7 +1,17 @@
 
-<p align="center">
-  <img src="docs/diagrams/weav-mascot.svg" alt="Weav mascot" width="320">
-</p>
+<pre align="center">
+               ,_,
+              (O,O)
+              (   )
+               " "
+
+         /-/-/-/-/-/-/-\
+         \-\-\-\-\-\-\-/
+         /-/-/-/-/-/-/-\
+
+               WEAV
+       context graphs for AI
+</pre>
 
 <h1 align="center">weav</h1>
 
