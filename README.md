@@ -1,17 +1,16 @@
 
-<pre align="center">
-               ,_,
-              (O,O)
-              (   )
-               " "
+<table align="center"><tr><td><pre>
+   ,_,
+  (O,O)
+  (   )
+   " "
 
-         /-/-/-/-/-/-/-\
-         \-\-\-\-\-\-\-/
-         /-/-/-/-/-/-/-\
+/-/-/-/-/-/-/-\
+\-\-\-\-\-\-\-/
+/-/-/-/-/-/-/-\
 
-               WEAV
-       context graphs for AI
-</pre>
+   WEAV
+</pre></td></tr></table>
 
 <h1 align="center">weav</h1>
 
