@@ -1,17 +1,6 @@
 
 <p align="center">
-
-```
-                            ,_,
-                           (O,O)
-                           (   )
-                            " "
-
-                   · · · W E A V · · ·
-
-            Weaving context graphs for AI.
-```
-
+  <img src="docs/diagrams/weav-mascot.svg" alt="Weav mascot" width="320">
 </p>
 
 <h1 align="center">weav</h1>

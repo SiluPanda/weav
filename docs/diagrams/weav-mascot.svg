@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 320" role="img" aria-labelledby="title desc">
+  <title id="title">Weav mascot</title>
+  <desc id="desc">A stylized owl mascot built from graph and weave motifs.</desc>
+  <defs>
+    <linearGradient id="orbit" x1="120" y1="80" x2="520" y2="240" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0f766e"/>
+      <stop offset="100%" stop-color="#f59e0b"/>
+    </linearGradient>
+    <linearGradient id="bodyFill" x1="240" y1="76" x2="400" y2="236" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#fff7ed"/>
+      <stop offset="100%" stop-color="#ffedd5"/>
+    </linearGradient>
+    <style>
+      .ink { stroke: #18212f; stroke-linecap: round; stroke-linejoin: round; }
+      .node { fill: #ffffff; stroke: #18212f; stroke-width: 5; }
+      .pupil { fill: #0f766e; }
+      .accent { fill: #f59e0b; }
+      .orbit { stroke: url(#orbit); stroke-width: 6; fill: none; opacity: 0.9; }
+      .weave { stroke: #0f766e; stroke-width: 6; fill: none; }
+    </style>
+  </defs>
+
+  <g transform="translate(320 154)">
+    <path class="orbit" d="M-178 -4c34-82 124-134 220-134s186 52 220 134"/>
+    <path class="orbit" d="M-174 72c40 54 111 86 174 86s134-32 174-86"/>
+
+    <path class="orbit" d="M-114 -58l48 26"/>
+    <path class="orbit" d="M114 -58l-48 26"/>
+    <path class="orbit" d="M-146 56l56-8"/>
+    <path class="orbit" d="M146 56l-56-8"/>
+
+    <circle class="node" cx="-178" cy="-4" r="13"/>
+    <circle class="node" cx="-114" cy="-58" r="13"/>
+    <circle class="node" cx="0" cy="-104" r="13"/>
+    <circle class="node" cx="114" cy="-58" r="13"/>
+    <circle class="node" cx="178" cy="-4" r="13"/>
+    <circle class="node" cx="-146" cy="56" r="13"/>
+    <circle class="node" cx="146" cy="56" r="13"/>
+
+    <path
+      d="M-72 18c-6-36-2-83 28-118l44 32 44-32c30 35 34 82 28 118-9 57-49 97-72 97s-63-40-72-97Z"
+      fill="url(#bodyFill)"
+      class="ink"
+      stroke-width="6"
+    />
+
+    <path d="M-44 -74l-18-34 34 18" fill="#fff7ed" class="ink" stroke-width="6"/>
+    <path d="M44 -74l18-34-34 18" fill="#fff7ed" class="ink" stroke-width="6"/>
+
+    <circle cx="-30" cy="-18" r="24" fill="#ffffff" class="ink" stroke-width="6"/>
+    <circle cx="30" cy="-18" r="24" fill="#ffffff" class="ink" stroke-width="6"/>
+    <circle class="pupil" cx="-30" cy="-18" r="11"/>
+    <circle class="pupil" cx="30" cy="-18" r="11"/>
+    <path class="accent ink" stroke-width="5" d="M0 -8l14 20H-14Z"/>
+
+    <path class="ink" stroke-width="6" fill="none" d="M-34 24c10 10 22 15 34 15s24-5 34-15"/>
+
+    <path class="ink" stroke-width="6" fill="none" d="M-72 16c-26 11-44 34-52 67"/>
+    <path class="ink" stroke-width="6" fill="none" d="M72 16c26 11 44 34 52 67"/>
+
+    <path class="weave" d="M-52 52H52"/>
+    <path class="weave" d="M-46 70H46"/>
+    <path class="weave" d="M-38 88H38"/>
+    <path class="weave" d="M-24 42V98"/>
+    <path class="weave" d="M0 42V98"/>
+    <path class="weave" d="M24 42V98"/>
+
+    <circle cx="-24" cy="52" r="6" fill="#f59e0b"/>
+    <circle cx="0" cy="70" r="6" fill="#f59e0b"/>
+    <circle cx="24" cy="88" r="6" fill="#f59e0b"/>
+  </g>
+</svg>
