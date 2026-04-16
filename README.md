@@ -6,15 +6,17 @@
 <h1 align="center">weav</h1>
 
 <p align="center">
-  <strong>An in-memory context graph database built for AI.</strong>
+  <strong>An in-memory graph + vector database for AI retrieval.</strong>
 </p>
 
 <p align="center">
   <a href="#quickstart">Quickstart</a> &middot;
+  <a href="#examples">Examples</a> &middot;
   <a href="#architecture">Architecture</a> &middot;
   <a href="#query-language">Query Language</a> &middot;
   <a href="#authentication--authorization">Auth</a> &middot;
   <a href="#api-reference">API Reference</a> &middot;
+  <a href="#mcp">MCP</a> &middot;
   <a href="#sdks">SDKs</a> &middot;
   <a href="#benchmarks">Benchmarks</a>
 </p>
@@ -22,37 +24,41 @@
 <p align="center">
   <img alt="License" src="https://img.shields.io/badge/license-MIT-blue.svg">
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.85%2B-orange.svg">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-1340%20passing-brightgreen.svg">
-  <img alt="Crates" src="https://img.shields.io/badge/crates-12-purple.svg">
+  <img alt="Protocols" src="https://img.shields.io/badge/protocols-HTTP%20%7C%20RESP3%20%7C%20gRPC%20%7C%20MCP-brightgreen.svg">
+  <img alt="Workspace" src="https://img.shields.io/badge/workspace-12%20crates-purple.svg">
 </p>
 
 ---
 
 ## What is Weav?
 
-Weav is a **Redis-like, in-memory context graph database** purpose-built for AI and LLM workloads. It combines graph topology, vector search, temporal tracking, and token-aware retrieval into a single system — so your AI applications can retrieve *exactly* the right context, within budget, in microseconds.
+Weav is an **in-memory graph + vector database** for AI systems that need more than chunk similarity. It stores entities, relationships, embeddings, provenance, and temporal validity in one process, then returns token-budgeted context over HTTP, RESP3, gRPC, or MCP.
 
-**The problem:** LLMs need context. RAG gives you chunks. But chunks lack structure — relationships, provenance, temporal validity, and relevance decay all get lost. You end up stitching together a vector DB, a graph DB, and a lot of glue code.
+Instead of stitching together a vector store, a graph database, and retrieval glue, Weav gives you one query engine for structure-aware context retrieval.
 
-**Weav's answer:** One database that natively understands all of it.
+### Why Weav
 
-### Key Capabilities
+- **More than vector search**: start from embeddings, then traverse relationships and score context through the graph
+- **Grounded retrieval**: provenance, confidence, and bi-temporal validity stay attached to the data
+- **Built for LLM windows**: token-budget-aware packing returns context that fits the model budget
+- **Fast local deployment**: single-process, in-memory architecture with optional WAL and snapshots
+- **Multiple ways in**: HTTP, RESP3, gRPC, CLI, and MCP all target the same engine
 
-| Capability | Description |
+### Good Fit
+
+- Agent memory and conversation state
+- Knowledge graphs with embeddings
+- Timeline-aware or provenance-sensitive retrieval
+- Low-latency, single-node AI infrastructure
+
+### Core Capabilities
+
+| Area | What you get |
 |---|---|
-| **Context Graph** | Directed, labeled, weighted graph with property storage |
-| **Vector Search** | HNSW index (via usearch) with cosine, euclidean, and dot product metrics |
-| **Bi-Temporal** | Track both real-world validity and transaction time for point-in-time queries |
-| **Token Budgeting** | Greedy knapsack packing — fit the most relevant context into your LLM's token window |
-| **Flow Scoring** | Relevance propagation from seed nodes through the graph topology |
-| **Entity Dedup** | Exact key, fuzzy name (Jaro-Winkler), and vector similarity deduplication |
-| **Provenance** | Track source, confidence, and extraction method for every piece of knowledge |
-| **Decay Functions** | Linear, exponential, and gaussian relevance decay over time |
-| **Changefeeds** | Public graph mutation streams over gRPC and HTTP SSE with replay cursors |
-| **MCP Server** | Model Context Protocol integration — connect directly from Claude, Cursor, etc. |
-| **Multi-Protocol** | HTTP REST, RESP3 (Redis protocol), and gRPC — all on one server |
-| **Auth & ACL** | Redis-ACL-inspired auth with command categories, graph-level permissions, API keys |
-| **Persistence** | WAL with CRC32 checksums + periodic snapshots with full recovery |
+| Retrieval | HNSW vector search, graph traversal, flow scoring, BM25 text search, rerank hooks |
+| Context assembly | Token budgets, provenance-aware chunks, temporal filters, optional subgraph output, LLM-ready formatting |
+| Operations | WAL + snapshots, CDC event streams, schema constraints, export/import, graph algorithms |
+| Interfaces | HTTP REST, RESP3, gRPC, CLI, MCP, plus Python and Node SDKs |
 
 ---
 
@@ -60,11 +66,15 @@ Weav is a **Redis-like, in-memory context graph database** purpose-built for AI 
 
 ### Build & Run
 
+Rust 1.85+ is required.
+
 ```bash
-# Clone and build
+# Clone
 git clone https://github.com/SiluPanda/weav.git
 cd weav
-cargo build --release
+
+# Build the server and CLI used below
+cargo build --release -p weav-server -p weav-cli
 
 # Start the server
 ./target/release/weav-server
@@ -75,20 +85,59 @@ cargo build --release
 #   HTTP   → :6382
 ```
 
+If you only want the server binary, `cargo build --release` is enough. The workspace default member is `weav-server`, so `weav-cli` must be built explicitly.
+
 #### Feature-Gated Builds
 
-The LLM provider integration (AWS SDK, Actix) is opt-in to keep default builds lean:
+Common build targets:
 
 ```bash
-# Default build — everything except LLM providers (~414 crates)
+# Default server build
 cargo build --release
 
-# Full build — including LLM extraction (~495 crates)
+# Server + CLI (used in the quickstart above)
+cargo build --release -p weav-server -p weav-cli
+
+# Full build — including optional LLM providers
 cargo build --release -p weav-server --features full
 
-# Minimal — HTTP-only graph database
+# Minimal — HTTP-only server
 cargo build --release -p weav-server --no-default-features
 ```
+
+### Run with Docker Compose
+
+If you want a prewired local deployment with persistence enabled:
+
+```bash
+docker compose up --build
+```
+
+This exposes `6380` (RESP3), `6381` (gRPC), and `6382` (HTTP), and persists WAL/snapshots in the `weav-data` Docker volume.
+
+### Smoke Test over HTTP
+
+```bash
+# Health check
+curl -s http://localhost:6382/health
+
+# Create a graph
+curl -sX POST http://localhost:6382/v1/graphs \
+  -H 'content-type: application/json' \
+  -d '{"name":"knowledge"}'
+
+# Add a node
+curl -sX POST http://localhost:6382/v1/graphs/knowledge/nodes \
+  -H 'content-type: application/json' \
+  -d '{"label":"concept","properties":{"name":"Transformers","content":"Self-attention architecture for sequence modeling"}}'
+
+# Retrieve context
+curl -sX POST http://localhost:6382/v1/context \
+  -H 'content-type: application/json' \
+  -d '{"graph":"knowledge","query":"self attention","budget":1024}'
+```
+
+HTTP responses use the standard envelope `{ "success": bool, "data"?: ..., "error"?: ... }`.
 
 ### Connect with the CLI
 
@@ -121,80 +170,34 @@ weav> EDGE ADD TO "knowledge" FROM 1 TO 0 LABEL "derived_from" WEIGHT 0.95
 weav> CONTEXT "attention mechanisms" FROM "knowledge" BUDGET 4096 TOKENS
 ```
 
-### Python SDK
+### SDK Setup
 
 ```bash
-pip install httpx  # dependency
+python -m pip install -e ./sdk/python
+cd sdk/node && npm install
 ```
 
-```python
-from weav import WeavClient
+See [SDKs](#sdks) for full Python and TypeScript examples.
 
-client = WeavClient(host="localhost", port=6382)
-# or with authentication:
-# client = WeavClient(host="localhost", port=6382, api_key="wk_live_abc123")
-# client = WeavClient(host="localhost", port=6382, username="admin", password="secret")
+---
 
-# Create a graph
-client.create_graph("research")
+## Examples
 
-# Add nodes with embeddings
-node_id = client.add_node("research",
-    label="paper",
-    properties={"title": "Attention Is All You Need", "year": 2017},
-    embedding=[0.1, 0.2, 0.3, ...]  # your embedding vector
-)
+| Path | What it shows |
+|---|---|
+| [`examples/quickstart.py`](examples/quickstart.py) | End-to-end HTTP quickstart: graph creation, nodes, edges, search, algorithms, and health checks |
+| [`examples/context_query.py`](examples/context_query.py) | Budget-aware retrieval, subgraph output, explain mode, and LLM-oriented formatting |
+| [`examples/quickstart.ts`](examples/quickstart.ts) | Minimal Node/TypeScript workflow against the HTTP API |
+| [`docker-compose.yml`](docker-compose.yml) | Local deployment with persistence enabled |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Deeper crate-by-crate architecture walkthrough |
 
-# Query context with token budget
-result = client.context("research",
-    query="transformer architectures",
-    retrieval_mode="hybrid",
-    rerank={"provider": "cross_encoder", "candidate_limit": 25, "score_weight": 0.35},
-    budget=4096,
-    include_provenance=True
-)
-
-# Ready for your LLM
-prompt = result.to_prompt()
-messages = result.to_messages()
-
-# Subscribe to graph mutation events (HTTP SSE)
-for event in client.subscribe_events("research", since_sequence=0, replay_limit=100):
-    print(event["kind"], event["graph"])
-```
-
-### Node.js / TypeScript SDK
-
-```typescript
-import { WeavClient } from "@weav/client";
-
-const client = new WeavClient({ host: "localhost", port: 6382 });
-// or with authentication:
-// const client = new WeavClient({ host: "localhost", port: 6382, apiKey: "wk_live_abc123" });
-// const client = new WeavClient({ host: "localhost", port: 6382, username: "admin", password: "secret" });
-
-await client.createGraph("research");
-
-const nodeId = await client.addNode("research", {
-  label: "paper",
-  properties: { title: "Attention Is All You Need", year: 2017 },
-  embedding: [0.1, 0.2, 0.3],
-});
-
-const result = await client.context({
-  graph: "research",
-  query: "transformer architectures",
-  retrievalMode: "hybrid",
-  rerank: { provider: "cross_encoder", candidateLimit: 25, scoreWeight: 0.35 },
-  budget: 4096,
-});
-
-const prompt = contextToPrompt(result);
-```
+If you want a runnable example before reading the full API surface, start with `examples/quickstart.py`.
 
 ---
 
 ## Architecture
+
+For a crate-by-crate deep dive beyond this overview, see [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ```
                     ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
@@ -251,7 +254,7 @@ const prompt = contextToPrompt(result);
 | `weav-auth` | Authentication (Argon2id), API keys (SHA-256), ACL store, command classification |
 | `weav-persist` | Write-ahead log, snapshot engine, crash recovery |
 | `weav-proto` | RESP3 codec, gRPC protobuf definitions, command mapping |
-| `weav-mcp` | Model Context Protocol server (8 tools, stdio + HTTP transports) |
+| `weav-mcp` | Model Context Protocol server exposing graph/context tools over stdio |
 | `weav-server` | Engine coordinator, HTTP/RESP3/gRPC servers (axum, tonic) |
 | `weav-cli` | Interactive REPL client with history (rustyline) |
 | `benchmarks` | Criterion benchmarks at 100K scale |
@@ -283,17 +286,18 @@ GRAPH INFO "<name>"
 ### Node Operations
 
 ```
-NODE ADD TO "<graph>" LABEL "<label>" PROPERTIES {json} [EMBEDDING [f32, ...]]
+NODE ADD TO "<graph>" LABEL "<label>" PROPERTIES {json} [EMBEDDING [f32, ...]] [ENTITY_KEY "<key>"] [TTL <ms>]
 NODE GET "<graph>" <id>
-NODE GET "<graph>" BY ENTITY_KEY "<key>"
-NODE UPDATE "<graph>" <id> PROPERTIES {json} [EMBEDDING [f32, ...]]
+NODE GET "<graph>" WHERE entity_key = "<key>"
+NODE UPDATE "<graph>" <id> [PROPERTIES {json}] [EMBEDDING [f32, ...]]
 NODE DELETE "<graph>" <id>
+NODE MERGE "<graph>" <source_id> INTO <target_id> [POLICY keep_target|keep_source|merge]
 ```
 
 ### Edge Operations
 
 ```
-EDGE ADD TO "<graph>" FROM <source> TO <target> LABEL "<label>" [WEIGHT <f32>]
+EDGE ADD TO "<graph>" FROM <source> TO <target> LABEL "<label>" [WEIGHT <f32>] [PROPERTIES {json}] [TTL <ms>]
 EDGE GET "<graph>" <id>
 EDGE DELETE "<graph>" <id>
 EDGE INVALIDATE "<graph>" <id>
@@ -311,18 +315,22 @@ BULK EDGES TO "<graph>" DATA [{edge}, {edge}, ...]
 The star of the show — retrieve structured, budget-aware context for your LLM:
 
 ```
-CONTEXT "<query>" FROM "<graph>" BUDGET <n> TOKENS
-  [SEEDS [node_id, ...]]
-  [MAX DEPTH <u8>]
+CONTEXT "<query>" FROM "<graph>" [BUDGET <n> TOKENS]
+  [SEEDS VECTOR [f32, ...] TOP <k>]
+  [SEEDS NODES ["entity_key", ...]]
+  [DEPTH <u8>]
   [RETRIEVAL LOCAL|GLOBAL|HYBRID|DRIFT]
   [RERANK {json}]
   [DIRECTION IN|OUT|BOTH]
-  [EDGE_FILTER {json}]
-  [DECAY linear|exponential|gaussian]
-  [TEMPORAL AT <timestamp>]
+  [FILTER LABELS ["label", ...] MIN_WEIGHT <f> MIN_CONFIDENCE <f>]
+  [DECAY EXPONENTIAL <ms> | LINEAR <ms> | STEP <ms> | NONE]
+  [PROVENANCE]
+  [AT <timestamp>]
   [LIMIT <u32>]
-  [SORT BY relevance|recency|confidence ASC|DESC]
+  [SCORE BY relevance|recency|confidence ASC|DESC]
 ```
+
+Vector and node seeds can be combined by repeating `SEEDS` in the same command.
 
 **How the context pipeline works:**
 
@@ -445,53 +453,56 @@ api_keys = ["wk_live_abc123def456"]
 
 Base URL: `http://localhost:6382`
 
-All responses follow `{ "success": bool, "data"?: T, "error"?: string }`.
+All responses follow `{ "success": bool, "data"?: T, "error"?: string }`. The `Response` column below shows the `data` payload.
 
 #### Graphs
 
 | Method | Endpoint | Body | Response |
 |---|---|---|---|
-| `POST` | `/v1/graphs` | `{ "name": "..." }` | `{ "name": "..." }` |
-| `GET` | `/v1/graphs` | — | `[{ "name", "node_count", "edge_count" }]` |
-| `GET` | `/v1/graphs/{name}` | — | `{ "name", "node_count", "edge_count" }` |
-| `DELETE` | `/v1/graphs/{name}` | — | `"dropped"` |
+| `POST` | `/v1/graphs` | `{ "name": "..." }` or `{ "scope": { ... } }` | empty |
+| `GET` | `/v1/graphs` | — | `["graph_a", "graph_b"]` |
+| `GET` | `/v1/graphs/{name}` | — | `{ "name", "node_count", "edge_count", "vector_count", "label_count", "default_ttl_ms"? }` |
+| `DELETE` | `/v1/graphs/{name}` | — | empty |
 
 #### Nodes
 
 | Method | Endpoint | Body | Response |
 |---|---|---|---|
-| `POST` | `/v1/graphs/{g}/nodes` | `{ "label", "properties?", "embedding?", "entity_key?" }` | `{ "node_id": u64 }` |
+| `POST` | `/v1/graphs/{g}/nodes` | `{ "label", "properties?", "embedding?", "entity_key?", "ttl_ms?" }` | `{ "node_id": u64 }` |
 | `GET` | `/v1/graphs/{g}/nodes/{id}` | — | `{ "node_id", "label", "properties" }` |
-| `PUT` | `/v1/graphs/{g}/nodes/{id}` | `{ "properties?", "embedding?" }` | `"updated"` |
-| `DELETE` | `/v1/graphs/{g}/nodes/{id}` | — | `"deleted"` |
+| `PUT` | `/v1/graphs/{g}/nodes/{id}` | `{ "properties?", "embedding?" }` | empty |
+| `DELETE` | `/v1/graphs/{g}/nodes/{id}` | — | empty |
+| `POST` | `/v1/graphs/{g}/nodes/merge` | `{ "source_id", "target_id", "conflict_policy?" }` | `{ "node_id": u64 }` |
 | `POST` | `/v1/graphs/{g}/nodes/bulk` | `{ "nodes": [...] }` | `{ "node_ids": [u64] }` |
 
 #### Edges
 
 | Method | Endpoint | Body | Response |
 |---|---|---|---|
-| `POST` | `/v1/graphs/{g}/edges` | `{ "source", "target", "label", "weight?", "properties?" }` | `{ "edge_id": u64 }` |
-| `GET` | `/v1/graphs/{g}/edges/{id}` | — | Edge details |
-| `DELETE` | `/v1/graphs/{g}/edges/{id}` | — | `"deleted"` |
-| `POST` | `/v1/graphs/{g}/edges/{id}/invalidate` | — | `"invalidated"` |
+| `POST` | `/v1/graphs/{g}/edges` | `{ "source", "target", "label", "weight?", "properties?", "ttl_ms?" }` | `{ "edge_id": u64 }` |
+| `GET` | `/v1/graphs/{g}/edges/{id}` | — | `{ "edge_id", "source", "target", "label", "weight", "properties" }` |
+| `DELETE` | `/v1/graphs/{g}/edges/{id}` | — | empty |
+| `POST` | `/v1/graphs/{g}/edges/{id}/invalidate` | — | empty |
 | `POST` | `/v1/graphs/{g}/edges/bulk` | `{ "edges": [...] }` | `{ "edge_ids": [u64] }` |
 
 #### Context
 
 | Method | Endpoint | Body |
 |---|---|---|
-| `POST` | `/v1/context` | `{ "graph"?, "scope"?, "query"?, "retrieval_mode"?, "rerank"?, "embedding"?, "seed_nodes"?, "budget"?, "max_depth"?, "include_provenance"?, "decay"?, "temporal_at"?, "limit"?, "sort_field"?, "sort_direction"?, "edge_labels"?, "direction"? }` |
+| `POST` | `/v1/context` | `{ "graph"?, "scope"?, "query"?, "retrieval_mode"?, "rerank"?, "embedding"?, "seed_nodes"?, "budget"?, "budget_preset"?, "max_depth"?, "include_provenance"?, "decay"?, "temporal_at"?, "limit"?, "sort_field"?, "sort_direction"?, "edge_labels"?, "direction"?, "explain"?, "output_format"?, "include_subgraph"? }` |
 
 Returns `ContextResult` with chunks, token counts, and query timing.
 
 `graph` and `scope` are mutually optional, with `graph` taking precedence when both are supplied.
 `scope` resolves to canonical graph names such as `ws:acme:user:u_123`.
+`budget_preset` accepts `small`/`4k`, `medium`/`8k`, `large`/`16k`, `xl`/`32k`, and `xxl`/`128k`.
+Set `explain: true` to return the query plan without executing it.
 
 **Decay parameter** (object, not string):
 ```json
 {
   "decay": {
-    "decay_type": "exponential",
+    "type": "exponential",
     "half_life_ms": 3600000,
     "max_age_ms": null,
     "cutoff_ms": null
@@ -539,7 +550,7 @@ Each SSE `data:` payload is JSON shaped like:
 | `GET` | `/health` | Health check |
 | `GET` | `/v1/info` | Server info |
 | `POST` | `/v1/snapshot` | Trigger snapshot |
-| `GET` | `/metrics` | Prometheus metrics |
+| `GET` | `/metrics` | Prometheus metrics (when built with `observability`, enabled by default) |
 
 ### RESP3 Protocol
 
@@ -547,13 +558,31 @@ Connect on port `6380` with any Redis client or `weav-cli`. Commands are sent as
 
 ### gRPC
 
-Connect on port `6381`. Proto definitions in `weav-proto/proto/weav.proto`. Supports 23 RPC methods including `ContextQueryStream` for streaming results and `SubscribeEvents` for CDC replay + live follow.
+Connect on port `6381`. Proto definitions live in `weav-proto/proto/weav.proto` and include unary graph operations plus streaming `ContextQueryStream` and `SubscribeEvents` RPCs.
+
+---
+
+## MCP
+
+`weav-mcp` exposes Weav operations as Model Context Protocol tools for agent runtimes that prefer stdio transport over direct HTTP/gRPC integration.
+
+```bash
+cargo run --release -p weav-mcp
+```
+
+The MCP server starts an in-memory Weav engine with persistence disabled by default. It is a good fit when you want an MCP client to create graphs, mutate nodes and edges, run context queries, or poll recent graph events without writing a separate adapter layer.
 
 ---
 
 ## SDKs
 
 ### Python
+
+Install from this repository:
+
+```bash
+python -m pip install -e ./sdk/python
+```
 
 ```python
 from weav import WeavClient, AsyncWeavClient
@@ -603,6 +632,8 @@ result = client.context({"workspace_id": "acme", "user_id": "u_123"},
 
 ### Node.js / TypeScript
 
+After adding `@weav/client` to your app:
+
 ```typescript
 import { WeavClient, contextToPrompt, contextToMessages } from "@weav/client";
 
@@ -630,7 +661,7 @@ contextToPrompt(result);    // Formatted prompt string
 contextToMessages(result);  // OpenAI-compatible messages
 ```
 
-All response fields use **camelCase** (`nodeId`, `relevanceScore`, `tokenCount`).
+Request parameters use **camelCase** (`seedNodes`, `retrievalMode`, `includeProvenance`), but some response objects preserve server field names such as `node_id`, `node_count`, and `edge_count`.
 
 ---
 
@@ -714,59 +745,15 @@ require_auth = false           # Set true to reject unauthenticated connections
 
 ## Data Model
 
-### Core Types
+| Type | Important Fields | Notes |
+|---|---|---|
+| `Node` | `node_id`, `label`, `properties`, `embedding?`, `entity_key?`, `temporal` | Core entity record; labels and property keys are interned |
+| `Edge` | `edge_id`, `source`, `target`, `label`, `weight`, `properties`, `provenance?`, `temporal` | Directed relationship between nodes |
+| `BiTemporal` | `valid_from`, `valid_until`, `tx_from`, `tx_until` | Tracks real-world validity and transaction time |
+| `Provenance` | `source`, `confidence`, `extraction_method`, `source_document_id?` | Keeps retrieval grounded in source metadata |
+| `Value` | `Null`, `Bool`, `Int`, `Float`, `String`, `Bytes`, `Timestamp`, `Vector`, `List`, `Map` | Dynamic property type system |
 
-```
-Node
-├── node_id: u64
-├── label: LabelId (interned u16)
-├── properties: Map<PropertyKeyId, Value>
-├── embedding: Option<Vec<f32>>
-├── entity_key: Option<String>
-└── temporal: BiTemporal
-
-Edge
-├── edge_id: u64
-├── source: NodeId → target: NodeId
-├── label: LabelId (interned u16)
-├── weight: f32
-├── properties: Map<PropertyKeyId, Value>
-├── provenance: Option<Provenance>
-└── temporal: BiTemporal
-
-BiTemporal
-├── valid_from / valid_until     ← real-world validity window
-└── tx_from / tx_until           ← database transaction time
-
-Provenance
-├── source: String               ← "gpt-4-turbo", "user-input", "sec-filing-10k"
-├── confidence: f32              ← 0.0 to 1.0
-├── extraction_method            ← LlmExtracted | NlpPipeline | UserProvided | Derived | Imported
-├── source_document_id: Option
-└── source_chunk_offset: Option
-
-Value (dynamic type system)
-├── Null | Bool | Int | Float
-├── String | Bytes | Timestamp
-├── Vector(Vec<f32>)
-├── List(Vec<Value>)
-└── Map(Vec<(String, Value)>)
-```
-
-### ContextChunk (query result)
-
-```
-ContextChunk
-├── node_id: u64
-├── content: String              ← concatenated text properties
-├── label: String
-├── relevance_score: f32         ← flow scoring result
-├── depth: u8                    ← hops from seed
-├── token_count: u32
-├── provenance: Option<Provenance>
-├── relationships: Vec<RelationshipSummary>
-└── temporal: Option<BiTemporal>
-```
+Context queries return `ContextChunk` values with `node_id`, `content`, `label`, `relevance_score`, `depth`, `token_count`, `relationships`, and optional provenance and temporal metadata.
 
 ---
 
@@ -814,69 +801,7 @@ cd sdk/python && pip install -e ".[dev]" && pytest
 cd sdk/node && npm test
 ```
 
-**1,340 Rust tests** across all crates, **1,414 total** including SDKs — all passing.
-
-| Crate | Tests |
-|---|---|
-| weav-core | 134 |
-| weav-graph | 343 |
-| weav-vector | 32 |
-| weav-extract | 32 |
-| weav-query | 227 |
-| weav-auth | 47 |
-| weav-persist | 47 |
-| weav-proto | 61 |
-| weav-server | 378 (282 unit + 28 integration + 68 E2E) |
-| weav-cli | 39 |
-| Python SDK | 49 |
-| Node SDK | 25 |
-
----
-
-## Project Structure
-
-```
-weav/
-├── weav-core/          Core types, config, errors, shard, message bus
-├── weav-graph/         Adjacency store, property store, traversal, dedup
-├── weav-vector/        HNSW vector index, token counter
-├── weav-extract/       Ingestion: document parsing, chunking, LLM extraction (opt-in)
-├── weav-query/         Parser (38 commands), planner, executor, budget enforcer
-├── weav-auth/          Authentication (Argon2id), API keys, ACL store
-├── weav-persist/       WAL, snapshots, recovery manager
-├── weav-proto/         RESP3 codec, gRPC proto, command mapping
-├── weav-mcp/           MCP server (Model Context Protocol for LLM tools)
-├── weav-server/        Engine, HTTP/RESP3/gRPC servers, binary
-├── weav-cli/           Interactive REPL client
-├── benchmarks/         Criterion benchmarks (100K scale)
-├── sdk/
-│   ├── python/         Python HTTP client + LLM integrations
-│   └── node/           TypeScript HTTP client
-└── Cargo.toml          Workspace root
-```
-
----
-
-## Dependencies
-
-Weav is built on battle-tested Rust crates:
-
-| Category | Crates |
-|---|---|
-| Async | tokio, tokio-util |
-| HTTP | axum, tower |
-| gRPC | tonic, prost |
-| Vector Search | usearch (HNSW) |
-| Tokenization | tiktoken-rs (cl100k, o200k) |
-| LLM Integration | llm (opt-in via `extract-llm` feature) |
-| Serialization | serde, bincode, rkyv |
-| Data Structures | roaring, smallvec, compact_str |
-| Hashing | xxhash-rust, crc32fast, sha2 |
-| Auth | argon2 (Argon2id), rand, glob-match |
-| String Matching | strsim (Jaro-Winkler) |
-| CLI | clap, rustyline |
-| Memory | bumpalo (arena allocator) |
-| Concurrency | crossbeam, parking_lot |
+Weav has broad Rust unit, integration, and end-to-end coverage plus Python and Node SDK tests.
 
 ---
 
