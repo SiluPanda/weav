@@ -6448,20 +6448,6 @@ mod tests {
         }
     }
 
-    // ── Helper: build a cycle graph ─────────────────────────────────────────
-
-    fn build_cycle_graph() -> AdjacencyStore {
-        // 1 -> 2 -> 3 -> 1 (directed cycle)
-        let mut adj = AdjacencyStore::new();
-        for i in 1..=3 {
-            adj.add_node(i);
-        }
-        adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
-        adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
-        adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
-        adj
-    }
-
     // ── Leiden Community Detection tests ────────────────────────────────────
 
     #[test]
