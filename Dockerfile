@@ -9,7 +9,7 @@ WORKDIR /build
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev cmake g++ \
+    pkg-config libssl-dev cmake g++ protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy manifests first for dependency caching
