@@ -310,10 +310,7 @@ mod tests {
 
         // Age wrong type -> fails
         let props3 = vec![
-            (
-                "name".to_string(),
-                Value::String(CompactString::new("Bob")),
-            ),
+            ("name".to_string(), Value::String(CompactString::new("Bob"))),
             (
                 "age".to_string(),
                 Value::String(CompactString::new("thirty")),
@@ -341,24 +338,30 @@ mod tests {
 
         // Node schema should not apply to edges
         let edge_props = vec![("since".to_string(), Value::Int(2024))];
-        assert!(schema
-            .validate_edge_properties("KNOWS", &edge_props)
-            .is_ok());
+        assert!(
+            schema
+                .validate_edge_properties("KNOWS", &edge_props)
+                .is_ok()
+        );
 
         // Edge schema should not apply to nodes
         let node_props = vec![(
             "name".to_string(),
             Value::String(CompactString::new("Alice")),
         )];
-        assert!(schema
-            .validate_node_properties("Person", &node_props)
-            .is_ok());
+        assert!(
+            schema
+                .validate_node_properties("Person", &node_props)
+                .is_ok()
+        );
 
         // Node without required name fails
         let bad_node_props = vec![("age".to_string(), Value::Int(30))];
-        assert!(schema
-            .validate_node_properties("Person", &bad_node_props)
-            .is_err());
+        assert!(
+            schema
+                .validate_node_properties("Person", &bad_node_props)
+                .is_err()
+        );
     }
 
     #[test]
@@ -373,14 +376,18 @@ mod tests {
         );
 
         let good_props = vec![("weight".to_string(), Value::Float(0.95))];
-        assert!(schema
-            .validate_edge_properties("KNOWS", &good_props)
-            .is_ok());
+        assert!(
+            schema
+                .validate_edge_properties("KNOWS", &good_props)
+                .is_ok()
+        );
 
         let bad_props = vec![("weight".to_string(), Value::Int(1))];
-        assert!(schema
-            .validate_edge_properties("KNOWS", &bad_props)
-            .is_err());
+        assert!(
+            schema
+                .validate_edge_properties("KNOWS", &bad_props)
+                .is_err()
+        );
     }
 
     #[test]
@@ -395,9 +402,7 @@ mod tests {
 
         // "Company" has no schema, so anything passes
         let props = vec![("random".to_string(), Value::Bool(true))];
-        assert!(schema
-            .validate_node_properties("Company", &props)
-            .is_ok());
+        assert!(schema.validate_node_properties("Company", &props).is_ok());
     }
 
     #[test]
@@ -479,14 +484,10 @@ mod tests {
             "title".to_string(),
             Value::String(CompactString::new("Hello")),
         )];
-        assert!(schema
-            .validate_node_properties("Document", &good)
-            .is_ok());
+        assert!(schema.validate_node_properties("Document", &good).is_ok());
 
         let bad = vec![("title".to_string(), Value::Int(42))];
-        assert!(schema
-            .validate_node_properties("Document", &bad)
-            .is_err());
+        assert!(schema.validate_node_properties("Document", &bad).is_err());
     }
 
     #[test]
@@ -501,16 +502,20 @@ mod tests {
         );
 
         let good = vec![("value".to_string(), Value::Float(3.14))];
-        assert!(schema
-            .validate_node_properties("Measurement", &good)
-            .is_ok());
+        assert!(
+            schema
+                .validate_node_properties("Measurement", &good)
+                .is_ok()
+        );
 
         let bad = vec![(
             "value".to_string(),
             Value::String(CompactString::new("3.14")),
         )];
-        assert!(schema
-            .validate_node_properties("Measurement", &bad)
-            .is_err());
+        assert!(
+            schema
+                .validate_node_properties("Measurement", &bad)
+                .is_err()
+        );
     }
 }

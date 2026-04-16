@@ -1,12 +1,6 @@
 //! Argon2id password hashing and verification.
 
-use argon2::{
-    Argon2,
-    PasswordHash,
-    PasswordHasher,
-    PasswordVerifier,
-    password_hash::SaltString,
-};
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use rand::rngs::OsRng;
 
 /// Hash a plaintext password using Argon2id with a random salt.

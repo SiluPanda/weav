@@ -199,9 +199,7 @@ impl VectorIndex {
             .keys
             .iter()
             .zip(matches.distances.iter())
-            .filter_map(|(&key, &dist)| {
-                self.key_to_node.get(&key).map(|&node_id| (node_id, dist))
-            })
+            .filter_map(|(&key, &dist)| self.key_to_node.get(&key).map(|&node_id| (node_id, dist)))
             .collect();
 
         Ok(results)
@@ -502,17 +500,13 @@ mod tests {
         index.insert(3, &[0.7, 0.7, 0.0, 0.0]).unwrap();
 
         // First search with an ef_search override of 200
-        let results_with_override = index
-            .search(&[1.0, 0.0, 0.0, 0.0], 3, Some(200))
-            .unwrap();
+        let results_with_override = index.search(&[1.0, 0.0, 0.0, 0.0], 3, Some(200)).unwrap();
         assert!(!results_with_override.is_empty());
         assert_eq!(results_with_override[0].0, 1);
 
         // Second search without override - should use the original ef_search (50)
         // and still return correct results, proving the override was restored
-        let results_without_override = index
-            .search(&[1.0, 0.0, 0.0, 0.0], 3, None)
-            .unwrap();
+        let results_without_override = index.search(&[1.0, 0.0, 0.0, 0.0], 3, None).unwrap();
         assert!(!results_without_override.is_empty());
         assert_eq!(results_without_override[0].0, 1);
 

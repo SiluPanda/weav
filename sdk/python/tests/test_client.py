@@ -12,6 +12,7 @@ These tests do NOT require a running Weav server. They test:
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from weav.client import (
@@ -20,6 +21,7 @@ from weav.client import (
     WeavError,
     _check_response,
     _parse_context_chunk,
+    _parse_ingest_result,
     _parse_context_result,
     _parse_graph_info,
     _parse_node_info,
@@ -31,9 +33,16 @@ from weav.types import (
     ContextChunk,
     ContextResult,
     GraphInfo,
+    IngestParams,
+    IngestResult,
     NodeInfo,
     Provenance,
+    RerankConfig,
+    RetrievalMode,
+    ResolutionMode,
     RelationshipSummary,
+    ScopeRef,
+    scope_to_graph,
 )
 
 
@@ -197,6 +206,18 @@ class TestTypeConstruction:
         assert n.properties["name"] == "Alice"
         assert n.properties["age"] == 30
 
+    def test_scope_to_graph(self) -> None:
+        scope = ScopeRef(
+            workspace_id="acme",
+            user_id="u_123",
+            agent_id="a_support",
+            session_id="s_456",
+        )
+        assert (
+            scope_to_graph(scope)
+            == "ws:acme:user:u_123:agent:a_support:session:s_456"
+        )
+
 
 # ---------------------------------------------------------------------------
 # ContextResult.to_prompt()
@@ -340,6 +361,74 @@ class TestClientURLConstruction:
     def test_async_client_custom_url(self) -> None:
         client = AsyncWeavClient(host="weav.example.com", port=8080)
         assert client.base_url == "http://weav.example.com:8080"
+
+
+# ---------------------------------------------------------------------------
+# Ingest request/response handling
+# ---------------------------------------------------------------------------
+
+
+class TestIngest:
+    """Test ingest request serialization and response parsing."""
+
+    def test_sync_ingest_serializes_new_options(self) -> None:
+        client = WeavClient()
+        captured: dict[str, Any] = {}
+
+        def fake_post(url: str, json: dict[str, Any] | None = None, **kwargs: Any) -> httpx.Response:
+            captured["url"] = url
+            captured["json"] = json
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": {
+                        "document_id": "doc-1",
+                        "chunks_created": 0,
+                        "entities_created": 0,
+                        "entities_merged": 0,
+                        "entities_resolved": 0,
+                        "entities_linked_existing": 0,
+                        "relationships_created": 0,
+                        "pipeline_duration_ms": 0,
+                    },
+                },
+            )
+
+        original_post = client._client.post
+        client._client.post = fake_post  # type: ignore[assignment]
+        try:
+            client.ingest(
+                "graph",
+                params=IngestParams(
+                    content="Alice works at Acme.",
+                    document_id="doc-1",
+                    skip_extraction=True,
+                    skip_dedup=False,
+                    chunk_size=64,
+                    entity_types=["person", "organization"],
+                    resolution_mode=ResolutionMode.SEMANTIC,
+                    link_existing_entities=True,
+                    resolution_candidate_limit=12,
+                    custom_resolution_prompt="Prefer canonical company names.",
+                ),
+            )
+            assert captured["url"] == "/v1/graphs/graph/ingest"
+            assert captured["json"] == {
+                "content": "Alice works at Acme.",
+                "document_id": "doc-1",
+                "skip_extraction": True,
+                "skip_dedup": False,
+                "chunk_size": 64,
+                "entity_types": ["person", "organization"],
+                "resolution_mode": "semantic",
+                "link_existing_entities": True,
+                "resolution_candidate_limit": 12,
+                "custom_resolution_prompt": "Prefer canonical company names.",
+            }
+        finally:
+            client._client.post = original_post  # type: ignore[assignment]
+            client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +591,28 @@ class TestResponseParsing:
         }
         result = _parse_context_result(data)
         assert result.chunks == []
+
+    def test_parse_ingest_result(self) -> None:
+        data = {
+            "document_id": "doc-42",
+            "chunks_created": 8,
+            "entities_created": 3,
+            "entities_merged": 1,
+            "entities_resolved": 6,
+            "entities_linked_existing": 4,
+            "relationships_created": 9,
+            "pipeline_duration_ms": 456,
+        }
+        result = _parse_ingest_result(data)
+        assert isinstance(result, IngestResult)
+        assert result.document_id == "doc-42"
+        assert result.chunks_created == 8
+        assert result.entities_created == 3
+        assert result.entities_merged == 1
+        assert result.entities_resolved == 6
+        assert result.entities_linked_existing == 4
+        assert result.relationships_created == 9
+        assert result.pipeline_duration_ms == 456
         assert result.total_tokens == 0
 
     def test_parse_graph_info(self) -> None:
@@ -559,6 +670,105 @@ class _FakeResponse:
             raise Exception(f"HTTP {self.status_code}")
 
 
+class _FakeSyncHttpClient:
+    """Minimal fake HTTP client for testing client helper methods."""
+
+    def __init__(self, response: _FakeResponse, stream_response: "_FakeStreamResponse | None" = None):
+        self.response = response
+        self.stream_response = stream_response or _FakeStreamResponse([])
+        self.last_path: str | None = None
+        self.last_json: dict | None = None
+        self.last_stream_path: str | None = None
+        self.last_stream_params: dict | None = None
+
+    def get(self, path: str):
+        self.last_path = path
+        return self.response
+
+    def post(self, path: str, json: dict | None = None):
+        self.last_path = path
+        self.last_json = json
+        return self.response
+
+    def stream(self, _method: str, path: str, params: dict | None = None):
+        self.last_stream_path = path
+        self.last_stream_params = params
+        return _FakeSyncStreamContext(self.stream_response)
+
+    def close(self) -> None:
+        pass
+
+
+class _FakeStreamResponse:
+    """Minimal fake streamed response for sync SSE tests."""
+
+    def __init__(self, lines: list[str], status_code: int = 200):
+        self._lines = lines
+        self.status_code = status_code
+
+    def iter_lines(self):
+        return iter(self._lines)
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise Exception(f"HTTP {self.status_code}")
+
+
+class _FakeSyncStreamContext:
+    def __init__(self, response: _FakeStreamResponse):
+        self.response = response
+
+    def __enter__(self) -> _FakeStreamResponse:
+        return self.response
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+
+class _FakeAsyncStreamResponse:
+    """Minimal fake streamed response for async SSE tests."""
+
+    def __init__(self, lines: list[str], status_code: int = 200):
+        self._lines = lines
+        self.status_code = status_code
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            yield line
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise Exception(f"HTTP {self.status_code}")
+
+
+class _FakeAsyncStreamContext:
+    def __init__(self, response: _FakeAsyncStreamResponse):
+        self.response = response
+
+    async def __aenter__(self) -> _FakeAsyncStreamResponse:
+        return self.response
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+
+class _FakeAsyncHttpClient:
+    """Minimal fake async HTTP client for async SSE tests."""
+
+    def __init__(self, stream_response: _FakeAsyncStreamResponse):
+        self.stream_response = stream_response
+        self.last_stream_path: str | None = None
+        self.last_stream_params: dict | None = None
+
+    def stream(self, _method: str, path: str, params: dict | None = None):
+        self.last_stream_path = path
+        self.last_stream_params = params
+        return _FakeAsyncStreamContext(self.stream_response)
+
+    async def aclose(self) -> None:
+        return None
+
+
 class TestCheckResponse:
     """Test the _check_response helper and WeavError."""
 
@@ -595,6 +805,147 @@ class TestCheckResponse:
     def test_weav_error_no_status(self) -> None:
         err = WeavError("no status")
         assert err.status_code is None
+
+
+class TestClientHelpers:
+    """Test lightweight client helper methods without a live server."""
+
+    def test_sync_info_uses_v1_info(self) -> None:
+        client = WeavClient()
+        fake = _FakeSyncHttpClient(
+            _FakeResponse({"success": True, "data": "weav-server 0.1.0"})
+        )
+        client._client = fake  # type: ignore[assignment]
+
+        assert client.info() == "weav-server 0.1.0"
+        assert fake.last_path == "/v1/info"
+
+    def test_sync_context_serializes_retrieval_mode(self) -> None:
+        client = WeavClient()
+        fake = _FakeSyncHttpClient(
+            _FakeResponse(
+                {
+                    "success": True,
+                    "data": {
+                        "chunks": [],
+                        "total_tokens": 0,
+                        "budget_used": 0.0,
+                        "nodes_considered": 0,
+                        "nodes_included": 0,
+                        "query_time_us": 0,
+                    },
+                }
+            )
+        )
+        client._client = fake  # type: ignore[assignment]
+
+        client.context("graph", query="rust", retrieval_mode=RetrievalMode.HYBRID)
+
+        assert fake.last_path == "/v1/context"
+        assert fake.last_json is not None
+        assert fake.last_json["retrieval_mode"] == "hybrid"
+
+    def test_sync_context_serializes_rerank(self) -> None:
+        client = WeavClient()
+        fake = _FakeSyncHttpClient(
+            _FakeResponse(
+                {
+                    "success": True,
+                    "data": {
+                        "chunks": [],
+                        "total_tokens": 0,
+                        "budget_used": 0.0,
+                        "nodes_considered": 0,
+                        "nodes_included": 0,
+                        "query_time_us": 0,
+                    },
+                }
+            )
+        )
+        client._client = fake  # type: ignore[assignment]
+
+        client.context(
+            "graph",
+            query="systems programming",
+            rerank=RerankConfig(
+                provider="cross_encoder",
+                candidate_limit=25,
+                score_weight=0.5,
+            ),
+        )
+
+        assert fake.last_path == "/v1/context"
+        assert fake.last_json is not None
+        assert fake.last_json["rerank"] == {
+            "enabled": True,
+            "provider": "cross_encoder",
+            "model": None,
+            "candidate_limit": 25,
+            "score_weight": 0.5,
+        }
+
+    def test_sync_context_serializes_scope(self) -> None:
+        client = WeavClient()
+        fake = _FakeSyncHttpClient(
+            _FakeResponse(
+                {
+                    "success": True,
+                    "data": {
+                        "chunks": [],
+                        "total_tokens": 0,
+                        "budget_used": 0.0,
+                        "nodes_considered": 0,
+                        "nodes_included": 0,
+                        "query_time_us": 0,
+                    },
+                }
+            )
+        )
+        client._client = fake  # type: ignore[assignment]
+
+        client.context(ScopeRef(workspace_id="acme", user_id="u_123"), query="rust")
+
+        assert fake.last_path == "/v1/context"
+        assert fake.last_json is not None
+        assert fake.last_json["scope"] == {
+            "workspace_id": "acme",
+            "user_id": "u_123",
+        }
+        assert "graph" not in fake.last_json
+
+    def test_sync_subscribe_events_serializes_graph_route_and_params(self) -> None:
+        client = WeavClient()
+        fake = _FakeSyncHttpClient(
+            _FakeResponse({"success": True}),
+            stream_response=_FakeStreamResponse(
+                ['data: {"sequence": 2, "kind": "node_created"}']
+            ),
+        )
+        client._client = fake  # type: ignore[assignment]
+
+        events = list(client.subscribe_events("graph", since_sequence=1, replay_limit=25))
+
+        assert fake.last_stream_path == "/v1/graphs/graph/events"
+        assert fake.last_stream_params == {"since_sequence": 1, "replay_limit": 25}
+        assert events == [{"sequence": 2, "kind": "node_created"}]
+
+    @pytest.mark.asyncio
+    async def test_async_subscribe_events_serializes_global_route_and_params(self) -> None:
+        client = AsyncWeavClient()
+        fake = _FakeAsyncHttpClient(
+            _FakeAsyncStreamResponse(
+                ['data: {"sequence": 3, "kind": "graph_created"}']
+            )
+        )
+        client._client = fake  # type: ignore[assignment]
+
+        events: list[dict] = []
+        async for event in client.subscribe_events(since_sequence=2):
+            events.append(event)
+
+        assert fake.last_stream_path == "/v1/events"
+        assert fake.last_stream_params == {"since_sequence": 2}
+        assert events == [{"sequence": 3, "kind": "graph_created"}]
 
 
 # ---------------------------------------------------------------------------

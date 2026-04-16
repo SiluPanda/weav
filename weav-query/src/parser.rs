@@ -7,7 +7,10 @@ use compact_str::CompactString;
 
 use weav_core::config::GraphConfig;
 use weav_core::error::WeavError;
-use weav_core::types::{DecayFunction, Direction, Timestamp, TokenBudget, Value};
+use weav_core::types::{
+    DecayFunction, Direction, RerankConfig, ResolutionMode, RetrievalMode, Timestamp, TokenBudget,
+    Value,
+};
 
 // ─── Command types ──────────────────────────────────────────────────────────
 
@@ -166,6 +169,8 @@ pub struct AclSetUserCmd {
 pub struct ContextQuery {
     pub query_text: Option<String>,
     pub graph: String,
+    pub retrieval_mode: RetrievalMode,
+    pub rerank: Option<RerankConfig>,
     pub budget: Option<TokenBudget>,
     pub seeds: SeedStrategy,
     pub max_depth: u8,
@@ -209,7 +214,10 @@ pub fn budget_preset(name: &str) -> Option<u32> {
 
 #[derive(Debug, Clone)]
 pub enum SeedStrategy {
-    Vector { embedding: Vec<f32>, top_k: u16 },
+    Vector {
+        embedding: Vec<f32>,
+        top_k: u16,
+    },
     Nodes(Vec<String>),
     Both {
         embedding: Vec<f32>,
@@ -310,12 +318,17 @@ pub struct EdgeGetCmd {
 pub struct IngestCmd {
     pub graph: String,
     pub content: String,
+    pub content_base64: Option<String>,
     pub format: Option<String>,
     pub document_id: Option<String>,
     pub skip_extraction: bool,
     pub skip_dedup: bool,
     pub chunk_size: Option<usize>,
     pub entity_types: Option<Vec<String>>,
+    pub resolution_mode: Option<ResolutionMode>,
+    pub link_existing_entities: Option<bool>,
+    pub resolution_candidate_limit: Option<usize>,
+    pub custom_resolution_prompt: Option<String>,
 }
 
 /// Search nodes by property key/value.
@@ -501,8 +514,8 @@ fn parse_err(msg: impl Into<String>) -> WeavError {
 
 /// Parse a JSON-like object string into a list of (key, Value) pairs.
 fn parse_properties_json(json_str: &str) -> Result<Vec<(String, Value)>, WeavError> {
-    let val: serde_json::Value =
-        serde_json::from_str(json_str).map_err(|e| parse_err(format!("invalid JSON properties: {e}")))?;
+    let val: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| parse_err(format!("invalid JSON properties: {e}")))?;
     let obj = val
         .as_object()
         .ok_or_else(|| parse_err("properties must be a JSON object"))?;
@@ -625,9 +638,9 @@ pub fn parse_command(input: &str) -> Result<Command, WeavError> {
         }
         "INDEX" => parse_index_command(&tokens),
         "CYPHER" => parse_cypher_command(input),
-        "MATCH" | "CREATE" if looks_like_cypher(input) => {
-            Err(parse_err("Cypher queries require a graph name: CYPHER \"graph\" MATCH ..."))
-        }
+        "MATCH" | "CREATE" if looks_like_cypher(input) => Err(parse_err(
+            "Cypher queries require a graph name: CYPHER \"graph\" MATCH ...",
+        )),
         _ => Err(parse_err(format!("unknown command: {}", &tokens[0]))),
     }
 }
@@ -647,15 +660,23 @@ fn parse_index_command(tokens: &[String]) -> Result<Command, WeavError> {
             }
             let graph = unquote(&tokens[2]).to_string();
             let property_key = unquote(&tokens[3]).to_string();
-            Ok(Command::CreateIndex(CreateIndexCmd { graph, property_key }))
+            Ok(Command::CreateIndex(CreateIndexCmd {
+                graph,
+                property_key,
+            }))
         }
-        _ => Err(parse_err(format!("unknown INDEX subcommand: {}", &tokens[1]))),
+        _ => Err(parse_err(format!(
+            "unknown INDEX subcommand: {}",
+            &tokens[1]
+        ))),
     }
 }
 
 fn parse_graph_command(tokens: &[String]) -> Result<Command, WeavError> {
     if tokens.len() < 2 {
-        return Err(parse_err("GRAPH requires a subcommand (CREATE, DROP, INFO, LIST, CHECK)"));
+        return Err(parse_err(
+            "GRAPH requires a subcommand (CREATE, DROP, INFO, LIST, CHECK)",
+        ));
     }
     let sub = tokens[1].to_uppercase();
     match sub.as_str() {
@@ -694,13 +715,18 @@ fn parse_graph_command(tokens: &[String]) -> Result<Command, WeavError> {
             }
             Ok(Command::GraphCheck(unquote(&tokens[2]).to_string()))
         }
-        _ => Err(parse_err(format!("unknown GRAPH subcommand: {}", &tokens[1]))),
+        _ => Err(parse_err(format!(
+            "unknown GRAPH subcommand: {}",
+            &tokens[1]
+        ))),
     }
 }
 
 fn parse_node_command(tokens: &[String]) -> Result<Command, WeavError> {
     if tokens.len() < 2 {
-        return Err(parse_err("NODE requires a subcommand (ADD, GET, UPDATE, DELETE, MERGE)"));
+        return Err(parse_err(
+            "NODE requires a subcommand (ADD, GET, UPDATE, DELETE, MERGE)",
+        ));
     }
     let sub = tokens[1].to_uppercase();
     match sub.as_str() {
@@ -709,15 +735,18 @@ fn parse_node_command(tokens: &[String]) -> Result<Command, WeavError> {
         "UPDATE" => parse_node_update(tokens),
         "DELETE" => parse_node_delete(tokens),
         "MERGE" => parse_node_merge(tokens),
-        _ => Err(parse_err(format!("unknown NODE subcommand: {}", &tokens[1]))),
+        _ => Err(parse_err(format!(
+            "unknown NODE subcommand: {}",
+            &tokens[1]
+        ))),
     }
 }
 
 /// Parse: NODE ADD TO "graph" LABEL "label" PROPERTIES {...} [EMBEDDING [...]] [KEY "key"]
 fn parse_node_add(tokens: &[String]) -> Result<Command, WeavError> {
     // Find "TO" keyword
-    let to_pos = find_keyword(tokens, "TO")
-        .ok_or_else(|| parse_err("NODE ADD requires TO \"graph\""))?;
+    let to_pos =
+        find_keyword(tokens, "TO").ok_or_else(|| parse_err("NODE ADD requires TO \"graph\""))?;
     if to_pos + 1 >= tokens.len() {
         return Err(parse_err("NODE ADD TO requires a graph name"));
     }
@@ -766,9 +795,11 @@ fn parse_node_add(tokens: &[String]) -> Result<Command, WeavError> {
         if ttl_pos + 1 >= tokens.len() {
             return Err(parse_err("TTL requires a value in milliseconds"));
         }
-        Some(tokens[ttl_pos + 1].parse::<u64>().map_err(|_| {
-            parse_err("TTL value must be a positive integer (milliseconds)")
-        })?)
+        Some(
+            tokens[ttl_pos + 1]
+                .parse::<u64>()
+                .map_err(|_| parse_err("TTL value must be a positive integer (milliseconds)"))?,
+        )
     } else {
         None
     };
@@ -802,7 +833,9 @@ fn parse_node_get(tokens: &[String]) -> Result<Command, WeavError> {
         }
         let field = &tokens[4];
         if field.to_lowercase() != "entity_key" {
-            return Err(parse_err(format!("NODE GET WHERE only supports entity_key, got: {field}")));
+            return Err(parse_err(format!(
+                "NODE GET WHERE only supports entity_key, got: {field}"
+            )));
         }
         // tokens[5] should be "="
         let key = unquote(&tokens[6]).to_string();
@@ -858,23 +891,26 @@ fn parse_node_merge(tokens: &[String]) -> Result<Command, WeavError> {
         .parse()
         .map_err(|_| parse_err(format!("invalid target node id: {}", &tokens[into_pos + 1])))?;
 
-    let conflict_policy = if let Some(policy_pos) = find_keyword_after(tokens, "POLICY", into_pos + 2) {
-        if policy_pos + 1 >= tokens.len() {
-            return Err(parse_err("POLICY requires a value (keep_target, keep_source, or merge)"));
-        }
-        let p = tokens[policy_pos + 1].to_lowercase();
-        match p.as_str() {
-            "keep_target" | "keep_source" | "merge" => p,
-            _ => {
-                return Err(parse_err(format!(
-                    "invalid conflict policy '{}': must be keep_target, keep_source, or merge",
-                    p
-                )));
+    let conflict_policy =
+        if let Some(policy_pos) = find_keyword_after(tokens, "POLICY", into_pos + 2) {
+            if policy_pos + 1 >= tokens.len() {
+                return Err(parse_err(
+                    "POLICY requires a value (keep_target, keep_source, or merge)",
+                ));
             }
-        }
-    } else {
-        "keep_target".to_string()
-    };
+            let p = tokens[policy_pos + 1].to_lowercase();
+            match p.as_str() {
+                "keep_target" | "keep_source" | "merge" => p,
+                _ => {
+                    return Err(parse_err(format!(
+                        "invalid conflict policy '{}': must be keep_target, keep_source, or merge",
+                        p
+                    )));
+                }
+            }
+        } else {
+            "keep_target".to_string()
+        };
 
     Ok(Command::NodeMerge(NodeMergeCmd {
         graph,
@@ -886,7 +922,9 @@ fn parse_node_merge(tokens: &[String]) -> Result<Command, WeavError> {
 
 fn parse_edge_command(tokens: &[String]) -> Result<Command, WeavError> {
     if tokens.len() < 2 {
-        return Err(parse_err("EDGE requires a subcommand (ADD, GET, DELETE, INVALIDATE)"));
+        return Err(parse_err(
+            "EDGE requires a subcommand (ADD, GET, DELETE, INVALIDATE)",
+        ));
     }
     let sub = tokens[1].to_uppercase();
     match sub.as_str() {
@@ -894,7 +932,10 @@ fn parse_edge_command(tokens: &[String]) -> Result<Command, WeavError> {
         "INVALIDATE" => parse_edge_invalidate(tokens),
         "DELETE" => parse_edge_delete(tokens),
         "GET" => parse_edge_get(tokens),
-        _ => Err(parse_err(format!("unknown EDGE subcommand: {}", &tokens[1]))),
+        _ => Err(parse_err(format!(
+            "unknown EDGE subcommand: {}",
+            &tokens[1]
+        ))),
     }
 }
 
@@ -963,9 +1004,11 @@ fn parse_edge_add(tokens: &[String]) -> Result<Command, WeavError> {
         if ttl_pos + 1 >= tokens.len() {
             return Err(parse_err("TTL requires a value in milliseconds"));
         }
-        Some(tokens[ttl_pos + 1].parse::<u64>().map_err(|_| {
-            parse_err("TTL value must be a positive integer (milliseconds)")
-        })?)
+        Some(
+            tokens[ttl_pos + 1]
+                .parse::<u64>()
+                .map_err(|_| parse_err("TTL value must be a positive integer (milliseconds)"))?,
+        )
     } else {
         None
     };
@@ -992,14 +1035,18 @@ fn parse_edge_invalidate(tokens: &[String]) -> Result<Command, WeavError> {
     let edge_id: u64 = tokens[3]
         .parse()
         .map_err(|_| parse_err(format!("invalid edge id: {}", &tokens[3])))?;
-    Ok(Command::EdgeInvalidate(EdgeInvalidateCmd { graph, edge_id }))
+    Ok(Command::EdgeInvalidate(EdgeInvalidateCmd {
+        graph,
+        edge_id,
+    }))
 }
 
 /// Parse: CONTEXT "query" FROM "graph" [BUDGET <n> TOKENS] [SEEDS VECTOR [...] TOP <k>]
 ///        [SEEDS NODES [...]] [DEPTH <d>] [DIRECTION OUT|IN|BOTH]
 ///        [FILTER LABELS [...] MIN_WEIGHT <f> MIN_CONFIDENCE <f>]
 ///        [DECAY EXPONENTIAL <ms> | LINEAR <ms> | STEP <ms> | NONE]
-///        [PROVENANCE] [AT <timestamp>] [LIMIT <n>]
+///        [PROVENANCE] [AT <timestamp>] [LIMIT <n>] [RETRIEVAL LOCAL|GLOBAL|HYBRID|DRIFT]
+///        [RERANK {...}]
 fn parse_context_command(tokens: &[String]) -> Result<Command, WeavError> {
     if tokens.len() < 2 {
         return Err(parse_err("CONTEXT requires a query text"));
@@ -1008,8 +1055,8 @@ fn parse_context_command(tokens: &[String]) -> Result<Command, WeavError> {
     let query_text = Some(unquote(&tokens[1]).to_string());
 
     // Find FROM "graph"
-    let from_pos = find_keyword(tokens, "FROM")
-        .ok_or_else(|| parse_err("CONTEXT requires FROM \"graph\""))?;
+    let from_pos =
+        find_keyword(tokens, "FROM").ok_or_else(|| parse_err("CONTEXT requires FROM \"graph\""))?;
     if from_pos + 1 >= tokens.len() {
         return Err(parse_err("CONTEXT FROM requires a graph name"));
     }
@@ -1025,6 +1072,31 @@ fn parse_context_command(tokens: &[String]) -> Result<Command, WeavError> {
             .map_err(|_| parse_err(format!("invalid budget: {}", &tokens[b_pos + 1])))?;
         // Skip optional "TOKENS" keyword
         Some(TokenBudget::new(max_tokens))
+    } else {
+        None
+    };
+
+    // Parse RETRIEVAL <mode>
+    let retrieval_mode = if let Some(r_pos) = find_keyword(tokens, "RETRIEVAL") {
+        if r_pos + 1 >= tokens.len() {
+            return Err(parse_err(
+                "RETRIEVAL requires LOCAL, GLOBAL, HYBRID, or DRIFT",
+            ));
+        }
+        RetrievalMode::from_str_lossy(&tokens[r_pos + 1])
+            .ok_or_else(|| parse_err(format!("invalid retrieval mode: {}", &tokens[r_pos + 1])))?
+    } else {
+        RetrievalMode::Local
+    };
+
+    let rerank = if let Some(r_pos) = find_keyword(tokens, "RERANK") {
+        if r_pos + 1 >= tokens.len() {
+            return Err(parse_err("RERANK requires a JSON object"));
+        }
+        Some(
+            serde_json::from_str::<RerankConfig>(&tokens[r_pos + 1])
+                .map_err(|e| parse_err(format!("invalid rerank config JSON: {e}")))?,
+        )
     } else {
         None
     };
@@ -1045,9 +1117,9 @@ fn parse_context_command(tokens: &[String]) -> Result<Command, WeavError> {
                         embedding = Some(parse_f32_array(&tokens[idx + 2])?);
                         // Check for TOP <k>
                         if idx + 4 < tokens.len() && tokens[idx + 3].to_uppercase() == "TOP" {
-                            top_k = tokens[idx + 4]
-                                .parse()
-                                .map_err(|_| parse_err(format!("invalid top_k: {}", &tokens[idx + 4])))?;
+                            top_k = tokens[idx + 4].parse().map_err(|_| {
+                                parse_err(format!("invalid top_k: {}", &tokens[idx + 4]))
+                            })?;
                             if top_k > 10_000 {
                                 return Err(parse_err("top_k exceeds maximum of 10000"));
                             }
@@ -1137,7 +1209,8 @@ fn parse_context_command(tokens: &[String]) -> Result<Command, WeavError> {
                 "LABELS" => {
                     if fi + 1 < tokens.len() {
                         let arr_str = &tokens[fi + 1];
-                        let val: serde_json::Value = serde_json::from_str(arr_str).unwrap_or(serde_json::Value::Null);
+                        let val: serde_json::Value =
+                            serde_json::from_str(arr_str).unwrap_or(serde_json::Value::Null);
                         if let Some(arr) = val.as_array() {
                             let mut lbls = Vec::new();
                             for v in arr {
@@ -1274,6 +1347,8 @@ fn parse_context_command(tokens: &[String]) -> Result<Command, WeavError> {
     Ok(Command::Context(ContextQuery {
         query_text,
         graph,
+        retrieval_mode,
+        rerank,
         budget,
         seeds,
         max_depth,
@@ -1338,21 +1413,24 @@ fn parse_bulk_command(tokens: &[String]) -> Result<Command, WeavError> {
     match sub.as_str() {
         "NODES" => parse_bulk_nodes(tokens),
         "EDGES" => parse_bulk_edges(tokens),
-        _ => Err(parse_err(format!("unknown BULK subcommand: {}", &tokens[1]))),
+        _ => Err(parse_err(format!(
+            "unknown BULK subcommand: {}",
+            &tokens[1]
+        ))),
     }
 }
 
 /// Parse: BULK NODES TO "graph" DATA [<json_array>]
 fn parse_bulk_nodes(tokens: &[String]) -> Result<Command, WeavError> {
-    let to_pos = find_keyword(tokens, "TO")
-        .ok_or_else(|| parse_err("BULK NODES requires TO \"graph\""))?;
+    let to_pos =
+        find_keyword(tokens, "TO").ok_or_else(|| parse_err("BULK NODES requires TO \"graph\""))?;
     if to_pos + 1 >= tokens.len() {
         return Err(parse_err("BULK NODES TO requires a graph name"));
     }
     let graph = unquote(&tokens[to_pos + 1]).to_string();
 
-    let data_pos = find_keyword(tokens, "DATA")
-        .ok_or_else(|| parse_err("BULK NODES requires DATA [...]"))?;
+    let data_pos =
+        find_keyword(tokens, "DATA").ok_or_else(|| parse_err("BULK NODES requires DATA [...]"))?;
     if data_pos + 1 >= tokens.len() {
         return Err(parse_err("BULK NODES DATA requires a JSON array"));
     }
@@ -1413,20 +1491,23 @@ fn parse_bulk_nodes(tokens: &[String]) -> Result<Command, WeavError> {
         });
     }
 
-    Ok(Command::BulkInsertNodes(BulkInsertNodesCmd { graph, nodes }))
+    Ok(Command::BulkInsertNodes(BulkInsertNodesCmd {
+        graph,
+        nodes,
+    }))
 }
 
 /// Parse: BULK EDGES TO "graph" DATA [<json_array>]
 fn parse_bulk_edges(tokens: &[String]) -> Result<Command, WeavError> {
-    let to_pos = find_keyword(tokens, "TO")
-        .ok_or_else(|| parse_err("BULK EDGES requires TO \"graph\""))?;
+    let to_pos =
+        find_keyword(tokens, "TO").ok_or_else(|| parse_err("BULK EDGES requires TO \"graph\""))?;
     if to_pos + 1 >= tokens.len() {
         return Err(parse_err("BULK EDGES TO requires a graph name"));
     }
     let graph = unquote(&tokens[to_pos + 1]).to_string();
 
-    let data_pos = find_keyword(tokens, "DATA")
-        .ok_or_else(|| parse_err("BULK EDGES requires DATA [...]"))?;
+    let data_pos =
+        find_keyword(tokens, "DATA").ok_or_else(|| parse_err("BULK EDGES requires DATA [...]"))?;
     if data_pos + 1 >= tokens.len() {
         return Err(parse_err("BULK EDGES DATA requires a JSON array"));
     }
@@ -1490,7 +1571,10 @@ fn parse_bulk_edges(tokens: &[String]) -> Result<Command, WeavError> {
         });
     }
 
-    Ok(Command::BulkInsertEdges(BulkInsertEdgesCmd { graph, edges }))
+    Ok(Command::BulkInsertEdges(BulkInsertEdgesCmd {
+        graph,
+        edges,
+    }))
 }
 
 /// Parse: EDGE DELETE "graph" <edge_id>
@@ -1539,7 +1623,10 @@ fn parse_config_command(tokens: &[String]) -> Result<Command, WeavError> {
             let key = unquote(&tokens[2]).to_string();
             Ok(Command::ConfigGet(key))
         }
-        _ => Err(parse_err(format!("unknown CONFIG subcommand: {}", &tokens[1]))),
+        _ => Err(parse_err(format!(
+            "unknown CONFIG subcommand: {}",
+            &tokens[1]
+        ))),
     }
 }
 
@@ -1562,13 +1649,17 @@ fn parse_auth_command(tokens: &[String]) -> Result<Command, WeavError> {
                 password: unquote(&tokens[2]).to_string(),
             })
         }
-        _ => Err(parse_err("AUTH requires 1 or 2 arguments: AUTH [username] password")),
+        _ => Err(parse_err(
+            "AUTH requires 1 or 2 arguments: AUTH [username] password",
+        )),
     }
 }
 
 fn parse_acl_command(tokens: &[String]) -> Result<Command, WeavError> {
     if tokens.len() < 2 {
-        return Err(parse_err("ACL requires a subcommand (SETUSER, DELUSER, LIST, GETUSER, WHOAMI, SAVE, LOAD)"));
+        return Err(parse_err(
+            "ACL requires a subcommand (SETUSER, DELUSER, LIST, GETUSER, WHOAMI, SAVE, LOAD)",
+        ));
     }
     let sub = tokens[1].to_uppercase();
     match sub.as_str() {
@@ -1630,7 +1721,9 @@ fn parse_acl_command(tokens: &[String]) -> Result<Command, WeavError> {
 
 /// Parse: INGEST "graph" "content" [FORMAT "pdf"|"text"|"docx"|"csv"]
 ///        [DOCID "id"] [SKIP_EXTRACTION] [SKIP_DEDUP] [CHUNK_SIZE 512]
-///        [ENTITY_TYPES "Person,Organization"]
+///        [ENTITY_TYPES "Person,Organization"] [RESOLUTION_MODE off|heuristic|semantic]
+///        [LINK_EXISTING_ENTITIES] [RESOLUTION_CANDIDATE_LIMIT 8]
+///        [CUSTOM_RESOLUTION_PROMPT "..."]
 fn parse_ingest_command(tokens: &[String]) -> Result<Command, WeavError> {
     if tokens.len() < 3 {
         return Err(parse_err(
@@ -1646,6 +1739,10 @@ fn parse_ingest_command(tokens: &[String]) -> Result<Command, WeavError> {
     let mut skip_dedup = false;
     let mut chunk_size = None;
     let mut entity_types = None;
+    let mut resolution_mode = None;
+    let mut link_existing_entities = None;
+    let mut resolution_candidate_limit = None;
+    let mut custom_resolution_prompt = None;
 
     let mut i = 3;
     while i < tokens.len() {
@@ -1672,9 +1769,11 @@ fn parse_ingest_command(tokens: &[String]) -> Result<Command, WeavError> {
             "CHUNK_SIZE" => {
                 i += 1;
                 if i < tokens.len() {
-                    chunk_size = Some(tokens[i].parse::<usize>().map_err(|_| {
-                        parse_err("CHUNK_SIZE value must be a number")
-                    })?);
+                    chunk_size = Some(
+                        tokens[i]
+                            .parse::<usize>()
+                            .map_err(|_| parse_err("CHUNK_SIZE value must be a number"))?,
+                    );
                 }
             }
             "ENTITY_TYPES" => {
@@ -1690,6 +1789,44 @@ fn parse_ingest_command(tokens: &[String]) -> Result<Command, WeavError> {
                     );
                 }
             }
+            "RESOLUTION_MODE" => {
+                i += 1;
+                if i < tokens.len() {
+                    let mode = unquote(&tokens[i]);
+                    resolution_mode =
+                        Some(ResolutionMode::from_str_lossy(mode).ok_or_else(|| {
+                            parse_err("RESOLUTION_MODE must be one of: off, heuristic, semantic")
+                        })?);
+                }
+            }
+            "LINK_EXISTING_ENTITIES" => {
+                if i + 1 < tokens.len() {
+                    let next = unquote(&tokens[i + 1]);
+                    if next.eq_ignore_ascii_case("true") || next.eq_ignore_ascii_case("false") {
+                        i += 1;
+                        link_existing_entities = Some(next.eq_ignore_ascii_case("true"));
+                    } else {
+                        link_existing_entities = Some(true);
+                    }
+                } else {
+                    link_existing_entities = Some(true);
+                }
+            }
+            "RESOLUTION_CANDIDATE_LIMIT" => {
+                i += 1;
+                if i < tokens.len() {
+                    resolution_candidate_limit =
+                        Some(tokens[i].parse::<usize>().map_err(|_| {
+                            parse_err("RESOLUTION_CANDIDATE_LIMIT value must be a number")
+                        })?);
+                }
+            }
+            "CUSTOM_RESOLUTION_PROMPT" => {
+                i += 1;
+                if i < tokens.len() {
+                    custom_resolution_prompt = Some(unquote(&tokens[i]).to_string());
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -1698,12 +1835,17 @@ fn parse_ingest_command(tokens: &[String]) -> Result<Command, WeavError> {
     Ok(Command::Ingest(IngestCmd {
         graph,
         content,
+        content_base64: None,
         format,
         document_id,
         skip_extraction,
         skip_dedup,
         chunk_size,
         entity_types,
+        resolution_mode,
+        link_existing_entities,
+        resolution_candidate_limit,
+        custom_resolution_prompt,
     }))
 }
 
@@ -1731,13 +1873,15 @@ fn parse_search_command(tokens: &[String]) -> Result<Command, WeavError> {
     }
 
     if tokens.len() < 6 {
-        return Err(parse_err("SEARCH requires: SEARCH \"graph\" WHERE key = \"value\" [LIMIT n]"));
+        return Err(parse_err(
+            "SEARCH requires: SEARCH \"graph\" WHERE key = \"value\" [LIMIT n]",
+        ));
     }
     let graph = unquote(&tokens[1]).to_string();
 
     // Find WHERE keyword
-    let where_pos = find_keyword(tokens, "WHERE")
-        .ok_or_else(|| parse_err("SEARCH requires WHERE clause"))?;
+    let where_pos =
+        find_keyword(tokens, "WHERE").ok_or_else(|| parse_err("SEARCH requires WHERE clause"))?;
     if where_pos + 3 >= tokens.len() {
         return Err(parse_err("WHERE requires: key = \"value\""));
     }
@@ -1749,9 +1893,11 @@ fn parse_search_command(tokens: &[String]) -> Result<Command, WeavError> {
         if lim_pos + 1 >= tokens.len() {
             return Err(parse_err("LIMIT requires a number"));
         }
-        Some(tokens[lim_pos + 1].parse::<u32>().map_err(|_| {
-            parse_err("LIMIT value must be a positive integer")
-        })?)
+        Some(
+            tokens[lim_pos + 1]
+                .parse::<u32>()
+                .map_err(|_| parse_err("LIMIT value must be a positive integer"))?,
+        )
     } else {
         None
     };
@@ -1780,9 +1926,11 @@ fn parse_search_text_command(tokens: &[String]) -> Result<Command, WeavError> {
         if lim_pos + 1 >= tokens.len() {
             return Err(parse_err("LIMIT requires a number"));
         }
-        Some(tokens[lim_pos + 1].parse::<u32>().map_err(|_| {
-            parse_err("LIMIT value must be a positive integer")
-        })?)
+        Some(
+            tokens[lim_pos + 1]
+                .parse::<u32>()
+                .map_err(|_| parse_err("LIMIT value must be a positive integer"))?,
+        )
     } else {
         None
     };
@@ -1797,10 +1945,13 @@ fn parse_search_text_command(tokens: &[String]) -> Result<Command, WeavError> {
 /// Parse: NEIGHBORS "graph" <node_id> [LABEL "label"] [DIRECTION OUT|IN|BOTH]
 fn parse_neighbors_command(tokens: &[String]) -> Result<Command, WeavError> {
     if tokens.len() < 3 {
-        return Err(parse_err("NEIGHBORS requires: NEIGHBORS \"graph\" <node_id>"));
+        return Err(parse_err(
+            "NEIGHBORS requires: NEIGHBORS \"graph\" <node_id>",
+        ));
     }
     let graph = unquote(&tokens[1]).to_string();
-    let node_id: u64 = tokens[2].parse()
+    let node_id: u64 = tokens[2]
+        .parse()
         .map_err(|_| parse_err(format!("invalid node_id: {}", &tokens[2])))?;
 
     let label = if let Some(lbl_pos) = find_keyword(tokens, "LABEL") {
@@ -1870,9 +2021,7 @@ fn parse_schema_set(tokens: &[String]) -> Result<Command, WeavError> {
     let graph = unquote(&tokens[2]).to_string();
     let target = tokens[3].to_lowercase();
     if target != "node" && target != "edge" {
-        return Err(parse_err(
-            "SCHEMA SET target must be 'node' or 'edge'",
-        ));
+        return Err(parse_err("SCHEMA SET target must be 'node' or 'edge'"));
     }
     let label = unquote(&tokens[4]).to_string();
     let constraint_type = tokens[5].to_lowercase();
@@ -1917,14 +2066,19 @@ fn looks_like_cypher(input: &str) -> bool {
 fn parse_cypher_command(input: &str) -> Result<Command, WeavError> {
     // Strip the leading CYPHER keyword (case-insensitive).
     let rest = input.trim();
-    let after_keyword = &rest[rest.find(char::is_whitespace)
-        .ok_or_else(|| parse_err("CYPHER requires a graph name and query"))?..].trim_start();
+    let after_keyword = &rest[rest
+        .find(char::is_whitespace)
+        .ok_or_else(|| parse_err("CYPHER requires a graph name and query"))?..]
+        .trim_start();
 
     // Extract the quoted graph name.
     if !after_keyword.starts_with('"') {
-        return Err(parse_err("CYPHER requires a quoted graph name: CYPHER \"graph\" MATCH ..."));
+        return Err(parse_err(
+            "CYPHER requires a quoted graph name: CYPHER \"graph\" MATCH ...",
+        ));
     }
-    let end_quote = after_keyword[1..].find('"')
+    let end_quote = after_keyword[1..]
+        .find('"')
         .ok_or_else(|| parse_err("unterminated graph name in CYPHER command"))?;
     let graph = after_keyword[1..1 + end_quote].to_string();
     let query = after_keyword[2 + end_quote..].trim().to_string();
@@ -2080,10 +2234,8 @@ mod tests {
 
     #[test]
     fn test_parse_edge_add() {
-        let cmd = parse_command(
-            r#"EDGE ADD TO "test_graph" FROM 1 TO 2 LABEL "knows" WEIGHT 0.9"#,
-        )
-        .unwrap();
+        let cmd = parse_command(r#"EDGE ADD TO "test_graph" FROM 1 TO 2 LABEL "knows" WEIGHT 0.9"#)
+            .unwrap();
         match cmd {
             Command::EdgeAdd(ea) => {
                 assert_eq!(ea.graph, "test_graph");
@@ -2098,10 +2250,7 @@ mod tests {
 
     #[test]
     fn test_parse_edge_add_default_weight() {
-        let cmd = parse_command(
-            r#"EDGE ADD TO "test_graph" FROM 1 TO 2 LABEL "knows""#,
-        )
-        .unwrap();
+        let cmd = parse_command(r#"EDGE ADD TO "test_graph" FROM 1 TO 2 LABEL "knows""#).unwrap();
         match cmd {
             Command::EdgeAdd(ea) => {
                 assert!((ea.weight - 1.0).abs() < 0.001);
@@ -2132,6 +2281,7 @@ mod tests {
             Command::Context(cq) => {
                 assert_eq!(cq.query_text.as_deref(), Some("what is rust"));
                 assert_eq!(cq.graph, "knowledge");
+                assert_eq!(cq.retrieval_mode, RetrievalMode::Local);
                 assert_eq!(cq.budget.as_ref().unwrap().max_tokens, 4096);
                 assert_eq!(cq.max_depth, 3);
                 assert_eq!(cq.direction, Direction::Both);
@@ -2142,50 +2292,37 @@ mod tests {
 
     #[test]
     fn test_parse_context_with_seeds() {
-        let cmd = parse_command(
-            r#"CONTEXT "test" FROM "g" SEEDS NODES ["key1", "key2"]"#,
-        )
-        .unwrap();
+        let cmd = parse_command(r#"CONTEXT "test" FROM "g" SEEDS NODES ["key1", "key2"]"#).unwrap();
         match cmd {
-            Command::Context(cq) => {
-                match &cq.seeds {
-                    SeedStrategy::Nodes(keys) => {
-                        assert_eq!(keys.len(), 2);
-                        assert_eq!(keys[0], "key1");
-                        assert_eq!(keys[1], "key2");
-                    }
-                    _ => panic!("expected Nodes seed strategy"),
+            Command::Context(cq) => match &cq.seeds {
+                SeedStrategy::Nodes(keys) => {
+                    assert_eq!(keys.len(), 2);
+                    assert_eq!(keys[0], "key1");
+                    assert_eq!(keys[1], "key2");
                 }
-            }
+                _ => panic!("expected Nodes seed strategy"),
+            },
             _ => panic!("expected Context"),
         }
     }
 
     #[test]
     fn test_parse_context_with_decay() {
-        let cmd = parse_command(
-            r#"CONTEXT "test" FROM "g" DECAY EXPONENTIAL 3600000"#,
-        )
-        .unwrap();
+        let cmd = parse_command(r#"CONTEXT "test" FROM "g" DECAY EXPONENTIAL 3600000"#).unwrap();
         match cmd {
-            Command::Context(cq) => {
-                match &cq.decay {
-                    Some(DecayFunction::Exponential { half_life_ms }) => {
-                        assert_eq!(*half_life_ms, 3600000);
-                    }
-                    _ => panic!("expected Exponential decay"),
+            Command::Context(cq) => match &cq.decay {
+                Some(DecayFunction::Exponential { half_life_ms }) => {
+                    assert_eq!(*half_life_ms, 3600000);
                 }
-            }
+                _ => panic!("expected Exponential decay"),
+            },
             _ => panic!("expected Context"),
         }
     }
 
     #[test]
     fn test_parse_context_with_provenance() {
-        let cmd = parse_command(
-            r#"CONTEXT "test" FROM "g" PROVENANCE"#,
-        )
-        .unwrap();
+        let cmd = parse_command(r#"CONTEXT "test" FROM "g" PROVENANCE"#).unwrap();
         match cmd {
             Command::Context(cq) => {
                 assert!(cq.include_provenance);
@@ -2196,13 +2333,40 @@ mod tests {
 
     #[test]
     fn test_parse_context_with_limit() {
+        let cmd = parse_command(r#"CONTEXT "test" FROM "g" LIMIT 50"#).unwrap();
+        match cmd {
+            Command::Context(cq) => {
+                assert_eq!(cq.limit, Some(50));
+            }
+            _ => panic!("expected Context"),
+        }
+    }
+
+    #[test]
+    fn test_parse_context_with_retrieval_mode() {
+        let cmd = parse_command(r#"CONTEXT "test" FROM "g" RETRIEVAL HYBRID"#).unwrap();
+        match cmd {
+            Command::Context(cq) => {
+                assert_eq!(cq.retrieval_mode, RetrievalMode::Hybrid);
+                assert!(cq.rerank.is_none());
+            }
+            _ => panic!("expected Context"),
+        }
+    }
+
+    #[test]
+    fn test_parse_context_with_rerank() {
         let cmd = parse_command(
-            r#"CONTEXT "test" FROM "g" LIMIT 50"#,
+            r#"CONTEXT "systems programming" FROM "g" RERANK {"provider":"cross_encoder","candidate_limit":25,"score_weight":0.5}"#,
         )
         .unwrap();
         match cmd {
             Command::Context(cq) => {
-                assert_eq!(cq.limit, Some(50));
+                let rerank = cq.rerank.expect("rerank config should be parsed");
+                assert!(rerank.enabled);
+                assert_eq!(rerank.supported_provider(), Some("cross_encoder"));
+                assert_eq!(rerank.candidate_limit, 25);
+                assert!((rerank.score_weight - 0.5).abs() < f32::EPSILON);
             }
             _ => panic!("expected Context"),
         }
@@ -2237,10 +2401,7 @@ mod tests {
 
     #[test]
     fn test_parse_context_at_timestamp() {
-        let cmd = parse_command(
-            r#"CONTEXT "test" FROM "g" AT 1000000"#,
-        )
-        .unwrap();
+        let cmd = parse_command(r#"CONTEXT "test" FROM "g" AT 1000000"#).unwrap();
         match cmd {
             Command::Context(cq) => {
                 assert_eq!(cq.temporal_at, Some(1000000));
@@ -2251,10 +2412,9 @@ mod tests {
 
     #[test]
     fn test_parse_node_update() {
-        let cmd = parse_command(
-            r#"NODE UPDATE "test_graph" 42 PROPERTIES {"name": "Bob", "age": 25}"#,
-        )
-        .unwrap();
+        let cmd =
+            parse_command(r#"NODE UPDATE "test_graph" 42 PROPERTIES {"name": "Bob", "age": 25}"#)
+                .unwrap();
         match cmd {
             Command::NodeUpdate(nu) => {
                 assert_eq!(nu.graph, "test_graph");
@@ -2268,10 +2428,9 @@ mod tests {
 
     #[test]
     fn test_parse_node_update_with_embedding() {
-        let cmd = parse_command(
-            r#"NODE UPDATE "g" 1 PROPERTIES {"x": 1} EMBEDDING [0.1, 0.2, 0.3]"#,
-        )
-        .unwrap();
+        let cmd =
+            parse_command(r#"NODE UPDATE "g" 1 PROPERTIES {"x": 1} EMBEDDING [0.1, 0.2, 0.3]"#)
+                .unwrap();
         match cmd {
             Command::NodeUpdate(nu) => {
                 assert_eq!(nu.node_id, 1);
@@ -2334,10 +2493,9 @@ mod tests {
 
     #[test]
     fn test_parse_bulk_edges_default_weight() {
-        let cmd = parse_command(
-            r#"BULK EDGES TO "g" DATA [{"source": 1, "target": 2, "label": "rel"}]"#,
-        )
-        .unwrap();
+        let cmd =
+            parse_command(r#"BULK EDGES TO "g" DATA [{"source": 1, "target": 2, "label": "rel"}]"#)
+                .unwrap();
         match cmd {
             Command::BulkInsertEdges(bulk) => {
                 assert!((bulk.edges[0].weight - 1.0).abs() < 0.001);
@@ -2390,7 +2548,9 @@ mod tests {
 
     #[test]
     fn test_parse_node_add_invalid_embedding() {
-        assert!(parse_command("NODE ADD TO \"g\" LABEL \"person\" EMBEDDING [not,numbers]").is_err());
+        assert!(
+            parse_command("NODE ADD TO \"g\" LABEL \"person\" EMBEDDING [not,numbers]").is_err()
+        );
     }
 
     #[test]
@@ -2406,6 +2566,16 @@ mod tests {
     #[test]
     fn test_parse_context_unknown_direction() {
         assert!(parse_command("CONTEXT \"q\" FROM \"g\" DIRECTION SIDEWAYS").is_err());
+    }
+
+    #[test]
+    fn test_parse_context_invalid_retrieval_mode() {
+        assert!(parse_command("CONTEXT \"q\" FROM \"g\" RETRIEVAL SIDEWAYS").is_err());
+    }
+
+    #[test]
+    fn test_parse_context_invalid_rerank_json() {
+        assert!(parse_command("CONTEXT \"q\" FROM \"g\" RERANK {invalid}").is_err());
     }
 
     #[test]
@@ -2450,14 +2620,20 @@ mod tests {
     #[test]
     fn test_parse_unknown_command_with_args() {
         let result = parse_command("FOOBAR something");
-        assert!(result.is_err(), "unknown command with args should return error");
+        assert!(
+            result.is_err(),
+            "unknown command with args should return error"
+        );
     }
 
     #[test]
     fn test_parse_sql_injection_attempt() {
         // Should fail parsing gracefully, not panic or execute anything dangerous
         let result = parse_command("NODE ADD; DROP TABLE users; --");
-        assert!(result.is_err(), "SQL injection-like input should fail gracefully");
+        assert!(
+            result.is_err(),
+            "SQL injection-like input should fail gracefully"
+        );
     }
 
     #[test]
@@ -2495,14 +2671,20 @@ mod tests {
     fn test_parse_negative_node_id() {
         // NodeId is u64, cannot be negative — parser should error
         let result = parse_command("NODE GET \"g\" -1");
-        assert!(result.is_err(), "negative node id should return error (u64 cannot be negative)");
+        assert!(
+            result.is_err(),
+            "negative node id should return error (u64 cannot be negative)"
+        );
     }
 
     #[test]
     fn test_parse_node_id_overflow() {
         // Number larger than u64::MAX should fail to parse
         let result = parse_command("NODE GET \"g\" 99999999999999999999");
-        assert!(result.is_err(), "node id overflow (> u64::MAX) should return error");
+        assert!(
+            result.is_err(),
+            "node id overflow (> u64::MAX) should return error"
+        );
     }
 
     #[test]
@@ -2532,15 +2714,15 @@ mod tests {
     #[test]
     fn test_parse_node_add_empty_properties() {
         // Empty JSON object {} should parse with empty property list
-        let cmd = parse_command(
-            r#"NODE ADD TO "g" LABEL "L" PROPERTIES {}"#,
-        )
-        .unwrap();
+        let cmd = parse_command(r#"NODE ADD TO "g" LABEL "L" PROPERTIES {}"#).unwrap();
         match cmd {
             Command::NodeAdd(na) => {
                 assert_eq!(na.graph, "g");
                 assert_eq!(na.label, "L");
-                assert!(na.properties.is_empty(), "empty JSON object should yield empty props");
+                assert!(
+                    na.properties.is_empty(),
+                    "empty JSON object should yield empty props"
+                );
             }
             _ => panic!("expected NodeAdd"),
         }
@@ -2549,20 +2731,18 @@ mod tests {
     #[test]
     fn test_parse_context_empty_embedding() {
         // SEEDS VECTOR [] — empty vector should parse
-        let cmd = parse_command(
-            r#"CONTEXT "q" FROM "g" SEEDS VECTOR [] TOP 5"#,
-        )
-        .unwrap();
+        let cmd = parse_command(r#"CONTEXT "q" FROM "g" SEEDS VECTOR [] TOP 5"#).unwrap();
         match cmd {
-            Command::Context(cq) => {
-                match &cq.seeds {
-                    SeedStrategy::Vector { embedding, top_k } => {
-                        assert!(embedding.is_empty(), "empty embedding array should parse to empty vec");
-                        assert_eq!(*top_k, 5);
-                    }
-                    _ => panic!("expected Vector seed strategy"),
+            Command::Context(cq) => match &cq.seeds {
+                SeedStrategy::Vector { embedding, top_k } => {
+                    assert!(
+                        embedding.is_empty(),
+                        "empty embedding array should parse to empty vec"
+                    );
+                    assert_eq!(*top_k, 5);
                 }
-            }
+                _ => panic!("expected Vector seed strategy"),
+            },
             _ => panic!("expected Context"),
         }
     }
@@ -2701,12 +2881,17 @@ mod tests {
         if let Command::Ingest(c) = cmd {
             assert_eq!(c.graph, "mygraph");
             assert_eq!(c.content, "Hello world text");
+            assert!(c.content_base64.is_none());
             assert!(c.format.is_none());
             assert!(c.document_id.is_none());
             assert!(!c.skip_extraction);
             assert!(!c.skip_dedup);
             assert!(c.chunk_size.is_none());
             assert!(c.entity_types.is_none());
+            assert!(c.resolution_mode.is_none());
+            assert!(c.link_existing_entities.is_none());
+            assert!(c.resolution_candidate_limit.is_none());
+            assert!(c.custom_resolution_prompt.is_none());
         } else {
             panic!("expected Ingest command");
         }
@@ -2715,12 +2900,13 @@ mod tests {
     #[test]
     fn test_parse_ingest_with_options() {
         let cmd = parse_command(
-            r#"INGEST "mygraph" "some content" FORMAT "pdf" DOCID "doc123" SKIP_EXTRACTION CHUNK_SIZE 1024 ENTITY_TYPES "Person,Organization""#,
+            r#"INGEST "mygraph" "some content" FORMAT "pdf" DOCID "doc123" SKIP_EXTRACTION CHUNK_SIZE 1024 ENTITY_TYPES "Person,Organization" RESOLUTION_MODE semantic LINK_EXISTING_ENTITIES RESOLUTION_CANDIDATE_LIMIT 12 CUSTOM_RESOLUTION_PROMPT "Prefer canonical organization names""#,
         )
         .unwrap();
         if let Command::Ingest(c) = cmd {
             assert_eq!(c.graph, "mygraph");
             assert_eq!(c.content, "some content");
+            assert!(c.content_base64.is_none());
             assert_eq!(c.format, Some("pdf".into()));
             assert_eq!(c.document_id, Some("doc123".into()));
             assert!(c.skip_extraction);
@@ -2729,6 +2915,13 @@ mod tests {
             assert_eq!(
                 c.entity_types,
                 Some(vec!["Person".into(), "Organization".into()])
+            );
+            assert_eq!(c.resolution_mode, Some(ResolutionMode::Semantic));
+            assert_eq!(c.link_existing_entities, Some(true));
+            assert_eq!(c.resolution_candidate_limit, Some(12));
+            assert_eq!(
+                c.custom_resolution_prompt,
+                Some("Prefer canonical organization names".into())
             );
         } else {
             panic!("expected Ingest command");
@@ -2747,6 +2940,22 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_ingest_invalid_resolution_mode() {
+        let result = parse_command(r#"INGEST "g" "text" RESOLUTION_MODE "mystery""#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_ingest_link_existing_entities_false() {
+        let cmd = parse_command(r#"INGEST "g" "text" LINK_EXISTING_ENTITIES false"#).unwrap();
+        if let Command::Ingest(c) = cmd {
+            assert_eq!(c.link_existing_entities, Some(false));
+        } else {
+            panic!("expected Ingest command");
+        }
+    }
+
+    #[test]
     fn test_parse_ingest_missing_args() {
         let result = parse_command("INGEST");
         assert!(result.is_err());
@@ -2758,7 +2967,8 @@ mod tests {
     fn test_parse_node_add_with_ttl() {
         let cmd = parse_command(
             r#"NODE ADD TO "g" LABEL "temp" PROPERTIES {"name": "ephemeral"} TTL 60000"#,
-        ).unwrap();
+        )
+        .unwrap();
         match cmd {
             Command::NodeAdd(c) => {
                 assert_eq!(c.graph, "g");
@@ -2771,9 +2981,8 @@ mod tests {
 
     #[test]
     fn test_parse_node_add_without_ttl() {
-        let cmd = parse_command(
-            r#"NODE ADD TO "g" LABEL "perm" PROPERTIES {"name": "permanent"}"#,
-        ).unwrap();
+        let cmd = parse_command(r#"NODE ADD TO "g" LABEL "perm" PROPERTIES {"name": "permanent"}"#)
+            .unwrap();
         match cmd {
             Command::NodeAdd(c) => {
                 assert_eq!(c.ttl_ms, None);
@@ -2784,9 +2993,7 @@ mod tests {
 
     #[test]
     fn test_parse_edge_add_with_ttl() {
-        let cmd = parse_command(
-            r#"EDGE ADD TO "g" FROM 1 TO 2 LABEL "link" TTL 30000"#,
-        ).unwrap();
+        let cmd = parse_command(r#"EDGE ADD TO "g" FROM 1 TO 2 LABEL "link" TTL 30000"#).unwrap();
         match cmd {
             Command::EdgeAdd(c) => {
                 assert_eq!(c.source, 1);
@@ -2799,17 +3006,13 @@ mod tests {
 
     #[test]
     fn test_parse_ttl_invalid_value() {
-        let result = parse_command(
-            r#"NODE ADD TO "g" LABEL "x" TTL abc"#,
-        );
+        let result = parse_command(r#"NODE ADD TO "g" LABEL "x" TTL abc"#);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_search() {
-        let cmd = parse_command(
-            r#"SEARCH "mygraph" WHERE name = "Alice""#,
-        ).unwrap();
+        let cmd = parse_command(r#"SEARCH "mygraph" WHERE name = "Alice""#).unwrap();
         match cmd {
             Command::Search(c) => {
                 assert_eq!(c.graph, "mygraph");
@@ -2823,9 +3026,7 @@ mod tests {
 
     #[test]
     fn test_parse_search_with_limit() {
-        let cmd = parse_command(
-            r#"SEARCH "g" WHERE age = "30" LIMIT 10"#,
-        ).unwrap();
+        let cmd = parse_command(r#"SEARCH "g" WHERE age = "30" LIMIT 10"#).unwrap();
         match cmd {
             Command::Search(c) => {
                 assert_eq!(c.key, "age");
@@ -2838,9 +3039,7 @@ mod tests {
 
     #[test]
     fn test_parse_neighbors() {
-        let cmd = parse_command(
-            r#"NEIGHBORS "mygraph" 42"#,
-        ).unwrap();
+        let cmd = parse_command(r#"NEIGHBORS "mygraph" 42"#).unwrap();
         match cmd {
             Command::Neighbors(c) => {
                 assert_eq!(c.graph, "mygraph");
@@ -2854,9 +3053,7 @@ mod tests {
 
     #[test]
     fn test_parse_neighbors_with_direction() {
-        let cmd = parse_command(
-            r#"NEIGHBORS "g" 1 DIRECTION OUT"#,
-        ).unwrap();
+        let cmd = parse_command(r#"NEIGHBORS "g" 1 DIRECTION OUT"#).unwrap();
         match cmd {
             Command::Neighbors(c) => {
                 assert_eq!(c.node_id, 1);
@@ -2868,9 +3065,7 @@ mod tests {
 
     #[test]
     fn test_parse_neighbors_with_label() {
-        let cmd = parse_command(
-            r#"NEIGHBORS "g" 5 LABEL "KNOWS" DIRECTION IN"#,
-        ).unwrap();
+        let cmd = parse_command(r#"NEIGHBORS "g" 5 LABEL "KNOWS" DIRECTION IN"#).unwrap();
         match cmd {
             Command::Neighbors(c) => {
                 assert_eq!(c.node_id, 5);
@@ -2889,9 +3084,7 @@ mod tests {
 
     #[test]
     fn test_parse_search_with_equals_sign() {
-        let cmd = parse_command(
-            r#"SEARCH "g" WHERE email = "a@b.com""#,
-        ).unwrap();
+        let cmd = parse_command(r#"SEARCH "g" WHERE email = "a@b.com""#).unwrap();
         match cmd {
             Command::Search(c) => {
                 assert_eq!(c.graph, "g");
@@ -2913,9 +3106,7 @@ mod tests {
 
     #[test]
     fn test_parse_schema_set_type() {
-        let cmd = parse_command(
-            r#"SCHEMA SET "mygraph" node "Person" type "age" int"#,
-        ).unwrap();
+        let cmd = parse_command(r#"SCHEMA SET "mygraph" node "Person" type "age" int"#).unwrap();
         match cmd {
             Command::SchemaSet(c) => {
                 assert_eq!(c.graph, "mygraph");
@@ -2931,9 +3122,7 @@ mod tests {
 
     #[test]
     fn test_parse_schema_set_required() {
-        let cmd = parse_command(
-            r#"SCHEMA SET "mygraph" node "Person" required "name""#,
-        ).unwrap();
+        let cmd = parse_command(r#"SCHEMA SET "mygraph" node "Person" required "name""#).unwrap();
         match cmd {
             Command::SchemaSet(c) => {
                 assert_eq!(c.graph, "mygraph");
@@ -2949,9 +3138,7 @@ mod tests {
 
     #[test]
     fn test_parse_schema_set_unique() {
-        let cmd = parse_command(
-            r#"SCHEMA SET "mygraph" edge "KNOWS" unique "id""#,
-        ).unwrap();
+        let cmd = parse_command(r#"SCHEMA SET "mygraph" edge "KNOWS" unique "id""#).unwrap();
         match cmd {
             Command::SchemaSet(c) => {
                 assert_eq!(c.graph, "mygraph");
@@ -2978,25 +3165,19 @@ mod tests {
 
     #[test]
     fn test_parse_schema_set_invalid_target() {
-        let result = parse_command(
-            r#"SCHEMA SET "g" table "Person" type "age" int"#,
-        );
+        let result = parse_command(r#"SCHEMA SET "g" table "Person" type "age" int"#);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_schema_set_invalid_constraint() {
-        let result = parse_command(
-            r#"SCHEMA SET "g" node "Person" check "age" int"#,
-        );
+        let result = parse_command(r#"SCHEMA SET "g" node "Person" check "age" int"#);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_schema_set_type_missing_value_type() {
-        let result = parse_command(
-            r#"SCHEMA SET "g" node "Person" type "age""#,
-        );
+        let result = parse_command(r#"SCHEMA SET "g" node "Person" type "age""#);
         assert!(result.is_err());
     }
 
@@ -3020,9 +3201,7 @@ mod tests {
 
     #[test]
     fn test_schema_set_type_name() {
-        let cmd = parse_command(
-            r#"SCHEMA SET "g" node "L" required "p""#,
-        ).unwrap();
+        let cmd = parse_command(r#"SCHEMA SET "g" node "L" required "p""#).unwrap();
         assert_eq!(cmd.type_name(), "schema_set");
 
         let cmd = parse_command(r#"SCHEMA GET "g""#).unwrap();
@@ -3045,8 +3224,7 @@ mod tests {
 
     #[test]
     fn test_parse_node_merge_with_policy() {
-        let cmd =
-            parse_command(r#"NODE MERGE "g" 10 INTO 20 POLICY keep_source"#).unwrap();
+        let cmd = parse_command(r#"NODE MERGE "g" 10 INTO 20 POLICY keep_source"#).unwrap();
         match cmd {
             Command::NodeMerge(c) => {
                 assert_eq!(c.source_id, 10);
@@ -3059,8 +3237,7 @@ mod tests {
 
     #[test]
     fn test_parse_node_merge_policy_merge() {
-        let cmd =
-            parse_command(r#"NODE MERGE "g" 5 INTO 6 POLICY merge"#).unwrap();
+        let cmd = parse_command(r#"NODE MERGE "g" 5 INTO 6 POLICY merge"#).unwrap();
         match cmd {
             Command::NodeMerge(c) => {
                 assert_eq!(c.conflict_policy, "merge");
@@ -3071,8 +3248,7 @@ mod tests {
 
     #[test]
     fn test_parse_node_merge_invalid_policy() {
-        let result =
-            parse_command(r#"NODE MERGE "g" 1 INTO 2 POLICY unknown"#);
+        let result = parse_command(r#"NODE MERGE "g" 1 INTO 2 POLICY unknown"#);
         assert!(result.is_err());
     }
 
@@ -3090,8 +3266,7 @@ mod tests {
 
     #[test]
     fn test_node_merge_type_name() {
-        let cmd =
-            parse_command(r#"NODE MERGE "g" 1 INTO 2"#).unwrap();
+        let cmd = parse_command(r#"NODE MERGE "g" 1 INTO 2"#).unwrap();
         assert_eq!(cmd.type_name(), "node_merge");
     }
 
@@ -3250,10 +3425,9 @@ mod tests {
 
     #[test]
     fn test_parse_cypher_match_with_where() {
-        let cmd = parse_command(
-            r#"CYPHER "mydb" MATCH (n:Person) WHERE n.name = 'Alice' RETURN n"#,
-        )
-        .unwrap();
+        let cmd =
+            parse_command(r#"CYPHER "mydb" MATCH (n:Person) WHERE n.name = 'Alice' RETURN n"#)
+                .unwrap();
         match cmd {
             Command::Cypher(c) => {
                 assert_eq!(c.graph, "mydb");
@@ -3300,7 +3474,10 @@ mod tests {
         let result = parse_command("MATCH (n:Person) RETURN n");
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("graph name"), "error should mention graph name: {err_msg}");
+        assert!(
+            err_msg.contains("graph name"),
+            "error should mention graph name: {err_msg}"
+        );
     }
 
     #[test]

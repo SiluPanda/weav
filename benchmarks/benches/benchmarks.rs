@@ -1,25 +1,26 @@
 //! Comprehensive criterion benchmarks for the Weav context graph database.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use compact_str::CompactString;
 
 use weav_core::config::{TokenCounterType, WalSyncMode, WeavConfig};
+use weav_core::context::ContextChunk;
+use weav_core::types::Direction;
 use weav_core::types::{BiTemporal, TokenBudget, Value};
 use weav_graph::adjacency::{AdjacencyStore, EdgeMeta};
+use weav_graph::dedup::{BlockingIndex, find_duplicate_by_key, find_duplicate_by_name_indexed};
 use weav_graph::properties::PropertyStore;
-use weav_graph::traversal::{bfs, flow_score, EdgeFilter, NodeFilter};
+use weav_graph::traversal::{EdgeFilter, NodeFilter, bfs, flow_score};
 use weav_persist::snapshot::{
-    make_meta, EdgeSnapshot, FullSnapshot, GraphSnapshot, NodeSnapshot, SnapshotEngine,
+    EdgeSnapshot, FullSnapshot, GraphSnapshot, NodeSnapshot, SnapshotEngine, make_meta,
 };
 use weav_persist::wal::{WalOperation, WriteAheadLog};
 use weav_query::budget::enforce_budget;
-use weav_core::context::ContextChunk;
 use weav_query::parser::parse_command;
-use weav_server::engine::Engine;
+use weav_server::engine::{CommandResponse, Engine};
 use weav_vector::index::{VectorConfig, VectorIndex};
 use weav_vector::tokens::TokenCounter;
-use weav_core::types::Direction;
 
 // ---- Deterministic pseudo-random helpers ----
 
@@ -125,13 +126,7 @@ fn bench_traversal(c: &mut Criterion) {
 
     c.bench_function("flow_score_100kn_depth3", |b| {
         b.iter(|| {
-            let result = flow_score(
-                black_box(&adj),
-                black_box(&[(1, 1.0)]),
-                0.5,
-                0.01,
-                3,
-            );
+            let result = flow_score(black_box(&adj), black_box(&[(1, 1.0)]), 0.5, 0.01, 3);
             black_box(result);
         });
     });
@@ -236,7 +231,8 @@ fn bench_token_counting(c: &mut Criterion) {
 // ---- 5. Query Parsing Benchmark ----
 
 fn bench_parse(c: &mut Criterion) {
-    let context_query = r#"CONTEXT "what is rust" FROM "knowledge" BUDGET 4096 TOKENS DEPTH 3 DIRECTION BOTH"#;
+    let context_query =
+        r#"CONTEXT "what is rust" FROM "knowledge" BUDGET 4096 TOKENS DEPTH 3 DIRECTION BOTH"#;
     let node_add_query = r#"NODE ADD TO "test_graph" LABEL "person" PROPERTIES {"name": "Alice", "age": 30} KEY "alice-001""#;
     let simple_query = "PING";
 
@@ -271,7 +267,10 @@ fn bench_budget(c: &mut Criterion) {
             let tokens = ((pseudo_random_f32(i as u64 * 11 + 17) * 200.0) as u32).max(1);
             ContextChunk {
                 node_id: i as u64 + 1,
-                content: format!("Content for node {}. This is some sample text to fill tokens.", i),
+                content: format!(
+                    "Content for node {}. This is some sample text to fill tokens.",
+                    i
+                ),
                 label: "entity".to_string(),
                 relevance_score: score,
                 depth: (i % 4) as u8,
@@ -371,7 +370,10 @@ fn bench_context_query(c: &mut Criterion) {
     for i in 0..1000u64 {
         let cmd_str = format!(
             r#"NODE ADD TO "ctx-bench" LABEL "document" PROPERTIES {{"title": "doc_{}", "content": "This is document number {} with some searchable content about topic {}"}} KEY "doc_{}""#,
-            i, i, i % 50, i
+            i,
+            i,
+            i % 50,
+            i
         );
         let cmd = parse_command(&cmd_str).unwrap();
         engine.execute_command(cmd, None).unwrap();
@@ -472,6 +474,8 @@ fn bench_persistence(c: &mut Criterion) {
                 weight: 0.8,
                 valid_from: 1000,
                 valid_until: u64::MAX,
+                tx_from: Some(1000),
+                tx_until: Some(u64::MAX),
                 properties_json: "{}".into(),
             })
             .collect();
@@ -514,9 +518,9 @@ fn bench_persistence(c: &mut Criterion) {
 // ---- Algorithm Benchmarks ----
 
 fn bench_algorithms(c: &mut Criterion) {
+    use weav_core::types::BiTemporal;
     use weav_graph::adjacency::{AdjacencyStore, EdgeMeta};
     use weav_graph::traversal;
-    use weav_core::types::BiTemporal;
 
     // Build a scale-free-ish graph: 1000 nodes, ~3000 edges
     let mut adj = AdjacencyStore::new();
@@ -525,25 +529,32 @@ fn bench_algorithms(c: &mut Criterion) {
         adj.add_node(i);
     }
     let temporal = BiTemporal::new_current(1000);
-    let mut edge_id = 0u64;
     for i in 2..=n {
         // Connect to a random earlier node (preferential-ish attachment)
         let target = ((i * 7 + 13) % (i - 1)) + 1;
         let meta = EdgeMeta {
-            source: i, target, label: 0,
-            temporal, provenance: None, weight: 1.0, token_cost: 0,
+            source: i,
+            target,
+            label: 0,
+            temporal,
+            provenance: None,
+            weight: 1.0,
+            token_cost: 0,
         };
-        adj.add_edge(i, target, edge_id, meta).unwrap();
-        edge_id += 1;
+        adj.add_edge(i, target, 0, meta).unwrap();
         // Add a second edge for some nodes
         if i % 3 == 0 {
             let target2 = ((i * 11 + 7) % (i - 1)) + 1;
             let meta2 = EdgeMeta {
-                source: i, target: target2, label: 0,
-                temporal, provenance: None, weight: 0.5, token_cost: 0,
+                source: i,
+                target: target2,
+                label: 0,
+                temporal,
+                provenance: None,
+                weight: 0.5,
+                token_cost: 0,
             };
-            adj.add_edge(i, target2, edge_id, meta2).unwrap();
-            edge_id += 1;
+            adj.add_edge(i, target2, 0, meta2).unwrap();
         }
     }
 
@@ -553,7 +564,9 @@ fn bench_algorithms(c: &mut Criterion) {
     group.bench_function("pagerank_1k", |b| {
         let seeds: Vec<(u64, f32)> = (1..=n).map(|i| (i, 1.0)).collect();
         b.iter(|| {
-            black_box(traversal::personalized_pagerank(&adj, &seeds, 0.85, 20, 1e-6));
+            black_box(traversal::personalized_pagerank(
+                &adj, &seeds, 0.85, 20, 1e-6,
+            ));
         });
     });
 
@@ -637,7 +650,9 @@ fn bench_text_search(c: &mut Criterion) {
     let mut index = TextIndex::new();
     // Index 10K documents
     for i in 0..10_000u64 {
-        let content = format!("document {i} about graph databases and knowledge retrieval systems for AI workloads number {i}");
+        let content = format!(
+            "document {i} about graph databases and knowledge retrieval systems for AI workloads number {i}"
+        );
         index.index_node(i, &content);
     }
 
@@ -658,6 +673,268 @@ fn bench_text_search(c: &mut Criterion) {
     group.finish();
 }
 
+fn context_precision_at_1(engine: &Engine, query: &str, relevant: &[u64]) -> f64 {
+    let cmd = parse_command(query).unwrap();
+    match engine.execute_command(cmd, None).unwrap() {
+        CommandResponse::Context(result) => result
+            .chunks
+            .first()
+            .map(|chunk| relevant.contains(&chunk.node_id) as u8 as f64)
+            .unwrap_or(0.0),
+        other => panic!("expected context response, got: {other:?}"),
+    }
+}
+
+fn bench_duplicate_suppression(c: &mut Criterion) {
+    let mut props = PropertyStore::new();
+    let mut blocking = BlockingIndex::new();
+    let mut workload = Vec::new();
+
+    for i in 0..500u64 {
+        let node_id = i + 1;
+        let canonical = format!("Acme Corporation {i}");
+        props.set_node_property(node_id, "name", Value::String(canonical.clone().into()));
+        blocking.insert(node_id, &canonical);
+        workload.push((format!("Acme Corp {i}"), node_id));
+    }
+
+    let mut group = c.benchmark_group("duplicate_suppression");
+    group.bench_function("full_scan_precision_at_1", |b| {
+        b.iter(|| {
+            let precision = workload
+                .iter()
+                .filter(|(query, expected)| {
+                    find_duplicate_by_name_indexed(&props, "name", query, 0.82, None, None)
+                        .map(|(node_id, _)| node_id)
+                        == Some(*expected)
+                })
+                .count() as f64
+                / workload.len() as f64;
+            black_box(precision);
+        });
+    });
+    group.bench_function("blocked_precision_at_1", |b| {
+        b.iter(|| {
+            let precision = workload
+                .iter()
+                .filter(|(query, expected)| {
+                    find_duplicate_by_name_indexed(
+                        &props,
+                        "name",
+                        query,
+                        0.82,
+                        Some(&blocking),
+                        Some(24),
+                    )
+                    .map(|(node_id, _)| node_id)
+                        == Some(*expected)
+                })
+                .count() as f64
+                / workload.len() as f64;
+            black_box(precision);
+        });
+    });
+    group.finish();
+}
+
+fn bench_link_existing_precision(c: &mut Criterion) {
+    let mut props = PropertyStore::new();
+    let mut blocking = BlockingIndex::new();
+    let mut workload = Vec::new();
+
+    for i in 0..200u64 {
+        let node_id = i + 1;
+        let name = format!("Northwind Analytics {i}");
+        let external_id = format!("nw-{i:04}");
+        props.set_node_property(node_id, "name", Value::String(name.clone().into()));
+        props.set_node_property(
+            node_id,
+            "external_id",
+            Value::String(external_id.clone().into()),
+        );
+        blocking.insert(node_id, &name);
+        workload.push((external_id, format!("Northwind Analytics {i}"), node_id));
+        workload.push((
+            format!("missing-{i:04}"),
+            format!("Northwind Analytic {i}"),
+            node_id,
+        ));
+    }
+
+    c.bench_function("link_existing_precision_at_1", |b| {
+        b.iter(|| {
+            let precision = workload
+                .iter()
+                .filter(|(external_id, name, expected)| {
+                    let linked =
+                        find_duplicate_by_key(&props, "external_id", external_id).or_else(|| {
+                            find_duplicate_by_name_indexed(
+                                &props,
+                                "name",
+                                name,
+                                0.85,
+                                Some(&blocking),
+                                Some(24),
+                            )
+                            .map(|(node_id, _)| node_id)
+                        });
+                    linked == Some(*expected)
+                })
+                .count() as f64
+                / workload.len() as f64;
+            black_box(precision);
+        });
+    });
+}
+
+fn bench_retrieval_lift(c: &mut Criterion) {
+    let engine = Engine::new(WeavConfig::default());
+    engine
+        .execute_command(
+            parse_command(r#"GRAPH CREATE "retrieval_eval""#).unwrap(),
+            None,
+        )
+        .unwrap();
+
+    let relevant_summary = match engine
+        .execute_command(
+            parse_command(
+                r#"NODE ADD TO "retrieval_eval" LABEL "_community_summary" PROPERTIES {"summary":"Rust systems programming community","member_count":12}"#,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap()
+    {
+        CommandResponse::Integer(node_id) => node_id,
+        other => panic!("expected node id, got: {other:?}"),
+    };
+    engine
+        .execute_command(
+            parse_command(
+                r#"NODE ADD TO "retrieval_eval" LABEL "_community_summary" PROPERTIES {"summary":"Bread baking techniques community","member_count":8}"#,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+
+    let mut group = c.benchmark_group("retrieval_lift");
+    for (name, query) in [
+        (
+            "local_precision_at_1",
+            r#"CONTEXT "systems programming" FROM "retrieval_eval" RETRIEVAL LOCAL BUDGET 1024 TOKENS"#,
+        ),
+        (
+            "global_precision_at_1",
+            r#"CONTEXT "systems programming" FROM "retrieval_eval" RETRIEVAL GLOBAL BUDGET 1024 TOKENS"#,
+        ),
+        (
+            "hybrid_precision_at_1",
+            r#"CONTEXT "systems programming" FROM "retrieval_eval" RETRIEVAL HYBRID BUDGET 1024 TOKENS"#,
+        ),
+    ] {
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                black_box(context_precision_at_1(&engine, query, &[relevant_summary]));
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_rerank_lift(c: &mut Criterion) {
+    let engine = Engine::new(WeavConfig::default());
+    engine
+        .execute_command(
+            parse_command(r#"GRAPH CREATE "rerank_eval""#).unwrap(),
+            None,
+        )
+        .unwrap();
+
+    let seed_id = match engine
+        .execute_command(
+            parse_command(
+                r#"NODE ADD TO "rerank_eval" LABEL "person" PROPERTIES {"name":"Alice"} KEY "alice""#,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap()
+    {
+        CommandResponse::Integer(node_id) => node_id,
+        other => panic!("expected node id, got: {other:?}"),
+    };
+    let relevant_topic = match engine
+        .execute_command(
+            parse_command(
+                r#"NODE ADD TO "rerank_eval" LABEL "topic" PROPERTIES {"name":"Rust","description":"A systems programming language"} KEY "rust""#,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap()
+    {
+        CommandResponse::Integer(node_id) => node_id,
+        other => panic!("expected node id, got: {other:?}"),
+    };
+    let distracting_topic = match engine
+        .execute_command(
+            parse_command(
+                r#"NODE ADD TO "rerank_eval" LABEL "topic" PROPERTIES {"name":"Baking","description":"Bread recipes and kitchen techniques"} KEY "baking""#,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap()
+    {
+        CommandResponse::Integer(node_id) => node_id,
+        other => panic!("expected node id, got: {other:?}"),
+    };
+    assert!(seed_id > 0 && distracting_topic > 0);
+    engine
+        .execute_command(
+            parse_command(
+                &format!(
+                    "EDGE ADD TO \"rerank_eval\" FROM {seed_id} TO {distracting_topic} LABEL \"likes\" WEIGHT 1.0"
+                ),
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+    engine
+        .execute_command(
+            parse_command(
+                &format!(
+                    "EDGE ADD TO \"rerank_eval\" FROM {seed_id} TO {relevant_topic} LABEL \"uses\" WEIGHT 0.6"
+                ),
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+
+    let mut group = c.benchmark_group("rerank_lift");
+    for (name, query) in [
+        (
+            "baseline_precision_at_1",
+            r#"CONTEXT "systems programming" FROM "rerank_eval" SEEDS NODES ["alice"] RETRIEVAL LOCAL BUDGET 1024 TOKENS"#,
+        ),
+        (
+            "reranked_precision_at_1",
+            r#"CONTEXT "systems programming" FROM "rerank_eval" SEEDS NODES ["alice"] RETRIEVAL LOCAL RERANK {"provider":"cross_encoder","candidate_limit":5,"score_weight":1.0} BUDGET 1024 TOKENS"#,
+        ),
+    ] {
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                black_box(context_precision_at_1(&engine, query, &[relevant_topic]));
+            });
+        });
+    }
+    group.finish();
+}
+
 // ---- Criterion Groups and Main ----
 
 criterion_group!(
@@ -673,6 +950,10 @@ criterion_group!(
     bench_persistence,
     bench_algorithms,
     bench_text_search,
+    bench_duplicate_suppression,
+    bench_link_existing_precision,
+    bench_retrieval_lift,
+    bench_rerank_lift,
 );
 
 criterion_main!(benches);

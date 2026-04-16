@@ -130,7 +130,6 @@ impl StringInterner {
     pub fn resolve_property_key(&self, id: PropertyKeyId) -> Option<&str> {
         self.id_to_prop.get(&id).map(|s| s.as_str())
     }
-
 }
 
 impl Default for StringInterner {
@@ -449,11 +448,19 @@ mod tests {
     #[test]
     fn test_shard_insert_replace_graph() {
         let mut shard = Shard::new(0);
-        shard.insert_graph(GraphShard::new(1, "original".into(), GraphConfig::default()));
+        shard.insert_graph(GraphShard::new(
+            1,
+            "original".into(),
+            GraphConfig::default(),
+        ));
         assert_eq!(shard.get_graph(1).unwrap().graph_name.as_str(), "original");
 
         // Insert with same ID replaces
-        shard.insert_graph(GraphShard::new(1, "replaced".into(), GraphConfig::default()));
+        shard.insert_graph(GraphShard::new(
+            1,
+            "replaced".into(),
+            GraphConfig::default(),
+        ));
         assert_eq!(shard.get_graph(1).unwrap().graph_name.as_str(), "replaced");
         assert_eq!(shard.graph_ids().len(), 1);
     }

@@ -98,8 +98,8 @@ impl TextIndex {
                 for &(node_id, tf) in postings {
                     let dl = self.doc_lengths.get(&node_id).copied().unwrap_or(1) as f32;
                     // BM25 term score
-                    let tf_norm = (tf as f32 * (k1 + 1.0))
-                        / (tf as f32 + k1 * (1.0 - b + b * dl / avg_dl));
+                    let tf_norm =
+                        (tf as f32 * (k1 + 1.0)) / (tf as f32 + k1 * (1.0 - b + b * dl / avg_dl));
                     *scores.entry(node_id).or_insert(0.0) += idf * tf_norm;
                 }
             }

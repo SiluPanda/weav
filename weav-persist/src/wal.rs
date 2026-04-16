@@ -136,14 +136,13 @@ impl WriteAheadLog {
             fs::create_dir_all(parent)?;
         }
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
         let current_size = file.metadata()?.len();
 
-        // Determine the current sequence number by scanning existing entries.
+        // Determine the current sequence number by scanning all WAL archives that
+        // belong to this path, not just the live file. This preserves monotonic
+        // sequence numbers across compaction/rotation and process restarts.
         let sequence_number = Self::scan_last_seq(&path)?;
 
         Ok(Self {
@@ -158,22 +157,57 @@ impl WriteAheadLog {
 
     /// Scan the WAL file to find the last sequence number (0 if empty).
     fn scan_last_seq(path: &Path) -> io::Result<u64> {
-        if !path.exists() {
+        let related_paths = Self::related_wal_paths(path)?;
+        if related_paths.is_empty() {
             return Ok(0);
         }
-        let meta = fs::metadata(path)?;
-        if meta.len() == 0 {
-            return Ok(0);
-        }
-        let reader = WalReader::open(path)?;
+
         let mut last_seq = 0u64;
-        for entry_result in reader {
-            match entry_result {
-                Ok(entry) => last_seq = entry.seq,
-                Err(_) => break, // Stop at first corrupted entry.
+        for wal_path in related_paths {
+            let meta = fs::metadata(&wal_path)?;
+            if meta.len() == 0 {
+                continue;
+            }
+            let reader = WalReader::open(&wal_path)?;
+            for entry_result in reader {
+                match entry_result {
+                    Ok(entry) => last_seq = last_seq.max(entry.seq),
+                    Err(_) => break, // Stop at first corrupted entry in this file.
+                }
             }
         }
         Ok(last_seq)
+    }
+
+    fn related_wal_paths(path: &Path) -> io::Result<Vec<PathBuf>> {
+        let parent = match path.parent() {
+            Some(parent) => parent,
+            None => return Ok(Vec::new()),
+        };
+        let file_name = match path.file_name().and_then(|name| name.to_str()) {
+            Some(name) => name,
+            None => return Ok(Vec::new()),
+        };
+
+        let mut wal_paths = Vec::new();
+        for entry in fs::read_dir(parent)? {
+            let entry = entry?;
+            let candidate = entry.path();
+            if !candidate.is_file() {
+                continue;
+            }
+
+            let candidate_name = match candidate.file_name().and_then(|name| name.to_str()) {
+                Some(name) => name,
+                None => continue,
+            };
+
+            if candidate_name == file_name || candidate_name.starts_with(&format!("{file_name}.")) {
+                wal_paths.push(candidate);
+            }
+        }
+
+        Ok(wal_paths)
     }
 
     /// Append an operation to the WAL. Returns the assigned sequence number.
@@ -182,7 +216,10 @@ impl WriteAheadLog {
 
         // Compute checksum over the serialized operation bytes.
         let op_bytes = bincode::serialize(&operation).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("bincode serialize op: {e}"))
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bincode serialize op: {e}"),
+            )
         })?;
         let checksum = compute_checksum(&op_bytes);
 
@@ -259,9 +296,7 @@ impl WriteAheadLog {
         fs::rename(&self.path, &rotated)?;
         fs::rename(&tmp_path, &self.path)?;
 
-        self.writer = BufWriter::new(
-            OpenOptions::new().append(true).open(&self.path)?,
-        );
+        self.writer = BufWriter::new(OpenOptions::new().append(true).open(&self.path)?);
         self.current_size = 0;
 
         Ok(rotated)
@@ -356,9 +391,7 @@ impl WriteAheadLog {
         fs::rename(&self.path, &compacted_path)?;
         fs::rename(&tmp_path, &self.path)?;
 
-        self.writer = BufWriter::new(
-            OpenOptions::new().append(true).open(&self.path)?,
-        );
+        self.writer = BufWriter::new(OpenOptions::new().append(true).open(&self.path)?);
         self.current_size = 0;
         // sequence_number is intentionally preserved for monotonicity.
 
@@ -520,9 +553,7 @@ mod tests {
             other => panic!("unexpected operation: {other:?}"),
         }
         match &entries[1].operation {
-            WalOperation::NodeAdd {
-                node_id, label, ..
-            } => {
+            WalOperation::NodeAdd { node_id, label, .. } => {
                 assert_eq!(*node_id, 100);
                 assert_eq!(label, "Person");
             }
@@ -541,13 +572,8 @@ mod tests {
         {
             let mut wal =
                 WriteAheadLog::new(wal_path.clone(), 1024 * 1024, WalSyncMode::Always).unwrap();
-            wal.append(
-                0,
-                WalOperation::GraphDrop {
-                    name: "g".into(),
-                },
-            )
-            .unwrap();
+            wal.append(0, WalOperation::GraphDrop { name: "g".into() })
+                .unwrap();
         }
 
         // Verify checksum passes during read.
@@ -584,12 +610,7 @@ mod tests {
 
         // Can still write to the new file.
         let seq = wal
-            .append(
-                0,
-                WalOperation::GraphDrop {
-                    name: "x".into(),
-                },
-            )
+            .append(0, WalOperation::GraphDrop { name: "x".into() })
             .unwrap();
         assert_eq!(seq, 2); // Sequence continues.
 
@@ -605,9 +626,12 @@ mod tests {
         {
             let mut wal =
                 WriteAheadLog::new(wal_path.clone(), 1024 * 1024, WalSyncMode::Always).unwrap();
-            wal.append(0, WalOperation::GraphDrop { name: "a".into() }).unwrap();
-            wal.append(0, WalOperation::GraphDrop { name: "b".into() }).unwrap();
-            wal.append(0, WalOperation::GraphDrop { name: "c".into() }).unwrap();
+            wal.append(0, WalOperation::GraphDrop { name: "a".into() })
+                .unwrap();
+            wal.append(0, WalOperation::GraphDrop { name: "b".into() })
+                .unwrap();
+            wal.append(0, WalOperation::GraphDrop { name: "c".into() })
+                .unwrap();
             assert_eq!(wal.sequence_number(), 3);
         }
 
@@ -631,9 +655,7 @@ mod tests {
                 name: "g".into(),
                 config_json: "{}".into(),
             },
-            WalOperation::GraphDrop {
-                name: "g".into(),
-            },
+            WalOperation::GraphDrop { name: "g".into() },
             WalOperation::NodeAdd {
                 graph_id: 1,
                 node_id: 1,
@@ -761,13 +783,8 @@ mod tests {
         let mut wal =
             WriteAheadLog::new(wal_path.clone(), 1024 * 1024, WalSyncMode::Always).unwrap();
         for _ in 0..5 {
-            wal.append(
-                0,
-                WalOperation::GraphDrop {
-                    name: "g".into(),
-                },
-            )
-            .unwrap();
+            wal.append(0, WalOperation::GraphDrop { name: "g".into() })
+                .unwrap();
         }
         assert_eq!(wal.sequence_number(), 5);
 
@@ -846,13 +863,8 @@ mod tests {
                 },
             )
             .unwrap();
-            wal.append(
-                0,
-                WalOperation::GraphDrop {
-                    name: "g1".into(),
-                },
-            )
-            .unwrap();
+            wal.append(0, WalOperation::GraphDrop { name: "g1".into() })
+                .unwrap();
         }
 
         // Append garbage bytes after the valid entries to simulate corruption.
@@ -996,9 +1008,7 @@ mod tests {
         assert_eq!(op.graph_id_hint(), 0);
 
         // GraphDrop returns 0.
-        let op = WalOperation::GraphDrop {
-            name: "g".into(),
-        };
+        let op = WalOperation::GraphDrop { name: "g".into() };
         assert_eq!(op.graph_id_hint(), 0);
 
         // NodeAdd returns its graph_id.
@@ -1212,6 +1222,44 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].seq, 4);
         assert_eq!(entries[1].seq, 5);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_wal_reopen_after_compact_preserves_sequence() {
+        let dir = test_dir("reopen_after_compact");
+        let wal_path = dir.join("wal");
+
+        {
+            let mut wal =
+                WriteAheadLog::new(wal_path.clone(), 1024 * 1024, WalSyncMode::Always).unwrap();
+            for _ in 0..3 {
+                wal.append(0, WalOperation::GraphDrop { name: "g".into() })
+                    .unwrap();
+            }
+            assert_eq!(wal.sequence_number(), 3);
+            wal.compact().unwrap();
+        }
+
+        let mut reopened =
+            WriteAheadLog::new(wal_path.clone(), 1024 * 1024, WalSyncMode::Always).unwrap();
+        assert_eq!(reopened.sequence_number(), 3);
+
+        reopened
+            .append(
+                0,
+                WalOperation::GraphDrop {
+                    name: "after".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(reopened.sequence_number(), 4);
+
+        let reader = WalReader::open(&wal_path).unwrap();
+        let entries: Vec<WalEntry> = reader.map(|r| r.unwrap()).collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].seq, 4);
 
         fs::remove_dir_all(&dir).ok();
     }

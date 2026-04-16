@@ -4,8 +4,8 @@
 //! module provides helpers to convert back and forth between the RESP3
 //! representation and the internal command / result types.
 
-use weav_core::error::WeavError;
 use weav_core::context::{ContextChunk, ContextResult, RelationshipSummary};
+use weav_core::error::WeavError;
 
 use crate::resp3::Resp3Value;
 
@@ -349,14 +349,14 @@ mod tests {
             nodes_included: 1,
             query_time_us: 123,
             conflicts: Vec::new(),
-        seed_time_us: 0,
-        flow_time_us: 0,
-        fusion_time_us: 0,
-        chunk_time_us: 0,
-        budget_time_us: 0,
-        plan: None,
-        formatted_messages: None,
-        subgraph: None,
+            seed_time_us: 0,
+            flow_time_us: 0,
+            fusion_time_us: 0,
+            chunk_time_us: 0,
+            budget_time_us: 0,
+            plan: None,
+            formatted_messages: None,
+            subgraph: None,
         }
     }
 
@@ -418,14 +418,14 @@ mod tests {
             nodes_included: 0,
             query_time_us: 1,
             conflicts: Vec::new(),
-        seed_time_us: 0,
-        flow_time_us: 0,
-        fusion_time_us: 0,
-        chunk_time_us: 0,
-        budget_time_us: 0,
-        plan: None,
-        formatted_messages: None,
-        subgraph: None,
+            seed_time_us: 0,
+            flow_time_us: 0,
+            fusion_time_us: 0,
+            chunk_time_us: 0,
+            budget_time_us: 0,
+            plan: None,
+            formatted_messages: None,
+            subgraph: None,
         };
         let val = context_result_to_resp3(&result);
         match &val {
@@ -468,14 +468,14 @@ mod tests {
             nodes_included: 1,
             query_time_us: 50,
             conflicts: Vec::new(),
-        seed_time_us: 0,
-        flow_time_us: 0,
-        fusion_time_us: 0,
-        chunk_time_us: 0,
-        budget_time_us: 0,
-        plan: None,
-        formatted_messages: None,
-        subgraph: None,
+            seed_time_us: 0,
+            flow_time_us: 0,
+            fusion_time_us: 0,
+            chunk_time_us: 0,
+            budget_time_us: 0,
+            plan: None,
+            formatted_messages: None,
+            subgraph: None,
         };
 
         let val = context_result_to_resp3(&result);
@@ -607,10 +607,7 @@ mod tests {
                     // The message should match the Display impl of WeavError.
                     assert_eq!(msg, &err.to_string());
                 }
-                other => panic!(
-                    "expected SimpleError for {:?}, got {:?}",
-                    err, other
-                ),
+                other => panic!("expected SimpleError for {:?}, got {:?}", err, other),
             }
         }
     }
@@ -637,14 +634,14 @@ mod tests {
             nodes_included: 1,
             query_time_us: 42,
             conflicts: Vec::new(),
-        seed_time_us: 0,
-        flow_time_us: 0,
-        fusion_time_us: 0,
-        chunk_time_us: 0,
-        budget_time_us: 0,
-        plan: None,
-        formatted_messages: None,
-        subgraph: None,
+            seed_time_us: 0,
+            flow_time_us: 0,
+            fusion_time_us: 0,
+            chunk_time_us: 0,
+            budget_time_us: 0,
+            plan: None,
+            formatted_messages: None,
+            subgraph: None,
         };
 
         let val = context_result_to_resp3(&result);
@@ -706,14 +703,14 @@ mod tests {
             nodes_included: 1,
             query_time_us: 10,
             conflicts: Vec::new(),
-        seed_time_us: 0,
-        flow_time_us: 0,
-        fusion_time_us: 0,
-        chunk_time_us: 0,
-        budget_time_us: 0,
-        plan: None,
-        formatted_messages: None,
-        subgraph: None,
+            seed_time_us: 0,
+            flow_time_us: 0,
+            fusion_time_us: 0,
+            chunk_time_us: 0,
+            budget_time_us: 0,
+            plan: None,
+            formatted_messages: None,
+            subgraph: None,
         };
 
         let val = context_result_to_resp3(&result);

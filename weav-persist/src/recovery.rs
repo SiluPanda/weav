@@ -80,9 +80,10 @@ impl RecoveryManager {
                     result.snapshot = Some(snapshot);
                 }
                 Err(e) => {
-                    result
-                        .errors
-                        .push(format!("failed to load snapshot {}: {e}", snap_path.display()));
+                    result.errors.push(format!(
+                        "failed to load snapshot {}: {e}",
+                        snap_path.display()
+                    ));
                     wal_sequence_cutoff = 0;
                 }
             },
@@ -155,8 +156,22 @@ impl RecoveryManager {
             }
         }
 
-        wal_files.sort();
+        wal_files.sort_by(|a, b| {
+            Self::first_sequence(a)
+                .cmp(&Self::first_sequence(b))
+                .then_with(|| a.cmp(b))
+        });
         Ok(wal_files)
+    }
+
+    fn first_sequence(path: &std::path::Path) -> u64 {
+        match WalReader::open(path)
+            .ok()
+            .and_then(|mut reader| reader.next())
+        {
+            Some(Ok(entry)) => entry.seq,
+            _ => u64::MAX,
+        }
     }
 }
 
@@ -195,8 +210,7 @@ mod tests {
         let wal_path = dir.join("wal");
 
         {
-            let mut wal =
-                WriteAheadLog::new(wal_path, 1024 * 1024, WalSyncMode::Always).unwrap();
+            let mut wal = WriteAheadLog::new(wal_path, 1024 * 1024, WalSyncMode::Always).unwrap();
             wal.append(
                 0,
                 WalOperation::GraphCreate {
@@ -311,8 +325,7 @@ mod tests {
         // Only entries with seq > 3 should be replayed.
         let wal_path = dir.join("wal");
         {
-            let mut wal =
-                WriteAheadLog::new(wal_path, 1024 * 1024, WalSyncMode::Always).unwrap();
+            let mut wal = WriteAheadLog::new(wal_path, 1024 * 1024, WalSyncMode::Always).unwrap();
             for i in 0..5 {
                 wal.append(
                     0,
@@ -461,8 +474,7 @@ mod tests {
         // Create a WAL, write some entries, rotate, write more.
         let wal_path = dir.join("wal");
         {
-            let mut wal =
-                WriteAheadLog::new(wal_path, 50, WalSyncMode::Always).unwrap();
+            let mut wal = WriteAheadLog::new(wal_path, 50, WalSyncMode::Always).unwrap();
             wal.append(
                 0,
                 WalOperation::GraphCreate {
@@ -510,8 +522,7 @@ mod tests {
 
         // Write: GraphCreate, NodeAdd, GraphDrop -- all for the same graph.
         {
-            let mut wal =
-                WriteAheadLog::new(wal_path, 1024 * 1024, WalSyncMode::Always).unwrap();
+            let mut wal = WriteAheadLog::new(wal_path, 1024 * 1024, WalSyncMode::Always).unwrap();
             wal.append(
                 0,
                 WalOperation::GraphCreate {
@@ -753,8 +764,7 @@ mod tests {
 
         // Write operations spanning 3 different graphs.
         {
-            let mut wal =
-                WriteAheadLog::new(wal_path, 1024 * 1024, WalSyncMode::Always).unwrap();
+            let mut wal = WriteAheadLog::new(wal_path, 1024 * 1024, WalSyncMode::Always).unwrap();
 
             // Graph 1 operations.
             wal.append(
@@ -841,6 +851,93 @@ mod tests {
         assert!(graph_ids.contains(&1));
         assert!(graph_ids.contains(&2));
         assert!(graph_ids.contains(&3));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_recovery_after_compact_restart_preserves_new_sequences() {
+        let dir = test_dir("compact_restart_sequences");
+
+        let engine = SnapshotEngine::new(dir.clone());
+        let snap = FullSnapshot {
+            meta: SnapshotMeta {
+                path: PathBuf::new(),
+                created_at: now_millis(),
+                size_bytes: 0,
+                node_count: 0,
+                edge_count: 0,
+                graph_count: 1,
+                wal_sequence: 3,
+            },
+            graphs: vec![GraphSnapshot {
+                graph_id: 1,
+                graph_name: "g1".into(),
+                config_json: "{}".into(),
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            }],
+        };
+        engine.save_snapshot(&snap).unwrap();
+
+        let wal_path = dir.join("wal");
+        {
+            let mut wal =
+                WriteAheadLog::new(wal_path.clone(), 1024 * 1024, WalSyncMode::Always).unwrap();
+            for _ in 0..3 {
+                wal.append(
+                    0,
+                    WalOperation::GraphCreate {
+                        name: "g1".into(),
+                        config_json: "{}".into(),
+                    },
+                )
+                .unwrap();
+            }
+            wal.compact().unwrap();
+        }
+
+        {
+            let mut wal =
+                WriteAheadLog::new(wal_path.clone(), 1024 * 1024, WalSyncMode::Always).unwrap();
+            wal.append(
+                0,
+                WalOperation::NodeAdd {
+                    graph_id: 1,
+                    node_id: 1,
+                    label: "Thing".into(),
+                    properties_json: "{}".into(),
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                    created_at: None,
+                },
+            )
+            .unwrap();
+            wal.append(
+                0,
+                WalOperation::NodeAdd {
+                    graph_id: 1,
+                    node_id: 2,
+                    label: "Thing".into(),
+                    properties_json: "{}".into(),
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                    created_at: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let mgr = RecoveryManager::new(dir.clone());
+        let result = mgr.recover().unwrap();
+
+        assert_eq!(result.snapshots_loaded, 1);
+        assert_eq!(result.wal_entries_replayed, 2);
+        assert_eq!(result.wal_entries.len(), 2);
+        assert_eq!(result.wal_entries[0].seq, 4);
+        assert_eq!(result.wal_entries[1].seq, 5);
 
         std::fs::remove_dir_all(&dir).ok();
     }

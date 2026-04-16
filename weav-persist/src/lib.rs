@@ -3,9 +3,9 @@
 //! This crate provides durable storage for the Weav context graph database,
 //! including a write-ahead log, snapshot engine, and recovery manager.
 
-pub mod wal;
-pub mod snapshot;
 pub mod recovery;
+pub mod snapshot;
+pub mod wal;
 
 /// Current time in milliseconds since the Unix epoch.
 pub fn now_millis() -> u64 {

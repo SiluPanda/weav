@@ -91,11 +91,7 @@ impl MessageBus {
     ///
     /// Returns [`WeavError::ShardUnavailable`] if the shard index is out of
     /// range or the channel is disconnected.
-    pub fn send_to_shard(
-        &self,
-        shard: ShardId,
-        msg: ShardMessage,
-    ) -> Result<(), WeavError> {
+    pub fn send_to_shard(&self, shard: ShardId, msg: ShardMessage) -> Result<(), WeavError> {
         let sender = self
             .senders
             .get(shard as usize)
@@ -382,9 +378,9 @@ mod tests {
 
         // Every shard should have received exactly one Shutdown message.
         for (i, rx) in receivers.iter().enumerate() {
-            let msg = rx.try_recv().unwrap_or_else(|_| {
-                panic!("shard {i} did not receive a Shutdown message")
-            });
+            let msg = rx
+                .try_recv()
+                .unwrap_or_else(|_| panic!("shard {i} did not receive a Shutdown message"));
             assert!(
                 matches!(msg, ShardMessage::Shutdown),
                 "shard {i} received unexpected message variant"
@@ -466,7 +462,13 @@ mod tests {
         // Send 100 snapshot messages
         for _ in 0..100 {
             let (resp_tx, _resp_rx) = crossbeam_channel::bounded(1);
-            bus.send_to_shard(0, ShardMessage::Snapshot { respond_to: resp_tx }).unwrap();
+            bus.send_to_shard(
+                0,
+                ShardMessage::Snapshot {
+                    respond_to: resp_tx,
+                },
+            )
+            .unwrap();
         }
         // Receive all 100
         let mut count = 0;

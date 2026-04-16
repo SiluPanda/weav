@@ -23,9 +23,8 @@ pub fn chunk_text(
         return Ok(Vec::new());
     }
 
-    let bpe = cl100k_base().map_err(|e| {
-        WeavError::ExtractionError(format!("failed to initialize tokenizer: {e}"))
-    })?;
+    let bpe = cl100k_base()
+        .map_err(|e| WeavError::ExtractionError(format!("failed to initialize tokenizer: {e}")))?;
 
     let splitter = TextSplitter::new(chunk_size);
 
@@ -83,9 +82,8 @@ pub fn chunk_text(
 
 /// Count tokens using cl100k tokenizer.
 pub fn count_tokens(text: &str) -> WeavResult<usize> {
-    let bpe = cl100k_base().map_err(|e| {
-        WeavError::ExtractionError(format!("failed to initialize tokenizer: {e}"))
-    })?;
+    let bpe = cl100k_base()
+        .map_err(|e| WeavError::ExtractionError(format!("failed to initialize tokenizer: {e}")))?;
     Ok(bpe.encode_ordinary(text).len())
 }
 

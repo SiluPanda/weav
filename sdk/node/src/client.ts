@@ -4,6 +4,8 @@ import {
   ContextResult,
   GraphInfo,
   NodeInfo,
+  GraphRef,
+  ScopeRef,
   AddNodeParams,
   AddEdgeParams,
   UpdateNodeParams,
@@ -21,6 +23,62 @@ export class WeavError extends Error {
     super(message);
     this.name = 'WeavError';
   }
+}
+
+function isScopeRef(value: GraphRef): value is ScopeRef {
+  return typeof value !== 'string';
+}
+
+function serializeScope(scope: ScopeRef): Record<string, string> {
+  return {
+    workspace_id: scope.workspaceId,
+    ...(scope.userId !== undefined ? { user_id: scope.userId } : {}),
+    ...(scope.agentId !== undefined ? { agent_id: scope.agentId } : {}),
+    ...(scope.sessionId !== undefined ? { session_id: scope.sessionId } : {}),
+  };
+}
+
+export function scopeToGraph(scope: ScopeRef): string {
+  const workspaceId = scope.workspaceId?.trim();
+  const userId = scope.userId?.trim();
+  const agentId = scope.agentId?.trim();
+  const sessionId = scope.sessionId?.trim();
+
+  if (!workspaceId) {
+    throw new WeavError("scope requires non-empty 'workspaceId'");
+  }
+  if (scope.userId !== undefined && !userId) {
+    throw new WeavError("scope field 'userId' cannot be empty");
+  }
+  if (scope.agentId !== undefined && !agentId) {
+    throw new WeavError("scope field 'agentId' cannot be empty");
+  }
+  if (scope.sessionId !== undefined && !sessionId) {
+    throw new WeavError("scope field 'sessionId' cannot be empty");
+  }
+  if (agentId && !userId) {
+    throw new WeavError("scope requires 'userId' before 'agentId'");
+  }
+  if (sessionId && !agentId) {
+    throw new WeavError("scope requires 'agentId' before 'sessionId'");
+  }
+
+  let graph = `ws:${workspaceId}`;
+  if (userId) {
+    graph += `:user:${userId}`;
+  }
+  if (agentId) {
+    graph += `:agent:${agentId}`;
+  }
+  if (sessionId) {
+    graph += `:session:${sessionId}`;
+  }
+  return graph;
+}
+
+function validatedScopePayload(scope: ScopeRef): Record<string, string> {
+  scopeToGraph(scope);
+  return serializeScope(scope);
 }
 
 export class WeavClient {
@@ -43,6 +101,10 @@ export class WeavClient {
   /** Visible for testing. */
   getBaseUrl(): string {
     return this.baseUrl;
+  }
+
+  private resolveGraphRef(graph: GraphRef): string {
+    return isScopeRef(graph) ? scopeToGraph(graph) : graph;
   }
 
   private async request<T>(
@@ -77,35 +139,38 @@ export class WeavClient {
     return response.ok;
   }
 
-  async info(): Promise<Record<string, unknown>> {
-    const response = await this.request<Record<string, unknown>>('GET', '/health');
-    return response;
+  async info(): Promise<string> {
+    return this.request<string>('GET', '/v1/info');
   }
 
   // ── Graph management ──────────────────────────────────────────────────
 
-  async createGraph(name: string): Promise<void> {
-    await this.request('POST', '/v1/graphs', { name });
+  async createGraph(name: GraphRef): Promise<void> {
+    const body = isScopeRef(name) ? { scope: validatedScopePayload(name) } : { name };
+    await this.request('POST', '/v1/graphs', body);
   }
 
-  async dropGraph(name: string): Promise<void> {
-    await this.request('DELETE', `/v1/graphs/${encodeURIComponent(name)}`);
+  async dropGraph(name: GraphRef): Promise<void> {
+    const graph = this.resolveGraphRef(name);
+    await this.request('DELETE', `/v1/graphs/${encodeURIComponent(graph)}`);
   }
 
   async listGraphs(): Promise<string[]> {
     return this.request<string[]>('GET', '/v1/graphs');
   }
 
-  async graphInfo(name: string): Promise<GraphInfo> {
+  async graphInfo(name: GraphRef): Promise<GraphInfo> {
+    const graph = this.resolveGraphRef(name);
     return this.request<GraphInfo>(
       'GET',
-      `/v1/graphs/${encodeURIComponent(name)}`,
+      `/v1/graphs/${encodeURIComponent(graph)}`,
     );
   }
 
   // ── Node operations ───────────────────────────────────────────────────
 
-  async addNode(graph: string, params: AddNodeParams): Promise<number> {
+  async addNode(graph: GraphRef, params: AddNodeParams): Promise<number> {
+    const graphName = this.resolveGraphRef(graph);
     const body = {
       label: params.label,
       properties: params.properties,
@@ -114,37 +179,41 @@ export class WeavClient {
     };
     const result = await this.request<{ node_id: number }>(
       'POST',
-      `/v1/graphs/${encodeURIComponent(graph)}/nodes`,
+      `/v1/graphs/${encodeURIComponent(graphName)}/nodes`,
       body,
     );
     return result.node_id;
   }
 
-  async getNode(graph: string, nodeId: number): Promise<NodeInfo> {
+  async getNode(graph: GraphRef, nodeId: number): Promise<NodeInfo> {
+    const graphName = this.resolveGraphRef(graph);
     return this.request<NodeInfo>(
       'GET',
-      `/v1/graphs/${encodeURIComponent(graph)}/nodes/${nodeId}`,
+      `/v1/graphs/${encodeURIComponent(graphName)}/nodes/${nodeId}`,
     );
   }
 
-  async deleteNode(graph: string, nodeId: number): Promise<void> {
+  async deleteNode(graph: GraphRef, nodeId: number): Promise<void> {
+    const graphName = this.resolveGraphRef(graph);
     await this.request(
       'DELETE',
-      `/v1/graphs/${encodeURIComponent(graph)}/nodes/${nodeId}`,
+      `/v1/graphs/${encodeURIComponent(graphName)}/nodes/${nodeId}`,
     );
   }
 
-  async updateNode(graph: string, nodeId: number, params: UpdateNodeParams): Promise<void> {
+  async updateNode(graph: GraphRef, nodeId: number, params: UpdateNodeParams): Promise<void> {
+    const graphName = this.resolveGraphRef(graph);
     await this.request(
       'PUT',
-      `/v1/graphs/${encodeURIComponent(graph)}/nodes/${nodeId}`,
+      `/v1/graphs/${encodeURIComponent(graphName)}/nodes/${nodeId}`,
       params,
     );
   }
 
   // ── Edge operations ───────────────────────────────────────────────────
 
-  async addEdge(graph: string, params: AddEdgeParams): Promise<number> {
+  async addEdge(graph: GraphRef, params: AddEdgeParams): Promise<number> {
+    const graphName = this.resolveGraphRef(graph);
     const body: Record<string, unknown> = {
       source: params.source,
       target: params.target,
@@ -156,20 +225,22 @@ export class WeavClient {
     }
     const result = await this.request<{ edge_id: number }>(
       'POST',
-      `/v1/graphs/${encodeURIComponent(graph)}/edges`,
+      `/v1/graphs/${encodeURIComponent(graphName)}/edges`,
       body,
     );
     return result.edge_id;
   }
 
-  async invalidateEdge(graph: string, edgeId: number): Promise<void> {
+  async invalidateEdge(graph: GraphRef, edgeId: number): Promise<void> {
+    const graphName = this.resolveGraphRef(graph);
     await this.request(
       'POST',
-      `/v1/graphs/${encodeURIComponent(graph)}/edges/${edgeId}/invalidate`,
+      `/v1/graphs/${encodeURIComponent(graphName)}/edges/${edgeId}/invalidate`,
     );
   }
 
-  async bulkAddNodes(graph: string, nodes: AddNodeParams[]): Promise<number[]> {
+  async bulkAddNodes(graph: GraphRef, nodes: AddNodeParams[]): Promise<number[]> {
+    const graphName = this.resolveGraphRef(graph);
     const body = {
       nodes: nodes.map(n => ({
         label: n.label,
@@ -180,13 +251,14 @@ export class WeavClient {
     };
     const result = await this.request<{ node_ids: number[] }>(
       'POST',
-      `/v1/graphs/${encodeURIComponent(graph)}/nodes/bulk`,
+      `/v1/graphs/${encodeURIComponent(graphName)}/nodes/bulk`,
       body,
     );
     return result.node_ids;
   }
 
-  async bulkAddEdges(graph: string, edges: AddEdgeParams[]): Promise<number[]> {
+  async bulkAddEdges(graph: GraphRef, edges: AddEdgeParams[]): Promise<number[]> {
+    const graphName = this.resolveGraphRef(graph);
     const body = {
       edges: edges.map(e => {
         const edge: Record<string, unknown> = {
@@ -203,7 +275,7 @@ export class WeavClient {
     };
     const result = await this.request<{ edge_ids: number[] }>(
       'POST',
-      `/v1/graphs/${encodeURIComponent(graph)}/edges/bulk`,
+      `/v1/graphs/${encodeURIComponent(graphName)}/edges/bulk`,
       body,
     );
     return result.edge_ids;
@@ -213,14 +285,30 @@ export class WeavClient {
 
   async context(params: ContextParams): Promise<ContextResult> {
     const body: Record<string, unknown> = {
-      graph: params.graph,
       query: params.query,
+      retrieval_mode: params.retrievalMode,
       embedding: params.embedding,
       seed_nodes: params.seedNodes,
       budget: params.budget ?? 4096,
       max_depth: params.maxDepth ?? 3,
       include_provenance: params.includeProvenance ?? false,
     };
+    if (params.graph !== undefined && params.graph.trim() !== '') {
+      body.graph = params.graph;
+    } else if (params.scope !== undefined) {
+      body.scope = validatedScopePayload(params.scope);
+    } else {
+      throw new WeavError("context requires either 'graph' or 'scope'");
+    }
+    if (params.rerank !== undefined) {
+      body.rerank = {
+        enabled: params.rerank.enabled,
+        provider: params.rerank.provider,
+        model: params.rerank.model,
+        candidate_limit: params.rerank.candidateLimit,
+        score_weight: params.rerank.scoreWeight,
+      };
+    }
     if (params.decay !== undefined) {
       body.decay = {
         type: params.decay.type,
@@ -258,28 +346,30 @@ export class WeavClient {
   // ── Search ───────────────────────────────────────────────────────────
 
   async searchText(
-    graph: string,
+    graph: GraphRef,
     query: string,
     limit: number = 20,
   ): Promise<Record<string, unknown>> {
+    const graphName = this.resolveGraphRef(graph);
     const params = new URLSearchParams({ q: query, limit: String(limit) });
     return this.request<Record<string, unknown>>(
       'GET',
-      `/v1/graphs/${encodeURIComponent(graph)}/search/text?${params}`,
+      `/v1/graphs/${encodeURIComponent(graphName)}/search/text?${params}`,
     );
   }
 
   // ── Node merge ──────────────────────────────────────────────────────
 
   async mergeNodes(
-    graph: string,
+    graph: GraphRef,
     sourceId: number,
     targetId: number,
     conflictPolicy: string = 'keep_target',
   ): Promise<Record<string, unknown>> {
+    const graphName = this.resolveGraphRef(graph);
     return this.request<Record<string, unknown>>(
       'POST',
-      `/v1/graphs/${encodeURIComponent(graph)}/nodes/merge`,
+      `/v1/graphs/${encodeURIComponent(graphName)}/nodes/merge`,
       {
         source_id: sourceId,
         target_id: targetId,
@@ -291,7 +381,7 @@ export class WeavClient {
   // ── Vector search ───────────────────────────────────────────────────
 
   async searchVector(
-    graph: string,
+    graph: GraphRef,
     embedding: number[],
     options?: {
       k?: number;
@@ -299,6 +389,7 @@ export class WeavClient {
       properties?: Record<string, unknown>;
     },
   ): Promise<Record<string, unknown>> {
+    const graphName = this.resolveGraphRef(graph);
     const body: Record<string, unknown> = { embedding };
     if (options?.k !== undefined) {
       body.k = options.k;
@@ -311,7 +402,7 @@ export class WeavClient {
     }
     return this.request<Record<string, unknown>>(
       'POST',
-      `/v1/graphs/${encodeURIComponent(graph)}/search/vector`,
+      `/v1/graphs/${encodeURIComponent(graphName)}/search/vector`,
       body,
     );
   }
@@ -319,13 +410,14 @@ export class WeavClient {
   // ── Graph diff ─────────────────────────────────────────────────────
 
   async graphDiff(
-    graph: string,
+    graph: GraphRef,
     fromTimestamp: number,
     toTimestamp: number,
   ): Promise<Record<string, unknown>> {
+    const graphName = this.resolveGraphRef(graph);
     return this.request<Record<string, unknown>>(
       'POST',
-      `/v1/graphs/${encodeURIComponent(graph)}/diff`,
+      `/v1/graphs/${encodeURIComponent(graphName)}/diff`,
       { from_timestamp: fromTimestamp, to_timestamp: toTimestamp },
     );
   }
@@ -333,15 +425,16 @@ export class WeavClient {
   // ── Community operations ───────────────────────────────────────────
 
   async communitySummarize(
-    graph: string,
+    graph: GraphRef,
     options?: {
       algorithm?: string;
       resolution?: number;
     },
   ): Promise<Record<string, unknown>> {
+    const graphName = this.resolveGraphRef(graph);
     return this.request<Record<string, unknown>>(
       'POST',
-      `/v1/graphs/${encodeURIComponent(graph)}/communities/summarize`,
+      `/v1/graphs/${encodeURIComponent(graphName)}/communities/summarize`,
       {
         algorithm: options?.algorithm ?? 'leiden',
         resolution: options?.resolution ?? 1.0,
@@ -349,21 +442,23 @@ export class WeavClient {
     );
   }
 
-  async communitySummaries(graph: string): Promise<Record<string, unknown>> {
+  async communitySummaries(graph: GraphRef): Promise<Record<string, unknown>> {
+    const graphName = this.resolveGraphRef(graph);
     return this.request<Record<string, unknown>>(
       'GET',
-      `/v1/graphs/${encodeURIComponent(graph)}/communities/summaries`,
+      `/v1/graphs/${encodeURIComponent(graphName)}/communities/summaries`,
     );
   }
 
   async communitySearch(
-    graph: string,
+    graph: GraphRef,
     query: string,
     limit?: number,
   ): Promise<Record<string, unknown>> {
+    const graphName = this.resolveGraphRef(graph);
     return this.request<Record<string, unknown>>(
       'POST',
-      `/v1/graphs/${encodeURIComponent(graph)}/communities/search`,
+      `/v1/graphs/${encodeURIComponent(graphName)}/communities/search`,
       { query, limit: limit ?? 10 },
     );
   }
@@ -371,13 +466,14 @@ export class WeavClient {
   // ── Algorithms ──────────────────────────────────────────────────────
 
   async runAlgorithm(
-    graph: string,
+    graph: GraphRef,
     algorithm: string,
     params?: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
+    const graphName = this.resolveGraphRef(graph);
     return this.request<Record<string, unknown>>(
       'POST',
-      `/v1/graphs/${encodeURIComponent(graph)}/algorithms/${encodeURIComponent(algorithm)}`,
+      `/v1/graphs/${encodeURIComponent(graphName)}/algorithms/${encodeURIComponent(algorithm)}`,
       params ?? {},
     );
   }
@@ -385,10 +481,11 @@ export class WeavClient {
   // ── CSV import/export ───────────────────────────────────────────────
 
   async importCsv(
-    graph: string,
+    graph: GraphRef,
     csvContent: string,
   ): Promise<Record<string, unknown>> {
-    const url = `${this.baseUrl}/v1/graphs/${encodeURIComponent(graph)}/import/csv`;
+    const graphName = this.resolveGraphRef(graph);
+    const url = `${this.baseUrl}/v1/graphs/${encodeURIComponent(graphName)}/import/csv`;
     const headers: Record<string, string> = { 'Content-Type': 'text/csv' };
     if (this.authHeader) {
       headers['Authorization'] = this.authHeader;
@@ -405,8 +502,9 @@ export class WeavClient {
     return json.data as Record<string, unknown>;
   }
 
-  async exportCsv(graph: string): Promise<string> {
-    const url = `${this.baseUrl}/v1/graphs/${encodeURIComponent(graph)}/export/csv`;
+  async exportCsv(graph: GraphRef): Promise<string> {
+    const graphName = this.resolveGraphRef(graph);
+    const url = `${this.baseUrl}/v1/graphs/${encodeURIComponent(graphName)}/export/csv`;
     const headers: Record<string, string> = {};
     if (this.authHeader) {
       headers['Authorization'] = this.authHeader;
@@ -420,7 +518,8 @@ export class WeavClient {
 
   // ── Ingest (extraction pipeline) ─────────────────────────────────────
 
-  async ingest(graph: string, params: IngestParams): Promise<IngestResult> {
+  async ingest(graph: GraphRef, params: IngestParams): Promise<IngestResult> {
+    const graphName = this.resolveGraphRef(graph);
     const body: Record<string, unknown> = {};
     if (params.content !== undefined) {
       body.content = params.content;
@@ -442,10 +541,22 @@ export class WeavClient {
     if (params.entityTypes !== undefined) {
       body.entity_types = params.entityTypes;
     }
+    if (params.resolutionMode !== undefined) {
+      body.resolution_mode = params.resolutionMode;
+    }
+    if (params.linkExistingEntities !== undefined) {
+      body.link_existing_entities = params.linkExistingEntities;
+    }
+    if (params.resolutionCandidateLimit !== undefined) {
+      body.resolution_candidate_limit = params.resolutionCandidateLimit;
+    }
+    if (params.customResolutionPrompt !== undefined) {
+      body.custom_resolution_prompt = params.customResolutionPrompt;
+    }
 
     const raw = await this.request<Record<string, unknown>>(
       'POST',
-      `/v1/graphs/${encodeURIComponent(graph)}/ingest`,
+      `/v1/graphs/${encodeURIComponent(graphName)}/ingest`,
       body,
     );
     return {
@@ -453,6 +564,8 @@ export class WeavClient {
       chunksCreated: raw.chunks_created as number,
       entitiesCreated: raw.entities_created as number,
       entitiesMerged: raw.entities_merged as number,
+      entitiesResolved: (raw.entities_resolved as number) ?? 0,
+      entitiesLinkedExisting: (raw.entities_linked_existing as number) ?? 0,
       relationshipsCreated: raw.relationships_created as number,
       pipelineDurationMs: raw.pipeline_duration_ms as number,
     };

@@ -4,7 +4,7 @@ use compact_str::CompactString;
 use weav_core::types::Value;
 
 use crate::types::{
-    ExtractedEntity, ExtractedRelationship, LlmExtractionOutput, LlmEntity, LlmRelationship,
+    ExtractedEntity, ExtractedRelationship, LlmEntity, LlmExtractionOutput, LlmRelationship,
 };
 
 /// Map LLM entities to typed ExtractedEntity instances.

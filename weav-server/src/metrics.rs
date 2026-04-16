@@ -1,6 +1,6 @@
 use prometheus::{
-    IntCounter, IntGauge, IntGaugeVec, HistogramVec, IntCounterVec,
-    Histogram, Opts, HistogramOpts, Registry,
+    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry,
 };
 use std::sync::LazyLock;
 
@@ -52,13 +52,17 @@ pub static WAL_WRITES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 });
 
 pub static WAL_BYTES_WRITTEN: LazyLock<IntCounter> = LazyLock::new(|| {
-    let counter = IntCounter::new("weav_wal_bytes_written_total", "Total bytes written to WAL").unwrap();
+    let counter =
+        IntCounter::new("weav_wal_bytes_written_total", "Total bytes written to WAL").unwrap();
     REGISTRY.register(Box::new(counter.clone())).unwrap();
     counter
 });
 
 pub static WAL_SYNC_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
-    let opts = HistogramOpts::new("weav_wal_sync_duration_seconds", "WAL fsync duration in seconds");
+    let opts = HistogramOpts::new(
+        "weav_wal_sync_duration_seconds",
+        "WAL fsync duration in seconds",
+    );
     let hist = Histogram::with_opts(opts).unwrap();
     REGISTRY.register(Box::new(hist.clone())).unwrap();
     hist
@@ -67,14 +71,21 @@ pub static WAL_SYNC_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
 // ─── Snapshot metrics ──────────────────────────────────────────────────────
 
 pub static SNAPSHOT_DURATION: LazyLock<Histogram> = LazyLock::new(|| {
-    let opts = HistogramOpts::new("weav_snapshot_duration_seconds", "Snapshot save duration in seconds");
+    let opts = HistogramOpts::new(
+        "weav_snapshot_duration_seconds",
+        "Snapshot save duration in seconds",
+    );
     let hist = Histogram::with_opts(opts).unwrap();
     REGISTRY.register(Box::new(hist.clone())).unwrap();
     hist
 });
 
 pub static SNAPSHOT_SIZE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
-    let gauge = IntGauge::new("weav_snapshot_size_bytes", "Size of the last snapshot in bytes").unwrap();
+    let gauge = IntGauge::new(
+        "weav_snapshot_size_bytes",
+        "Size of the last snapshot in bytes",
+    )
+    .unwrap();
     REGISTRY.register(Box::new(gauge.clone())).unwrap();
     gauge
 });
@@ -82,7 +93,10 @@ pub static SNAPSHOT_SIZE_BYTES: LazyLock<IntGauge> = LazyLock::new(|| {
 // ─── Vector search metrics ─────────────────────────────────────────────────
 
 pub static VECTOR_SEARCH_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
-    let opts = HistogramOpts::new("weav_vector_search_duration_seconds", "Vector search duration in seconds");
+    let opts = HistogramOpts::new(
+        "weav_vector_search_duration_seconds",
+        "Vector search duration in seconds",
+    );
     let hist = HistogramVec::new(opts, &["graph"]).unwrap();
     REGISTRY.register(Box::new(hist.clone())).unwrap();
     hist
@@ -108,7 +122,10 @@ pub static TOKEN_BUDGET_USAGE: LazyLock<HistogramVec> = LazyLock::new(|| {
 });
 
 pub static TOKEN_BUDGET_OVERFLOW: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    let opts = Opts::new("weav_token_budget_overflow_total", "Token budget overflow events");
+    let opts = Opts::new(
+        "weav_token_budget_overflow_total",
+        "Token budget overflow events",
+    );
     let counter = IntCounterVec::new(opts, &["graph"]).unwrap();
     REGISTRY.register(Box::new(counter.clone())).unwrap();
     counter
@@ -117,7 +134,10 @@ pub static TOKEN_BUDGET_OVERFLOW: LazyLock<IntCounterVec> = LazyLock::new(|| {
 // ─── TTL metrics ───────────────────────────────────────────────────────────
 
 pub static TTL_EXPIRED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
-    let opts = Opts::new("weav_ttl_expired_total", "Total entities expired by TTL sweep");
+    let opts = Opts::new(
+        "weav_ttl_expired_total",
+        "Total entities expired by TTL sweep",
+    );
     let counter = IntCounterVec::new(opts, &["graph", "entity_type"]).unwrap();
     REGISTRY.register(Box::new(counter.clone())).unwrap();
     counter
@@ -143,7 +163,10 @@ pub static AUTH_ATTEMPTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
 // ─── Ingest metrics ────────────────────────────────────────────────────────
 
 pub static INGEST_DURATION: LazyLock<HistogramVec> = LazyLock::new(|| {
-    let opts = HistogramOpts::new("weav_ingest_duration_seconds", "Document ingest duration in seconds");
+    let opts = HistogramOpts::new(
+        "weav_ingest_duration_seconds",
+        "Document ingest duration in seconds",
+    );
     let hist = HistogramVec::new(opts, &["graph", "format"]).unwrap();
     REGISTRY.register(Box::new(hist.clone())).unwrap();
     hist
@@ -193,14 +216,24 @@ mod tests {
         EDGES_TOTAL.with_label_values(&["_init"]).set(0);
         QUERY_DURATION.with_label_values(&["_init"]).observe(0.0);
         QUERY_TOTAL.with_label_values(&["_init", "_init"]).inc();
-        WAL_WRITES_TOTAL.with_label_values(&["_init", "_init"]).inc();
-        VECTOR_SEARCH_DURATION.with_label_values(&["_init"]).observe(0.0);
+        WAL_WRITES_TOTAL
+            .with_label_values(&["_init", "_init"])
+            .inc();
+        VECTOR_SEARCH_DURATION
+            .with_label_values(&["_init"])
+            .observe(0.0);
         VECTOR_INDEX_SIZE.with_label_values(&["_init"]).set(0);
-        TOKEN_BUDGET_USAGE.with_label_values(&["_init", "_init"]).observe(0.0);
+        TOKEN_BUDGET_USAGE
+            .with_label_values(&["_init", "_init"])
+            .observe(0.0);
         TOKEN_BUDGET_OVERFLOW.with_label_values(&["_init"]).inc();
-        TTL_EXPIRED_TOTAL.with_label_values(&["_init", "_init"]).inc();
+        TTL_EXPIRED_TOTAL
+            .with_label_values(&["_init", "_init"])
+            .inc();
         AUTH_ATTEMPTS_TOTAL.with_label_values(&["_init"]).inc();
-        INGEST_DURATION.with_label_values(&["_init", "_init"]).observe(0.0);
+        INGEST_DURATION
+            .with_label_values(&["_init", "_init"])
+            .observe(0.0);
         INGEST_DOCUMENTS_TOTAL.with_label_values(&["_init"]).inc();
 
         let families = REGISTRY.gather();
@@ -227,7 +260,10 @@ mod tests {
     fn test_histogram_observation() {
         WAL_SYNC_DURATION.observe(0.005);
         let count = WAL_SYNC_DURATION.get_sample_count();
-        assert!(count >= 1, "WAL_SYNC_DURATION should have >= 1 observation, got {count}");
+        assert!(
+            count >= 1,
+            "WAL_SYNC_DURATION should have >= 1 observation, got {count}"
+        );
     }
 
     #[test]
@@ -252,17 +288,16 @@ mod tests {
         let count = VECTOR_SEARCH_DURATION
             .with_label_values(&["bench_graph"])
             .get_sample_count();
-        assert!(count >= 1, "VECTOR_SEARCH_DURATION should have >= 1 observation");
+        assert!(
+            count >= 1,
+            "VECTOR_SEARCH_DURATION should have >= 1 observation"
+        );
     }
 
     #[test]
     fn test_labeled_gauge_set() {
-        VECTOR_INDEX_SIZE
-            .with_label_values(&["idx_graph"])
-            .set(500);
-        let val = VECTOR_INDEX_SIZE
-            .with_label_values(&["idx_graph"])
-            .get();
+        VECTOR_INDEX_SIZE.with_label_values(&["idx_graph"]).set(500);
+        let val = VECTOR_INDEX_SIZE.with_label_values(&["idx_graph"]).get();
         assert_eq!(val, 500);
     }
 
@@ -271,26 +306,16 @@ mod tests {
         TTL_EXPIRED_TOTAL
             .with_label_values(&["g", "node"])
             .inc_by(5);
-        let val = TTL_EXPIRED_TOTAL
-            .with_label_values(&["g", "node"])
-            .get();
+        let val = TTL_EXPIRED_TOTAL.with_label_values(&["g", "node"]).get();
         assert!(val >= 5, "TTL_EXPIRED_TOTAL should be >= 5, got {val}");
     }
 
     #[test]
     fn test_auth_attempts_counter() {
-        AUTH_ATTEMPTS_TOTAL
-            .with_label_values(&["success"])
-            .inc();
-        AUTH_ATTEMPTS_TOTAL
-            .with_label_values(&["failure"])
-            .inc();
-        let success = AUTH_ATTEMPTS_TOTAL
-            .with_label_values(&["success"])
-            .get();
-        let failure = AUTH_ATTEMPTS_TOTAL
-            .with_label_values(&["failure"])
-            .get();
+        AUTH_ATTEMPTS_TOTAL.with_label_values(&["success"]).inc();
+        AUTH_ATTEMPTS_TOTAL.with_label_values(&["failure"]).inc();
+        let success = AUTH_ATTEMPTS_TOTAL.with_label_values(&["success"]).get();
+        let failure = AUTH_ATTEMPTS_TOTAL.with_label_values(&["failure"]).get();
         assert!(success >= 1);
         assert!(failure >= 1);
     }
@@ -305,12 +330,8 @@ mod tests {
             .get_sample_count();
         assert!(count >= 1);
 
-        TOKEN_BUDGET_OVERFLOW
-            .with_label_values(&["g"])
-            .inc();
-        let val = TOKEN_BUDGET_OVERFLOW
-            .with_label_values(&["g"])
-            .get();
+        TOKEN_BUDGET_OVERFLOW.with_label_values(&["g"]).inc();
+        let val = TOKEN_BUDGET_OVERFLOW.with_label_values(&["g"]).get();
         assert!(val >= 1);
     }
 
@@ -333,12 +354,8 @@ mod tests {
             .get_sample_count();
         assert!(count >= 1);
 
-        INGEST_DOCUMENTS_TOTAL
-            .with_label_values(&["g"])
-            .inc();
-        let val = INGEST_DOCUMENTS_TOTAL
-            .with_label_values(&["g"])
-            .get();
+        INGEST_DOCUMENTS_TOTAL.with_label_values(&["g"]).inc();
+        let val = INGEST_DOCUMENTS_TOTAL.with_label_values(&["g"]).get();
         assert!(val >= 1);
     }
 }

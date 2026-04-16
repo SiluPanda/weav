@@ -72,6 +72,10 @@ pub struct EdgeSnapshot {
     pub weight: f32,
     pub valid_from: Timestamp,
     pub valid_until: Timestamp,
+    #[serde(default)]
+    pub tx_from: Option<Timestamp>,
+    #[serde(default)]
+    pub tx_until: Option<Timestamp>,
     pub properties_json: String,
 }
 
@@ -128,7 +132,9 @@ impl SnapshotEngine {
         file.sync_all()?;
 
         // Write metadata sidecar for fast listing
-        let meta_path = self.data_dir.join(format!("snapshot-{}.meta.json", snapshot.meta.created_at));
+        let meta_path = self
+            .data_dir
+            .join(format!("snapshot-{}.meta.json", snapshot.meta.created_at));
         let meta_json = serde_json::json!({
             "created_at": snapshot.meta.created_at,
             "size_bytes": data.len() as u64,
@@ -137,10 +143,13 @@ impl SnapshotEngine {
             "graph_count": snapshot.meta.graph_count,
             "wal_sequence": snapshot.meta.wal_sequence,
         });
-        if let Ok(json_str) = serde_json::to_string(&meta_json) {
-            if let Err(e) = fs::write(&meta_path, json_str) {
-                tracing::warn!("failed to write snapshot meta sidecar {}: {e}", meta_path.display());
-            }
+        if let Ok(json_str) = serde_json::to_string(&meta_json)
+            && let Err(e) = fs::write(&meta_path, json_str)
+        {
+            tracing::warn!(
+                "failed to write snapshot meta sidecar {}: {e}",
+                meta_path.display()
+            );
         }
 
         Ok(path)
@@ -196,7 +205,9 @@ impl SnapshotEngine {
                 snapshots.push(SnapshotMeta {
                     path: path.clone(),
                     created_at: val["created_at"].as_u64().unwrap_or(0),
-                    size_bytes: val["size_bytes"].as_u64().unwrap_or(entry.metadata()?.len()),
+                    size_bytes: val["size_bytes"]
+                        .as_u64()
+                        .unwrap_or(entry.metadata()?.len()),
                     node_count: val["node_count"].as_u64().unwrap_or(0),
                     edge_count: val["edge_count"].as_u64().unwrap_or(0),
                     graph_count: val["graph_count"].as_u64().unwrap_or(0) as u32,
@@ -326,6 +337,8 @@ mod tests {
                     weight: 1.0,
                     valid_from: 1000,
                     valid_until: u64::MAX,
+                    tx_from: Some(1000),
+                    tx_until: Some(u64::MAX),
                     properties_json: "{}".into(),
                 }],
             }],
@@ -527,8 +540,8 @@ mod tests {
                 path: PathBuf::new(),
                 created_at: now_millis(),
                 size_bytes: 0,
-                node_count: 6,  // 1 + 2 + 3
-                edge_count: 3,  // 0 + 1 + 2
+                node_count: 6, // 1 + 2 + 3
+                edge_count: 3, // 0 + 1 + 2
                 graph_count: 3,
                 wal_sequence: 50,
             },
@@ -574,6 +587,8 @@ mod tests {
                         weight: 0.5,
                         valid_from: 500,
                         valid_until: u64::MAX,
+                        tx_from: Some(500),
+                        tx_until: Some(u64::MAX),
                         properties_json: "{}".into(),
                     }],
                 },
@@ -613,6 +628,8 @@ mod tests {
                             weight: 1.0,
                             valid_from: 0,
                             valid_until: u64::MAX,
+                            tx_from: Some(0),
+                            tx_until: Some(u64::MAX),
                             properties_json: "{}".into(),
                         },
                         EdgeSnapshot {
@@ -623,6 +640,8 @@ mod tests {
                             weight: 0.8,
                             valid_from: 0,
                             valid_until: u64::MAX,
+                            tx_from: Some(0),
+                            tx_until: Some(u64::MAX),
                             properties_json: "{}".into(),
                         },
                     ],

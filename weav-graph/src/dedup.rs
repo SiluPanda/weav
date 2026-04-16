@@ -223,12 +223,16 @@ pub fn find_duplicate_by_name_indexed(
     name: &str,
     threshold: f32,
     blocking_index: Option<&BlockingIndex>,
+    candidate_limit: Option<usize>,
 ) -> Option<(NodeId, f32)> {
     // Fast path: use blocking index
     if let Some(index) = blocking_index {
         let candidates = index.candidates(name, 1);
         let mut best: Option<(NodeId, f32)> = None;
-        for nid in candidates {
+        for nid in candidates
+            .into_iter()
+            .take(candidate_limit.unwrap_or(usize::MAX))
+        {
             if let Some(val) = properties.get_node_property(nid, name_field)
                 && let Some(existing_name) = val.as_str()
             {
@@ -330,8 +334,16 @@ mod tests {
     #[test]
     fn test_find_duplicate_by_key_found() {
         let mut props = PropertyStore::new();
-        props.set_node_property(1, "email", Value::String(CompactString::from("alice@example.com")));
-        props.set_node_property(2, "email", Value::String(CompactString::from("bob@example.com")));
+        props.set_node_property(
+            1,
+            "email",
+            Value::String(CompactString::from("alice@example.com")),
+        );
+        props.set_node_property(
+            2,
+            "email",
+            Value::String(CompactString::from("bob@example.com")),
+        );
 
         let found = find_duplicate_by_key(&props, "email", "alice@example.com");
         assert_eq!(found, Some(1));
@@ -340,7 +352,11 @@ mod tests {
     #[test]
     fn test_find_duplicate_by_key_not_found() {
         let mut props = PropertyStore::new();
-        props.set_node_property(1, "email", Value::String(CompactString::from("alice@example.com")));
+        props.set_node_property(
+            1,
+            "email",
+            Value::String(CompactString::from("alice@example.com")),
+        );
 
         let found = find_duplicate_by_key(&props, "email", "nobody@example.com");
         assert_eq!(found, None);
@@ -349,7 +365,11 @@ mod tests {
     #[test]
     fn test_find_duplicate_by_key_wrong_field() {
         let mut props = PropertyStore::new();
-        props.set_node_property(1, "email", Value::String(CompactString::from("alice@example.com")));
+        props.set_node_property(
+            1,
+            "email",
+            Value::String(CompactString::from("alice@example.com")),
+        );
 
         let found = find_duplicate_by_key(&props, "phone", "alice@example.com");
         assert_eq!(found, None);
@@ -358,7 +378,11 @@ mod tests {
     #[test]
     fn test_find_duplicate_by_name_exact() {
         let mut props = PropertyStore::new();
-        props.set_node_property(1, "name", Value::String(CompactString::from("Alice Johnson")));
+        props.set_node_property(
+            1,
+            "name",
+            Value::String(CompactString::from("Alice Johnson")),
+        );
         props.set_node_property(2, "name", Value::String(CompactString::from("Bob Smith")));
 
         let found = find_duplicate_by_name(&props, "name", "Alice Johnson", 0.85);
@@ -371,7 +395,11 @@ mod tests {
     #[test]
     fn test_find_duplicate_by_name_fuzzy() {
         let mut props = PropertyStore::new();
-        props.set_node_property(1, "name", Value::String(CompactString::from("Alice Johnson")));
+        props.set_node_property(
+            1,
+            "name",
+            Value::String(CompactString::from("Alice Johnson")),
+        );
 
         let found = find_duplicate_by_name(&props, "name", "Alice Jonson", 0.85);
         assert!(found.is_some());
@@ -382,7 +410,11 @@ mod tests {
     #[test]
     fn test_find_duplicate_by_name_below_threshold() {
         let mut props = PropertyStore::new();
-        props.set_node_property(1, "name", Value::String(CompactString::from("Alice Johnson")));
+        props.set_node_property(
+            1,
+            "name",
+            Value::String(CompactString::from("Alice Johnson")),
+        );
 
         let found = find_duplicate_by_name(&props, "name", "Completely Different Name", 0.85);
         assert!(found.is_none());
@@ -556,7 +588,12 @@ mod tests {
             "name".to_string(),
             Value::String(CompactString::from("Alicia")),
         )];
-        let result = merge_properties(&mut props, 1, &new_props, &ConflictPolicy::HighestConfidence);
+        let result = merge_properties(
+            &mut props,
+            1,
+            &new_props,
+            &ConflictPolicy::HighestConfidence,
+        );
 
         // HighestConfidence falls through to last-write-wins in the code
         match result {
@@ -792,7 +829,11 @@ mod tests {
     #[test]
     fn test_find_duplicate_by_name_indexed_fast_path() {
         let mut props = PropertyStore::new();
-        props.set_node_property(1, "name", Value::String(CompactString::from("Albert Einstein")));
+        props.set_node_property(
+            1,
+            "name",
+            Value::String(CompactString::from("Albert Einstein")),
+        );
         props.set_node_property(2, "name", Value::String(CompactString::from("Marie Curie")));
 
         let mut index = BlockingIndex::new();
@@ -800,8 +841,14 @@ mod tests {
         index.insert(2, "Marie Curie");
 
         // Should find Albert Einstein via blocking index
-        let found =
-            find_duplicate_by_name_indexed(&props, "name", "Albert Einsten", 0.85, Some(&index));
+        let found = find_duplicate_by_name_indexed(
+            &props,
+            "name",
+            "Albert Einsten",
+            0.85,
+            Some(&index),
+            None,
+        );
         assert!(found.is_some());
         let (node_id, score) = found.unwrap();
         assert_eq!(node_id, 1);
@@ -811,11 +858,15 @@ mod tests {
     #[test]
     fn test_find_duplicate_by_name_indexed_slow_path() {
         let mut props = PropertyStore::new();
-        props.set_node_property(1, "name", Value::String(CompactString::from("Alice Johnson")));
+        props.set_node_property(
+            1,
+            "name",
+            Value::String(CompactString::from("Alice Johnson")),
+        );
 
         // No blocking index: falls back to full scan
         let found =
-            find_duplicate_by_name_indexed(&props, "name", "Alice Jonson", 0.85, None);
+            find_duplicate_by_name_indexed(&props, "name", "Alice Jonson", 0.85, None, None);
         assert!(found.is_some());
         let (node_id, score) = found.unwrap();
         assert_eq!(node_id, 1);

@@ -15,6 +15,15 @@ export interface GraphInfo {
   edge_count: number;
 }
 
+export interface ScopeRef {
+  workspaceId: string;
+  userId?: string;
+  agentId?: string;
+  sessionId?: string;
+}
+
+export type GraphRef = string | ScopeRef;
+
 export interface NodeInfo {
   node_id: number;
   label: string;
@@ -62,6 +71,10 @@ export interface ContextResult {
   queryTimeUs: number;
 }
 
+export type RetrievalMode = 'local' | 'global' | 'hybrid' | 'drift';
+
+export type ResolutionMode = 'off' | 'heuristic' | 'semantic';
+
 export interface DecayParams {
   type: 'exponential' | 'linear' | 'step' | 'none';
   halfLifeMs?: number;
@@ -69,9 +82,20 @@ export interface DecayParams {
   cutoffMs?: number;
 }
 
+export interface RerankConfig {
+  enabled?: boolean;
+  provider?: string;
+  model?: string;
+  candidateLimit?: number;
+  scoreWeight?: number;
+}
+
 export interface ContextParams {
-  graph: string;
+  graph?: string;
+  scope?: ScopeRef;
   query?: string;
+  retrievalMode?: RetrievalMode;
+  rerank?: RerankConfig;
   embedding?: number[];
   seedNodes?: string[];
   budget?: number;
@@ -115,6 +139,10 @@ export interface IngestParams {
   skipDedup?: boolean;
   chunkSize?: number;
   entityTypes?: string[];
+  resolutionMode?: ResolutionMode;
+  linkExistingEntities?: boolean;
+  resolutionCandidateLimit?: number;
+  customResolutionPrompt?: string;
 }
 
 export interface IngestResult {
@@ -122,6 +150,8 @@ export interface IngestResult {
   chunksCreated: number;
   entitiesCreated: number;
   entitiesMerged: number;
+  entitiesResolved: number;
+  entitiesLinkedExisting: number;
   relationshipsCreated: number;
   pipelineDurationMs: number;
 }

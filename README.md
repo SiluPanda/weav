@@ -48,6 +48,7 @@ Weav is a **Redis-like, in-memory context graph database** purpose-built for AI 
 | **Entity Dedup** | Exact key, fuzzy name (Jaro-Winkler), and vector similarity deduplication |
 | **Provenance** | Track source, confidence, and extraction method for every piece of knowledge |
 | **Decay Functions** | Linear, exponential, and gaussian relevance decay over time |
+| **Changefeeds** | Public graph mutation streams over gRPC and HTTP SSE with replay cursors |
 | **MCP Server** | Model Context Protocol integration — connect directly from Claude, Cursor, etc. |
 | **Multi-Protocol** | HTTP REST, RESP3 (Redis protocol), and gRPC — all on one server |
 | **Auth & ACL** | Redis-ACL-inspired auth with command categories, graph-level permissions, API keys |
@@ -147,6 +148,8 @@ node_id = client.add_node("research",
 # Query context with token budget
 result = client.context("research",
     query="transformer architectures",
+    retrieval_mode="hybrid",
+    rerank={"provider": "cross_encoder", "candidate_limit": 25, "score_weight": 0.35},
     budget=4096,
     include_provenance=True
 )
@@ -154,6 +157,10 @@ result = client.context("research",
 # Ready for your LLM
 prompt = result.to_prompt()
 messages = result.to_messages()
+
+# Subscribe to graph mutation events (HTTP SSE)
+for event in client.subscribe_events("research", since_sequence=0, replay_limit=100):
+    print(event["kind"], event["graph"])
 ```
 
 ### Node.js / TypeScript SDK
@@ -177,6 +184,8 @@ const nodeId = await client.addNode("research", {
 const result = await client.context({
   graph: "research",
   query: "transformer architectures",
+  retrievalMode: "hybrid",
+  rerank: { provider: "cross_encoder", candidateLimit: 25, scoreWeight: 0.35 },
   budget: 4096,
 });
 
@@ -305,6 +314,8 @@ The star of the show — retrieve structured, budget-aware context for your LLM:
 CONTEXT "<query>" FROM "<graph>" BUDGET <n> TOKENS
   [SEEDS [node_id, ...]]
   [MAX DEPTH <u8>]
+  [RETRIEVAL LOCAL|GLOBAL|HYBRID|DRIFT]
+  [RERANK {json}]
   [DIRECTION IN|OUT|BOTH]
   [EDGE_FILTER {json}]
   [DECAY linear|exponential|gaussian]
@@ -469,9 +480,12 @@ All responses follow `{ "success": bool, "data"?: T, "error"?: string }`.
 
 | Method | Endpoint | Body |
 |---|---|---|
-| `POST` | `/v1/context` | `{ "graph", "query?", "embedding?", "seed_nodes?", "budget?", "max_depth?", "include_provenance?", "decay?", "temporal_at?", "limit?", "sort_field?", "sort_direction?", "edge_labels?", "direction?" }` |
+| `POST` | `/v1/context` | `{ "graph"?, "scope"?, "query"?, "retrieval_mode"?, "rerank"?, "embedding"?, "seed_nodes"?, "budget"?, "max_depth"?, "include_provenance"?, "decay"?, "temporal_at"?, "limit"?, "sort_field"?, "sort_direction"?, "edge_labels"?, "direction"? }` |
 
 Returns `ContextResult` with chunks, token counts, and query timing.
+
+`graph` and `scope` are mutually optional, with `graph` taking precedence when both are supplied.
+`scope` resolves to canonical graph names such as `ws:acme:user:u_123`.
 
 **Decay parameter** (object, not string):
 ```json
@@ -485,6 +499,38 @@ Returns `ContextResult` with chunks, token counts, and query timing.
 }
 ```
 Supported types: `exponential`, `linear`, `step`, `none`.
+
+**Rerank parameter**:
+```json
+{
+  "rerank": {
+    "enabled": true,
+    "provider": "cross_encoder",
+    "model": "bge-reranker-v2-m3",
+    "candidate_limit": 50,
+    "score_weight": 0.35
+  }
+}
+```
+
+#### Events
+
+| Method | Endpoint | Query | Description |
+|---|---|---|---|
+| `GET` | `/v1/events` | `since_sequence?`, `replay_limit?` | Replay recent events across all visible graphs, then continue as SSE |
+| `GET` | `/v1/graphs/{g}/events` | `since_sequence?`, `replay_limit?` | Replay recent events for one graph, then continue as SSE |
+
+Each SSE `data:` payload is JSON shaped like:
+
+```json
+{
+  "sequence": 42,
+  "graph": "knowledge",
+  "timestamp_ms": 1712345678901,
+  "kind": "node_created",
+  "payload_json": "{\"node_id\":1,\"label\":\"person\"}"
+}
+```
 
 #### Server
 
@@ -501,7 +547,7 @@ Connect on port `6380` with any Redis client or `weav-cli`. Commands are sent as
 
 ### gRPC
 
-Connect on port `6381`. Proto definitions in `weav-proto/proto/weav.proto`. Supports 22 RPC methods including `ContextQueryStream` for streaming results.
+Connect on port `6381`. Proto definitions in `weav-proto/proto/weav.proto`. Supports 23 RPC methods including `ContextQueryStream` for streaming results and `SubscribeEvents` for CDC replay + live follow.
 
 ---
 
@@ -537,8 +583,10 @@ result.to_messages()   # OpenAI-compatible message list
 **Full parameter support:**
 
 ```python
-result = client.context("my_graph",
+result = client.context({"workspace_id": "acme", "user_id": "u_123"},
     query="transformer architectures",
+    retrieval_mode="hybrid",
+    rerank={"provider": "cross_encoder", "candidate_limit": 25, "score_weight": 0.35},
     budget=4096,
     decay={"type": "exponential", "half_life_ms": 3600000},
     edge_labels=["derived_from", "related_to"],
@@ -564,8 +612,10 @@ const client = new WeavClient({ host: "localhost", port: 6382 });
 // new WeavClient({ host: "localhost", port: 6382, username: "admin", password: "secret" });
 
 const result = await client.context({
-  graph: "my_graph",
+  scope: { workspaceId: "acme", userId: "u_123" },
   query: "...",
+  retrievalMode: "hybrid",
+  rerank: { provider: "cross_encoder", candidateLimit: 25, scoreWeight: 0.35 },
   budget: 4096,
   decay: { type: "exponential", halfLifeMs: 3600000 },
   edgeLabels: ["related_to", "derived_from"],
@@ -734,6 +784,10 @@ cargo bench
 | `bfs_100kn_depth3` | 100K nodes, avg degree 5 | BFS traversal to depth 3 |
 | `flow_score_100kn_depth3` | 100K nodes, avg degree 5 | Relevance flow scoring |
 | `node_adjacency_10k` | 10K insertions | Adjacency insert throughput |
+| `duplicate_suppression/*` | 500 canonical entities | Full-scan vs blocked duplicate suppression precision |
+| `link_existing_precision_at_1` | 200 canonical entities | Mixed exact-key + fuzzy link-to-existing precision |
+| `retrieval_lift/*` | Summary-search eval graph | Precision lift from `global` and `hybrid` retrieval |
+| `rerank_lift/*` | Seeded local graph | Top-1 precision lift from cross-encoder reranking |
 
 Benchmarks produce HTML reports via [criterion](https://github.com/bheisler/criterion.rs).
 

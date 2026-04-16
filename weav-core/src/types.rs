@@ -89,16 +89,17 @@ impl BiTemporal {
     /// Both the record interval and query interval are half-open: [from, until).
     /// Empty intervals (start == end or valid_from == valid_until) never overlap.
     pub fn is_valid_during(&self, start: Timestamp, end: Timestamp) -> bool {
-        start < end && self.valid_from < self.valid_until
-            && self.valid_from < end && self.valid_until > start
+        start < end
+            && self.valid_from < self.valid_until
+            && self.valid_from < end
+            && self.valid_until > start
     }
 
     /// Returns `true` if this record was created in the database during [start, end).
     /// Both the record interval and query interval are half-open: [from, until).
     /// Empty intervals (start == end or tx_from == tx_until) never overlap.
     pub fn was_current_during(&self, start: Timestamp, end: Timestamp) -> bool {
-        start < end && self.tx_from < self.tx_until
-            && self.tx_from < end && self.tx_until > start
+        start < end && self.tx_from < self.tx_until && self.tx_from < end && self.tx_until > start
     }
 }
 
@@ -241,7 +242,11 @@ impl Provenance {
     pub fn new(source: impl Into<CompactString>, confidence: f32) -> Self {
         Self {
             source: source.into(),
-            confidence: if confidence.is_nan() { 0.0 } else { confidence.clamp(0.0, 1.0) },
+            confidence: if confidence.is_nan() {
+                0.0
+            } else {
+                confidence.clamp(0.0, 1.0)
+            },
             extraction_method: ExtractionMethod::UserProvided,
             source_document_id: None,
             source_chunk_offset: None,
@@ -262,6 +267,123 @@ pub enum ExtractionMethod {
     Derived,
     /// Bulk imported from an external source.
     Imported,
+}
+
+/// How aggressively the ingest pipeline should try to resolve entity aliases.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolutionMode {
+    /// Preserve extracted names as-is.
+    Off,
+    /// Use existing exact/fuzzy heuristics only.
+    #[default]
+    Heuristic,
+    /// Allow the LLM to emit canonical names that are applied during ingest.
+    Semantic,
+}
+
+impl ResolutionMode {
+    /// Parse a resolution mode string (case-insensitive).
+    pub fn from_str_lossy(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "off" | "none" => Some(Self::Off),
+            "heuristic" | "heuristics" => Some(Self::Heuristic),
+            "semantic" | "llm" => Some(Self::Semantic),
+            _ => None,
+        }
+    }
+}
+
+/// How a context query should retrieve results.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalMode {
+    /// Existing traversal-first context retrieval.
+    #[default]
+    Local,
+    /// Search stored `_community_summary` nodes only.
+    Global,
+    /// Fuse local traversal results with global community-summary hits.
+    Hybrid,
+    /// Reserved for a future second-pass retrieval mode.
+    Drift,
+}
+
+impl RetrievalMode {
+    /// Parse a retrieval mode string (case-insensitive).
+    pub fn from_str_lossy(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "local" => Some(Self::Local),
+            "global" => Some(Self::Global),
+            "hybrid" => Some(Self::Hybrid),
+            "drift" => Some(Self::Drift),
+            _ => None,
+        }
+    }
+}
+
+pub const fn default_rerank_enabled() -> bool {
+    true
+}
+
+pub const fn default_rerank_candidate_limit() -> u32 {
+    50
+}
+
+pub const fn default_rerank_score_weight() -> f32 {
+    0.35
+}
+
+/// Optional reranking applied after chunk construction and before budget enforcement.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RerankConfig {
+    #[serde(default = "default_rerank_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default = "default_rerank_candidate_limit")]
+    pub candidate_limit: u32,
+    #[serde(default = "default_rerank_score_weight")]
+    pub score_weight: f32,
+}
+
+impl Default for RerankConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_rerank_enabled(),
+            provider: None,
+            model: None,
+            candidate_limit: default_rerank_candidate_limit(),
+            score_weight: default_rerank_score_weight(),
+        }
+    }
+}
+
+impl RerankConfig {
+    /// Return the normalized provider identifier for supported rerankers.
+    pub fn supported_provider(&self) -> Option<&'static str> {
+        let provider = self.provider.as_deref()?.trim();
+        if provider.is_empty() {
+            return None;
+        }
+
+        match provider.to_ascii_lowercase().as_str() {
+            "cross_encoder" | "cross-encoder" | "crossencoder" => Some("cross_encoder"),
+            _ => None,
+        }
+    }
+
+    /// Whether reranking should be attempted.
+    pub fn is_active(&self) -> bool {
+        self.enabled && self.supported_provider().is_some() && self.candidate_limit > 0
+    }
+
+    /// Clamp the score blend weight to a valid range.
+    pub fn clamped_score_weight(&self) -> f32 {
+        self.score_weight.clamp(0.0, 1.0)
+    }
 }
 
 // ─── Token Budget ──────────────────────────────────────────────────────────
@@ -384,7 +506,6 @@ impl DecayFunction {
     }
 }
 
-
 // ─── Conflict Resolution ───────────────────────────────────────────────────
 
 /// Policy for resolving conflicting writes to the same entity/property.
@@ -402,7 +523,6 @@ pub enum ConflictPolicy {
     /// Reject conflicting writes.
     Reject,
 }
-
 
 // ─── Node / Edge data (for insertion) ──────────────────────────────────────
 
@@ -544,9 +664,7 @@ mod tests {
 
     #[test]
     fn test_decay_exponential() {
-        let d = DecayFunction::Exponential {
-            half_life_ms: 1000,
-        };
+        let d = DecayFunction::Exponential { half_life_ms: 1000 };
         let score = d.apply(1.0, 0, 1000);
         assert!((score - 0.5).abs() < 0.001);
 
@@ -688,10 +806,7 @@ mod tests {
         assert_eq!(Value::String("hi".into()).value_type(), ValueType::String);
         assert_eq!(Value::Bytes(vec![0]).value_type(), ValueType::Bytes);
         assert_eq!(Value::Vector(vec![1.0]).value_type(), ValueType::Vector);
-        assert_eq!(
-            Value::List(vec![Value::Null]).value_type(),
-            ValueType::List
-        );
+        assert_eq!(Value::List(vec![Value::Null]).value_type(), ValueType::List);
         assert_eq!(
             Value::Map(vec![("k".into(), Value::Null)]).value_type(),
             ValueType::Map
@@ -708,8 +823,79 @@ mod tests {
         let _e = ExtractionMethod::Imported;
 
         // Verify they compare correctly
-        assert_eq!(ExtractionMethod::LlmExtracted, ExtractionMethod::LlmExtracted);
+        assert_eq!(
+            ExtractionMethod::LlmExtracted,
+            ExtractionMethod::LlmExtracted
+        );
         assert_ne!(ExtractionMethod::LlmExtracted, ExtractionMethod::Imported);
+    }
+
+    #[test]
+    fn test_resolution_mode_defaults_and_parsing() {
+        assert_eq!(ResolutionMode::default(), ResolutionMode::Heuristic);
+        assert_eq!(
+            ResolutionMode::from_str_lossy("off"),
+            Some(ResolutionMode::Off)
+        );
+        assert_eq!(
+            ResolutionMode::from_str_lossy("Heuristic"),
+            Some(ResolutionMode::Heuristic)
+        );
+        assert_eq!(
+            ResolutionMode::from_str_lossy("semantic"),
+            Some(ResolutionMode::Semantic)
+        );
+        assert_eq!(ResolutionMode::from_str_lossy("unknown"), None);
+    }
+
+    #[test]
+    fn test_retrieval_mode_defaults_and_parsing() {
+        assert_eq!(RetrievalMode::default(), RetrievalMode::Local);
+        assert_eq!(
+            RetrievalMode::from_str_lossy("local"),
+            Some(RetrievalMode::Local)
+        );
+        assert_eq!(
+            RetrievalMode::from_str_lossy("GLOBAL"),
+            Some(RetrievalMode::Global)
+        );
+        assert_eq!(
+            RetrievalMode::from_str_lossy("hybrid"),
+            Some(RetrievalMode::Hybrid)
+        );
+        assert_eq!(
+            RetrievalMode::from_str_lossy("drift"),
+            Some(RetrievalMode::Drift)
+        );
+        assert_eq!(RetrievalMode::from_str_lossy("unknown"), None);
+    }
+
+    #[test]
+    fn test_rerank_config_defaults_and_provider_aliases() {
+        let config = RerankConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.candidate_limit, 50);
+        assert!((config.score_weight - 0.35).abs() < f32::EPSILON);
+        assert!(!config.is_active());
+
+        let alias = RerankConfig {
+            provider: Some("cross-encoder".into()),
+            ..RerankConfig::default()
+        };
+        assert_eq!(alias.supported_provider(), Some("cross_encoder"));
+        assert!(alias.is_active());
+    }
+
+    #[test]
+    fn test_rerank_config_clamps_weight_and_rejects_unknown_provider() {
+        let config = RerankConfig {
+            provider: Some("unsupported".into()),
+            score_weight: 2.0,
+            ..RerankConfig::default()
+        };
+        assert_eq!(config.supported_provider(), None);
+        assert!(!config.is_active());
+        assert!((config.clamped_score_weight() - 1.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -887,10 +1073,16 @@ mod tests {
             tx_from: 500,
             tx_until: 500,
         };
-        assert!(!bt.is_valid_at(500), "zero-width window should not be valid at boundary");
+        assert!(
+            !bt.is_valid_at(500),
+            "zero-width window should not be valid at boundary"
+        );
         assert!(!bt.is_valid_at(499));
         assert!(!bt.is_valid_at(501));
-        assert!(!bt.is_current_at(500), "zero-width tx window should not be current");
+        assert!(
+            !bt.is_current_at(500),
+            "zero-width tx window should not be current"
+        );
         assert!(!bt.is_active());
     }
 
@@ -903,8 +1095,14 @@ mod tests {
             tx_until: BiTemporal::OPEN,
         };
         // valid_from = MAX, valid_until = MAX => [MAX, MAX) is empty
-        assert!(!bt.is_valid_at(u64::MAX), "half-open at MAX should be invalid");
-        assert!(!bt.is_valid_at(u64::MAX - 1), "below MAX not >= valid_from if MAX-1 < MAX");
+        assert!(
+            !bt.is_valid_at(u64::MAX),
+            "half-open at MAX should be invalid"
+        );
+        assert!(
+            !bt.is_valid_at(u64::MAX - 1),
+            "below MAX not >= valid_from if MAX-1 < MAX"
+        );
         // Actually MAX-1 < MAX so valid_from(MAX) <= MAX-1 is false
     }
 
@@ -976,12 +1174,10 @@ mod tests {
     #[test]
     fn test_value_nested_structures() {
         let nested = Value::List(vec![
-            Value::Map(vec![
-                ("inner_list".into(), Value::List(vec![
-                    Value::Int(42),
-                    Value::String("deep".into()),
-                ])),
-            ]),
+            Value::Map(vec![(
+                "inner_list".into(),
+                Value::List(vec![Value::Int(42), Value::String("deep".into())]),
+            )]),
             Value::List(vec![Value::Null]),
         ]);
         assert_eq!(nested.type_name(), "list");
@@ -1032,7 +1228,13 @@ mod tests {
             text_chunks_pct: 0.1,
             metadata_pct: 0.1,
         };
-        if let TokenAllocation::Proportional { entities_pct, relationships_pct, text_chunks_pct, metadata_pct } = alloc {
+        if let TokenAllocation::Proportional {
+            entities_pct,
+            relationships_pct,
+            text_chunks_pct,
+            metadata_pct,
+        } = alloc
+        {
             let sum = entities_pct + relationships_pct + text_chunks_pct + metadata_pct;
             assert!((sum - 0.5).abs() < 0.001, "sum should be 0.5, got {sum}");
         }
@@ -1044,7 +1246,13 @@ mod tests {
             text_chunks_pct: 0.5,
             metadata_pct: 0.5,
         };
-        if let TokenAllocation::Proportional { entities_pct, relationships_pct, text_chunks_pct, metadata_pct } = over {
+        if let TokenAllocation::Proportional {
+            entities_pct,
+            relationships_pct,
+            text_chunks_pct,
+            metadata_pct,
+        } = over
+        {
             let sum = entities_pct + relationships_pct + text_chunks_pct + metadata_pct;
             assert!((sum - 2.0).abs() < 0.001);
         }

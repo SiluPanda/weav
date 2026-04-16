@@ -5,11 +5,18 @@ from .integrations import WeavLangChain, WeavLlamaIndex
 from .types import (
     ContextChunk,
     ContextResult,
+    IngestParams,
     GraphInfo,
+    GraphRef,
     IngestResult,
     NodeInfo,
     Provenance,
+    RerankConfig,
+    RetrievalMode,
+    ResolutionMode,
     RelationshipSummary,
+    ScopeRef,
+    scope_to_graph,
 )
 
 __all__ = [
@@ -20,9 +27,16 @@ __all__ = [
     "WeavLlamaIndex",
     "ContextChunk",
     "ContextResult",
+    "IngestParams",
     "GraphInfo",
+    "GraphRef",
     "IngestResult",
     "NodeInfo",
     "Provenance",
+    "RerankConfig",
+    "RetrievalMode",
+    "ResolutionMode",
     "RelationshipSummary",
+    "ScopeRef",
+    "scope_to_graph",
 ]

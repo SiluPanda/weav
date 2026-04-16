@@ -223,7 +223,8 @@ impl PropertyStore {
 
     /// Create a secondary index for a property key, building from existing data.
     pub fn create_index(&mut self, key: &str) {
-        self.index.build_for_key(key, &self.schema, &self.node_columns);
+        self.index
+            .build_for_key(key, &self.schema, &self.node_columns);
     }
 
     pub fn nodes_with_property(&self, key: &str) -> Vec<NodeId> {
@@ -257,11 +258,7 @@ impl PropertyStore {
         };
         self.edge_overflow
             .iter()
-            .filter(|(_, props)| {
-                props
-                    .iter()
-                    .any(|(k, v)| *k == key_id && predicate(v))
-            })
+            .filter(|(_, props)| props.iter().any(|(k, v)| *k == key_id && predicate(v)))
             .map(|(&eid, _)| eid)
             .collect()
     }
@@ -285,10 +282,7 @@ impl PropertyStore {
     pub fn get_edge_property(&self, edge_id: EdgeId, key: &str) -> Option<&Value> {
         let key_id = self.schema.get(key)?;
         let props = self.edge_overflow.get(&edge_id)?;
-        props
-            .iter()
-            .find(|(k, _)| k == key_id)
-            .map(|(_, v)| v)
+        props.iter().find(|(k, _)| k == key_id).map(|(_, v)| v)
     }
 
     /// Get all properties for an edge.
@@ -319,7 +313,13 @@ impl PropertyStore {
 fn value_char_len(val: &Value) -> u32 {
     match val {
         Value::Null => 4,
-        Value::Bool(b) => if *b { 4 } else { 5 },
+        Value::Bool(b) => {
+            if *b {
+                4
+            } else {
+                5
+            }
+        }
         Value::Int(i) => i.to_string().len() as u32,
         Value::Float(f) => f.to_string().len() as u32,
         Value::String(s) => s.len() as u32,
@@ -414,7 +414,10 @@ mod tests {
         store.set_node_properties_batch(
             1,
             vec![
-                ("name".to_string(), Value::String(CompactString::from("Alice"))),
+                (
+                    "name".to_string(),
+                    Value::String(CompactString::from("Alice")),
+                ),
                 ("age".to_string(), Value::Int(30)),
             ],
         );
@@ -447,9 +450,8 @@ mod tests {
         store.set_node_property(2, "age", Value::Int(30));
         store.set_node_property(3, "age", Value::Int(40));
 
-        let mut adults = store.nodes_where("age", &|v| {
-            v.as_int().map(|i| i >= 30).unwrap_or(false)
-        });
+        let mut adults =
+            store.nodes_where("age", &|v| v.as_int().map(|i| i >= 30).unwrap_or(false));
         adults.sort();
         assert_eq!(adults, vec![2, 3]);
     }
@@ -562,7 +564,10 @@ mod tests {
             "map_val",
             Value::Map(vec![
                 (CompactString::from("k1"), Value::Int(10)),
-                (CompactString::from("k2"), Value::String(CompactString::from("v2"))),
+                (
+                    CompactString::from("k2"),
+                    Value::String(CompactString::from("v2")),
+                ),
             ]),
         );
         store.set_node_property(1, "timestamp_val", Value::Timestamp(12345));
@@ -706,8 +711,14 @@ mod tests {
         store.set_edge_property(200, "weight", Value::Float(0.9));
         store.set_edge_property(200, "type", Value::String(CompactString::from("knows")));
 
-        assert_eq!(store.get_edge_property(100, "weight"), Some(&Value::Float(0.5)));
-        assert_eq!(store.get_edge_property(200, "weight"), Some(&Value::Float(0.9)));
+        assert_eq!(
+            store.get_edge_property(100, "weight"),
+            Some(&Value::Float(0.5))
+        );
+        assert_eq!(
+            store.get_edge_property(200, "weight"),
+            Some(&Value::Float(0.9))
+        );
         assert_eq!(store.get_all_edge_properties(100).len(), 1);
         assert_eq!(store.get_all_edge_properties(200).len(), 2);
     }
@@ -864,9 +875,7 @@ mod tests {
         store.set_node_property(3, "city", Value::String(CompactString::from("NYC")));
 
         // Without index: use nodes_where
-        let mut scan_result = store.nodes_where("city", &|v| {
-            v.as_str() == Some("NYC")
-        });
+        let mut scan_result = store.nodes_where("city", &|v| v.as_str() == Some("NYC"));
         scan_result.sort();
 
         // Create index and use lookup

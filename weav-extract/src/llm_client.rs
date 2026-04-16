@@ -4,6 +4,7 @@ use llm::builder::LLMBackend;
 use llm::chat::ChatMessage;
 use weav_core::config::ExtractConfig;
 use weav_core::error::{WeavError, WeavResult};
+use weav_core::types::ResolutionMode;
 
 use crate::types::{LlmExtractionOutput, TextChunk};
 
@@ -26,13 +27,19 @@ impl LlmClient {
         chunks: &[TextChunk],
         entity_types: Option<&[String]>,
         custom_prompt: Option<&str>,
+        resolution_mode: ResolutionMode,
+        custom_resolution_prompt: Option<&str>,
     ) -> WeavResult<LlmExtractionOutput> {
-        let schema = serde_json::to_string_pretty(
-            &schemars::schema_for!(LlmExtractionOutput),
-        )
-        .map_err(|e| WeavError::ExtractionError(format!("failed to generate schema: {e}")))?;
+        let schema = serde_json::to_string_pretty(&schemars::schema_for!(LlmExtractionOutput))
+            .map_err(|e| WeavError::ExtractionError(format!("failed to generate schema: {e}")))?;
 
-        let system_prompt = build_extraction_prompt(&schema, entity_types, custom_prompt);
+        let system_prompt = build_extraction_prompt(
+            &schema,
+            entity_types,
+            custom_prompt,
+            resolution_mode,
+            custom_resolution_prompt,
+        );
 
         let combined_text: String = chunks
             .iter()
@@ -56,17 +63,16 @@ impl LlmClient {
             builder = builder.base_url(base_url);
         }
 
-        let llm_instance = builder.build().map_err(|e| {
-            WeavError::LlmError(format!("failed to build LLM client: {e}"))
-        })?;
+        let llm_instance = builder
+            .build()
+            .map_err(|e| WeavError::LlmError(format!("failed to build LLM client: {e}")))?;
 
-        let messages = vec![
-            ChatMessage::user().content(&combined_text).build(),
-        ];
+        let messages = vec![ChatMessage::user().content(&combined_text).build()];
 
-        let response = llm_instance.chat(&messages).await.map_err(|e| {
-            WeavError::LlmError(format!("LLM extraction call failed: {e}"))
-        })?;
+        let response = llm_instance
+            .chat(&messages)
+            .await
+            .map_err(|e| WeavError::LlmError(format!("LLM extraction call failed: {e}")))?;
 
         let response_text = response
             .text()
@@ -98,16 +104,17 @@ impl LlmClient {
             builder = builder.base_url(base_url);
         }
 
-        let llm_instance = builder.build().map_err(|e| {
-            WeavError::LlmError(format!("failed to build embedding client: {e}"))
-        })?;
+        let llm_instance = builder
+            .build()
+            .map_err(|e| WeavError::LlmError(format!("failed to build embedding client: {e}")))?;
 
         let mut all_embeddings = Vec::with_capacity(texts.len());
         for batch in texts.chunks(self.config.embedding_batch_size) {
             let batch_vec: Vec<String> = batch.to_vec();
-            let embeddings = llm_instance.embed(batch_vec).await.map_err(|e| {
-                WeavError::LlmError(format!("embedding call failed: {e}"))
-            })?;
+            let embeddings = llm_instance
+                .embed(batch_vec)
+                .await
+                .map_err(|e| WeavError::LlmError(format!("embedding call failed: {e}")))?;
             all_embeddings.extend(embeddings);
         }
 
@@ -140,6 +147,8 @@ fn build_extraction_prompt(
     schema: &str,
     entity_types: Option<&[String]>,
     custom_prompt: Option<&str>,
+    resolution_mode: ResolutionMode,
+    custom_resolution_prompt: Option<&str>,
 ) -> String {
     let mut prompt = String::from(
         "You are an expert knowledge graph extraction system. \
@@ -155,6 +164,19 @@ fn build_extraction_prompt(
 
     if let Some(custom) = custom_prompt {
         prompt.push_str(&format!("Additional instructions: {custom}\n\n"));
+    }
+
+    if matches!(resolution_mode, ResolutionMode::Semantic) {
+        prompt.push_str(
+            "Alias resolution mode is enabled. When two mentions in the provided text refer \
+             to the same entity, add a `canonical_name` string inside that entity's `properties` \
+             object and set it to the most canonical mention from the provided text. \
+             Omit `canonical_name` when the entity name is already canonical.\n\n",
+        );
+
+        if let Some(custom) = custom_resolution_prompt {
+            prompt.push_str(&format!("Resolution instructions: {custom}\n\n"));
+        }
     }
 
     prompt.push_str(&format!(
@@ -232,7 +254,8 @@ mod tests {
 
     #[test]
     fn test_parse_extraction_response_valid() {
-        let json = r#"{"entities": [{"name": "Alice", "entity_type": "Person"}], "relationships": []}"#;
+        let json =
+            r#"{"entities": [{"name": "Alice", "entity_type": "Person"}], "relationships": []}"#;
         let result = parse_extraction_response(json).unwrap();
         assert_eq!(result.entities.len(), 1);
         assert_eq!(result.entities[0].name, "Alice");
@@ -246,7 +269,7 @@ mod tests {
 
     #[test]
     fn test_build_extraction_prompt_basic() {
-        let prompt = build_extraction_prompt("{}", None, None);
+        let prompt = build_extraction_prompt("{}", None, None, ResolutionMode::Heuristic, None);
         assert!(prompt.contains("knowledge graph extraction"));
         assert!(prompt.contains("JSON"));
     }
@@ -254,14 +277,34 @@ mod tests {
     #[test]
     fn test_build_extraction_prompt_with_entity_types() {
         let types = vec!["Person".into(), "Organization".into()];
-        let prompt = build_extraction_prompt("{}", Some(&types), None);
+        let prompt =
+            build_extraction_prompt("{}", Some(&types), None, ResolutionMode::Heuristic, None);
         assert!(prompt.contains("Person, Organization"));
     }
 
     #[test]
     fn test_build_extraction_prompt_with_custom() {
-        let prompt = build_extraction_prompt("{}", None, Some("Focus on technical entities"));
+        let prompt = build_extraction_prompt(
+            "{}",
+            None,
+            Some("Focus on technical entities"),
+            ResolutionMode::Heuristic,
+            None,
+        );
         assert!(prompt.contains("Focus on technical entities"));
+    }
+
+    #[test]
+    fn test_build_extraction_prompt_with_semantic_resolution() {
+        let prompt = build_extraction_prompt(
+            "{}",
+            None,
+            None,
+            ResolutionMode::Semantic,
+            Some("Prefer full company names."),
+        );
+        assert!(prompt.contains("canonical_name"));
+        assert!(prompt.contains("Prefer full company names."));
     }
 
     #[test]

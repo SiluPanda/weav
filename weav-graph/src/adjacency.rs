@@ -6,9 +6,7 @@ use roaring::RoaringTreemap;
 use smallvec::SmallVec;
 
 use weav_core::error::WeavError;
-use weav_core::types::{
-    BiTemporal, Direction, EdgeId, LabelId, NodeId, Provenance, Timestamp,
-};
+use weav_core::types::{BiTemporal, Direction, EdgeId, LabelId, NodeId, Provenance, Timestamp};
 
 /// Metadata stored for each edge.
 pub struct EdgeMeta {
@@ -34,10 +32,7 @@ impl DirectedAdjacency {
     }
 
     fn add(&mut self, from: NodeId, to: NodeId, edge_id: EdgeId) {
-        self.adjacency
-            .entry(from)
-            .or_default()
-            .push((to, edge_id));
+        self.adjacency.entry(from).or_default().push((to, edge_id));
     }
 
     fn remove_edge(&mut self, from: NodeId, edge_id: EdgeId) {
@@ -189,10 +184,7 @@ impl AdjacencyStore {
             .add(tgt, src, edge_id);
 
         // Maintain pair index
-        self.pair_index
-            .entry((src, tgt))
-            .or_default()
-            .push(edge_id);
+        self.pair_index.entry((src, tgt)).or_default().push(edge_id);
 
         self.edge_meta.insert(edge_id, meta);
         Ok(())
@@ -229,6 +221,7 @@ impl AdjacencyStore {
             .get_mut(&edge_id)
             .ok_or(WeavError::EdgeNotFound(edge_id))?;
         meta.temporal.invalidate(invalid_at);
+        meta.temporal.supersede(invalid_at);
         Ok(())
     }
 
@@ -275,12 +268,7 @@ impl AdjacencyStore {
         result
     }
 
-    pub fn edge_between(
-        &self,
-        src: NodeId,
-        tgt: NodeId,
-        label: Option<LabelId>,
-    ) -> Option<EdgeId> {
+    pub fn edge_between(&self, src: NodeId, tgt: NodeId, label: Option<LabelId>) -> Option<EdgeId> {
         if let Some(pair_edges) = self.pair_index.get(&(src, tgt)) {
             match label {
                 Some(lbl) => pair_edges
@@ -554,6 +542,7 @@ mod tests {
         store.invalidate_edge(eid, 2000).unwrap();
         let edge = store.get_edge(eid).unwrap();
         assert_eq!(edge.temporal.valid_until, 2000);
+        assert_eq!(edge.temporal.tx_until, 2000);
         assert!(edge.temporal.is_valid_at(1500));
         assert!(!edge.temporal.is_valid_at(2500));
     }
@@ -822,7 +811,9 @@ mod tests {
         let mut store = AdjacencyStore::new();
         store.add_node(1);
         store.add_node(2);
-        store.add_edge(1, 2, 0, make_meta_at(1, 2, 0, 1000)).unwrap();
+        store
+            .add_edge(1, 2, 0, make_meta_at(1, 2, 0, 1000))
+            .unwrap();
 
         // Timestamp 500 is before valid_from(1000)
         let result = store.neighbors_at(1, 500, None);
@@ -834,7 +825,9 @@ mod tests {
         let mut store = AdjacencyStore::new();
         store.add_node(1);
         store.add_node(2);
-        store.add_edge(1, 2, 0, make_meta_at(1, 2, 0, 1000)).unwrap();
+        store
+            .add_edge(1, 2, 0, make_meta_at(1, 2, 0, 1000))
+            .unwrap();
 
         // At valid_from: is_valid_at uses inclusive lower bound [from, until)
         let result = store.neighbors_at(1, 1000, None);
@@ -846,7 +839,9 @@ mod tests {
         let mut store = AdjacencyStore::new();
         store.add_node(1);
         store.add_node(2);
-        let eid = store.add_edge(1, 2, 0, make_meta_at(1, 2, 0, 1000)).unwrap();
+        let eid = store
+            .add_edge(1, 2, 0, make_meta_at(1, 2, 0, 1000))
+            .unwrap();
         store.invalidate_edge(eid, 2000).unwrap();
 
         // At valid_until(2000): exclusive upper bound, so NOT included

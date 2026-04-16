@@ -183,7 +183,10 @@ fn decode_value(
             match read_line(buf, pos)? {
                 Some(line) => {
                     let n: i64 = line.parse().map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, format!("invalid number: {line}"))
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid number: {line}"),
+                        )
                     })?;
                     Ok(Some(Resp3Value::Number(n)))
                 }
@@ -581,10 +584,7 @@ mod tests {
     #[test]
     fn test_nested_array_roundtrip() {
         let val = Resp3Value::Array(vec![
-            Resp3Value::Array(vec![
-                Resp3Value::Number(1),
-                Resp3Value::Number(2),
-            ]),
+            Resp3Value::Array(vec![Resp3Value::Number(1), Resp3Value::Number(2)]),
             Resp3Value::Array(vec![
                 Resp3Value::SimpleString("a".to_string()),
                 Resp3Value::BlobString(b"b".to_vec()),
@@ -708,9 +708,7 @@ mod tests {
         codec
             .encode(Resp3Value::SimpleString("first".to_string()), &mut buf)
             .unwrap();
-        codec
-            .encode(Resp3Value::Number(42), &mut buf)
-            .unwrap();
+        codec.encode(Resp3Value::Number(42), &mut buf).unwrap();
 
         let v1 = codec.decode(&mut buf).unwrap().unwrap();
         assert_eq!(v1, Resp3Value::SimpleString("first".to_string()));

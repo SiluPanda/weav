@@ -67,8 +67,10 @@ impl AclStore {
             let hash = config
                 .default_password
                 .as_ref()
-                .map(|p| password::hash_password(p)
-                    .map_err(|e| WeavError::Internal(format!("password hash failed: {e}"))))
+                .map(|p| {
+                    password::hash_password(p)
+                        .map_err(|e| WeavError::Internal(format!("password hash failed: {e}")))
+                })
                 .transpose()?;
             users.insert(
                 "default".into(),
@@ -195,12 +197,16 @@ impl AclStore {
                 parts.push("#<hashed>".into());
             }
             for acl in &user.graph_acl {
-                parts.push(format!("~{}:{}", acl.pattern, match acl.permission {
-                    GraphPermission::Read => "read",
-                    GraphPermission::ReadWrite => "readwrite",
-                    GraphPermission::Admin => "admin",
-                    GraphPermission::None => "none",
-                }));
+                parts.push(format!(
+                    "~{}:{}",
+                    acl.pattern,
+                    match acl.permission {
+                        GraphPermission::Read => "read",
+                        GraphPermission::ReadWrite => "readwrite",
+                        GraphPermission::Admin => "admin",
+                        GraphPermission::None => "none",
+                    }
+                ));
             }
             lines.push(parts.join(" "));
         }
@@ -226,8 +232,14 @@ fn acl_user_from_config(config: &UserConfig) -> WeavResult<AclUser> {
     let password_hash = config
         .password
         .as_ref()
-        .map(|p| password::hash_password(p)
-            .map_err(|e| WeavError::Internal(format!("password hash failed for '{}': {e}", config.username))))
+        .map(|p| {
+            password::hash_password(p).map_err(|e| {
+                WeavError::Internal(format!(
+                    "password hash failed for '{}': {e}",
+                    config.username
+                ))
+            })
+        })
         .transpose()?;
 
     let categories = if config.categories.is_empty() {
@@ -484,12 +496,10 @@ mod tests {
             username: "reader".into(),
             password: Some("pass".into()),
             categories: vec!["+@read".into(), "+@connection".into()],
-            graph_patterns: vec![
-                weav_core::config::GraphPatternConfig {
-                    pattern: "app:*".into(),
-                    permission: "read".into(),
-                },
-            ],
+            graph_patterns: vec![weav_core::config::GraphPatternConfig {
+                pattern: "app:*".into(),
+                permission: "read".into(),
+            }],
             api_keys: Vec::new(),
             enabled: true,
         };

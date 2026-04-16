@@ -8,18 +8,18 @@
 use std::collections::HashMap;
 
 use rmcp::{
-    ErrorData as McpError, ServerHandler,
-    handler::server::wrapper::Parameters,
-    model::*,
-    schemars, tool, tool_handler, tool_router,
+    ErrorData as McpError, ServerHandler, handler::server::wrapper::Parameters, model::*, schemars,
+    tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
 
-use weav_core::types::{Direction, TokenAllocation, TokenBudget, Value};
+use weav_core::scope::{ScopeRef, resolve_graph_ref};
+use weav_core::types::{
+    Direction, RerankConfig, RetrievalMode, TokenAllocation, TokenBudget, Value,
+};
 use weav_query::parser::{
-    Command, ContextQuery, EdgeAddCmd, EdgeDeleteCmd, EdgeGetCmd, GraphCreateCmd,
-    IngestCmd, NodeAddCmd, NodeDeleteCmd, NodeGetCmd, NodeUpdateCmd, SchemaGetCmd,
-    SchemaSetCmd, SeedStrategy,
+    Command, ContextQuery, EdgeAddCmd, EdgeDeleteCmd, EdgeGetCmd, GraphCreateCmd, IngestCmd,
+    NodeAddCmd, NodeDeleteCmd, NodeGetCmd, NodeUpdateCmd, SchemaGetCmd, SchemaSetCmd, SeedStrategy,
 };
 use weav_server::engine::CommandResponse;
 
@@ -27,32 +27,59 @@ use crate::WeavMcpServer;
 
 // ─── Parameter structs ──────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct McpScopeRef {
+    pub workspace_id: Option<String>,
+    pub user_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub session_id: Option<String>,
+}
+
+impl From<&McpScopeRef> for ScopeRef {
+    fn from(value: &McpScopeRef) -> Self {
+        Self {
+            workspace_id: value.workspace_id.clone(),
+            user_id: value.user_id.clone(),
+            agent_id: value.agent_id.clone(),
+            session_id: value.session_id.clone(),
+        }
+    }
+}
+
 /// Parameters for graph_info tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GraphInfoParams {
     /// Name of the graph.
-    pub graph: String,
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
 }
 
 /// Parameters for graph_create tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GraphCreateParams {
     /// Name of the graph to create.
-    pub name: String,
+    pub name: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `name` is omitted.
+    pub scope: Option<McpScopeRef>,
 }
 
 /// Parameters for graph_drop tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GraphDropParams {
     /// Name of the graph to drop.
-    pub name: String,
+    pub name: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `name` is omitted.
+    pub scope: Option<McpScopeRef>,
 }
 
 /// Parameters for adding a node.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct NodeAddParams {
     /// Name of the graph to add the node to.
-    pub graph: String,
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
     /// Label for the node (e.g. "Person", "Document", "Concept").
     pub label: String,
     /// Key-value properties for the node.
@@ -66,7 +93,9 @@ pub struct NodeAddParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct NodeGetParams {
     /// Name of the graph.
-    pub graph: String,
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
     /// Node ID to look up (provide either node_id or entity_key).
     pub node_id: Option<u64>,
     /// Entity key to look up (provide either node_id or entity_key).
@@ -77,7 +106,9 @@ pub struct NodeGetParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SearchNodesParams {
     /// Name of the graph.
-    pub graph: String,
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
     /// Property key to search on.
     pub key: String,
     /// Value to match (compared as string, int, float, or bool).
@@ -90,7 +121,9 @@ pub struct SearchNodesParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetNeighborsParams {
     /// Name of the graph.
-    pub graph: String,
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
     /// Node ID to get neighbors for.
     pub node_id: u64,
 }
@@ -99,21 +132,40 @@ pub struct GetNeighborsParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ExportGraphParams {
     /// Name of the graph to export.
-    pub graph: String,
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
 }
 
 /// Parameters for getting graph statistics.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GraphStatsParams {
     /// Name of the graph.
-    pub graph: String,
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
+}
+
+/// Parameters for polling recent graph mutation events.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RecentEventsParams {
+    /// Optional graph filter. When omitted, returns events across all visible graphs.
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
+    /// Replay events strictly after this sequence number.
+    pub since_sequence: Option<u64>,
+    /// Maximum number of replayed events. Defaults to 100.
+    pub replay_limit: Option<u32>,
 }
 
 /// Parameters for updating a node's properties.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct NodeUpdateParams {
     /// Name of the graph.
-    pub graph: String,
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
     /// Node ID to update.
     pub node_id: u64,
     /// New key-value properties to set (merges with existing).
@@ -127,7 +179,9 @@ pub struct NodeUpdateParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct NodeDeleteParams {
     /// Name of the graph.
-    pub graph: String,
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
     /// Node ID to delete.
     pub node_id: u64,
 }
@@ -136,7 +190,9 @@ pub struct NodeDeleteParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EdgeGetParams {
     /// Name of the graph.
-    pub graph: String,
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
     /// Edge ID to retrieve.
     pub edge_id: u64,
 }
@@ -145,18 +201,50 @@ pub struct EdgeGetParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EdgeDeleteParams {
     /// Name of the graph.
-    pub graph: String,
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
     /// Edge ID to delete.
     pub edge_id: u64,
 }
 
 /// Parameters for context-aware retrieval with token budget.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct McpRerankConfig {
+    #[serde(default = "weav_core::types::default_rerank_enabled")]
+    pub enabled: bool,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    #[serde(default = "weav_core::types::default_rerank_candidate_limit")]
+    pub candidate_limit: u32,
+    #[serde(default = "weav_core::types::default_rerank_score_weight")]
+    pub score_weight: f32,
+}
+
+impl From<McpRerankConfig> for RerankConfig {
+    fn from(value: McpRerankConfig) -> Self {
+        Self {
+            enabled: value.enabled,
+            provider: value.provider,
+            model: value.model,
+            candidate_limit: value.candidate_limit,
+            score_weight: value.score_weight,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ContextQueryParams {
     /// Name of the graph.
-    pub graph: String,
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
     /// Natural language query text.
     pub query: Option<String>,
+    /// Retrieval mode: "local" (default), "global", "hybrid", or reserved "drift".
+    pub retrieval_mode: Option<String>,
+    /// Optional reranking config applied after chunk construction.
+    pub rerank: Option<McpRerankConfig>,
     /// Seed node entity keys to start traversal from.
     #[serde(default)]
     pub seed_keys: Vec<String>,
@@ -193,7 +281,9 @@ pub struct ContextQueryParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct VectorSearchParams {
     /// Name of the graph.
-    pub graph: String,
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
     /// Query embedding vector.
     pub embedding: Vec<f32>,
     /// Number of results to return (default 10).
@@ -208,7 +298,9 @@ pub struct VectorSearchParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GraphDiffParams {
     /// Name of the graph.
-    pub graph: String,
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
     /// Start timestamp (milliseconds since epoch).
     pub from_timestamp: u64,
     /// End timestamp (milliseconds since epoch).
@@ -219,7 +311,9 @@ pub struct GraphDiffParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CommunitySummarizeParams {
     /// Name of the graph.
-    pub graph: String,
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
     /// Algorithm to use: "leiden" (default) or "label_propagation".
     pub algorithm: Option<String>,
     /// Resolution parameter (default 1.0).
@@ -230,7 +324,9 @@ pub struct CommunitySummarizeParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CommunitySearchParams {
     /// Name of the graph.
-    pub graph: String,
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
     /// Search query text.
     pub query: String,
     /// Maximum results (default 10).
@@ -241,7 +337,9 @@ pub struct CommunitySearchParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RunAlgorithmParams {
     /// Name of the graph.
-    pub graph: String,
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
     /// Algorithm name: "pagerank", "communities", "shortest_path", "connected_components",
     /// "betweenness", "closeness", "degree", "triangle_count", "scc", "topological_sort".
     pub algorithm: String,
@@ -261,7 +359,9 @@ pub struct RunAlgorithmParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EdgeAddParams {
     /// Name of the graph.
-    pub graph: String,
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
     /// Source node ID.
     pub source: u64,
     /// Target node ID.
@@ -279,20 +379,32 @@ pub struct EdgeAddParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct IngestDocumentParams {
     /// Name of the graph.
-    pub graph: String,
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
     /// Document content (text, markdown, etc.).
     pub content: String,
     /// Format hint: "text", "markdown", "csv", "pdf". Defaults to "text".
     pub format: Option<String>,
     /// Optional document ID for tracking.
     pub document_id: Option<String>,
+    /// Alias resolution mode for extracted entities: off, heuristic, or semantic.
+    pub resolution_mode: Option<String>,
+    /// When true, link extracted entities to existing graph-local entities when possible.
+    pub link_existing_entities: Option<bool>,
+    /// Maximum number of graph-local resolution candidates to inspect.
+    pub resolution_candidate_limit: Option<usize>,
+    /// Additional instructions for semantic alias resolution.
+    pub custom_resolution_prompt: Option<String>,
 }
 
 /// Parameters for setting a schema constraint.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SchemaSetParams {
     /// Name of the graph.
-    pub graph: String,
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
     /// Target: "node" or "edge".
     pub target: String,
     /// Label to apply the constraint to (e.g. "Person", "KNOWS").
@@ -309,7 +421,9 @@ pub struct SchemaSetParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SchemaGetParams {
     /// Name of the graph.
-    pub graph: String,
+    pub graph: Option<String>,
+    /// Hierarchical scope resolved to a canonical graph name when `graph` is omitted.
+    pub scope: Option<McpScopeRef>,
 }
 
 /// Parameters for setting a config key.
@@ -327,6 +441,25 @@ pub struct TriggerSnapshotParams {}
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+fn resolve_graph_input(
+    graph: Option<&str>,
+    scope: Option<&McpScopeRef>,
+) -> Result<String, McpError> {
+    let scope = scope.map(ScopeRef::from);
+    resolve_graph_ref(graph, scope.as_ref())
+        .map_err(|err| McpError::invalid_params(err.to_string(), None))
+}
+
+fn resolve_optional_graph_input(
+    graph: Option<&str>,
+    scope: Option<&McpScopeRef>,
+) -> Result<Option<String>, McpError> {
+    match (graph, scope) {
+        (None, None) => Ok(None),
+        _ => resolve_graph_input(graph, scope).map(Some),
+    }
+}
+
 /// Convert a `serde_json::Value` to a Weav `Value`.
 fn json_to_value(v: &serde_json::Value) -> Value {
     match v {
@@ -341,16 +474,17 @@ fn json_to_value(v: &serde_json::Value) -> Value {
                 Value::Null
             }
         }
-        serde_json::Value::String(s) => {
-            Value::String(compact_str::CompactString::from(s.as_str()))
-        }
-        serde_json::Value::Array(arr) => {
-            Value::List(arr.iter().map(json_to_value).collect())
-        }
+        serde_json::Value::String(s) => Value::String(compact_str::CompactString::from(s.as_str())),
+        serde_json::Value::Array(arr) => Value::List(arr.iter().map(json_to_value).collect()),
         serde_json::Value::Object(obj) => {
             let pairs = obj
                 .iter()
-                .map(|(k, v)| (compact_str::CompactString::from(k.as_str()), json_to_value(v)))
+                .map(|(k, v)| {
+                    (
+                        compact_str::CompactString::from(k.as_str()),
+                        json_to_value(v),
+                    )
+                })
                 .collect();
             Value::Map(pairs)
         }
@@ -367,9 +501,7 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         Value::String(s) => serde_json::Value::String(s.to_string()),
         Value::Bytes(b) => serde_json::json!(b),
         Value::Vector(v) => serde_json::json!(v),
-        Value::List(items) => {
-            serde_json::Value::Array(items.iter().map(value_to_json).collect())
-        }
+        Value::List(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
         Value::Map(pairs) => {
             let mut map = serde_json::Map::new();
             for (k, v) in pairs {
@@ -391,9 +523,8 @@ fn props_to_pairs(props: &HashMap<String, serde_json::Value>) -> Vec<(String, Va
 
 /// Build a success `CallToolResult` from a JSON-serializable value.
 fn success_json<T: serde::Serialize>(value: &T) -> Result<CallToolResult, McpError> {
-    let text = serde_json::to_string_pretty(value).map_err(|e| {
-        McpError::internal_error(format!("JSON serialization failed: {e}"), None)
-    })?;
+    let text = serde_json::to_string_pretty(value)
+        .map_err(|e| McpError::internal_error(format!("JSON serialization failed: {e}"), None))?;
     Ok(CallToolResult::success(vec![Content::text(text)]))
 }
 
@@ -427,15 +558,15 @@ impl WeavMcpServer {
     }
 
     /// Get information about a graph.
-    #[tool(description = "Get information about a graph including its name, node count, and edge count.")]
+    #[tool(
+        description = "Get information about a graph including its name, node count, and edge count."
+    )]
     fn graph_info(
         &self,
         Parameters(params): Parameters<GraphInfoParams>,
     ) -> Result<CallToolResult, McpError> {
-        match self
-            .engine
-            .execute_command(Command::GraphInfo(params.graph), None)
-        {
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
+        match self.engine.execute_command(Command::GraphInfo(graph), None) {
             Ok(CommandResponse::GraphInfo(info)) => success_json(&serde_json::json!({
                 "name": info.name,
                 "node_count": info.node_count,
@@ -457,14 +588,15 @@ impl WeavMcpServer {
         &self,
         Parameters(params): Parameters<GraphCreateParams>,
     ) -> Result<CallToolResult, McpError> {
+        let graph = resolve_graph_input(params.name.as_deref(), params.scope.as_ref())?;
         let cmd = Command::GraphCreate(GraphCreateCmd {
-            name: params.name.clone(),
+            name: graph.clone(),
             config: None,
         });
         match self.engine.execute_command(cmd, None) {
             Ok(CommandResponse::Ok) => success_json(&serde_json::json!({
                 "status": "created",
-                "graph": params.name,
+                "graph": graph,
             })),
             Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "{resp:?}"
@@ -479,13 +611,14 @@ impl WeavMcpServer {
         &self,
         Parameters(params): Parameters<GraphDropParams>,
     ) -> Result<CallToolResult, McpError> {
+        let graph = resolve_graph_input(params.name.as_deref(), params.scope.as_ref())?;
         match self
             .engine
-            .execute_command(Command::GraphDrop(params.name.clone()), None)
+            .execute_command(Command::GraphDrop(graph.clone()), None)
         {
             Ok(CommandResponse::Ok) => success_json(&serde_json::json!({
                 "status": "dropped",
-                "graph": params.name,
+                "graph": graph,
             })),
             Ok(resp) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "{resp:?}"
@@ -495,13 +628,16 @@ impl WeavMcpServer {
     }
 
     /// Add a node to a graph.
-    #[tool(description = "Add a node to a graph with a label and optional properties. Returns the assigned node ID.")]
+    #[tool(
+        description = "Add a node to a graph with a label and optional properties. Returns the assigned node ID."
+    )]
     fn node_add(
         &self,
         Parameters(params): Parameters<NodeAddParams>,
     ) -> Result<CallToolResult, McpError> {
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
         let cmd = Command::NodeAdd(NodeAddCmd {
-            graph: params.graph,
+            graph,
             label: params.label,
             properties: props_to_pairs(&params.properties),
             embedding: None,
@@ -520,13 +656,16 @@ impl WeavMcpServer {
     }
 
     /// Get a node by ID or entity key.
-    #[tool(description = "Get a node from a graph by its numeric ID or entity key. Returns the node's label and properties.")]
+    #[tool(
+        description = "Get a node from a graph by its numeric ID or entity key. Returns the node's label and properties."
+    )]
     fn node_get(
         &self,
         Parameters(params): Parameters<NodeGetParams>,
     ) -> Result<CallToolResult, McpError> {
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
         let cmd = Command::NodeGet(NodeGetCmd {
-            graph: params.graph,
+            graph,
             node_id: params.node_id,
             entity_key: params.entity_key,
         });
@@ -554,13 +693,16 @@ impl WeavMcpServer {
     }
 
     /// Add an edge between two nodes.
-    #[tool(description = "Add a directed edge between two nodes in a graph. Specify source and target node IDs, a label, and an optional weight (0.0 to 1.0).")]
+    #[tool(
+        description = "Add a directed edge between two nodes in a graph. Specify source and target node IDs, a label, and an optional weight (0.0 to 1.0)."
+    )]
     fn edge_add(
         &self,
         Parameters(params): Parameters<EdgeAddParams>,
     ) -> Result<CallToolResult, McpError> {
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
         let cmd = Command::EdgeAdd(EdgeAddCmd {
-            graph: params.graph,
+            graph,
             source: params.source,
             target: params.target,
             label: params.label,
@@ -580,14 +722,18 @@ impl WeavMcpServer {
     }
 
     /// Search nodes by property key/value.
-    #[tool(description = "Search for nodes in a graph by matching a property key against a value. The value is compared as string, integer, float, or boolean. Returns matching node IDs, labels, and properties.")]
+    #[tool(
+        description = "Search for nodes in a graph by matching a property key against a value. The value is compared as string, integer, float, or boolean. Returns matching node IDs, labels, and properties."
+    )]
     fn search_nodes(
         &self,
         Parameters(params): Parameters<SearchNodesParams>,
     ) -> Result<CallToolResult, McpError> {
-        let graph_arc = self.engine.get_graph(&params.graph).map_err(|e| {
-            McpError::internal_error(e.to_string(), None)
-        })?;
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
+        let graph_arc = self
+            .engine
+            .get_graph(&graph)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let gs = graph_arc.read();
 
         let search_value = params.value.clone();
@@ -647,14 +793,18 @@ impl WeavMcpServer {
     }
 
     /// Get all neighbors of a node.
-    #[tool(description = "Get all neighbors (both incoming and outgoing) of a node in a graph. Returns neighbor node IDs, edge IDs, labels, direction, and edge weight.")]
+    #[tool(
+        description = "Get all neighbors (both incoming and outgoing) of a node in a graph. Returns neighbor node IDs, edge IDs, labels, direction, and edge weight."
+    )]
     fn get_neighbors(
         &self,
         Parameters(params): Parameters<GetNeighborsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let graph_arc = self.engine.get_graph(&params.graph).map_err(|e| {
-            McpError::internal_error(e.to_string(), None)
-        })?;
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
+        let graph_arc = self
+            .engine
+            .get_graph(&graph)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let gs = graph_arc.read();
 
         if !gs.adjacency.has_node(params.node_id) {
@@ -713,14 +863,18 @@ impl WeavMcpServer {
     }
 
     /// Export entire graph as JSON.
-    #[tool(description = "Export an entire graph as JSON including all nodes with their labels and properties, and all edges with source, target, label, and weight.")]
+    #[tool(
+        description = "Export an entire graph as JSON including all nodes with their labels and properties, and all edges with source, target, label, and weight."
+    )]
     fn export_graph(
         &self,
         Parameters(params): Parameters<ExportGraphParams>,
     ) -> Result<CallToolResult, McpError> {
-        let graph_arc = self.engine.get_graph(&params.graph).map_err(|e| {
-            McpError::internal_error(e.to_string(), None)
-        })?;
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
+        let graph_arc = self
+            .engine
+            .get_graph(&graph)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let gs = graph_arc.read();
 
         // Export all nodes.
@@ -777,7 +931,7 @@ impl WeavMcpServer {
             .collect();
 
         success_json(&serde_json::json!({
-            "graph": params.graph,
+            "graph": graph,
             "node_count": nodes.len(),
             "edge_count": edges.len(),
             "nodes": nodes,
@@ -786,14 +940,18 @@ impl WeavMcpServer {
     }
 
     /// Get detailed graph statistics.
-    #[tool(description = "Get detailed statistics for a graph including node count, edge count, vector count, label distribution, and average node degree.")]
+    #[tool(
+        description = "Get detailed statistics for a graph including node count, edge count, vector count, label distribution, and average node degree."
+    )]
     fn graph_stats(
         &self,
         Parameters(params): Parameters<GraphStatsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let graph_arc = self.engine.get_graph(&params.graph).map_err(|e| {
-            McpError::internal_error(e.to_string(), None)
-        })?;
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
+        let graph_arc = self
+            .engine
+            .get_graph(&graph)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let gs = graph_arc.read();
 
         let node_count = gs.adjacency.node_count();
@@ -822,7 +980,7 @@ impl WeavMcpServer {
         };
 
         success_json(&serde_json::json!({
-            "graph": params.graph,
+            "graph": graph,
             "node_count": node_count,
             "edge_count": edge_count,
             "vector_count": vector_count,
@@ -833,12 +991,15 @@ impl WeavMcpServer {
 
     /// Get comprehensive graph statistics including degree distribution,
     /// label/edge-type distribution, memory estimates, and temporal node count.
-    #[tool(description = "Get comprehensive statistics for a graph: degree distribution (min/max/avg/p50/p95/p99), label distribution, edge type distribution, memory estimates, temporal node count, and graph config.")]
+    #[tool(
+        description = "Get comprehensive statistics for a graph: degree distribution (min/max/avg/p50/p95/p99), label distribution, edge type distribution, memory estimates, temporal node count, and graph config."
+    )]
     fn graph_stats_detailed(
         &self,
         Parameters(params): Parameters<GraphStatsParams>,
     ) -> Result<CallToolResult, McpError> {
-        match self.engine.handle_detailed_stats(&params.graph) {
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
+        match self.engine.handle_detailed_stats(&graph) {
             Ok(CommandResponse::Text(json_str)) => {
                 Ok(CallToolResult::success(vec![Content::text(json_str)]))
             }
@@ -846,6 +1007,31 @@ impl WeavMcpServer {
                 "{resp:?}"
             ))])),
             Err(e) => weav_error(e),
+        }
+    }
+
+    /// Poll recent graph mutation events.
+    #[tool(
+        description = "Poll recent graph mutation events. Supports optional graph filtering plus since_sequence and replay_limit cursors."
+    )]
+    fn recent_events(
+        &self,
+        Parameters(params): Parameters<RecentEventsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let graph = resolve_optional_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
+        let events = self.engine.replay_events(
+            graph.as_deref(),
+            params.since_sequence.unwrap_or(0),
+            params.replay_limit.unwrap_or(100) as usize,
+        );
+        let public_events: Result<Vec<_>, _> =
+            events.iter().map(|event| event.to_public_event()).collect();
+        match public_events {
+            Ok(events) => success_json(&events),
+            Err(err) => Err(McpError::internal_error(
+                format!("failed to serialize recent events: {err}"),
+                None,
+            )),
         }
     }
 
@@ -864,13 +1050,16 @@ impl WeavMcpServer {
     }
 
     /// Update a node's properties or embedding.
-    #[tool(description = "Update an existing node's properties (merge) or embedding vector. Provide the node ID and new properties to set.")]
+    #[tool(
+        description = "Update an existing node's properties (merge) or embedding vector. Provide the node ID and new properties to set."
+    )]
     fn node_update(
         &self,
         Parameters(params): Parameters<NodeUpdateParams>,
     ) -> Result<CallToolResult, McpError> {
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
         let cmd = Command::NodeUpdate(NodeUpdateCmd {
-            graph: params.graph,
+            graph,
             node_id: params.node_id,
             properties: props_to_pairs(&params.properties),
             embedding: params.embedding,
@@ -893,8 +1082,9 @@ impl WeavMcpServer {
         &self,
         Parameters(params): Parameters<NodeDeleteParams>,
     ) -> Result<CallToolResult, McpError> {
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
         let cmd = Command::NodeDelete(NodeDeleteCmd {
-            graph: params.graph,
+            graph,
             node_id: params.node_id,
         });
         match self.engine.execute_command(cmd, None) {
@@ -910,13 +1100,16 @@ impl WeavMcpServer {
     }
 
     /// Get an edge by ID.
-    #[tool(description = "Get an edge from a graph by its edge ID. Returns source, target, label, and weight.")]
+    #[tool(
+        description = "Get an edge from a graph by its edge ID. Returns source, target, label, and weight."
+    )]
     fn edge_get(
         &self,
         Parameters(params): Parameters<EdgeGetParams>,
     ) -> Result<CallToolResult, McpError> {
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
         let cmd = Command::EdgeGet(EdgeGetCmd {
-            graph: params.graph,
+            graph,
             edge_id: params.edge_id,
         });
         match self.engine.execute_command(cmd, None) {
@@ -943,8 +1136,9 @@ impl WeavMcpServer {
         &self,
         Parameters(params): Parameters<EdgeDeleteParams>,
     ) -> Result<CallToolResult, McpError> {
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
         let cmd = Command::EdgeDelete(EdgeDeleteCmd {
-            graph: params.graph,
+            graph,
             edge_id: params.edge_id,
         });
         match self.engine.execute_command(cmd, None) {
@@ -960,11 +1154,28 @@ impl WeavMcpServer {
     }
 
     /// Context-aware retrieval with token budget management.
-    #[tool(description = "Retrieve context from a graph with intelligent token budget management. This is Weav's unique differentiator — no other graph database offers budget-aware context retrieval. Supports multiple strategies: 'auto' (greedy knapsack), 'diversity' (MMR for diverse results), 'submodular' (facility location for maximum coverage), or 'proportional' (fixed allocation). Provide seed nodes and/or an embedding vector to start traversal.")]
+    #[tool(
+        description = "Retrieve context from a graph with intelligent token budget management. This is Weav's unique differentiator — no other graph database offers budget-aware context retrieval. Supports multiple strategies: 'auto' (greedy knapsack), 'diversity' (MMR for diverse results), 'submodular' (facility location for maximum coverage), or 'proportional' (fixed allocation). Provide seed nodes and/or an embedding vector to start traversal."
+    )]
     fn context_query(
         &self,
         Parameters(params): Parameters<ContextQueryParams>,
     ) -> Result<CallToolResult, McpError> {
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
+        let retrieval_mode = params
+            .retrieval_mode
+            .as_deref()
+            .map(|mode| {
+                RetrievalMode::from_str_lossy(mode).ok_or_else(|| {
+                    McpError::invalid_params(
+                        "'retrieval_mode' must be one of: local, global, hybrid, drift",
+                        None,
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
+
         let seeds = match (&params.embedding, params.seed_keys.is_empty()) {
             (Some(emb), true) => SeedStrategy::Vector {
                 embedding: emb.clone(),
@@ -1007,7 +1218,9 @@ impl WeavMcpServer {
 
         let cmd = Command::Context(ContextQuery {
             query_text: params.query,
-            graph: params.graph,
+            graph,
+            retrieval_mode,
+            rerank: params.rerank.map(Into::into),
             budget: Some(TokenBudget {
                 max_tokens: resolved_tokens,
                 allocation,
@@ -1075,14 +1288,18 @@ impl WeavMcpServer {
     }
 
     /// Vector similarity search.
-    #[tool(description = "Search for the most similar nodes using vector embeddings (HNSW index). Returns nodes ranked by cosine similarity to the query vector. Optionally filter by labels and/or property values.")]
+    #[tool(
+        description = "Search for the most similar nodes using vector embeddings (HNSW index). Returns nodes ranked by cosine similarity to the query vector. Optionally filter by labels and/or property values."
+    )]
     fn vector_search(
         &self,
         Parameters(params): Parameters<VectorSearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        let graph_arc = self.engine.get_graph(&params.graph).map_err(|e| {
-            McpError::internal_error(e.to_string(), None)
-        })?;
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
+        let graph_arc = self
+            .engine
+            .get_graph(&graph)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let gs = graph_arc.read();
 
         let top_k = params.top_k.unwrap_or(10) as u16;
@@ -1090,37 +1307,41 @@ impl WeavMcpServer {
         let results = if has_filter {
             let filter_labels = &params.labels;
             let filter_props = &params.properties;
-            gs.vector_index.search_filtered(
-                &params.embedding,
-                top_k,
-                &|node_id: u64| {
-                    if let Some(labels) = filter_labels {
-                        let node_label = gs.properties
-                            .get_node_property(node_id, "_label")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        if !labels.iter().any(|l| l == node_label) {
-                            return false;
-                        }
-                    }
-                    if let Some(props) = filter_props {
-                        for (key, expected) in props {
-                            match gs.properties.get_node_property(node_id, key) {
-                                Some(actual) => {
-                                    if value_to_json(actual) != *expected {
-                                        return false;
-                                    }
-                                }
-                                None => return false,
+            gs.vector_index
+                .search_filtered(
+                    &params.embedding,
+                    top_k,
+                    &|node_id: u64| {
+                        if let Some(labels) = filter_labels {
+                            let node_label = gs
+                                .properties
+                                .get_node_property(node_id, "_label")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if !labels.iter().any(|l| l == node_label) {
+                                return false;
                             }
                         }
-                    }
-                    true
-                },
-                None,
-            ).unwrap_or_default()
+                        if let Some(props) = filter_props {
+                            for (key, expected) in props {
+                                match gs.properties.get_node_property(node_id, key) {
+                                    Some(actual) => {
+                                        if value_to_json(actual) != *expected {
+                                            return false;
+                                        }
+                                    }
+                                    None => return false,
+                                }
+                            }
+                        }
+                        true
+                    },
+                    None,
+                )
+                .unwrap_or_default()
         } else {
-            gs.vector_index.search(&params.embedding, top_k, None)
+            gs.vector_index
+                .search(&params.embedding, top_k, None)
                 .unwrap_or_default()
         };
 
@@ -1150,36 +1371,35 @@ impl WeavMcpServer {
             .collect();
 
         success_json(&serde_json::json!({
-            "graph": params.graph,
+            "graph": graph,
             "count": items.len(),
             "results": items,
         }))
     }
 
     /// Run a graph algorithm.
-    #[tool(description = "Run a graph algorithm on a graph. Supported algorithms: 'pagerank', 'communities' (Louvain), 'label_propagation', 'shortest_path' (Dijkstra, requires source+target), 'connected_components', 'wcc' (alias), 'betweenness', 'closeness', 'degree', 'triangle_count', 'scc', 'topological_sort', 'fastrp', 'similarity' (Jaccard/Cosine/Overlap, requires source+target), 'link_prediction' (Adamic-Adar top-k), 'random_walk' (requires source), 'k_core', 'max_flow' (requires source+target), 'mst' (minimum spanning tree).")]
+    #[tool(
+        description = "Run a graph algorithm on a graph. Supported algorithms: 'pagerank', 'communities' (Louvain), 'label_propagation', 'shortest_path' (Dijkstra, requires source+target), 'connected_components', 'wcc' (alias), 'betweenness', 'closeness', 'degree', 'triangle_count', 'scc', 'topological_sort', 'fastrp', 'similarity' (Jaccard/Cosine/Overlap, requires source+target), 'link_prediction' (Adamic-Adar top-k), 'random_walk' (requires source), 'k_core', 'max_flow' (requires source+target), 'mst' (minimum spanning tree)."
+    )]
     fn run_algorithm(
         &self,
         Parameters(params): Parameters<RunAlgorithmParams>,
     ) -> Result<CallToolResult, McpError> {
         use weav_graph::traversal;
 
-        let graph_arc = self.engine.get_graph(&params.graph).map_err(|e| {
-            McpError::internal_error(e.to_string(), None)
-        })?;
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
+        let graph_arc = self
+            .engine
+            .get_graph(&graph)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let gs = graph_arc.read();
         let limit = params.limit.unwrap_or(50);
 
         match params.algorithm.as_str() {
             "pagerank" => {
                 let max_iter = params.max_iterations.unwrap_or(100);
-                let scores = traversal::personalized_pagerank(
-                    &gs.adjacency,
-                    &[],
-                    0.85,
-                    max_iter,
-                    1e-6,
-                );
+                let scores =
+                    traversal::personalized_pagerank(&gs.adjacency, &[], 0.85, max_iter, 1e-6);
                 let top: Vec<serde_json::Value> = scores
                     .iter()
                     .take(limit)
@@ -1201,8 +1421,7 @@ impl WeavMcpServer {
                 for (&node, &comm) in &communities {
                     groups.entry(comm).or_default().push(node);
                 }
-                let mut sorted_groups: Vec<(u64, Vec<u64>)> =
-                    groups.into_iter().collect();
+                let mut sorted_groups: Vec<(u64, Vec<u64>)> = groups.into_iter().collect();
                 sorted_groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
                 let result: Vec<serde_json::Value> = sorted_groups
                     .iter()
@@ -1223,14 +1442,12 @@ impl WeavMcpServer {
             }
             "label_propagation" => {
                 let max_iter = params.max_iterations.unwrap_or(100);
-                let labels =
-                    traversal::label_propagation(&gs.adjacency, max_iter);
+                let labels = traversal::label_propagation(&gs.adjacency, max_iter);
                 let mut groups: HashMap<u64, Vec<u64>> = HashMap::new();
                 for (&node, &label) in &labels {
                     groups.entry(label).or_default().push(node);
                 }
-                let mut sorted_groups: Vec<(u64, Vec<u64>)> =
-                    groups.into_iter().collect();
+                let mut sorted_groups: Vec<(u64, Vec<u64>)> = groups.into_iter().collect();
                 sorted_groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
                 let result: Vec<serde_json::Value> = sorted_groups
                     .iter()
@@ -1256,12 +1473,7 @@ impl WeavMcpServer {
                 let target = params.target.ok_or_else(|| {
                     McpError::invalid_params("'target' is required for shortest_path", None)
                 })?;
-                match traversal::dijkstra_shortest_path(
-                    &gs.adjacency,
-                    source,
-                    target,
-                    u8::MAX,
-                ) {
+                match traversal::dijkstra_shortest_path(&gs.adjacency, source, target, u8::MAX) {
                     Some(path) => success_json(&serde_json::json!({
                         "algorithm": "shortest_path",
                         "path": path.nodes,
@@ -1313,10 +1525,8 @@ impl WeavMcpServer {
                 }))
             }
             "closeness" => {
-                let scores = traversal::closeness_centrality(
-                    &gs.adjacency,
-                    &traversal::EdgeFilter::none(),
-                );
+                let scores =
+                    traversal::closeness_centrality(&gs.adjacency, &traversal::EdgeFilter::none());
                 let top: Vec<serde_json::Value> = scores
                     .iter()
                     .take(limit)
@@ -1352,11 +1562,10 @@ impl WeavMcpServer {
                 }))
             }
             "triangle_count" => {
-                let result = traversal::triangle_count(
-                    &gs.adjacency,
-                    &traversal::EdgeFilter::none(),
-                );
-                let top: Vec<serde_json::Value> = result.per_node
+                let result =
+                    traversal::triangle_count(&gs.adjacency, &traversal::EdgeFilter::none());
+                let top: Vec<serde_json::Value> = result
+                    .per_node
                     .iter()
                     .take(limit)
                     .map(|&(nid, count, coeff): &(u64, u32, f64)| {
@@ -1404,7 +1613,8 @@ impl WeavMcpServer {
             "fastrp" => {
                 let dim = 128usize;
                 let iterations = params.max_iterations.unwrap_or(3) as usize;
-                let embeddings = traversal::fastrp_embeddings(&gs.adjacency, dim, iterations, 1.0, 42);
+                let embeddings =
+                    traversal::fastrp_embeddings(&gs.adjacency, dim, iterations, 1.0, 42);
                 let results: Vec<serde_json::Value> = embeddings
                     .into_iter()
                     .take(limit)
@@ -1470,9 +1680,7 @@ impl WeavMcpServer {
                     .iter()
                     .map(|(&nid, &core)| serde_json::json!({"node_id": nid, "core_number": core}))
                     .collect();
-                results.sort_by(|a, b| {
-                    b["core_number"].as_u64().cmp(&a["core_number"].as_u64())
-                });
+                results.sort_by(|a, b| b["core_number"].as_u64().cmp(&a["core_number"].as_u64()));
                 let max_core = cores.values().max().copied().unwrap_or(0);
                 success_json(&serde_json::json!({
                     "algorithm": "k_core",
@@ -1490,12 +1698,15 @@ impl WeavMcpServer {
                 })?;
                 match traversal::max_flow(&gs.adjacency, source, sink) {
                     Ok(result) => {
-                        let edges: Vec<serde_json::Value> = result.flow_edges
+                        let edges: Vec<serde_json::Value> = result
+                            .flow_edges
                             .iter()
-                            .map(|e| serde_json::json!({
-                                "source": e.source, "target": e.target,
-                                "flow": e.flow, "capacity": e.capacity,
-                            }))
+                            .map(|e| {
+                                serde_json::json!({
+                                    "source": e.source, "target": e.target,
+                                    "flow": e.flow, "capacity": e.capacity,
+                                })
+                            })
                             .collect();
                         success_json(&serde_json::json!({
                             "algorithm": "max_flow",
@@ -1508,12 +1719,15 @@ impl WeavMcpServer {
             }
             "mst" => {
                 let result = traversal::minimum_spanning_tree(&gs.adjacency);
-                let edges: Vec<serde_json::Value> = result.edges
+                let edges: Vec<serde_json::Value> = result
+                    .edges
                     .iter()
-                    .map(|e| serde_json::json!({
-                        "source": e.source, "target": e.target,
-                        "weight": e.weight, "edge_id": e.edge_id,
-                    }))
+                    .map(|e| {
+                        serde_json::json!({
+                            "source": e.source, "target": e.target,
+                            "weight": e.weight, "edge_id": e.edge_id,
+                        })
+                    })
                     .collect();
                 success_json(&serde_json::json!({
                     "algorithm": "mst",
@@ -1545,20 +1759,41 @@ impl WeavMcpServer {
     }
 
     /// Ingest a document into a graph using the LLM extraction pipeline.
-    #[tool(description = "Ingest a document into a graph. The extraction pipeline chunks the text, extracts entities and relationships using LLM, and builds the knowledge graph automatically. Supports text, markdown, CSV formats.")]
+    #[tool(
+        description = "Ingest a document into a graph. The extraction pipeline chunks the text, extracts entities and relationships using LLM, and builds the knowledge graph automatically. Supports text, markdown, CSV formats."
+    )]
     fn ingest_document(
         &self,
         Parameters(params): Parameters<IngestDocumentParams>,
     ) -> Result<CallToolResult, McpError> {
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
+        let resolution_mode = params
+            .resolution_mode
+            .as_deref()
+            .map(|mode| {
+                weav_core::types::ResolutionMode::from_str_lossy(mode).ok_or_else(|| {
+                    McpError::invalid_params(
+                        "'resolution_mode' must be one of: off, heuristic, semantic",
+                        None,
+                    )
+                })
+            })
+            .transpose()?;
+
         let cmd = Command::Ingest(IngestCmd {
-            graph: params.graph,
+            graph,
             content: params.content,
+            content_base64: None,
             format: params.format,
             document_id: params.document_id,
             skip_extraction: false,
             skip_dedup: false,
             chunk_size: None,
             entity_types: None,
+            resolution_mode,
+            link_existing_entities: params.link_existing_entities,
+            resolution_candidate_limit: params.resolution_candidate_limit,
+            custom_resolution_prompt: params.custom_resolution_prompt,
         });
         match self.engine.execute_command(cmd, None) {
             Ok(CommandResponse::IngestResult(info)) => success_json(&serde_json::json!({
@@ -1566,6 +1801,8 @@ impl WeavMcpServer {
                 "chunks_created": info.chunks_created,
                 "entities_created": info.entities_created,
                 "entities_merged": info.entities_merged,
+                "entities_resolved": info.entities_resolved,
+                "entities_linked_existing": info.entities_linked_existing,
                 "relationships_created": info.relationships_created,
                 "pipeline_duration_ms": info.pipeline_duration_ms,
             })),
@@ -1577,14 +1814,18 @@ impl WeavMcpServer {
     }
 
     /// Compare graph state between two timestamps (temporal diff).
-    #[tool(description = "Compare graph state between two timestamps. Returns edges added/removed and active node/edge counts at each timestamp. Useful for understanding temporal evolution of a knowledge graph.")]
+    #[tool(
+        description = "Compare graph state between two timestamps. Returns edges added/removed and active node/edge counts at each timestamp. Useful for understanding temporal evolution of a knowledge graph."
+    )]
     fn graph_diff(
         &self,
         Parameters(params): Parameters<GraphDiffParams>,
     ) -> Result<CallToolResult, McpError> {
-        let graph_arc = self.engine.get_graph(&params.graph).map_err(|e| {
-            McpError::internal_error(e.to_string(), None)
-        })?;
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
+        let graph_arc = self
+            .engine
+            .get_graph(&graph)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let gs = graph_arc.read();
 
         let mut added_edges = Vec::new();
@@ -1605,7 +1846,7 @@ impl WeavMcpServer {
         }
 
         success_json(&serde_json::json!({
-            "graph": params.graph,
+            "graph": graph,
             "from_timestamp": params.from_timestamp,
             "to_timestamp": params.to_timestamp,
             "edges_added": added_edges.len(),
@@ -1616,26 +1857,26 @@ impl WeavMcpServer {
     }
 
     /// Run community detection and generate summaries (GraphRAG pattern).
-    #[tool(description = "Run community detection on a graph and generate text summaries for each community. Creates synthetic _community_summary nodes searchable via BM25. Algorithms: 'leiden' (default), 'label_propagation'.")]
+    #[tool(
+        description = "Run community detection on a graph and generate text summaries for each community. Creates synthetic _community_summary nodes searchable via BM25. Algorithms: 'leiden' (default), 'label_propagation'."
+    )]
     fn community_summarize(
         &self,
         Parameters(params): Parameters<CommunitySummarizeParams>,
     ) -> Result<CallToolResult, McpError> {
-        let graph_arc = self.engine.get_graph(&params.graph).map_err(|e| {
-            McpError::internal_error(e.to_string(), None)
-        })?;
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
+        let graph_arc = self
+            .engine
+            .get_graph(&graph)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let mut gs = graph_arc.write();
 
         let algorithm = params.algorithm.as_deref().unwrap_or("leiden");
         let resolution = params.resolution.unwrap_or(1.0) as f32;
 
         let community_map = match algorithm {
-            "label_propagation" => {
-                weav_graph::traversal::label_propagation(&gs.adjacency, 100)
-            }
-            _ => {
-                weav_graph::traversal::leiden_communities(&gs.adjacency, 100, resolution, 0.3)
-            }
+            "label_propagation" => weav_graph::traversal::label_propagation(&gs.adjacency, 100),
+            _ => weav_graph::traversal::leiden_communities(&gs.adjacency, 100, resolution, 0.3),
         };
 
         // Group nodes by community
@@ -1649,12 +1890,14 @@ impl WeavMcpServer {
             // Build summary from member properties
             let mut summary_parts = Vec::new();
             for &nid in members.iter().take(20) {
-                let label = gs.properties
+                let label = gs
+                    .properties
                     .get_node_property(nid, "_label")
                     .and_then(|v| v.as_str())
                     .unwrap_or("node")
                     .to_string();
-                let name = gs.properties
+                let name = gs
+                    .properties
                     .get_node_property(nid, "name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
@@ -1673,20 +1916,36 @@ impl WeavMcpServer {
             let node_id = gs.next_node_id;
             gs.next_node_id += 1;
             gs.adjacency.add_node(node_id);
-            gs.properties.set_node_property(node_id, "_label",
-                weav_core::types::Value::String(compact_str::CompactString::from("_community_summary")));
-            gs.properties.set_node_property(node_id, "community_id",
-                weav_core::types::Value::Int(*comm_id as i64));
-            gs.properties.set_node_property(node_id, "summary",
-                weav_core::types::Value::String(compact_str::CompactString::from(summary_text.as_str())));
-            gs.properties.set_node_property(node_id, "member_count",
-                weav_core::types::Value::Int(members.len() as i64));
+            gs.properties.set_node_property(
+                node_id,
+                "_label",
+                weav_core::types::Value::String(compact_str::CompactString::from(
+                    "_community_summary",
+                )),
+            );
+            gs.properties.set_node_property(
+                node_id,
+                "community_id",
+                weav_core::types::Value::Int(*comm_id as i64),
+            );
+            gs.properties.set_node_property(
+                node_id,
+                "summary",
+                weav_core::types::Value::String(compact_str::CompactString::from(
+                    summary_text.as_str(),
+                )),
+            );
+            gs.properties.set_node_property(
+                node_id,
+                "member_count",
+                weav_core::types::Value::Int(members.len() as i64),
+            );
             gs.text_index.index_node(node_id, &summary_text);
             summaries_created += 1;
         }
 
         success_json(&serde_json::json!({
-            "graph": params.graph,
+            "graph": graph,
             "algorithm": algorithm,
             "communities_found": groups.len(),
             "summaries_created": summaries_created,
@@ -1694,14 +1953,18 @@ impl WeavMcpServer {
     }
 
     /// Search community summaries using BM25 text search.
-    #[tool(description = "Search community summaries using BM25 text ranking. Returns matching community summaries ordered by relevance. Use after running community_summarize.")]
+    #[tool(
+        description = "Search community summaries using BM25 text ranking. Returns matching community summaries ordered by relevance. Use after running community_summarize."
+    )]
     fn community_search(
         &self,
         Parameters(params): Parameters<CommunitySearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        let graph_arc = self.engine.get_graph(&params.graph).map_err(|e| {
-            McpError::internal_error(e.to_string(), None)
-        })?;
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
+        let graph_arc = self
+            .engine
+            .get_graph(&graph)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let gs = graph_arc.read();
 
         let limit = params.limit.unwrap_or(10);
@@ -1719,16 +1982,19 @@ impl WeavMcpServer {
             })
             .take(limit)
             .map(|&(nid, score)| {
-                let summary = gs.properties
+                let summary = gs
+                    .properties
                     .get_node_property(nid, "summary")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let comm_id = gs.properties
+                let comm_id = gs
+                    .properties
                     .get_node_property(nid, "community_id")
                     .and_then(|v| v.as_int())
                     .unwrap_or(0);
-                let member_count = gs.properties
+                let member_count = gs
+                    .properties
                     .get_node_property(nid, "member_count")
                     .and_then(|v| v.as_int())
                     .unwrap_or(0);
@@ -1743,7 +2009,7 @@ impl WeavMcpServer {
             .collect();
 
         success_json(&serde_json::json!({
-            "graph": params.graph,
+            "graph": graph,
             "query": params.query,
             "count": matches.len(),
             "results": matches,
@@ -1751,13 +2017,16 @@ impl WeavMcpServer {
     }
 
     /// Set a schema constraint on a graph.
-    #[tool(description = "Set a schema constraint on node or edge labels. Constraint types: 'type' (enforce property data type), 'required' (property must exist), 'unique' (property value must be unique within the label). Example: set type constraint on Person.age to 'int'.")]
+    #[tool(
+        description = "Set a schema constraint on node or edge labels. Constraint types: 'type' (enforce property data type), 'required' (property must exist), 'unique' (property value must be unique within the label). Example: set type constraint on Person.age to 'int'."
+    )]
     fn schema_set(
         &self,
         Parameters(params): Parameters<SchemaSetParams>,
     ) -> Result<CallToolResult, McpError> {
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
         let cmd = Command::SchemaSet(SchemaSetCmd {
-            graph: params.graph.clone(),
+            graph: graph.clone(),
             target: params.target,
             label: params.label.clone(),
             constraint_type: params.constraint_type,
@@ -1767,7 +2036,7 @@ impl WeavMcpServer {
         match self.engine.execute_command(cmd, None) {
             Ok(CommandResponse::Ok) => success_json(&serde_json::json!({
                 "status": "constraint_added",
-                "graph": params.graph,
+                "graph": graph,
                 "label": params.label,
                 "property": params.property,
             })),
@@ -1779,14 +2048,15 @@ impl WeavMcpServer {
     }
 
     /// Get the schema for a graph.
-    #[tool(description = "Get all schema constraints defined for a graph, including property type, required, and uniqueness constraints for both node and edge labels.")]
+    #[tool(
+        description = "Get all schema constraints defined for a graph, including property type, required, and uniqueness constraints for both node and edge labels."
+    )]
     fn schema_get(
         &self,
         Parameters(params): Parameters<SchemaGetParams>,
     ) -> Result<CallToolResult, McpError> {
-        let cmd = Command::SchemaGet(SchemaGetCmd {
-            graph: params.graph,
-        });
+        let graph = resolve_graph_input(params.graph.as_deref(), params.scope.as_ref())?;
+        let cmd = Command::SchemaGet(SchemaGetCmd { graph });
         match self.engine.execute_command(cmd, None) {
             Ok(CommandResponse::Text(schema_json)) => {
                 Ok(CallToolResult::success(vec![Content::text(schema_json)]))
@@ -1819,11 +2089,12 @@ impl WeavMcpServer {
     }
 
     /// Trigger a persistence snapshot.
-    #[tool(description = "Trigger an immediate persistence snapshot of all graph data to disk. Useful before maintenance or to ensure durability.")]
+    #[tool(
+        description = "Trigger an immediate persistence snapshot of all graph data to disk. Useful before maintenance or to ensure durability."
+    )]
     fn trigger_snapshot(
         &self,
-        #[allow(unused_variables)]
-        Parameters(params): Parameters<TriggerSnapshotParams>,
+        #[allow(unused_variables)] Parameters(params): Parameters<TriggerSnapshotParams>,
     ) -> Result<CallToolResult, McpError> {
         match self.engine.execute_command(Command::Snapshot, None) {
             Ok(CommandResponse::Ok) => success_json(&serde_json::json!({
@@ -1845,13 +2116,13 @@ impl ServerHandler for WeavMcpServer {
             .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(
                 "Weav is an in-memory context graph database for AI/LLM workloads. \
-                 25 tools available: graph_list, graph_create, graph_info, graph_stats, graph_stats_detailed, graph_drop, \
+                 26 tools available: graph_list, graph_create, graph_info, graph_stats, graph_stats_detailed, graph_drop, \
                  node_add, node_get, node_update, node_delete, \
                  edge_add, edge_get, edge_delete, \
                  search_nodes, get_neighbors, vector_search, \
                  context_query (token-budget-aware retrieval — Weav's unique feature), \
                  run_algorithm (PageRank, communities, shortest path, centrality, etc.), \
-                 export_graph, server_info, \
+                 export_graph, server_info, recent_events, \
                  ingest_document (LLM entity extraction pipeline), \
                  schema_set, schema_get (property type/required/unique constraints), \
                  config_set, trigger_snapshot. \
@@ -1867,7 +2138,9 @@ impl ServerHandler for WeavMcpServer {
 mod tests {
     use std::sync::Arc;
 
+    use super::{ContextQueryParams, resolve_graph_input};
     use weav_core::config::WeavConfig;
+    use weav_core::types::RerankConfig;
     use weav_server::engine::Engine;
 
     use crate::WeavMcpServer;
@@ -1885,7 +2158,10 @@ mod tests {
         use weav_server::engine::CommandResponse;
 
         let server = test_server();
-        let resp = server.engine.execute_command(Command::GraphList, None).unwrap();
+        let resp = server
+            .engine
+            .execute_command(Command::GraphList, None)
+            .unwrap();
         match resp {
             CommandResponse::StringList(names) => assert!(names.is_empty()),
             other => panic!("unexpected response: {other:?}"),
@@ -1908,7 +2184,10 @@ mod tests {
         assert!(matches!(resp, CommandResponse::Ok));
 
         // Verify it appears in the list.
-        let resp = server.engine.execute_command(Command::GraphList, None).unwrap();
+        let resp = server
+            .engine
+            .execute_command(Command::GraphList, None)
+            .unwrap();
         match resp {
             CommandResponse::StringList(names) => {
                 assert_eq!(names.len(), 1);
@@ -1955,9 +2234,10 @@ mod tests {
         let cmd = Command::NodeAdd(NodeAddCmd {
             graph: "g".to_string(),
             label: "Person".to_string(),
-            properties: vec![
-                ("name".to_string(), weav_core::types::Value::String("Alice".into())),
-            ],
+            properties: vec![(
+                "name".to_string(),
+                weav_core::types::Value::String("Alice".into()),
+            )],
             embedding: None,
             entity_key: Some("alice".to_string()),
             ttl_ms: None,
@@ -2091,7 +2371,10 @@ mod tests {
             .unwrap();
 
         // Verify it exists.
-        let resp = server.engine.execute_command(Command::GraphList, None).unwrap();
+        let resp = server
+            .engine
+            .execute_command(Command::GraphList, None)
+            .unwrap();
         match resp {
             CommandResponse::StringList(names) => assert!(names.contains(&"to_drop".to_string())),
             other => panic!("unexpected: {other:?}"),
@@ -2105,7 +2388,10 @@ mod tests {
         assert!(matches!(resp, CommandResponse::Ok));
 
         // Verify it's gone.
-        let resp = server.engine.execute_command(Command::GraphList, None).unwrap();
+        let resp = server
+            .engine
+            .execute_command(Command::GraphList, None)
+            .unwrap();
         match resp {
             CommandResponse::StringList(names) => {
                 assert!(!names.contains(&"to_drop".to_string()))
@@ -2163,6 +2449,7 @@ mod tests {
         assert!(router.has_route("vector_search"));
         assert!(router.has_route("run_algorithm"));
         assert!(router.has_route("ingest_document"));
+        assert!(router.has_route("recent_events"));
         assert!(router.has_route("schema_set"));
         assert!(router.has_route("schema_get"));
         assert!(router.has_route("config_set"));
@@ -2192,7 +2479,10 @@ mod tests {
                     graph: "tg".to_string(),
                     label: "Person".to_string(),
                     properties: vec![
-                        ("name".to_string(), weav_core::types::Value::String("Alice".into())),
+                        (
+                            "name".to_string(),
+                            weav_core::types::Value::String("Alice".into()),
+                        ),
                         ("age".to_string(), weav_core::types::Value::Int(30)),
                     ],
                     embedding: None,
@@ -2213,9 +2503,10 @@ mod tests {
                 Command::NodeAdd(NodeAddCmd {
                     graph: "tg".to_string(),
                     label: "Document".to_string(),
-                    properties: vec![
-                        ("name".to_string(), weav_core::types::Value::String("Report".into())),
-                    ],
+                    properties: vec![(
+                        "name".to_string(),
+                        weav_core::types::Value::String("Report".into()),
+                    )],
                     embedding: None,
                     entity_key: None,
                     ttl_ms: None,
@@ -2256,9 +2547,9 @@ mod tests {
         let gs = graph_arc.read();
 
         // Search for "Alice" by name property.
-        let matching = gs.properties.nodes_where("name", &|v| {
-            v.as_str() == Some("Alice")
-        });
+        let matching = gs
+            .properties
+            .nodes_where("name", &|v| v.as_str() == Some("Alice"));
         assert_eq!(matching.len(), 1);
         assert_eq!(matching[0], n1);
     }
@@ -2293,9 +2584,9 @@ mod tests {
         let graph_arc = server.engine.get_graph("tg").unwrap();
         let gs = graph_arc.read();
 
-        let matching = gs.properties.nodes_where("name", &|v| {
-            v.as_str() == Some("NonExistent")
-        });
+        let matching = gs
+            .properties
+            .nodes_where("name", &|v| v.as_str() == Some("NonExistent"));
         assert!(matching.is_empty());
     }
 
@@ -2401,7 +2692,10 @@ mod tests {
         server
             .engine
             .execute_command(
-                Command::GraphCreate(GraphCreateCmd { name: "ug".into(), config: None }),
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "ug".into(),
+                    config: None,
+                }),
                 None,
             )
             .unwrap();
@@ -2410,9 +2704,15 @@ mod tests {
             .engine
             .execute_command(
                 Command::NodeAdd(NodeAddCmd {
-                    graph: "ug".into(), label: "Person".into(),
-                    properties: vec![("name".into(), weav_core::types::Value::String("Alice".into()))],
-                    embedding: None, entity_key: None, ttl_ms: None,
+                    graph: "ug".into(),
+                    label: "Person".into(),
+                    properties: vec![(
+                        "name".into(),
+                        weav_core::types::Value::String("Alice".into()),
+                    )],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
                 }),
                 None,
             )
@@ -2426,7 +2726,8 @@ mod tests {
             .engine
             .execute_command(
                 Command::NodeUpdate(NodeUpdateCmd {
-                    graph: "ug".into(), node_id: nid,
+                    graph: "ug".into(),
+                    node_id: nid,
                     properties: vec![("age".into(), weav_core::types::Value::Int(25))],
                     embedding: None,
                 }),
@@ -2438,13 +2739,21 @@ mod tests {
         let resp = server
             .engine
             .execute_command(
-                Command::NodeGet(NodeGetCmd { graph: "ug".into(), node_id: Some(nid), entity_key: None }),
+                Command::NodeGet(NodeGetCmd {
+                    graph: "ug".into(),
+                    node_id: Some(nid),
+                    entity_key: None,
+                }),
                 None,
             )
             .unwrap();
         match resp {
             CommandResponse::NodeInfo(info) => {
-                assert!(info.properties.iter().any(|(k, v)| k == "age" && v.as_int() == Some(25)));
+                assert!(
+                    info.properties
+                        .iter()
+                        .any(|(k, v)| k == "age" && v.as_int() == Some(25))
+                );
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -2459,7 +2768,10 @@ mod tests {
         server
             .engine
             .execute_command(
-                Command::GraphCreate(GraphCreateCmd { name: "dg".into(), config: None }),
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "dg".into(),
+                    config: None,
+                }),
                 None,
             )
             .unwrap();
@@ -2468,8 +2780,12 @@ mod tests {
             .engine
             .execute_command(
                 Command::NodeAdd(NodeAddCmd {
-                    graph: "dg".into(), label: "Temp".into(),
-                    properties: vec![], embedding: None, entity_key: None, ttl_ms: None,
+                    graph: "dg".into(),
+                    label: "Temp".into(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
                 }),
                 None,
             )
@@ -2482,7 +2798,10 @@ mod tests {
         let resp = server
             .engine
             .execute_command(
-                Command::NodeDelete(NodeDeleteCmd { graph: "dg".into(), node_id: nid }),
+                Command::NodeDelete(NodeDeleteCmd {
+                    graph: "dg".into(),
+                    node_id: nid,
+                }),
                 None,
             )
             .unwrap();
@@ -2495,56 +2814,93 @@ mod tests {
 
     #[test]
     fn test_edge_get_and_delete() {
-        use weav_query::parser::{Command, EdgeAddCmd, EdgeDeleteCmd, EdgeGetCmd, GraphCreateCmd, NodeAddCmd};
+        use weav_query::parser::{
+            Command, EdgeAddCmd, EdgeDeleteCmd, EdgeGetCmd, GraphCreateCmd, NodeAddCmd,
+        };
         use weav_server::engine::CommandResponse;
 
         let server = test_server();
         server
             .engine
             .execute_command(
-                Command::GraphCreate(GraphCreateCmd { name: "eg".into(), config: None }),
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "eg".into(),
+                    config: None,
+                }),
                 None,
             )
             .unwrap();
 
-        let n1 = match server.engine.execute_command(
-            Command::NodeAdd(NodeAddCmd {
-                graph: "eg".into(), label: "A".into(),
-                properties: vec![], embedding: None, entity_key: None, ttl_ms: None,
-            }),
-            None,
-        ).unwrap() {
+        let n1 = match server
+            .engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "eg".into(),
+                    label: "A".into(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
             CommandResponse::Integer(id) => id,
             other => panic!("unexpected: {other:?}"),
         };
 
-        let n2 = match server.engine.execute_command(
-            Command::NodeAdd(NodeAddCmd {
-                graph: "eg".into(), label: "B".into(),
-                properties: vec![], embedding: None, entity_key: None, ttl_ms: None,
-            }),
-            None,
-        ).unwrap() {
+        let n2 = match server
+            .engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "eg".into(),
+                    label: "B".into(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
             CommandResponse::Integer(id) => id,
             other => panic!("unexpected: {other:?}"),
         };
 
-        let eid = match server.engine.execute_command(
-            Command::EdgeAdd(EdgeAddCmd {
-                graph: "eg".into(), source: n1, target: n2,
-                label: "LINK".into(), weight: 0.5, properties: vec![], ttl_ms: None,
-            }),
-            None,
-        ).unwrap() {
+        let eid = match server
+            .engine
+            .execute_command(
+                Command::EdgeAdd(EdgeAddCmd {
+                    graph: "eg".into(),
+                    source: n1,
+                    target: n2,
+                    label: "LINK".into(),
+                    weight: 0.5,
+                    properties: vec![],
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
             CommandResponse::Integer(id) => id,
             other => panic!("unexpected: {other:?}"),
         };
 
         // Get the edge.
-        match server.engine.execute_command(
-            Command::EdgeGet(EdgeGetCmd { graph: "eg".into(), edge_id: eid }),
-            None,
-        ).unwrap() {
+        match server
+            .engine
+            .execute_command(
+                Command::EdgeGet(EdgeGetCmd {
+                    graph: "eg".into(),
+                    edge_id: eid,
+                }),
+                None,
+            )
+            .unwrap()
+        {
             CommandResponse::EdgeInfo(info) => {
                 assert_eq!(info.edge_id, eid);
                 assert_eq!(info.source, n1);
@@ -2554,10 +2910,16 @@ mod tests {
         }
 
         // Delete the edge.
-        let resp = server.engine.execute_command(
-            Command::EdgeDelete(EdgeDeleteCmd { graph: "eg".into(), edge_id: eid }),
-            None,
-        ).unwrap();
+        let resp = server
+            .engine
+            .execute_command(
+                Command::EdgeDelete(EdgeDeleteCmd {
+                    graph: "eg".into(),
+                    edge_id: eid,
+                }),
+                None,
+            )
+            .unwrap();
         assert!(matches!(resp, CommandResponse::Ok));
 
         let graph_arc = server.engine.get_graph("eg").unwrap();
@@ -2571,9 +2933,8 @@ mod tests {
         let _ = setup_graph_with_nodes(&server);
         let graph_arc = server.engine.get_graph("tg").unwrap();
         let gs = graph_arc.read();
-        let scores = weav_graph::traversal::personalized_pagerank(
-            &gs.adjacency, &[], 0.85, 100, 1e-6,
-        );
+        let scores =
+            weav_graph::traversal::personalized_pagerank(&gs.adjacency, &[], 0.85, 100, 1e-6);
         // With empty seeds, PageRank may return empty or all nodes.
         // Just verify it doesn't crash.
         assert!(scores.len() <= 2);
@@ -2595,9 +2956,7 @@ mod tests {
         let (n1, n2) = setup_graph_with_nodes(&server);
         let graph_arc = server.engine.get_graph("tg").unwrap();
         let gs = graph_arc.read();
-        let path = weav_graph::traversal::dijkstra_shortest_path(
-            &gs.adjacency, n1, n2, u8::MAX,
-        );
+        let path = weav_graph::traversal::dijkstra_shortest_path(&gs.adjacency, n1, n2, u8::MAX);
         assert!(path.is_some());
         assert_eq!(path.unwrap().nodes, vec![n1, n2]);
     }
@@ -2609,7 +2968,8 @@ mod tests {
         let graph_arc = server.engine.get_graph("tg").unwrap();
         let gs = graph_arc.read();
         let scores = weav_graph::traversal::betweenness_centrality(
-            &gs.adjacency, &weav_graph::traversal::EdgeFilter::none(),
+            &gs.adjacency,
+            &weav_graph::traversal::EdgeFilter::none(),
         );
         assert_eq!(scores.len(), 2);
     }
@@ -2654,13 +3014,31 @@ mod tests {
         let server = test_server();
         let router = &server.tool_router;
         let expected = [
-            "graph_list", "graph_info", "graph_create", "graph_drop",
-            "node_add", "node_get", "node_update", "node_delete",
-            "edge_add", "edge_get", "edge_delete",
-            "search_nodes", "get_neighbors", "export_graph", "graph_stats",
-            "server_info", "context_query", "vector_search", "run_algorithm",
-            "ingest_document", "schema_set", "schema_get",
-            "config_set", "trigger_snapshot",
+            "graph_list",
+            "graph_info",
+            "graph_create",
+            "graph_drop",
+            "node_add",
+            "node_get",
+            "node_update",
+            "node_delete",
+            "edge_add",
+            "edge_get",
+            "edge_delete",
+            "search_nodes",
+            "get_neighbors",
+            "export_graph",
+            "graph_stats",
+            "server_info",
+            "context_query",
+            "vector_search",
+            "run_algorithm",
+            "ingest_document",
+            "recent_events",
+            "schema_set",
+            "schema_get",
+            "config_set",
+            "trigger_snapshot",
         ];
         for tool in &expected {
             assert!(router.has_route(tool), "missing tool: {tool}");
@@ -2668,35 +3046,93 @@ mod tests {
     }
 
     #[test]
+    fn test_context_query_params_deserialize_rerank() {
+        let params: ContextQueryParams = serde_json::from_value(serde_json::json!({
+            "graph": "g",
+            "query": "systems programming",
+            "seed_keys": ["alice"],
+            "rerank": {
+                "provider": "cross_encoder",
+                "candidate_limit": 25,
+                "score_weight": 0.5
+            }
+        }))
+        .unwrap();
+
+        let rerank = params.rerank.expect("rerank should deserialize");
+        assert!(rerank.enabled);
+        assert_eq!(rerank.provider.as_deref(), Some("cross_encoder"));
+        assert_eq!(rerank.candidate_limit, 25);
+        assert!((rerank.score_weight - 0.5).abs() < f32::EPSILON);
+
+        let internal: RerankConfig = rerank.into();
+        assert_eq!(internal.supported_provider(), Some("cross_encoder"));
+    }
+
+    #[test]
+    fn test_context_query_params_deserialize_scope() {
+        let params: ContextQueryParams = serde_json::from_value(serde_json::json!({
+            "scope": {
+                "workspace_id": "acme",
+                "user_id": "u_123"
+            },
+            "query": "who is alice",
+            "seed_keys": ["alice"]
+        }))
+        .unwrap();
+
+        assert!(params.graph.is_none());
+        let scope = params.scope.expect("scope should deserialize");
+        assert_eq!(scope.workspace_id.as_deref(), Some("acme"));
+        assert_eq!(scope.user_id.as_deref(), Some("u_123"));
+        assert_eq!(
+            resolve_graph_input(params.graph.as_deref(), Some(&scope)).unwrap(),
+            "ws:acme:user:u_123"
+        );
+    }
+
+    #[test]
     fn test_schema_set_and_get() {
-        use weav_query::parser::{Command, GraphCreateCmd, SchemaSetCmd, SchemaGetCmd};
+        use weav_query::parser::{Command, GraphCreateCmd, SchemaGetCmd, SchemaSetCmd};
         use weav_server::engine::CommandResponse;
 
         let server = test_server();
-        server.engine.execute_command(
-            Command::GraphCreate(GraphCreateCmd { name: "sg".into(), config: None }),
-            None,
-        ).unwrap();
+        server
+            .engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "sg".into(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
 
         // Set a type constraint.
-        let resp = server.engine.execute_command(
-            Command::SchemaSet(SchemaSetCmd {
-                graph: "sg".into(),
-                target: "node".into(),
-                label: "Person".into(),
-                constraint_type: "type".into(),
-                property: "age".into(),
-                value_type: Some("int".into()),
-            }),
-            None,
-        ).unwrap();
+        let resp = server
+            .engine
+            .execute_command(
+                Command::SchemaSet(SchemaSetCmd {
+                    graph: "sg".into(),
+                    target: "node".into(),
+                    label: "Person".into(),
+                    constraint_type: "type".into(),
+                    property: "age".into(),
+                    value_type: Some("int".into()),
+                }),
+                None,
+            )
+            .unwrap();
         assert!(matches!(resp, CommandResponse::Ok));
 
         // Get schema.
-        let resp = server.engine.execute_command(
-            Command::SchemaGet(SchemaGetCmd { graph: "sg".into() }),
-            None,
-        ).unwrap();
+        let resp = server
+            .engine
+            .execute_command(
+                Command::SchemaGet(SchemaGetCmd { graph: "sg".into() }),
+                None,
+            )
+            .unwrap();
         match resp {
             CommandResponse::Text(json) => {
                 assert!(json.contains("Person"));
@@ -2712,16 +3148,19 @@ mod tests {
         use weav_server::engine::CommandResponse;
 
         let server = test_server();
-        let resp = server.engine.execute_command(
-            Command::ConfigSet("test_key".into(), "test_value".into()),
-            None,
-        ).unwrap();
+        let resp = server
+            .engine
+            .execute_command(
+                Command::ConfigSet("test_key".into(), "test_value".into()),
+                None,
+            )
+            .unwrap();
         assert!(matches!(resp, CommandResponse::Ok));
 
-        let resp = server.engine.execute_command(
-            Command::ConfigGet("test_key".into()),
-            None,
-        ).unwrap();
+        let resp = server
+            .engine
+            .execute_command(Command::ConfigGet("test_key".into()), None)
+            .unwrap();
         match resp {
             CommandResponse::Text(v) => assert_eq!(v, "test_value"),
             other => panic!("unexpected: {other:?}"),
@@ -2734,7 +3173,10 @@ mod tests {
         use weav_server::engine::CommandResponse;
 
         let server = test_server();
-        let resp = server.engine.execute_command(Command::Snapshot, None).unwrap();
+        let resp = server
+            .engine
+            .execute_command(Command::Snapshot, None)
+            .unwrap();
         assert!(matches!(resp, CommandResponse::Ok));
     }
 }

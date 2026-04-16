@@ -1,8 +1,12 @@
-#![allow(clippy::collapsible_if, clippy::collapsible_else_if, clippy::unnecessary_unwrap)]
+#![allow(
+    clippy::collapsible_if,
+    clippy::collapsible_else_if,
+    clippy::unnecessary_unwrap
+)]
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
-use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 use weav_proto::resp3::{Resp3Codec, Resp3Value};
@@ -366,10 +370,7 @@ mod tests {
 
     #[test]
     fn test_tokenize_empty_quoted_string() {
-        assert_eq!(
-            tokenize("GRAPH CREATE \"\""),
-            vec!["GRAPH", "CREATE", ""]
-        );
+        assert_eq!(tokenize("GRAPH CREATE \"\""), vec!["GRAPH", "CREATE", ""]);
     }
 
     #[test]
@@ -610,10 +611,7 @@ mod tests {
         let val = Resp3Value::Map(vec![
             (
                 Resp3Value::SimpleString("items".to_string()),
-                Resp3Value::Array(vec![
-                    Resp3Value::Number(10),
-                    Resp3Value::Number(20),
-                ]),
+                Resp3Value::Array(vec![Resp3Value::Number(10), Resp3Value::Number(20)]),
             ),
             (
                 Resp3Value::SimpleString("count".to_string()),

@@ -1,7 +1,7 @@
 //! Configuration system for Weav.
 
 use crate::schema::GraphSchema;
-use crate::types::ConflictPolicy;
+use crate::types::{ConflictPolicy, ResolutionMode};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -95,18 +95,55 @@ impl WeavConfig {
         env_override!("WEAV_EXTRACT_ENABLED", self.extract.enabled);
         env_override_str!("WEAV_EXTRACT_LLM_BACKEND", self.extract.llm_backend);
         env_override_opt!("WEAV_EXTRACT_LLM_API_KEY", self.extract.llm_api_key);
-        env_override_str!("WEAV_EXTRACT_EXTRACTION_MODEL", self.extract.extraction_model);
+        env_override_str!(
+            "WEAV_EXTRACT_EXTRACTION_MODEL",
+            self.extract.extraction_model
+        );
         env_override_opt!("WEAV_EXTRACT_LLM_BASE_URL", self.extract.llm_base_url);
-        env_override_str!("WEAV_EXTRACT_EMBEDDING_BACKEND", self.extract.embedding_backend);
-        env_override_opt!("WEAV_EXTRACT_EMBEDDING_API_KEY", self.extract.embedding_api_key);
+        env_override_str!(
+            "WEAV_EXTRACT_EMBEDDING_BACKEND",
+            self.extract.embedding_backend
+        );
+        env_override_opt!(
+            "WEAV_EXTRACT_EMBEDDING_API_KEY",
+            self.extract.embedding_api_key
+        );
         env_override_str!("WEAV_EXTRACT_EMBEDDING_MODEL", self.extract.embedding_model);
-        env_override!("WEAV_EXTRACT_EMBEDDING_DIMENSIONS", self.extract.embedding_dimensions);
+        env_override!(
+            "WEAV_EXTRACT_EMBEDDING_DIMENSIONS",
+            self.extract.embedding_dimensions
+        );
         env_override!("WEAV_EXTRACT_CHUNK_SIZE", self.extract.chunk_size);
         env_override!("WEAV_EXTRACT_CHUNK_OVERLAP", self.extract.chunk_overlap);
-        env_override!("WEAV_EXTRACT_MAX_EXTRACTION_TOKENS", self.extract.max_extraction_tokens);
-        env_override!("WEAV_EXTRACT_MAX_CONCURRENT_LLM_CALLS", self.extract.max_concurrent_llm_calls);
-        env_override!("WEAV_EXTRACT_MAX_CONCURRENT_EMBEDDING_CALLS", self.extract.max_concurrent_embedding_calls);
-        env_override!("WEAV_EXTRACT_EMBEDDING_BATCH_SIZE", self.extract.embedding_batch_size);
+        env_override!(
+            "WEAV_EXTRACT_MAX_EXTRACTION_TOKENS",
+            self.extract.max_extraction_tokens
+        );
+        if let Ok(v) = std::env::var("WEAV_EXTRACT_RESOLUTION_MODE")
+            && let Some(mode) = ResolutionMode::from_str_lossy(&v)
+        {
+            self.extract.resolution_mode = mode;
+        }
+        env_override!(
+            "WEAV_EXTRACT_LINK_EXISTING_ENTITIES",
+            self.extract.link_existing_entities
+        );
+        env_override!(
+            "WEAV_EXTRACT_RESOLUTION_CANDIDATE_LIMIT",
+            self.extract.resolution_candidate_limit
+        );
+        env_override!(
+            "WEAV_EXTRACT_MAX_CONCURRENT_LLM_CALLS",
+            self.extract.max_concurrent_llm_calls
+        );
+        env_override!(
+            "WEAV_EXTRACT_MAX_CONCURRENT_EMBEDDING_CALLS",
+            self.extract.max_concurrent_embedding_calls
+        );
+        env_override!(
+            "WEAV_EXTRACT_EMBEDDING_BATCH_SIZE",
+            self.extract.embedding_batch_size
+        );
     }
 
     fn validate(&self) -> Result<(), crate::error::WeavError> {
@@ -312,6 +349,12 @@ pub struct ExtractConfig {
     pub max_extraction_tokens: usize,
     /// Temperature for extraction LLM calls.
     pub extraction_temperature: f32,
+    /// Alias resolution mode for extracted entities.
+    pub resolution_mode: ResolutionMode,
+    /// When true, ingest may link extracted entities to existing graph-local entities.
+    pub link_existing_entities: bool,
+    /// Maximum number of resolution candidates to consider per entity.
+    pub resolution_candidate_limit: usize,
     /// Maximum concurrent LLM extraction calls.
     pub max_concurrent_llm_calls: usize,
     /// Maximum concurrent embedding API calls.
@@ -336,6 +379,9 @@ impl Default for ExtractConfig {
             chunk_overlap: 50,
             max_extraction_tokens: 4096,
             extraction_temperature: 0.0,
+            resolution_mode: ResolutionMode::Heuristic,
+            link_existing_entities: true,
+            resolution_candidate_limit: 8,
             max_concurrent_llm_calls: 4,
             max_concurrent_embedding_calls: 8,
             embedding_batch_size: 32,
@@ -359,7 +405,6 @@ pub struct AuthConfig {
     /// Statically-defined users from config.
     pub users: Vec<UserConfig>,
 }
-
 
 /// A user definition in the config file.
 #[derive(Debug, Clone, Deserialize)]
@@ -695,7 +740,10 @@ api_keys = ["wk_live_abc123"]
     #[test]
     fn test_graph_config_defaults() {
         let gc = GraphConfig::default();
-        assert_eq!(gc.default_conflict_policy, crate::types::ConflictPolicy::LastWriteWins);
+        assert_eq!(
+            gc.default_conflict_policy,
+            crate::types::ConflictPolicy::LastWriteWins
+        );
         assert_eq!(gc.default_decay, crate::types::DecayFunction::None);
         assert_eq!(gc.max_nodes, None);
         assert_eq!(gc.max_edges, None);
@@ -721,6 +769,9 @@ api_keys = ["wk_live_abc123"]
         assert_eq!(ec.chunk_overlap, 50);
         assert_eq!(ec.max_extraction_tokens, 4096);
         assert_eq!(ec.extraction_temperature, 0.0);
+        assert_eq!(ec.resolution_mode, ResolutionMode::Heuristic);
+        assert!(ec.link_existing_entities);
+        assert_eq!(ec.resolution_candidate_limit, 8);
         assert_eq!(ec.max_concurrent_llm_calls, 4);
         assert_eq!(ec.max_concurrent_embedding_calls, 8);
         assert_eq!(ec.embedding_batch_size, 32);
@@ -745,6 +796,9 @@ embedding_model = "text-embedding-3-large"
 embedding_dimensions = 3072
 chunk_size = 1024
 chunk_overlap = 100
+resolution_mode = "semantic"
+link_existing_entities = false
+resolution_candidate_limit = 12
 "#;
         let config: WeavConfig = toml::from_str(toml_str).unwrap();
         assert!(config.extract.enabled);
@@ -755,6 +809,9 @@ chunk_overlap = 100
         assert_eq!(config.extract.embedding_dimensions, 3072);
         assert_eq!(config.extract.chunk_size, 1024);
         assert_eq!(config.extract.chunk_overlap, 100);
+        assert_eq!(config.extract.resolution_mode, ResolutionMode::Semantic);
+        assert!(!config.extract.link_existing_entities);
+        assert_eq!(config.extract.resolution_candidate_limit, 12);
         // Defaults preserved for unset fields
         assert_eq!(config.extract.max_concurrent_llm_calls, 4);
         assert_eq!(config.extract.embedding_batch_size, 32);

@@ -1,6 +1,8 @@
 //! Query planner that converts a `ContextQuery` into an ordered execution plan.
 
-use weav_core::types::{ConflictPolicy, DecayFunction, Direction, Timestamp, TokenBudget};
+use weav_core::types::{
+    ConflictPolicy, DecayFunction, Direction, RetrievalMode, Timestamp, TokenBudget,
+};
 
 use crate::parser::{ContextQuery, EdgeFilterConfig, SeedStrategy};
 
@@ -15,15 +17,12 @@ pub struct QueryPlan {
 /// A single step in the query execution plan.
 #[derive(Debug)]
 pub enum PlanStep {
+    /// Search stored community-summary nodes.
+    SummarySearch,
     /// Perform a vector similarity search to find seed nodes.
-    VectorSearch {
-        query_vector: Vec<f32>,
-        k: u16,
-    },
+    VectorSearch { query_vector: Vec<f32>, k: u16 },
     /// Look up nodes by their entity keys.
-    NodeLookup {
-        node_keys: Vec<String>,
-    },
+    NodeLookup { node_keys: Vec<String> },
     /// Traverse the graph from seed nodes.
     GraphTraversal {
         max_depth: u8,
@@ -37,35 +36,32 @@ pub enum PlanStep {
         max_depth: u8,
     },
     /// Filter results by temporal validity.
-    TemporalFilter {
-        timestamp: Timestamp,
-    },
+    TemporalFilter { timestamp: Timestamp },
     /// Apply relevance decay based on age.
-    RelevanceScore {
-        decay: Option<DecayFunction>,
+    RelevanceScore { decay: Option<DecayFunction> },
+    /// Rerank the top candidate chunks before final limiting and budgeting.
+    Rerank {
+        provider: &'static str,
+        model: Option<String>,
+        candidate_limit: u32,
+        score_weight: f32,
     },
     /// Enforce the token budget constraint.
-    TokenBudgetEnforce {
-        budget: TokenBudget,
-    },
+    TokenBudgetEnforce { budget: TokenBudget },
     /// Extract paths through the graph.
-    PathExtraction {
-        max_paths: u32,
-        max_length: u8,
-    },
+    PathExtraction { max_paths: u32, max_length: u8 },
+    /// Fuse local and global ranked lists into one ranking.
+    HybridFusion { sources: u8 },
     /// Detect conflicting information across nodes.
-    ConflictDetection {
-        policy: ConflictPolicy,
-    },
+    ConflictDetection { policy: ConflictPolicy },
     /// Format the final context output.
-    FormatContext {
-        include_provenance: bool,
-    },
+    FormatContext { include_provenance: bool },
 }
 
 impl std::fmt::Display for PlanStep {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            PlanStep::SummarySearch => write!(f, "SummarySearch"),
             PlanStep::VectorSearch { k, .. } => write!(f, "VectorSearch(top_k={k})"),
             PlanStep::NodeLookup { node_keys } => {
                 write!(f, "NodeLookup(keys=[{}])", node_keys.join(", "))
@@ -89,6 +85,15 @@ impl std::fmt::Display for PlanStep {
             PlanStep::RelevanceScore { decay } => {
                 write!(f, "RelevanceScore(decay={decay:?})")
             }
+            PlanStep::Rerank {
+                provider,
+                model,
+                candidate_limit,
+                score_weight,
+            } => write!(
+                f,
+                "Rerank(provider={provider}, model={model:?}, candidates={candidate_limit}, weight={score_weight})"
+            ),
             PlanStep::TokenBudgetEnforce { budget } => {
                 write!(f, "TokenBudgetEnforce(max={})", budget.max_tokens)
             }
@@ -96,12 +101,13 @@ impl std::fmt::Display for PlanStep {
                 max_paths,
                 max_length,
             } => write!(f, "PathExtraction(paths={max_paths}, len={max_length})"),
+            PlanStep::HybridFusion { sources } => write!(f, "HybridFusion(sources={sources})"),
             PlanStep::ConflictDetection { policy } => {
                 write!(f, "ConflictDetection(policy={policy:?})")
             }
-            PlanStep::FormatContext {
-                include_provenance,
-            } => write!(f, "FormatContext(provenance={include_provenance})"),
+            PlanStep::FormatContext { include_provenance } => {
+                write!(f, "FormatContext(provenance={include_provenance})")
+            }
         }
     }
 }
@@ -110,81 +116,98 @@ impl std::fmt::Display for PlanStep {
 
 /// Convert a `ContextQuery` into an ordered `QueryPlan`.
 ///
-/// The plan steps are ordered as follows:
-/// 1. VectorSearch (if seeds have vectors)
-/// 2. NodeLookup (if seeds have node keys)
-/// 3. GraphTraversal (always)
-/// 4. FlowScore (always, with defaults alpha=0.5, theta=0.01)
-/// 5. TemporalFilter (if temporal_at is set)
-/// 6. RelevanceScore (with decay)
-/// 7. TokenBudgetEnforce (if budget is set)
-/// 8. FormatContext (always)
+/// The plan changes based on `retrieval_mode`:
+/// - `local`: existing traversal-first path
+/// - `global`: summary-node search only
+/// - `hybrid`: local path + summary search + hybrid fusion
 pub fn plan_context_query(query: &ContextQuery) -> QueryPlan {
     let mut steps = Vec::new();
 
-    // Step 1: Vector search if seeds contain an embedding
-    match &query.seeds {
-        SeedStrategy::Vector { embedding, top_k } => {
-            steps.push(PlanStep::VectorSearch {
-                query_vector: embedding.clone(),
-                k: *top_k,
-            });
-        }
-        SeedStrategy::Both {
-            embedding, top_k, ..
-        } => {
-            steps.push(PlanStep::VectorSearch {
-                query_vector: embedding.clone(),
-                k: *top_k,
-            });
-        }
-        SeedStrategy::Nodes(_) => {}
+    let include_local = matches!(
+        query.retrieval_mode,
+        RetrievalMode::Local | RetrievalMode::Hybrid | RetrievalMode::Drift
+    );
+    let include_global = matches!(
+        query.retrieval_mode,
+        RetrievalMode::Global | RetrievalMode::Hybrid | RetrievalMode::Drift
+    );
+
+    if include_global {
+        steps.push(PlanStep::SummarySearch);
     }
 
-    // Step 2: Node lookup if seeds contain node keys
-    match &query.seeds {
-        SeedStrategy::Nodes(keys) if !keys.is_empty() => {
-            steps.push(PlanStep::NodeLookup {
-                node_keys: keys.clone(),
-            });
+    if include_local {
+        // Step 1: Vector search if seeds contain an embedding
+        match &query.seeds {
+            SeedStrategy::Vector { embedding, top_k } => {
+                steps.push(PlanStep::VectorSearch {
+                    query_vector: embedding.clone(),
+                    k: *top_k,
+                });
+            }
+            SeedStrategy::Both {
+                embedding, top_k, ..
+            } => {
+                steps.push(PlanStep::VectorSearch {
+                    query_vector: embedding.clone(),
+                    k: *top_k,
+                });
+            }
+            SeedStrategy::Nodes(_) => {}
         }
-        SeedStrategy::Both { node_keys, .. } if !node_keys.is_empty() => {
-            steps.push(PlanStep::NodeLookup {
-                node_keys: node_keys.clone(),
-            });
+
+        // Step 2: Node lookup if seeds contain node keys
+        match &query.seeds {
+            SeedStrategy::Nodes(keys) if !keys.is_empty() => {
+                steps.push(PlanStep::NodeLookup {
+                    node_keys: keys.clone(),
+                });
+            }
+            SeedStrategy::Both { node_keys, .. } if !node_keys.is_empty() => {
+                steps.push(PlanStep::NodeLookup {
+                    node_keys: node_keys.clone(),
+                });
+            }
+            _ => {}
         }
-        _ => {}
+
+        // Step 3: Graph traversal (always for local retrieval)
+        steps.push(PlanStep::GraphTraversal {
+            max_depth: query.max_depth,
+            direction: query.direction,
+            edge_filter: query.edge_filter.clone(),
+        });
+
+        // Step 4: Flow score (always for local retrieval, with defaults)
+        steps.push(PlanStep::FlowScore {
+            alpha: 0.5,
+            theta: 0.01,
+            max_depth: query.max_depth,
+        });
+
+        // Step 4b: Path extraction (when multiple node seeds)
+        match &query.seeds {
+            SeedStrategy::Nodes(keys) if keys.len() >= 2 => {
+                steps.push(PlanStep::PathExtraction {
+                    max_paths: 10,
+                    max_length: query.max_depth,
+                });
+            }
+            SeedStrategy::Both { node_keys, .. } if node_keys.len() >= 2 => {
+                steps.push(PlanStep::PathExtraction {
+                    max_paths: 10,
+                    max_length: query.max_depth,
+                });
+            }
+            _ => {}
+        }
     }
 
-    // Step 3: Graph traversal (always)
-    steps.push(PlanStep::GraphTraversal {
-        max_depth: query.max_depth,
-        direction: query.direction,
-        edge_filter: query.edge_filter.clone(),
-    });
-
-    // Step 4: Flow score (always, with defaults)
-    steps.push(PlanStep::FlowScore {
-        alpha: 0.5,
-        theta: 0.01,
-        max_depth: query.max_depth,
-    });
-
-    // Step 4b: Path extraction (when multiple node seeds)
-    match &query.seeds {
-        SeedStrategy::Nodes(keys) if keys.len() >= 2 => {
-            steps.push(PlanStep::PathExtraction {
-                max_paths: 10,
-                max_length: query.max_depth,
-            });
-        }
-        SeedStrategy::Both { node_keys, .. } if node_keys.len() >= 2 => {
-            steps.push(PlanStep::PathExtraction {
-                max_paths: 10,
-                max_length: query.max_depth,
-            });
-        }
-        _ => {}
+    if matches!(
+        query.retrieval_mode,
+        RetrievalMode::Hybrid | RetrievalMode::Drift
+    ) {
+        steps.push(PlanStep::HybridFusion { sources: 2 });
     }
 
     // Step 5: Temporal filter (if set)
@@ -201,6 +224,21 @@ pub fn plan_context_query(query: &ContextQuery) -> QueryPlan {
     steps.push(PlanStep::RelevanceScore {
         decay: query.decay.clone(),
     });
+
+    if let Some(rerank) = query.rerank.as_ref()
+        && rerank.is_active()
+        && query
+            .query_text
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
+    {
+        steps.push(PlanStep::Rerank {
+            provider: rerank.supported_provider().unwrap_or("cross_encoder"),
+            model: rerank.model.clone(),
+            candidate_limit: rerank.candidate_limit,
+            score_weight: rerank.clamped_score_weight(),
+        });
+    }
 
     // Step 7: Token budget enforcement (if set)
     if let Some(ref budget) = query.budget {
@@ -223,12 +261,14 @@ pub fn plan_context_query(query: &ContextQuery) -> QueryPlan {
 mod tests {
     use super::*;
     use crate::parser::{SortDirection, SortField, SortOrder};
-    use weav_core::types::TokenBudget;
+    use weav_core::types::{RetrievalMode, TokenBudget};
 
     fn make_basic_query() -> ContextQuery {
         ContextQuery {
             query_text: Some("test query".to_string()),
             graph: "test_graph".to_string(),
+            retrieval_mode: RetrievalMode::Local,
+            rerank: None,
             budget: None,
             seeds: SeedStrategy::Nodes(vec!["key1".to_string()]),
             max_depth: 2,
@@ -271,7 +311,10 @@ mod tests {
 
         // Should have: VectorSearch, GraphTraversal, FlowScore, ConflictDetection, RelevanceScore, FormatContext
         assert_eq!(plan.steps.len(), 6);
-        assert!(matches!(&plan.steps[0], PlanStep::VectorSearch { k: 5, .. }));
+        assert!(matches!(
+            &plan.steps[0],
+            PlanStep::VectorSearch { k: 5, .. }
+        ));
     }
 
     #[test]
@@ -404,6 +447,8 @@ mod tests {
         let query = ContextQuery {
             query_text: Some("full test".to_string()),
             graph: "g".to_string(),
+            retrieval_mode: RetrievalMode::Local,
+            rerank: None,
             budget: Some(TokenBudget::new(2048)),
             seeds: SeedStrategy::Both {
                 embedding: vec![0.1, 0.2],
@@ -440,7 +485,10 @@ mod tests {
         assert!(matches!(&plan.steps[4], PlanStep::TemporalFilter { .. }));
         assert!(matches!(&plan.steps[5], PlanStep::ConflictDetection { .. }));
         assert!(matches!(&plan.steps[6], PlanStep::RelevanceScore { .. }));
-        assert!(matches!(&plan.steps[7], PlanStep::TokenBudgetEnforce { .. }));
+        assert!(matches!(
+            &plan.steps[7],
+            PlanStep::TokenBudgetEnforce { .. }
+        ));
         assert!(matches!(&plan.steps[8], PlanStep::FormatContext { .. }));
     }
 
@@ -468,6 +516,46 @@ mod tests {
             _ => None,
         });
         assert_eq!(path_step, Some((10, 2)));
+    }
+
+    #[test]
+    fn test_plan_with_active_rerank() {
+        let mut query = make_basic_query();
+        query.rerank = Some(weav_core::types::RerankConfig {
+            provider: Some("cross_encoder".to_string()),
+            candidate_limit: 25,
+            score_weight: 0.5,
+            ..Default::default()
+        });
+
+        let plan = plan_context_query(&query);
+        let rerank = plan.steps.iter().find_map(|step| match step {
+            PlanStep::Rerank {
+                provider,
+                candidate_limit,
+                score_weight,
+                ..
+            } => Some((*provider, *candidate_limit, *score_weight)),
+            _ => None,
+        });
+
+        assert_eq!(rerank, Some(("cross_encoder", 25, 0.5)));
+    }
+
+    #[test]
+    fn test_plan_skips_rerank_without_supported_provider() {
+        let mut query = make_basic_query();
+        query.rerank = Some(weav_core::types::RerankConfig {
+            provider: Some("unsupported".to_string()),
+            ..Default::default()
+        });
+
+        assert!(
+            !plan_context_query(&query)
+                .steps
+                .iter()
+                .any(|step| matches!(step, PlanStep::Rerank { .. }))
+        );
     }
 
     // ── Round 7 edge-case tests ─────────────────────────────────────────────
@@ -516,7 +604,10 @@ mod tests {
             .steps
             .iter()
             .any(|s| matches!(s, PlanStep::VectorSearch { .. }));
-        assert!(has_vector_search, "VectorSearch should be present for Both seeds");
+        assert!(
+            has_vector_search,
+            "VectorSearch should be present for Both seeds"
+        );
 
         // NodeLookup should NOT be present (empty node_keys are skipped)
         let has_node_lookup = plan
@@ -567,6 +658,8 @@ mod tests {
         let query = ContextQuery {
             query_text: Some("all options".to_string()),
             graph: "g".to_string(),
+            retrieval_mode: RetrievalMode::Local,
+            rerank: None,
             budget: Some(TokenBudget::new(8192)),
             seeds: SeedStrategy::Both {
                 embedding: vec![0.1, 0.2, 0.3],
@@ -580,7 +673,9 @@ mod tests {
                 min_weight: Some(0.3),
                 min_confidence: Some(0.7),
             }),
-            decay: Some(DecayFunction::Step { cutoff_ms: 86400000 }),
+            decay: Some(DecayFunction::Step {
+                cutoff_ms: 86400000,
+            }),
             include_provenance: true,
             temporal_at: Some(999999),
             limit: Some(100),
@@ -598,17 +693,52 @@ mod tests {
         // Should have all 10 steps:
         // VectorSearch, NodeLookup, GraphTraversal, FlowScore, PathExtraction,
         // TemporalFilter, ConflictDetection, RelevanceScore, TokenBudgetEnforce, FormatContext
-        assert_eq!(plan.steps.len(), 10, "all options combined should produce 10 steps");
-        assert!(matches!(&plan.steps[0], PlanStep::VectorSearch { k: 20, .. }));
+        assert_eq!(
+            plan.steps.len(),
+            10,
+            "all options combined should produce 10 steps"
+        );
+        assert!(matches!(
+            &plan.steps[0],
+            PlanStep::VectorSearch { k: 20, .. }
+        ));
         assert!(matches!(&plan.steps[1], PlanStep::NodeLookup { .. }));
-        assert!(matches!(&plan.steps[2], PlanStep::GraphTraversal { max_depth: 5, .. }));
-        assert!(matches!(&plan.steps[3], PlanStep::FlowScore { max_depth: 5, .. }));
-        assert!(matches!(&plan.steps[4], PlanStep::PathExtraction { max_paths: 10, max_length: 5 }));
-        assert!(matches!(&plan.steps[5], PlanStep::TemporalFilter { timestamp: 999999 }));
+        assert!(matches!(
+            &plan.steps[2],
+            PlanStep::GraphTraversal { max_depth: 5, .. }
+        ));
+        assert!(matches!(
+            &plan.steps[3],
+            PlanStep::FlowScore { max_depth: 5, .. }
+        ));
+        assert!(matches!(
+            &plan.steps[4],
+            PlanStep::PathExtraction {
+                max_paths: 10,
+                max_length: 5
+            }
+        ));
+        assert!(matches!(
+            &plan.steps[5],
+            PlanStep::TemporalFilter { timestamp: 999999 }
+        ));
         assert!(matches!(&plan.steps[6], PlanStep::ConflictDetection { .. }));
-        assert!(matches!(&plan.steps[7], PlanStep::RelevanceScore { decay: Some(DecayFunction::Step { .. }) }));
-        assert!(matches!(&plan.steps[8], PlanStep::TokenBudgetEnforce { .. }));
-        assert!(matches!(&plan.steps[9], PlanStep::FormatContext { include_provenance: true }));
+        assert!(matches!(
+            &plan.steps[7],
+            PlanStep::RelevanceScore {
+                decay: Some(DecayFunction::Step { .. })
+            }
+        ));
+        assert!(matches!(
+            &plan.steps[8],
+            PlanStep::TokenBudgetEnforce { .. }
+        ));
+        assert!(matches!(
+            &plan.steps[9],
+            PlanStep::FormatContext {
+                include_provenance: true
+            }
+        ));
     }
 
     #[test]
@@ -635,7 +765,10 @@ mod tests {
         // 1. Basic node seeds
         let plan1 = plan_context_query(&make_basic_query());
         assert!(
-            plan1.steps.iter().any(|s| matches!(s, PlanStep::ConflictDetection { .. })),
+            plan1
+                .steps
+                .iter()
+                .any(|s| matches!(s, PlanStep::ConflictDetection { .. })),
             "ConflictDetection should be present for basic node seeds"
         );
 
@@ -647,7 +780,10 @@ mod tests {
         };
         let plan2 = plan_context_query(&q2);
         assert!(
-            plan2.steps.iter().any(|s| matches!(s, PlanStep::ConflictDetection { .. })),
+            plan2
+                .steps
+                .iter()
+                .any(|s| matches!(s, PlanStep::ConflictDetection { .. })),
             "ConflictDetection should be present for vector seeds"
         );
 
@@ -656,7 +792,10 @@ mod tests {
         q3.seeds = SeedStrategy::Nodes(vec![]);
         let plan3 = plan_context_query(&q3);
         assert!(
-            plan3.steps.iter().any(|s| matches!(s, PlanStep::ConflictDetection { .. })),
+            plan3
+                .steps
+                .iter()
+                .any(|s| matches!(s, PlanStep::ConflictDetection { .. })),
             "ConflictDetection should be present even with empty seeds"
         );
 
@@ -666,8 +805,61 @@ mod tests {
         q4.temporal_at = Some(5000);
         let plan4 = plan_context_query(&q4);
         assert!(
-            plan4.steps.iter().any(|s| matches!(s, PlanStep::ConflictDetection { .. })),
+            plan4
+                .steps
+                .iter()
+                .any(|s| matches!(s, PlanStep::ConflictDetection { .. })),
             "ConflictDetection should be present with budget and temporal"
+        );
+    }
+
+    #[test]
+    fn test_plan_global_query_uses_summary_search_only() {
+        let mut query = make_basic_query();
+        query.retrieval_mode = RetrievalMode::Global;
+
+        let plan = plan_context_query(&query);
+
+        assert!(matches!(&plan.steps[0], PlanStep::SummarySearch));
+        assert!(
+            !plan
+                .steps
+                .iter()
+                .any(|s| matches!(s, PlanStep::GraphTraversal { .. })),
+            "global retrieval should not include graph traversal"
+        );
+        assert!(
+            plan.steps
+                .iter()
+                .any(|s| matches!(s, PlanStep::ConflictDetection { .. })),
+            "global retrieval should still include downstream formatting steps"
+        );
+    }
+
+    #[test]
+    fn test_plan_hybrid_query_includes_summary_search_and_fusion() {
+        let mut query = make_basic_query();
+        query.retrieval_mode = RetrievalMode::Hybrid;
+
+        let plan = plan_context_query(&query);
+
+        assert!(
+            plan.steps
+                .iter()
+                .any(|s| matches!(s, PlanStep::SummarySearch)),
+            "hybrid retrieval should search summaries"
+        );
+        assert!(
+            plan.steps
+                .iter()
+                .any(|s| matches!(s, PlanStep::HybridFusion { sources: 2 })),
+            "hybrid retrieval should fuse local and global rankings"
+        );
+        assert!(
+            plan.steps
+                .iter()
+                .any(|s| matches!(s, PlanStep::GraphTraversal { .. })),
+            "hybrid retrieval should keep local traversal"
         );
     }
 
@@ -675,6 +867,9 @@ mod tests {
 
     #[test]
     fn test_plan_step_display() {
+        let step = PlanStep::SummarySearch;
+        assert_eq!(format!("{step}"), "SummarySearch");
+
         let step = PlanStep::VectorSearch {
             query_vector: vec![1.0, 0.0],
             k: 10,
@@ -698,12 +893,18 @@ mod tests {
             theta: 0.01,
             max_depth: 2,
         };
-        assert_eq!(format!("{step}"), "FlowScore(alpha=0.5, theta=0.01, depth=2)");
+        assert_eq!(
+            format!("{step}"),
+            "FlowScore(alpha=0.5, theta=0.01, depth=2)"
+        );
 
         let step = PlanStep::TokenBudgetEnforce {
             budget: TokenBudget::new(4096),
         };
         assert_eq!(format!("{step}"), "TokenBudgetEnforce(max=4096)");
+
+        let step = PlanStep::HybridFusion { sources: 2 };
+        assert_eq!(format!("{step}"), "HybridFusion(sources=2)");
 
         let step = PlanStep::FormatContext {
             include_provenance: true,

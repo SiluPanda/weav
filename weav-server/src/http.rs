@@ -2,24 +2,29 @@
 //!
 //! Translates JSON requests into engine `Command`s and engine responses back to JSON.
 
+use std::convert::Infallible;
 use std::sync::Arc;
-
 use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tower_http::timeout::TimeoutLayer;
 
+use weav_core::events::GraphEvent;
+use weav_core::scope::{ScopeRef, resolve_graph_ref};
 use weav_core::types::{DecayFunction, Direction, TokenBudget, Value};
 use weav_query::parser::{
     BulkInsertEdgesCmd, BulkInsertNodesCmd, Command, ContextQuery, CypherCmd, EdgeAddCmd,
     EdgeDeleteCmd, EdgeFilterConfig, EdgeInvalidateCmd, GraphCreateCmd, NodeAddCmd, NodeDeleteCmd,
-    NodeGetCmd, NodeUpdateCmd, SeedStrategy, SortDirection, SortField, SortOrder,
+    NodeGetCmd, NodeMergeCmd, NodeUpdateCmd, SeedStrategy, SortDirection, SortField, SortOrder,
 };
 
 use crate::engine::{CommandResponse, Engine};
@@ -28,7 +33,8 @@ use crate::engine::{CommandResponse, Engine};
 
 #[derive(Deserialize)]
 pub struct CreateGraphRequest {
-    pub name: String,
+    pub name: Option<String>,
+    pub scope: Option<ScopeRef>,
 }
 
 #[derive(Deserialize)]
@@ -59,6 +65,13 @@ pub struct UpdateNodeRequest {
 }
 
 #[derive(Deserialize)]
+pub struct MergeNodesRequest {
+    pub source_id: u64,
+    pub target_id: u64,
+    pub conflict_policy: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct BulkAddNodesRequest {
     pub nodes: Vec<AddNodeRequest>,
 }
@@ -84,8 +97,11 @@ pub struct DecayRequest {
 
 #[derive(Deserialize)]
 pub struct ContextRequest {
-    pub graph: String,
+    pub graph: Option<String>,
+    pub scope: Option<ScopeRef>,
     pub query: Option<String>,
+    pub retrieval_mode: Option<weav_core::types::RetrievalMode>,
+    pub rerank: Option<weav_core::types::RerankConfig>,
     pub embedding: Option<Vec<f32>>,
     pub seed_nodes: Option<Vec<String>>,
     pub budget: Option<u32>,
@@ -136,6 +152,12 @@ pub struct TemporalQueryRequest {
 #[derive(Deserialize)]
 pub struct BackupRequest {
     pub label: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+pub struct EventsQueryParams {
+    pub since_sequence: Option<u64>,
+    pub replay_limit: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -248,6 +270,7 @@ struct EdgeDetailJson {
 
 /// Build the axum Router with all routes.
 pub fn build_router(engine: Arc<Engine>) -> Router {
+    let request_timeout = engine.http_request_timeout();
     let router = Router::new()
         .route("/health", get(health))
         // Graph routes.
@@ -255,10 +278,13 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/graphs", get(list_graphs))
         .route("/v1/graphs/{name}", get(get_graph_info))
         .route("/v1/graphs/{name}", delete(drop_graph))
+        .route("/v1/events", get(stream_events))
         .route("/v1/graphs/{graph}/check", get(check_graph))
+        .route("/v1/graphs/{graph}/events", get(stream_graph_events))
         // Node routes.
         .route("/v1/graphs/{graph}/nodes", post(add_node))
         .route("/v1/graphs/{graph}/nodes/bulk", post(bulk_add_nodes))
+        .route("/v1/graphs/{graph}/nodes/merge", post(merge_nodes))
         .route("/v1/graphs/{graph}/nodes/{id}", get(get_node))
         .route("/v1/graphs/{graph}/nodes/{id}", put(update_node))
         .route("/v1/graphs/{graph}/nodes/{id}", delete(delete_node))
@@ -360,7 +386,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(30),
+            request_timeout,
         ))
         .with_state(engine)
 }
@@ -428,6 +454,25 @@ fn extract_group_id(headers: &HeaderMap) -> Option<String> {
         .get("x-group-id")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
+}
+
+fn event_visible_to_identity(
+    event: &GraphEvent,
+    identity: Option<&weav_auth::identity::SessionIdentity>,
+) -> bool {
+    identity.is_none_or(|id| id.permissions.can_read_graph(event.graph.as_str()))
+}
+
+fn sse_event(event: &GraphEvent) -> Result<Event, weav_core::error::WeavError> {
+    let public = event
+        .to_public_event()
+        .map_err(|err| weav_core::error::WeavError::Internal(err.to_string()))?;
+    let data = serde_json::to_string(&public)
+        .map_err(|err| weav_core::error::WeavError::Internal(err.to_string()))?;
+    Ok(Event::default()
+        .id(public.sequence.to_string())
+        .event(&public.kind)
+        .data(data))
 }
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
@@ -1600,56 +1645,63 @@ async fn graph_diff(
     let mut active_at_start: Vec<u64> = Vec::new();
     let mut active_at_end: Vec<u64> = Vec::new();
 
-    let mut added_nodes: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let mut removed_nodes: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let mut nodes_at_start: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let mut nodes_at_end: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut added_nodes: Vec<u64> = Vec::new();
+    let mut removed_nodes: Vec<u64> = Vec::new();
+    let mut nodes_at_start: Vec<u64> = Vec::new();
+    let mut nodes_at_end: Vec<u64> = Vec::new();
 
-    for (eid, meta) in gs.adjacency.all_edges() {
-        let t = &meta.temporal;
-
-        // Edge was added during [from_ts, to_ts)
-        if t.tx_from >= from_ts && t.tx_from < to_ts {
+    for (&eid, temporal) in &gs.edge_temporal {
+        if temporal.tx_from >= from_ts && temporal.tx_from < to_ts {
             added_edges.push(eid);
-            added_nodes.insert(meta.source);
-            added_nodes.insert(meta.target);
         }
-
-        // Edge was removed during [from_ts, to_ts)
-        if t.tx_until != u64::MAX && t.tx_until >= from_ts && t.tx_until < to_ts {
+        if temporal.tx_until != u64::MAX
+            && temporal.tx_until >= from_ts
+            && temporal.tx_until < to_ts
+        {
             removed_edges.push(eid);
-            removed_nodes.insert(meta.source);
-            removed_nodes.insert(meta.target);
         }
-
-        // Edge active at from_ts
-        if t.is_valid_at(from_ts) && t.is_current_at(from_ts) {
+        if temporal.is_valid_at(from_ts) && temporal.is_current_at(from_ts) {
             active_at_start.push(eid);
-            nodes_at_start.insert(meta.source);
-            nodes_at_start.insert(meta.target);
         }
-
-        // Edge active at to_ts
-        if t.is_valid_at(to_ts) && t.is_current_at(to_ts) {
+        if temporal.is_valid_at(to_ts) && temporal.is_current_at(to_ts) {
             active_at_end.push(eid);
-            nodes_at_end.insert(meta.source);
-            nodes_at_end.insert(meta.target);
         }
     }
 
-    // Filter added_nodes to only those not present at start
-    let truly_added_nodes: Vec<u64> = added_nodes
-        .iter()
-        .filter(|n| !nodes_at_start.contains(n))
-        .copied()
-        .collect();
+    for (&nid, temporal) in &gs.node_temporal {
+        if temporal.tx_from >= from_ts && temporal.tx_from < to_ts {
+            added_nodes.push(nid);
+        }
+        if temporal.tx_until != u64::MAX
+            && temporal.tx_until >= from_ts
+            && temporal.tx_until < to_ts
+        {
+            removed_nodes.push(nid);
+        }
+        if temporal.is_valid_at(from_ts) && temporal.is_current_at(from_ts) {
+            nodes_at_start.push(nid);
+        }
+        if temporal.is_valid_at(to_ts) && temporal.is_current_at(to_ts) {
+            nodes_at_end.push(nid);
+        }
+    }
 
-    // Filter removed_nodes to only those not present at end
-    let truly_removed_nodes: Vec<u64> = removed_nodes
-        .iter()
-        .filter(|n| !nodes_at_end.contains(n))
-        .copied()
-        .collect();
+    added_edges.sort_unstable();
+    removed_edges.sort_unstable();
+    active_at_start.sort_unstable();
+    active_at_end.sort_unstable();
+    added_nodes.sort_unstable();
+    removed_nodes.sort_unstable();
+    nodes_at_start.sort_unstable();
+    nodes_at_end.sort_unstable();
+    let added_edges_count = added_edges.len();
+    let removed_edges_count = removed_edges.len();
+    let active_edges_at_start = active_at_start.len();
+    let active_edges_at_end = active_at_end.len();
+    let added_nodes_count = added_nodes.len();
+    let removed_nodes_count = removed_nodes.len();
+    let active_nodes_at_start = nodes_at_start.len();
+    let active_nodes_at_end = nodes_at_end.len();
 
     (
         StatusCode::OK,
@@ -1659,18 +1711,18 @@ async fn graph_diff(
             "edges": {
                 "added": added_edges,
                 "removed": removed_edges,
-                "added_count": added_edges.len(),
-                "removed_count": removed_edges.len(),
-                "active_at_start": active_at_start.len(),
-                "active_at_end": active_at_end.len(),
+                "added_count": added_edges_count,
+                "removed_count": removed_edges_count,
+                "active_at_start": active_edges_at_start,
+                "active_at_end": active_edges_at_end,
             },
             "nodes": {
-                "added": truly_added_nodes,
-                "removed": truly_removed_nodes,
-                "added_count": truly_added_nodes.len(),
-                "removed_count": truly_removed_nodes.len(),
-                "active_at_start": nodes_at_start.len(),
-                "active_at_end": nodes_at_end.len(),
+                "added": added_nodes,
+                "removed": removed_nodes,
+                "added_count": added_nodes_count,
+                "removed_count": removed_nodes_count,
+                "active_at_start": active_nodes_at_start,
+                "active_at_end": active_nodes_at_end,
             },
         }))),
     )
@@ -2196,16 +2248,119 @@ async fn metrics_handler() -> impl IntoResponse {
     )
 }
 
+async fn stream_events(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Query(params): Query<EventsQueryParams>,
+) -> impl IntoResponse {
+    stream_events_impl(engine, headers, None, params).await
+}
+
+async fn stream_graph_events(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+    Query(params): Query<EventsQueryParams>,
+) -> impl IntoResponse {
+    stream_events_impl(engine, headers, Some(graph), params).await
+}
+
+async fn stream_events_impl(
+    engine: Arc<Engine>,
+    headers: HeaderMap,
+    graph: Option<String>,
+    params: EventsQueryParams,
+) -> axum::response::Response {
+    let identity = extract_identity(&engine, &headers);
+    if let Some(graph_name) = graph.as_deref() {
+        if let Err(err) = engine.check_permission(
+            identity.as_ref(),
+            graph_name,
+            weav_auth::identity::GraphPermission::Read,
+        ) {
+            return weav_error_to_response(err).into_response();
+        }
+    } else if engine.is_auth_required() && identity.is_none() {
+        return weav_error_to_response(weav_core::error::WeavError::AuthenticationRequired)
+            .into_response();
+    }
+
+    let since_sequence = params.since_sequence.unwrap_or(0);
+    let replay_limit = params.replay_limit.unwrap_or(0) as usize;
+    let mut live_rx = engine.subscribe_events();
+    let backlog = engine.replay_events(graph.as_deref(), since_sequence, replay_limit);
+    let mut next_sequence = backlog
+        .last()
+        .map(|event| event.sequence.saturating_add(1))
+        .unwrap_or(since_sequence.saturating_add(1));
+
+    let (tx, rx) = mpsc::channel(backlog.len().max(16));
+    tokio::spawn(async move {
+        for event in backlog {
+            if !event_visible_to_identity(&event, identity.as_ref()) {
+                continue;
+            }
+            let sse = match sse_event(&event) {
+                Ok(event) => event,
+                Err(err) => {
+                    tracing::warn!("failed to serialize replay event: {err}");
+                    return;
+                }
+            };
+            if tx.send(Ok::<Event, Infallible>(sse)).await.is_err() {
+                return;
+            }
+        }
+
+        loop {
+            match live_rx.recv().await {
+                Ok(event) => {
+                    if event.sequence < next_sequence {
+                        continue;
+                    }
+                    next_sequence = event.sequence.saturating_add(1);
+                    if graph
+                        .as_deref()
+                        .is_some_and(|name| event.graph.as_str() != name)
+                        || !event_visible_to_identity(&event, identity.as_ref())
+                    {
+                        continue;
+                    }
+                    let sse = match sse_event(&event) {
+                        Ok(event) => event,
+                        Err(err) => {
+                            tracing::warn!("failed to serialize live event: {err}");
+                            return;
+                        }
+                    };
+                    if tx.send(Ok::<Event, Infallible>(sse)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!("event stream lagged by {skipped} messages");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    });
+
+    Sse::new(ReceiverStream::new(rx))
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
+}
+
 async fn create_graph(
     State(engine): State<Arc<Engine>>,
     headers: HeaderMap,
     Json(body): Json<CreateGraphRequest>,
 ) -> impl IntoResponse {
     let identity = extract_identity(&engine, &headers);
-    let cmd = Command::GraphCreate(GraphCreateCmd {
-        name: body.name,
-        config: None,
-    });
+    let name = match resolve_graph_ref(body.name.as_deref(), body.scope.as_ref()) {
+        Ok(name) => name,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
+    let cmd = Command::GraphCreate(GraphCreateCmd { name, config: None });
     match engine.execute_command(cmd, identity.as_ref()) {
         Ok(_) => (StatusCode::CREATED, Json(ApiResponse::<()>::ok_empty())).into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
@@ -2427,6 +2582,39 @@ async fn delete_node(
 
     match engine.execute_command(cmd, identity.as_ref()) {
         Ok(_) => (StatusCode::OK, Json(ApiResponse::<()>::ok_empty())).into_response(),
+        Err(e) => weav_error_to_response(e).into_response(),
+    }
+}
+
+async fn merge_nodes(
+    State(engine): State<Arc<Engine>>,
+    headers: HeaderMap,
+    Path(graph): Path<String>,
+    Json(body): Json<MergeNodesRequest>,
+) -> impl IntoResponse {
+    let identity = extract_identity(&engine, &headers);
+    let cmd = Command::NodeMerge(NodeMergeCmd {
+        graph,
+        source_id: body.source_id,
+        target_id: body.target_id,
+        conflict_policy: body
+            .conflict_policy
+            .unwrap_or_else(|| "keep_target".to_string()),
+    });
+
+    match engine.execute_command(cmd, identity.as_ref()) {
+        Ok(CommandResponse::Integer(id)) => (
+            StatusCode::OK,
+            Json(ApiResponse::ok(NodeIdResponse { node_id: id })),
+        )
+            .into_response(),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<()>::err(
+                "unexpected response type".to_string(),
+            )),
+        )
+            .into_response(),
         Err(e) => weav_error_to_response(e).into_response(),
     }
 }
@@ -2805,6 +2993,10 @@ async fn context_query(
     Json(body): Json<ContextRequest>,
 ) -> impl IntoResponse {
     let identity = extract_identity(&engine, &headers);
+    let graph = match resolve_graph_ref(body.graph.as_deref(), body.scope.as_ref()) {
+        Ok(graph) => graph,
+        Err(e) => return weav_error_to_response(e).into_response(),
+    };
     // Build the seed strategy.
     let seeds = match (&body.embedding, &body.seed_nodes) {
         (Some(emb), Some(nodes)) if !nodes.is_empty() => SeedStrategy::Both {
@@ -2876,7 +3068,9 @@ async fn context_query(
 
     let query = ContextQuery {
         query_text: body.query,
-        graph: body.graph,
+        graph,
+        retrieval_mode: body.retrieval_mode.unwrap_or_default(),
+        rerank: body.rerank,
         budget: resolved_budget,
         seeds,
         max_depth: body.max_depth.unwrap_or(2),
@@ -2923,6 +3117,10 @@ pub struct IngestRequest {
     pub skip_dedup: bool,
     pub chunk_size: Option<usize>,
     pub entity_types: Option<Vec<String>>,
+    pub resolution_mode: Option<weav_core::types::ResolutionMode>,
+    pub link_existing_entities: Option<bool>,
+    pub resolution_candidate_limit: Option<usize>,
+    pub custom_resolution_prompt: Option<String>,
 }
 
 #[cfg(feature = "extract")]
@@ -2932,6 +3130,8 @@ struct IngestResultJson {
     chunks_created: usize,
     entities_created: usize,
     entities_merged: usize,
+    entities_resolved: usize,
+    entities_linked_existing: usize,
     relationships_created: usize,
     pipeline_duration_ms: u64,
 }
@@ -2944,33 +3144,11 @@ async fn ingest(
     Json(body): Json<IngestRequest>,
 ) -> impl IntoResponse {
     let identity = extract_identity(&engine, &headers);
-    // Resolve content from either text or base64.
-    let content = if let Some(ref text) = body.content {
-        text.clone()
+    // Resolve content from either plain text or a base64-encoded binary payload.
+    let (content, content_base64) = if let Some(ref text) = body.content {
+        (text.clone(), None)
     } else if let Some(ref b64) = body.content_base64 {
-        match base64::engine::general_purpose::STANDARD.decode(b64) {
-            Ok(bytes) => match String::from_utf8(bytes) {
-                Ok(s) => s,
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(ApiResponse::<()>::err(format!(
-                            "content_base64 is not valid UTF-8: {e}"
-                        ))),
-                    )
-                        .into_response();
-                }
-            },
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ApiResponse::<()>::err(format!(
-                        "invalid base64 in content_base64: {e}"
-                    ))),
-                )
-                    .into_response();
-            }
-        }
+        (String::new(), Some(b64.clone()))
     } else {
         return (
             StatusCode::BAD_REQUEST,
@@ -2986,12 +3164,17 @@ async fn ingest(
     let cmd = Command::Ingest(IngestCmd {
         graph,
         content,
+        content_base64,
         format: body.format,
         document_id: body.document_id,
         skip_extraction: body.skip_extraction,
         skip_dedup: body.skip_dedup,
         chunk_size: body.chunk_size,
         entity_types: body.entity_types,
+        resolution_mode: body.resolution_mode,
+        link_existing_entities: body.link_existing_entities,
+        resolution_candidate_limit: body.resolution_candidate_limit,
+        custom_resolution_prompt: body.custom_resolution_prompt,
     });
 
     match engine.execute_command_async(cmd, identity.as_ref()).await {
@@ -3002,6 +3185,8 @@ async fn ingest(
                 chunks_created: info.chunks_created,
                 entities_created: info.entities_created,
                 entities_merged: info.entities_merged,
+                entities_resolved: info.entities_resolved,
+                entities_linked_existing: info.entities_linked_existing,
                 relationships_created: info.relationships_created,
                 pipeline_duration_ms: info.pipeline_duration_ms,
             })),
@@ -3245,10 +3430,9 @@ async fn infer_schema(
 
     // Collect node type info
     let all_nodes = gs.adjacency.all_node_ids();
-    let mut label_props: std::collections::HashMap<
-        String,
-        std::collections::HashMap<String, (String, u64, u64, std::collections::HashSet<String>)>,
-    > = std::collections::HashMap::new();
+    type PropertyStats = (String, u64, u64, std::collections::HashSet<String>);
+    type LabelProps = std::collections::HashMap<String, std::collections::HashMap<String, PropertyStats>>;
+    let mut label_props: LabelProps = std::collections::HashMap::new();
     let mut label_counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
 
     for &nid in &all_nodes {
@@ -5164,6 +5348,271 @@ mod tests {
         assert!(json["data"]["nodes_included"].as_u64().is_some());
     }
 
+    #[tokio::test]
+    async fn test_context_endpoint_resolves_scope_to_graph() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "ws:acme:user:u_123".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "ws:acme:user:u_123".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![(
+                        "name".to_string(),
+                        Value::String(compact_str::CompactString::from("Alice")),
+                    )],
+                    embedding: None,
+                    entity_key: Some("alice".to_string()),
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let body = serde_json::json!({
+            "scope": {
+                "workspace_id": "acme",
+                "user_id": "u_123"
+            },
+            "query": "who is alice",
+            "seed_nodes": ["alice"],
+            "budget": 4096,
+            "max_depth": 2
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/context")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        assert!(json["data"]["nodes_included"].as_u64().unwrap_or(0) >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_context_endpoint_global_retrieval_mode() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "cg_global".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "cg_global".to_string(),
+                    label: "_community_summary".to_string(),
+                    properties: vec![
+                        (
+                            "summary".to_string(),
+                            Value::String(compact_str::CompactString::from(
+                                "Rust systems programming community",
+                            )),
+                        ),
+                        ("member_count".to_string(), Value::Int(4)),
+                    ],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let body = serde_json::json!({
+            "graph": "cg_global",
+            "query": "systems programming",
+            "retrieval_mode": "global",
+            "budget": 4096
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/context")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["chunks"][0]["label"], "_community_summary");
+    }
+
+    #[tokio::test]
+    async fn test_context_endpoint_rerank_parsing() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "cg_rerank".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let alice_id = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "cg_rerank".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![
+                        (
+                            "name".to_string(),
+                            Value::String(compact_str::CompactString::from("Alice")),
+                        ),
+                        (
+                            "description".to_string(),
+                            Value::String(compact_str::CompactString::from("A software engineer")),
+                        ),
+                    ],
+                    embedding: None,
+                    entity_key: Some("alice".to_string()),
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+
+        let rust_id = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "cg_rerank".to_string(),
+                    label: "topic".to_string(),
+                    properties: vec![
+                        (
+                            "name".to_string(),
+                            Value::String(compact_str::CompactString::from("Rust")),
+                        ),
+                        (
+                            "description".to_string(),
+                            Value::String(compact_str::CompactString::from(
+                                "A systems programming language",
+                            )),
+                        ),
+                    ],
+                    embedding: None,
+                    entity_key: Some("rust".to_string()),
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+
+        engine
+            .execute_command(
+                Command::EdgeAdd(EdgeAddCmd {
+                    graph: "cg_rerank".to_string(),
+                    source: alice_id,
+                    target: rust_id,
+                    label: "uses".to_string(),
+                    weight: 1.0,
+                    properties: vec![],
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let body = serde_json::json!({
+            "graph": "cg_rerank",
+            "query": "systems programming",
+            "seed_nodes": ["alice"],
+            "budget": 4096,
+            "rerank": {
+                "enabled": true,
+                "provider": "cross_encoder",
+                "candidate_limit": 5,
+                "score_weight": 1.0
+            }
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/context")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["chunks"][0]["node_id"], rust_id);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "extract")]
+    async fn test_http_ingest_binary_base64_accepts_non_utf8() {
+        let mut config = WeavConfig::default();
+        config.extract.enabled = true;
+        let engine = Arc::new(Engine::new(config));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "ingest_binary".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let payload = serde_json::json!({
+            "content_base64": base64::engine::general_purpose::STANDARD
+                .encode([0_u8, 159, 146, 150, 255]),
+            "format": "pdf",
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/ingest_binary/ingest")
+            .header("content-type", "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], false);
+        let err = json["error"].as_str().unwrap();
+        assert!(!err.contains("valid UTF-8"));
+        assert!(err.to_lowercase().contains("pdf"));
+    }
+
     // ─── Auth tests ─────────────────────────────────────────────────────────
 
     fn make_authed_app() -> (Router, Arc<Engine>) {
@@ -5304,6 +5753,60 @@ mod tests {
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_http_events_require_auth_when_enabled() {
+        let (app, _engine) = make_authed_app();
+
+        let req = Request::builder()
+            .uri("/v1/events")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_http_graph_events_returns_sse_content_type() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "events_http".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+        engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "events_http".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![("name".to_string(), Value::String("Alice".into()))],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let req = Request::builder()
+            .uri("/v1/graphs/events_http/events?since_sequence=0&replay_limit=2")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
     }
 
     #[tokio::test]
@@ -7312,6 +7815,206 @@ mod tests {
         assert_eq!(json["success"], true);
         assert_eq!(json["data"]["from_timestamp"], 0);
         assert!(json["data"]["edges"]["added_count"].as_u64().unwrap() >= 1);
+    }
+
+    #[tokio::test]
+    async fn test_graph_diff_reports_hard_deletes_and_isolated_nodes() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "diff_hard".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let isolated = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "diff_hard".to_string(),
+                    label: "isolated".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+        let n2 = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "diff_hard".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+        let n3 = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "diff_hard".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+        let edge_id = match engine
+            .execute_command(
+                Command::EdgeAdd(EdgeAddCmd {
+                    graph: "diff_hard".to_string(),
+                    source: n2,
+                    target: n3,
+                    label: "link".to_string(),
+                    weight: 1.0,
+                    properties: vec![],
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        engine
+            .execute_command(
+                Command::NodeDelete(NodeDeleteCmd {
+                    graph: "diff_hard".to_string(),
+                    node_id: isolated,
+                }),
+                None,
+            )
+            .unwrap();
+        engine
+            .execute_command(
+                Command::NodeDelete(NodeDeleteCmd {
+                    graph: "diff_hard".to_string(),
+                    node_id: n2,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let diff_body = serde_json::json!({
+            "from_timestamp": 0,
+            "to_timestamp": now_ms + 10_000
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/diff_hard/diff")
+            .header("content-type", "application/json")
+            .body(Body::from(diff_body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+
+        let removed_nodes = json["data"]["nodes"]["removed"].as_array().unwrap();
+        assert!(removed_nodes.contains(&serde_json::json!(isolated)));
+        assert!(removed_nodes.contains(&serde_json::json!(n2)));
+
+        let removed_edges = json["data"]["edges"]["removed"].as_array().unwrap();
+        assert!(removed_edges.contains(&serde_json::json!(edge_id)));
+    }
+
+    #[tokio::test]
+    async fn test_merge_nodes_route() {
+        let engine = Arc::new(Engine::new(WeavConfig::default()));
+        let app = build_router(engine.clone());
+
+        engine
+            .execute_command(
+                Command::GraphCreate(GraphCreateCmd {
+                    name: "merge_http".to_string(),
+                    config: None,
+                }),
+                None,
+            )
+            .unwrap();
+
+        let source = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "merge_http".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![("name".to_string(), Value::String("Alice".into()))],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+        let target = match engine
+            .execute_command(
+                Command::NodeAdd(NodeAddCmd {
+                    graph: "merge_http".to_string(),
+                    label: "person".to_string(),
+                    properties: vec![("city".to_string(), Value::String("SF".into()))],
+                    embedding: None,
+                    entity_key: None,
+                    ttl_ms: None,
+                }),
+                None,
+            )
+            .unwrap()
+        {
+            CommandResponse::Integer(id) => id,
+            _ => panic!("expected Integer"),
+        };
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/graphs/merge_http/nodes/merge")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "source_id": source,
+                    "target_id": target,
+                    "conflict_policy": "keep_target"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_to_json(resp.into_body()).await;
+        assert_eq!(json["success"], true);
+        assert_eq!(json["data"]["node_id"], target);
     }
 
     // ── Community summarize/search tests ───────────────────────────────

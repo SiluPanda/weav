@@ -1,12 +1,18 @@
 //! Pipeline orchestration: document → chunks → embeddings → entities → graph.
 
 use std::collections::HashMap;
+#[cfg(any(feature = "llm-providers", test))]
+use std::collections::HashSet;
 use std::time::Instant;
 
 #[cfg(feature = "llm-providers")]
 use tokio::sync::Semaphore;
 use weav_core::config::ExtractConfig;
 use weav_core::error::WeavResult;
+#[cfg(feature = "llm-providers")]
+use weav_core::types::ResolutionMode;
+#[cfg(any(feature = "llm-providers", test))]
+use weav_core::types::Value;
 
 use crate::chunker;
 use crate::document;
@@ -64,6 +70,8 @@ pub async fn run_pipeline(
     // When llm-providers is enabled, use LLM for embeddings and entity extraction.
     #[cfg(feature = "llm-providers")]
     let (chunks_with_embeddings, entities_with_embeddings, mut relationships) = {
+        let effective_resolution_mode = options.resolution_mode.unwrap_or(config.resolution_mode);
+
         // Step 3: Generate chunk embeddings.
         let llm = LlmClient::new(config)?;
         let chunk_texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
@@ -95,8 +103,7 @@ pub async fn run_pipeline(
             let _llm_semaphore = Semaphore::new(config.max_concurrent_llm_calls);
 
             for batch in &extraction_batches {
-                let batch_chunks: Vec<&TextChunk> =
-                    batch.iter().map(|cwe| &cwe.chunk).collect();
+                let batch_chunks: Vec<&TextChunk> = batch.iter().map(|cwe| &cwe.chunk).collect();
                 let chunk_indices: Vec<usize> =
                     batch_chunks.iter().map(|c| c.chunk_index).collect();
 
@@ -108,6 +115,8 @@ pub async fn run_pipeline(
                         &text_chunks,
                         options.entity_types.as_deref(),
                         options.custom_extraction_prompt.as_deref(),
+                        effective_resolution_mode,
+                        options.custom_resolution_prompt.as_deref(),
                     )
                     .await?;
                 stats.llm_calls += 1;
@@ -118,6 +127,14 @@ pub async fn run_pipeline(
                 entities.extend(batch_entities);
                 relationships.extend(batch_rels);
             }
+        }
+
+        if matches!(effective_resolution_mode, ResolutionMode::Semantic) {
+            let (resolved_entities, resolved_relationships, resolved_count) =
+                apply_semantic_resolution(entities, relationships);
+            entities = resolved_entities;
+            relationships = resolved_relationships;
+            stats.entities_resolved = resolved_count;
         }
 
         // Step 5: Deduplicate entities by name.
@@ -164,7 +181,11 @@ pub async fn run_pipeline(
             .map(|(entity, embedding)| EntityWithEmbedding { entity, embedding })
             .collect();
 
-        (chunks_with_embeddings, entities_with_embeddings, relationships)
+        (
+            chunks_with_embeddings,
+            entities_with_embeddings,
+            relationships,
+        )
     };
 
     // When llm-providers is disabled, return chunks with empty embeddings and no entities.
@@ -181,11 +202,13 @@ pub async fn run_pipeline(
         let entities_with_embeddings: Vec<EntityWithEmbedding> = Vec::new();
         let relationships: Vec<ExtractedRelationship> = Vec::new();
 
-        tracing::debug!(
-            "LLM providers not available - skipping embeddings and entity extraction"
-        );
+        tracing::debug!("LLM providers not available - skipping embeddings and entity extraction");
 
-        (chunks_with_embeddings, entities_with_embeddings, relationships)
+        (
+            chunks_with_embeddings,
+            entities_with_embeddings,
+            relationships,
+        )
     };
 
     // Step 7: Deduplicate relationships by (source, target, type).
@@ -270,6 +293,89 @@ fn batch_chunks_by_tokens(
 #[cfg(any(feature = "llm-providers", test))]
 const DEDUP_FUZZY_THRESHOLD: f64 = 0.85;
 
+/// Reserved property emitted by semantic resolution prompts.
+#[cfg(any(feature = "llm-providers", test))]
+const CANONICAL_NAME_PROPERTY: &str = "canonical_name";
+
+/// Apply semantic alias-resolution decisions emitted by the LLM.
+#[cfg(any(feature = "llm-providers", test))]
+fn apply_semantic_resolution(
+    mut entities: Vec<ExtractedEntity>,
+    mut relationships: Vec<ExtractedRelationship>,
+) -> (Vec<ExtractedEntity>, Vec<ExtractedRelationship>, usize) {
+    let mut alias_pairs = Vec::new();
+
+    for entity in &mut entities {
+        let mut canonical_name: Option<String> = None;
+        let mut filtered_properties = Vec::with_capacity(entity.properties.len());
+
+        for (key, value) in std::mem::take(&mut entity.properties) {
+            if key == CANONICAL_NAME_PROPERTY {
+                canonical_name = value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(|name| name.to_string());
+            } else {
+                filtered_properties.push((key, value));
+            }
+        }
+        entity.properties = filtered_properties;
+
+        if let Some(canonical_name) = canonical_name
+            && !canonical_name.eq_ignore_ascii_case(&entity.name)
+        {
+            alias_pairs.push((entity.name.clone(), canonical_name));
+        }
+    }
+
+    if alias_pairs.is_empty() {
+        return (entities, relationships, 0);
+    }
+
+    let alias_map: HashMap<String, String> = alias_pairs
+        .iter()
+        .map(|(name, canonical)| (name.to_lowercase(), canonical.clone()))
+        .collect();
+
+    let mut resolved_entities = 0;
+    for entity in &mut entities {
+        let resolved_name = resolve_canonical_name(&entity.name, &alias_map);
+        if !resolved_name.eq_ignore_ascii_case(&entity.name) {
+            entity.name = resolved_name;
+            resolved_entities += 1;
+        }
+    }
+
+    for relationship in &mut relationships {
+        relationship.source_entity =
+            resolve_canonical_name(&relationship.source_entity, &alias_map);
+        relationship.target_entity =
+            resolve_canonical_name(&relationship.target_entity, &alias_map);
+    }
+
+    (entities, relationships, resolved_entities)
+}
+
+#[cfg(any(feature = "llm-providers", test))]
+fn resolve_canonical_name(name: &str, alias_map: &HashMap<String, String>) -> String {
+    let mut resolved = name.to_string();
+    let mut seen = HashSet::new();
+
+    loop {
+        let lowered = resolved.to_lowercase();
+        if !seen.insert(lowered.clone()) {
+            break;
+        }
+        match alias_map.get(&lowered) {
+            Some(next) if !next.eq_ignore_ascii_case(&resolved) => resolved = next.clone(),
+            _ => break,
+        }
+    }
+
+    resolved
+}
+
 /// Deduplicate entities by fuzzy name matching (Jaro-Winkler similarity),
 /// merging source_chunks and keeping the higher confidence.
 #[cfg(any(feature = "llm-providers", test))]
@@ -302,12 +408,27 @@ fn dedup_entities(entities: Vec<ExtractedEntity>) -> Vec<ExtractedEntity> {
                 existing.confidence = entity.confidence;
                 existing.description = entity.description;
             }
+            merge_entity_properties(&mut existing.properties, entity.properties);
         } else {
             result.push(entity);
         }
     }
 
     result
+}
+
+#[cfg(any(feature = "llm-providers", test))]
+fn merge_entity_properties(existing: &mut Vec<(String, Value)>, incoming: Vec<(String, Value)>) {
+    for (key, value) in incoming {
+        if let Some((_, existing_value)) = existing
+            .iter_mut()
+            .find(|(existing_key, _)| *existing_key == key)
+        {
+            *existing_value = value;
+        } else {
+            existing.push((key, value));
+        }
+    }
 }
 
 /// Deduplicate relationships by (source, target, type) key.
@@ -395,6 +516,86 @@ mod tests {
         assert_eq!(result[0].confidence, 0.9);
         assert_eq!(result[0].description, "Second mention with better desc");
         assert_eq!(result[0].source_chunks, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_dedup_entities_merges_properties() {
+        let entities = vec![
+            ExtractedEntity {
+                name: "Alice".into(),
+                entity_type: "Person".into(),
+                description: "First mention".into(),
+                properties: vec![("title".into(), Value::String("Engineer".into()))],
+                confidence: 0.7,
+                source_chunks: vec![0],
+            },
+            ExtractedEntity {
+                name: "alice".into(),
+                entity_type: "Person".into(),
+                description: "Second mention".into(),
+                properties: vec![("team".into(), Value::String("Platform".into()))],
+                confidence: 0.9,
+                source_chunks: vec![1],
+            },
+        ];
+
+        let result = dedup_entities(entities);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].properties.iter().any(|(k, _)| k == "title"));
+        assert!(result[0].properties.iter().any(|(k, _)| k == "team"));
+    }
+
+    #[test]
+    fn test_apply_semantic_resolution_rewrites_entities_and_relationships() {
+        let entities = vec![
+            ExtractedEntity {
+                name: "IBM".into(),
+                entity_type: "Organization".into(),
+                description: String::new(),
+                properties: vec![(
+                    CANONICAL_NAME_PROPERTY.into(),
+                    Value::String("International Business Machines".into()),
+                )],
+                confidence: 0.9,
+                source_chunks: vec![0],
+            },
+            ExtractedEntity {
+                name: "International Business Machines".into(),
+                entity_type: "Organization".into(),
+                description: String::new(),
+                properties: vec![],
+                confidence: 0.8,
+                source_chunks: vec![0],
+            },
+        ];
+        let relationships = vec![ExtractedRelationship {
+            source_entity: "IBM".into(),
+            target_entity: "Alice".into(),
+            relationship_type: "employs".into(),
+            properties: vec![],
+            weight: 1.0,
+            confidence: 0.9,
+            source_chunks: vec![0],
+        }];
+
+        let (entities, relationships, resolved_count) =
+            apply_semantic_resolution(entities, relationships);
+
+        assert_eq!(resolved_count, 1);
+        assert_eq!(
+            entities[0].name,
+            "International Business Machines".to_string()
+        );
+        assert!(
+            entities[0]
+                .properties
+                .iter()
+                .all(|(k, _)| k != CANONICAL_NAME_PROPERTY)
+        );
+        assert_eq!(
+            relationships[0].source_entity,
+            "International Business Machines"
+        );
     }
 
     #[test]

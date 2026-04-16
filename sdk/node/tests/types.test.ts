@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { WeavClient, WeavError, contextToPrompt, contextToMessages } from '../src/index.js';
+import { WeavClient, WeavError, contextToPrompt, contextToMessages, scopeToGraph } from '../src/index.js';
 import type {
   ContextResult,
   ContextParams,
@@ -9,6 +9,7 @@ import type {
   NodeInfo,
   AddNodeParams,
   AddEdgeParams,
+  ScopeRef,
 } from '../src/index.js';
 
 // ── WeavClient construction ─────────────────────────────────────────────────
@@ -32,6 +33,318 @@ describe('WeavClient construction', () => {
   it('uses default host when only port is provided', () => {
     const client = new WeavClient({ port: 8080 });
     assert.equal(client.getBaseUrl(), 'http://localhost:8080');
+  });
+});
+
+describe('WeavClient HTTP paths', () => {
+  it('info() requests /v1/info', async () => {
+    const client = new WeavClient({ host: '127.0.0.1', port: 9000 });
+    const originalFetch = globalThis.fetch;
+    const calls: string[] = [];
+
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      calls.push(String(input));
+      return {
+        ok: true,
+        json: async () => ({ success: true, data: 'weav-server 0.1.0' }),
+      } as Response;
+    }) as typeof fetch;
+
+    try {
+      const info = await client.info();
+      assert.equal(info, 'weav-server 0.1.0');
+      assert.equal(calls[0], 'http://127.0.0.1:9000/v1/info');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('context() serializes retrieval_mode', async () => {
+    const client = new WeavClient({ host: '127.0.0.1', port: 9000 });
+    const originalFetch = globalThis.fetch;
+    let requestBody: Record<string, unknown> | undefined;
+
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      return {
+        ok: true,
+        json: async () => ({
+          success: true,
+          data: {
+            chunks: [],
+            total_tokens: 0,
+            budget_used: 0,
+            nodes_considered: 0,
+            nodes_included: 0,
+            query_time_us: 0,
+          },
+        }),
+      } as Response;
+    }) as typeof fetch;
+
+    try {
+      await client.context({ graph: 'g', query: 'rust', retrievalMode: 'hybrid' });
+      assert.equal(requestBody?.retrieval_mode, 'hybrid');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('context() serializes rerank config', async () => {
+    const client = new WeavClient({ host: '127.0.0.1', port: 9000 });
+    const originalFetch = globalThis.fetch;
+    let requestBody: Record<string, unknown> | undefined;
+
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      return {
+        ok: true,
+        json: async () => ({
+          success: true,
+          data: {
+            chunks: [],
+            total_tokens: 0,
+            budget_used: 0,
+            nodes_considered: 0,
+            nodes_included: 0,
+            query_time_us: 0,
+          },
+        }),
+      } as Response;
+    }) as typeof fetch;
+
+    try {
+      await client.context({
+        graph: 'g',
+        query: 'systems programming',
+        rerank: {
+          provider: 'cross_encoder',
+          candidateLimit: 25,
+          scoreWeight: 0.5,
+        },
+      });
+      assert.deepEqual(requestBody?.rerank, {
+        provider: 'cross_encoder',
+        candidate_limit: 25,
+        score_weight: 0.5,
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('context() serializes scope when graph is omitted', async () => {
+    const client = new WeavClient({ host: '127.0.0.1', port: 9000 });
+    const originalFetch = globalThis.fetch;
+    let requestBody: Record<string, unknown> | undefined;
+
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      return {
+        ok: true,
+        json: async () => ({
+          success: true,
+          data: {
+            chunks: [],
+            total_tokens: 0,
+            budget_used: 0,
+            nodes_considered: 0,
+            nodes_included: 0,
+            query_time_us: 0,
+          },
+        }),
+      } as Response;
+    }) as typeof fetch;
+
+    try {
+      await client.context({
+        scope: { workspaceId: 'acme', userId: 'u_123' },
+        query: 'rust',
+      });
+      assert.deepEqual(requestBody?.scope, {
+        workspace_id: 'acme',
+        user_id: 'u_123',
+      });
+      assert.equal(requestBody?.graph, undefined);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('context() parses snake_case response fields into SDK types', async () => {
+    const client = new WeavClient({ host: '127.0.0.1', port: 9000 });
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = (async () => {
+      return {
+        ok: true,
+        json: async () => ({
+          success: true,
+          data: {
+            chunks: [
+              {
+                node_id: 7,
+                content: 'Alice works on retrieval quality.',
+                label: 'person',
+                relevance_score: 0.91,
+                depth: 1,
+                token_count: 6,
+                provenance: { source: 'doc-1', confidence: 0.8 },
+                relationships: [
+                  {
+                    edge_label: 'works_on',
+                    target_node_id: 9,
+                    target_name: 'retrieval',
+                    direction: 'outgoing',
+                    weight: 1.0,
+                  },
+                ],
+              },
+            ],
+            total_tokens: 6,
+            budget_used: 0.25,
+            nodes_considered: 12,
+            nodes_included: 1,
+            query_time_us: 345,
+          },
+        }),
+      } as Response;
+    }) as typeof fetch;
+
+    try {
+      const result = await client.context({ graph: 'g', query: 'retrieval quality' });
+      assert.equal(result.totalTokens, 6);
+      assert.equal(result.budgetUtilization, 0.25);
+      assert.equal(result.nodesConsidered, 12);
+      assert.equal(result.nodesIncluded, 1);
+      assert.equal(result.queryTimeUs, 345);
+      assert.equal(result.chunks[0]?.nodeId, 7);
+      assert.equal(result.chunks[0]?.relevanceScore, 0.91);
+      assert.equal(result.chunks[0]?.tokenCount, 6);
+      assert.deepEqual(result.chunks[0]?.provenance, {
+        source: 'doc-1',
+        confidence: 0.8,
+      });
+      assert.deepEqual(result.chunks[0]?.relationships, [
+        {
+          edge_label: 'works_on',
+          target_node_id: 9,
+          target_name: 'retrieval',
+          direction: 'outgoing',
+          weight: 1.0,
+        },
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('ingest() serializes the current ingest options', async () => {
+    const client = new WeavClient({ host: '127.0.0.1', port: 9000 });
+    const originalFetch = globalThis.fetch;
+    let requestBody: Record<string, unknown> | undefined;
+
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      requestBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      return {
+        ok: true,
+        json: async () => ({
+          success: true,
+          data: {
+            document_id: 'doc-1',
+            chunks_created: 2,
+            entities_created: 3,
+            entities_merged: 1,
+            entities_resolved: 4,
+            entities_linked_existing: 2,
+            relationships_created: 5,
+            pipeline_duration_ms: 123,
+          },
+        }),
+      } as Response;
+    }) as typeof fetch;
+
+    try {
+      await client.ingest('g', {
+        content: 'Alice works at Acme.',
+        documentId: 'doc-1',
+        skipExtraction: true,
+        skipDedup: false,
+        chunkSize: 64,
+        entityTypes: ['person', 'organization'],
+        resolutionMode: 'semantic',
+        linkExistingEntities: true,
+        resolutionCandidateLimit: 12,
+        customResolutionPrompt: 'Prefer canonical company names.',
+      });
+      assert.deepEqual(requestBody, {
+        content: 'Alice works at Acme.',
+        document_id: 'doc-1',
+        skip_extraction: true,
+        skip_dedup: false,
+        chunk_size: 64,
+        entity_types: ['person', 'organization'],
+        resolution_mode: 'semantic',
+        link_existing_entities: true,
+        resolution_candidate_limit: 12,
+        custom_resolution_prompt: 'Prefer canonical company names.',
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('ingest() parses the response fields into SDK result types', async () => {
+    const client = new WeavClient({ host: '127.0.0.1', port: 9000 });
+    const originalFetch = globalThis.fetch;
+
+    globalThis.fetch = (async () => {
+      return {
+        ok: true,
+        json: async () => ({
+          success: true,
+          data: {
+            document_id: 'doc-42',
+            chunks_created: 8,
+            entities_created: 3,
+            entities_merged: 1,
+            entities_resolved: 6,
+            entities_linked_existing: 4,
+            relationships_created: 9,
+            pipeline_duration_ms: 456,
+          },
+        }),
+      } as Response;
+    }) as typeof fetch;
+
+    try {
+      const result = await client.ingest('g', { content: 'Hello world' });
+      assert.equal(result.documentId, 'doc-42');
+      assert.equal(result.chunksCreated, 8);
+      assert.equal(result.entitiesCreated, 3);
+      assert.equal(result.entitiesMerged, 1);
+      assert.equal(result.entitiesResolved, 6);
+      assert.equal(result.entitiesLinkedExisting, 4);
+      assert.equal(result.relationshipsCreated, 9);
+      assert.equal(result.pipelineDurationMs, 456);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe('scopeToGraph', () => {
+  it('resolves the canonical graph hierarchy', () => {
+    const scope: ScopeRef = {
+      workspaceId: 'acme',
+      userId: 'u_123',
+      agentId: 'a_support',
+      sessionId: 's_456',
+    };
+    assert.equal(
+      scopeToGraph(scope),
+      'ws:acme:user:u_123:agent:a_support:session:s_456',
+    );
   });
 });
 
@@ -320,12 +633,14 @@ describe('ContextParams', () => {
     assert.equal(params.edgeLabels, undefined);
     assert.equal(params.temporalAt, undefined);
     assert.equal(params.includeProvenance, undefined);
+    assert.equal(params.retrievalMode, undefined);
   });
 
   it('allows construction with all optional fields', () => {
     const params: ContextParams = {
       graph: 'g',
       query: 'tell me about Alice',
+      retrievalMode: 'hybrid',
       embedding: [0.1, 0.2, 0.3],
       seedNodes: ['node1', 'node2'],
       budget: 4096,
@@ -341,6 +656,7 @@ describe('ContextParams', () => {
     };
     assert.equal(params.graph, 'g');
     assert.equal(params.query, 'tell me about Alice');
+    assert.equal(params.retrievalMode, 'hybrid');
     assert.deepEqual(params.embedding, [0.1, 0.2, 0.3]);
     assert.deepEqual(params.seedNodes, ['node1', 'node2']);
     assert.equal(params.budget, 4096);

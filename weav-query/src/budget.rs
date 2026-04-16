@@ -181,10 +181,7 @@ fn enforce_budget_proportional(
         }
     }
 
-    fn greedy_fill(
-        pool: &[(usize, &ContextChunk)],
-        pool_budget: u32,
-    ) -> (Vec<usize>, u32) {
+    fn greedy_fill(pool: &[(usize, &ContextChunk)], pool_budget: u32) -> (Vec<usize>, u32) {
         let pool_chunks: Vec<ContextChunk> = pool.iter().map(|(_, c)| (*c).clone()).collect();
         let ranked = rank_by_density(&pool_chunks);
 
@@ -206,7 +203,12 @@ fn enforce_budget_proportional(
     let (meta_inc, meta_used) = greedy_fill(&metadata, metadata_budget);
 
     let mut all_included: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    for idx in ent_inc.iter().chain(rel_inc.iter()).chain(txt_inc.iter()).chain(meta_inc.iter()) {
+    for idx in ent_inc
+        .iter()
+        .chain(rel_inc.iter())
+        .chain(txt_inc.iter())
+        .chain(meta_inc.iter())
+    {
         all_included.insert(*idx);
     }
 
@@ -445,8 +447,8 @@ fn enforce_budget_submodular(
     // Since S is empty, max_sim_to_selected[j] = 0 for all j.
     // So coverage gain = count of chunks with same label as c (including c itself).
     let compute_marginal_gain = |c_idx: usize,
-                                  covered_labels: &std::collections::HashSet<&str>,
-                                  label_counts: &std::collections::HashMap<&str, usize>|
+                                 covered_labels: &std::collections::HashSet<&str>,
+                                 label_counts: &std::collections::HashMap<&str, usize>|
      -> f32 {
         let relevance_term = alpha * norm_relevance[c_idx];
 
@@ -676,10 +678,7 @@ mod tests {
 
     #[test]
     fn test_enforce_budget_zero_token_chunks() {
-        let chunks = vec![
-            make_chunk(1, 0.9, 0),
-            make_chunk(2, 0.8, 10),
-        ];
+        let chunks = vec![make_chunk(1, 0.9, 0), make_chunk(2, 0.8, 10)];
         let result = enforce_budget(chunks, &TokenBudget::new(10));
 
         // Zero-token chunks should always be included
@@ -698,15 +697,17 @@ mod tests {
 
     #[test]
     fn test_enforce_budget_utilization() {
-        let chunks = vec![
-            make_chunk(1, 0.9, 25),
-            make_chunk(2, 0.8, 25),
-        ];
+        let chunks = vec![make_chunk(1, 0.9, 25), make_chunk(2, 0.8, 25)];
         let result = enforce_budget(chunks, &TokenBudget::new(100));
         assert!((result.budget_utilization - 0.5).abs() < 0.001);
     }
 
-    fn make_chunk_with_label(node_id: u64, relevance: f32, tokens: u32, label: &str) -> ContextChunk {
+    fn make_chunk_with_label(
+        node_id: u64,
+        relevance: f32,
+        tokens: u32,
+        label: &str,
+    ) -> ContextChunk {
         ContextChunk {
             node_id,
             content: format!("content for node {node_id}"),
@@ -746,10 +747,7 @@ mod tests {
 
     #[test]
     fn test_enforce_budget_zero_max_tokens() {
-        let chunks = vec![
-            make_chunk(1, 0.9, 10),
-            make_chunk(2, 0.8, 20),
-        ];
+        let chunks = vec![make_chunk(1, 0.9, 10), make_chunk(2, 0.8, 20)];
         let result = enforce_budget(chunks, &TokenBudget::new(0));
         assert!(result.included.is_empty());
         assert_eq!(result.excluded.len(), 2);
@@ -888,10 +886,10 @@ mod tests {
     fn test_enforce_budget_proportional_zero_category() {
         // Proportional with metadata_pct=0.0. Metadata chunks should be excluded.
         let chunks = vec![
-            make_chunk_with_label(1, 0.9, 10, "person"),      // entity
+            make_chunk_with_label(1, 0.9, 10, "person"), // entity
             make_chunk_with_label(2, 0.8, 10, "relationship"), // relationship
-            make_chunk_with_label(3, 0.7, 10, "text_chunk"),   // text
-            make_chunk_with_label(4, 0.95, 10, "metadata"),    // metadata — budget=0
+            make_chunk_with_label(3, 0.7, 10, "text_chunk"), // text
+            make_chunk_with_label(4, 0.95, 10, "metadata"), // metadata — budget=0
         ];
         let budget = TokenBudget {
             max_tokens: 100,
@@ -909,18 +907,12 @@ mod tests {
             !included_ids.contains(&4),
             "Metadata chunk (node 4) should be excluded when metadata_pct=0.0"
         );
-        assert!(
-            included_ids.contains(&1),
-            "Entity chunk should be included"
-        );
+        assert!(included_ids.contains(&1), "Entity chunk should be included");
         assert!(
             included_ids.contains(&2),
             "Relationship chunk should be included"
         );
-        assert!(
-            included_ids.contains(&3),
-            "Text chunk should be included"
-        );
+        assert!(included_ids.contains(&3), "Text chunk should be included");
         assert_eq!(result.included.len(), 3);
     }
 
@@ -1028,7 +1020,7 @@ mod tests {
             make_chunk_with_label(5, 0.50, 20, "relationship"), // lower relevance but different label
         ];
         let budget_diverse = TokenBudget {
-            max_tokens: 60, // room for 3 chunks
+            max_tokens: 60,                                              // room for 3 chunks
             allocation: TokenAllocation::DiversityAware { lambda: 0.3 }, // strong diversity
         };
         let result = enforce_budget(chunks.clone(), &budget_diverse);
@@ -1068,10 +1060,7 @@ mod tests {
 
     #[test]
     fn test_mmr_zero_token_chunks() {
-        let chunks = vec![
-            make_chunk(1, 0.9, 0),
-            make_chunk(2, 0.8, 0),
-        ];
+        let chunks = vec![make_chunk(1, 0.9, 0), make_chunk(2, 0.8, 0)];
         let budget = TokenBudget {
             max_tokens: 10,
             allocation: TokenAllocation::DiversityAware { lambda: 0.7 },
@@ -1132,10 +1121,7 @@ mod tests {
 
     #[test]
     fn test_submodular_all_fit() {
-        let chunks = vec![
-            make_chunk(1, 0.9, 10),
-            make_chunk(2, 0.8, 10),
-        ];
+        let chunks = vec![make_chunk(1, 0.9, 10), make_chunk(2, 0.8, 10)];
         let budget = TokenBudget {
             max_tokens: 100,
             allocation: TokenAllocation::SubmodularFacilityLocation { alpha: 0.5 },
@@ -1161,7 +1147,11 @@ mod tests {
         let result = enforce_budget(chunks, &budget);
         let ids: Vec<u64> = result.included.iter().map(|c| c.node_id).collect();
         // Should include the relationship for coverage diversity
-        assert!(ids.contains(&5), "Submodular should include relationship for diversity, got {:?}", ids);
+        assert!(
+            ids.contains(&5),
+            "Submodular should include relationship for diversity, got {:?}",
+            ids
+        );
         assert_eq!(result.included.len(), 3);
     }
 

@@ -1,13 +1,26 @@
-export { WeavClient, WeavError, contextToMessages, contextToPrompt } from './client.js';
+export {
+  WeavClient,
+  WeavError,
+  contextToMessages,
+  contextToPrompt,
+  scopeToGraph,
+} from './client.js';
 export type {
   WeavConfig,
   ContextParams,
   ContextResult,
   ContextChunk,
+  RerankConfig,
+  RetrievalMode,
+  GraphRef,
+  ScopeRef,
   GraphInfo,
   NodeInfo,
   Provenance,
   RelationshipSummary,
   AddNodeParams,
   AddEdgeParams,
+  IngestParams,
+  IngestResult,
+  ResolutionMode,
 } from './types.js';

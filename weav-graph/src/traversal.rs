@@ -182,15 +182,12 @@ fn node_passes_filter(
         let outgoing = adjacency.neighbors_out(node, None);
         let incoming = adjacency.neighbors_in(node, None);
 
-        let has_valid_edge = outgoing
-            .iter()
-            .chain(incoming.iter())
-            .any(|&(_, eid)| {
-                adjacency
-                    .get_edge(eid)
-                    .map(|m| m.temporal.is_valid_at(ts))
-                    .unwrap_or(false)
-            });
+        let has_valid_edge = outgoing.iter().chain(incoming.iter()).any(|&(_, eid)| {
+            adjacency
+                .get_edge(eid)
+                .map(|m| m.temporal.is_valid_at(ts))
+                .unwrap_or(false)
+        });
 
         if !has_valid_edge {
             return false;
@@ -293,7 +290,13 @@ pub fn bfs(
             if seen.insert(neighbor) {
                 // Apply node filter to discovered neighbor
                 if has_node_filter
-                    && !node_passes_filter(adjacency, neighbor, node_filter, node_label_lookup, property_check)
+                    && !node_passes_filter(
+                        adjacency,
+                        neighbor,
+                        node_filter,
+                        node_label_lookup,
+                        property_check,
+                    )
                 {
                     // Node doesn't pass the filter; mark as seen but don't visit
                     continue;
@@ -431,11 +434,7 @@ pub fn flow_score(
 ///
 /// Complexity: O(V + E) where V and E are the nodes and edges within the
 /// `radius`-hop neighborhood.
-pub fn ego_network(
-    adjacency: &AdjacencyStore,
-    center: NodeId,
-    radius: u8,
-) -> SubGraph {
+pub fn ego_network(adjacency: &AdjacencyStore, center: NodeId, radius: u8) -> SubGraph {
     let result = bfs(
         adjacency,
         &[center],
@@ -546,8 +545,7 @@ pub fn scored_paths(
     max_paths: u32,
     max_path_length: u8,
 ) -> Vec<ScoredPath> {
-    let anchor_scores: HashMap<NodeId, f32> =
-        anchors.iter().copied().collect();
+    let anchor_scores: HashMap<NodeId, f32> = anchors.iter().copied().collect();
 
     let mut all_paths: Vec<ScoredPath> = Vec::new();
 
@@ -948,10 +946,7 @@ pub fn personalized_pagerank(
 ///
 /// Complexity: O(I * (V + E)) where I is the number of iterations until
 /// convergence.
-pub fn label_propagation(
-    adjacency: &AdjacencyStore,
-    max_iterations: u32,
-) -> HashMap<NodeId, u64> {
+pub fn label_propagation(adjacency: &AdjacencyStore, max_iterations: u32) -> HashMap<NodeId, u64> {
     let all_nodes = adjacency.all_node_ids();
     if all_nodes.is_empty() {
         return HashMap::new();
@@ -1167,15 +1162,12 @@ pub fn modularity_communities(
 
                 // Gain of adding node to candidate community:
                 //   add_gain = ki_cand / m - resolution * ki * sigma_tot_cand / (2 * m^2)
-                let add_gain =
-                    ki_cand / m - resolution * ki * sigma_tot_cand / (2.0 * m * m);
+                let add_gain = ki_cand / m - resolution * ki * sigma_tot_cand / (2.0 * m * m);
 
                 // Net gain = add_gain - remove_cost
                 let net_gain = add_gain - remove_cost;
 
-                if net_gain > best_gain
-                    || (net_gain == best_gain && cand_comm < best_comm)
-                {
+                if net_gain > best_gain || (net_gain == best_gain && cand_comm < best_comm) {
                     best_gain = net_gain;
                     best_comm = cand_comm;
                 }
@@ -1287,7 +1279,11 @@ pub fn betweenness_centrality(
     }
 
     let mut result: Vec<(NodeId, f64)> = cb.into_iter().collect();
-    result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0)));
+    result.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
     result
 }
 
@@ -1351,7 +1347,11 @@ pub fn closeness_centrality(
         }
     }
 
-    result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0)));
+    result.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
     result
 }
 
@@ -1380,10 +1380,7 @@ pub struct TriangleResult {
 ///
 /// Complexity: O(V * d^2) where d is the maximum node degree (intersection
 /// of neighbor sets for each edge).
-pub fn triangle_count(
-    adjacency: &AdjacencyStore,
-    edge_filter: &EdgeFilter,
-) -> TriangleResult {
+pub fn triangle_count(adjacency: &AdjacencyStore, edge_filter: &EdgeFilter) -> TriangleResult {
     let all_nodes = adjacency.all_node_ids();
     if all_nodes.is_empty() {
         return TriangleResult {
@@ -1574,9 +1571,7 @@ pub fn tarjan_scc(adjacency: &AdjacencyStore) -> Vec<Vec<NodeId>> {
                     }
 
                     // If we exhausted all neighbors, check if v is a root
-                    if i == neighbors.len()
-                        && lowlink[&v] == index_map[&v]
-                    {
+                    if i == neighbors.len() && lowlink[&v] == index_map[&v] {
                         let mut component = Vec::new();
                         loop {
                             let w = stack.pop().unwrap();
@@ -1936,9 +1931,8 @@ pub fn node2vec_walks(
                 }
 
                 // Build neighbor set of prev for distance computation
-                let prev_nbrs: HashSet<NodeId> = undirected_neighbors(adjacency, prev)
-                    .into_iter()
-                    .collect();
+                let prev_nbrs: HashSet<NodeId> =
+                    undirected_neighbors(adjacency, prev).into_iter().collect();
 
                 // Compute unnormalized weights
                 let mut weights: Vec<f64> = Vec::with_capacity(nbrs.len());
@@ -2493,10 +2487,7 @@ pub fn eigenvector_centrality(
         }
 
         // Normalize by L-infinity norm (max value)
-        let max_score = new_scores
-            .iter()
-            .copied()
-            .fold(0.0_f64, f64::max);
+        let max_score = new_scores.iter().copied().fold(0.0_f64, f64::max);
 
         if max_score > 0.0 {
             for s in &mut new_scores {
@@ -2719,7 +2710,9 @@ pub fn fastrp_embeddings(
     for (i, _) in all_nodes.iter().enumerate() {
         let mut vec = vec![0.0_f64; embedding_dim];
         for (j, slot) in vec.iter_mut().enumerate() {
-            let h = fastrp_hash(seed ^ (i as u64).wrapping_mul(1_000_003) ^ (j as u64).wrapping_mul(999_983));
+            let h = fastrp_hash(
+                seed ^ (i as u64).wrapping_mul(1_000_003) ^ (j as u64).wrapping_mul(999_983),
+            );
             let r = h % 6;
             *slot = match r {
                 0 => sqrt3,
@@ -2955,11 +2948,7 @@ pub fn adamic_adar(adjacency: &AdjacencyStore, node_a: NodeId, node_b: NodeId) -
 /// Common neighbors count between two nodes.
 ///
 /// |N(a) ∩ N(b)|
-pub fn common_neighbors_count(
-    adjacency: &AdjacencyStore,
-    node_a: NodeId,
-    node_b: NodeId,
-) -> usize {
+pub fn common_neighbors_count(adjacency: &AdjacencyStore, node_a: NodeId, node_b: NodeId) -> usize {
     let na = undirected_neighbors(adjacency, node_a);
     let nb = undirected_neighbors(adjacency, node_b);
     na.intersection(&nb).count()
@@ -2968,11 +2957,7 @@ pub fn common_neighbors_count(
 /// Preferential attachment score between two nodes.
 ///
 /// |N(a)| * |N(b)|
-pub fn preferential_attachment(
-    adjacency: &AdjacencyStore,
-    node_a: NodeId,
-    node_b: NodeId,
-) -> f64 {
+pub fn preferential_attachment(adjacency: &AdjacencyStore, node_a: NodeId, node_b: NodeId) -> f64 {
     let na = undirected_neighbors(adjacency, node_a).len();
     let nb = undirected_neighbors(adjacency, node_b).len();
     (na * nb) as f64
@@ -2981,11 +2966,7 @@ pub fn preferential_attachment(
 /// Resource allocation index between two nodes.
 ///
 /// sum(1 / |N(z)|) for z in N(a) ∩ N(b)
-pub fn resource_allocation(
-    adjacency: &AdjacencyStore,
-    node_a: NodeId,
-    node_b: NodeId,
-) -> f64 {
+pub fn resource_allocation(adjacency: &AdjacencyStore, node_a: NodeId, node_b: NodeId) -> f64 {
     let na = undirected_neighbors(adjacency, node_a);
     let nb = undirected_neighbors(adjacency, node_b);
     let mut score = 0.0;
@@ -3032,9 +3013,7 @@ pub fn predict_links(
                 LinkPredictionMetric::PreferentialAttachment => {
                     preferential_attachment(adjacency, a, b)
                 }
-                LinkPredictionMetric::ResourceAllocation => {
-                    resource_allocation(adjacency, a, b)
-                }
+                LinkPredictionMetric::ResourceAllocation => resource_allocation(adjacency, a, b),
             };
             if score > 0.0 {
                 results.push((a, b, score));
@@ -3249,11 +3228,8 @@ pub fn max_flow(
     // Build capacity/flow graph using adjacency list of indices.
     // Map NodeId -> index for efficient lookup.
     let all_nodes = adjacency.all_node_ids();
-    let node_to_idx: HashMap<NodeId, usize> = all_nodes
-        .iter()
-        .enumerate()
-        .map(|(i, &n)| (n, i))
-        .collect();
+    let node_to_idx: HashMap<NodeId, usize> =
+        all_nodes.iter().enumerate().map(|(i, &n)| (n, i)).collect();
     let n = all_nodes.len();
 
     // Adjacency list of (neighbor_index, edge_index_in_edges_vec)
@@ -3450,13 +3426,8 @@ pub fn minimum_spanning_tree(adjacency: &AdjacencyStore) -> MstResult {
     }
 
     // Sort edges by weight ascending (lower weight = lower cost)
-    let mut sorted_edges: Vec<((NodeId, NodeId), (EdgeId, f64))> =
-        edge_map.into_iter().collect();
-    sorted_edges.sort_by(|a, b| {
-        a.1 .1
-            .partial_cmp(&b.1 .1)
-            .unwrap_or(Ordering::Equal)
-    });
+    let mut sorted_edges: Vec<((NodeId, NodeId), (EdgeId, f64))> = edge_map.into_iter().collect();
+    sorted_edges.sort_by(|a, b| a.1.1.partial_cmp(&b.1.1).unwrap_or(Ordering::Equal));
 
     let mut uf = UnionFind::new(&all_nodes);
     let mut mst_edges = Vec::new();
@@ -3497,10 +3468,7 @@ pub fn minimum_spanning_tree(adjacency: &AdjacencyStore) -> MstResult {
 /// or `WeavError::Internal` if a negative cycle is detected.
 ///
 /// Complexity: O(V * E).
-pub fn bellman_ford(
-    adjacency: &AdjacencyStore,
-    source: NodeId,
-) -> WeavResult<Vec<(NodeId, f64)>> {
+pub fn bellman_ford(adjacency: &AdjacencyStore, source: NodeId) -> WeavResult<Vec<(NodeId, f64)>> {
     if !adjacency.has_node(source) {
         return Err(WeavError::NodeNotFound(source, 0));
     }
@@ -3881,10 +3849,7 @@ pub struct GraphColoringResult {
 ///
 /// Complexity: O(I * V * d) where d is the maximum node degree and I is
 /// the number of iterations.
-pub fn k1_coloring(
-    adjacency: &AdjacencyStore,
-    max_iterations: u32,
-) -> GraphColoringResult {
+pub fn k1_coloring(adjacency: &AdjacencyStore, max_iterations: u32) -> GraphColoringResult {
     let all_nodes = adjacency.all_node_ids();
     if all_nodes.is_empty() {
         return GraphColoringResult {
@@ -3909,17 +3874,17 @@ pub fn k1_coloring(
             // Collect neighbor colors
             let mut neighbor_colors: HashSet<u32> = HashSet::new();
             for &(nbr, _) in adjacency.neighbors_out(node, None).iter() {
-                if nbr != node {
-                    if let Some(&c) = colors.get(&nbr) {
-                        neighbor_colors.insert(c);
-                    }
+                if nbr != node
+                    && let Some(&c) = colors.get(&nbr)
+                {
+                    neighbor_colors.insert(c);
                 }
             }
             for &(nbr, _) in adjacency.neighbors_in(node, None).iter() {
-                if nbr != node {
-                    if let Some(&c) = colors.get(&nbr) {
-                        neighbor_colors.insert(c);
-                    }
+                if nbr != node
+                    && let Some(&c) = colors.get(&nbr)
+                {
+                    neighbor_colors.insert(c);
                 }
             }
 
@@ -4186,8 +4151,7 @@ pub fn neighbor_sample(
     let mut rng_state: u64 = if seed == 0 { 1 } else { seed };
     let mut frontier: Vec<NodeId> = node_ids.clone();
 
-    for hop in 0..num_neighbors.len() {
-        let fan_out = num_neighbors[hop];
+    for &fan_out in num_neighbors {
         let mut next_frontier: Vec<NodeId> = Vec::new();
 
         for &node in &frontier {
@@ -4367,16 +4331,24 @@ mod tests {
         adj.add_node(3);
 
         let meta1 = EdgeMeta {
-            source: 1, target: 2, label: 0,
+            source: 1,
+            target: 2,
+            label: 0,
             temporal: BiTemporal::new_current(1000),
-            provenance: None, weight: 0.5, token_cost: 0,
+            provenance: None,
+            weight: 0.5,
+            token_cost: 0,
         };
         adj.add_edge(1, 2, 0, meta1).unwrap();
 
         let meta2 = EdgeMeta {
-            source: 1, target: 3, label: 0,
+            source: 1,
+            target: 3,
+            label: 0,
             temporal: BiTemporal::new_current(1000),
-            provenance: None, weight: 0.9, token_cost: 0,
+            provenance: None,
+            weight: 0.9,
+            token_cost: 0,
         };
         adj.add_edge(1, 3, 0, meta2).unwrap();
 
@@ -4385,8 +4357,15 @@ mod tests {
             ..EdgeFilter::none()
         };
         let result = bfs(
-            &adj, &[1], 1, 100, &filter, &NodeFilter::none(), Direction::Outgoing,
-            None, None,
+            &adj,
+            &[1],
+            1,
+            100,
+            &filter,
+            &NodeFilter::none(),
+            Direction::Outgoing,
+            None,
+            None,
         );
         // Only node 3 should be reachable (weight 0.9 >= 0.8)
         assert_eq!(result.visited_nodes.len(), 2); // seed + node 3
@@ -4402,18 +4381,24 @@ mod tests {
         adj.add_node(3);
 
         let meta1 = EdgeMeta {
-            source: 1, target: 2, label: 0,
+            source: 1,
+            target: 2,
+            label: 0,
             temporal: BiTemporal::new_current(1000),
             provenance: Some(Provenance::new("test", 0.5)),
-            weight: 1.0, token_cost: 0,
+            weight: 1.0,
+            token_cost: 0,
         };
         adj.add_edge(1, 2, 0, meta1).unwrap();
 
         let meta2 = EdgeMeta {
-            source: 1, target: 3, label: 0,
+            source: 1,
+            target: 3,
+            label: 0,
             temporal: BiTemporal::new_current(1000),
             provenance: Some(Provenance::new("test", 0.9)),
-            weight: 1.0, token_cost: 0,
+            weight: 1.0,
+            token_cost: 0,
         };
         adj.add_edge(1, 3, 0, meta2).unwrap();
 
@@ -4422,8 +4407,15 @@ mod tests {
             ..EdgeFilter::none()
         };
         let result = bfs(
-            &adj, &[1], 1, 100, &filter, &NodeFilter::none(), Direction::Outgoing,
-            None, None,
+            &adj,
+            &[1],
+            1,
+            100,
+            &filter,
+            &NodeFilter::none(),
+            Direction::Outgoing,
+            None,
+            None,
         );
         assert_eq!(result.visited_nodes.len(), 2);
         assert!(result.visited_nodes.contains(&3));
@@ -4438,21 +4430,29 @@ mod tests {
         adj.add_node(3);
 
         let meta1 = EdgeMeta {
-            source: 1, target: 2, label: 0,
+            source: 1,
+            target: 2,
+            label: 0,
             temporal: BiTemporal {
                 valid_from: 100,
                 valid_until: 200,
                 tx_from: 100,
                 tx_until: BiTemporal::OPEN,
             },
-            provenance: None, weight: 1.0, token_cost: 0,
+            provenance: None,
+            weight: 1.0,
+            token_cost: 0,
         };
         adj.add_edge(1, 2, 0, meta1).unwrap();
 
         let meta2 = EdgeMeta {
-            source: 1, target: 3, label: 0,
+            source: 1,
+            target: 3,
+            label: 0,
             temporal: BiTemporal::new_current(100),
-            provenance: None, weight: 1.0, token_cost: 0,
+            provenance: None,
+            weight: 1.0,
+            token_cost: 0,
         };
         adj.add_edge(1, 3, 0, meta2).unwrap();
 
@@ -4462,8 +4462,15 @@ mod tests {
             ..EdgeFilter::none()
         };
         let result = bfs(
-            &adj, &[1], 1, 100, &filter150, &NodeFilter::none(), Direction::Outgoing,
-            None, None,
+            &adj,
+            &[1],
+            1,
+            100,
+            &filter150,
+            &NodeFilter::none(),
+            Direction::Outgoing,
+            None,
+            None,
         );
         assert_eq!(result.visited_nodes.len(), 3);
 
@@ -4473,8 +4480,15 @@ mod tests {
             ..EdgeFilter::none()
         };
         let result = bfs(
-            &adj, &[1], 1, 100, &filter250, &NodeFilter::none(), Direction::Outgoing,
-            None, None,
+            &adj,
+            &[1],
+            1,
+            100,
+            &filter250,
+            &NodeFilter::none(),
+            Direction::Outgoing,
+            None,
+            None,
         );
         assert_eq!(result.visited_nodes.len(), 2);
         assert!(result.visited_nodes.contains(&3));
@@ -4488,8 +4502,7 @@ mod tests {
         // Node 1: 1.0, Node 2: 0.5, Node 3: 0.25, Node 4: 0.125
         assert!(result.len() >= 4);
 
-        let score_map: HashMap<NodeId, f32> =
-            result.iter().map(|s| (s.node_id, s.score)).collect();
+        let score_map: HashMap<NodeId, f32> = result.iter().map(|s| (s.node_id, s.score)).collect();
         assert!((score_map[&1] - 1.0).abs() < 0.001);
         assert!((score_map[&2] - 0.5).abs() < 0.001);
         assert!((score_map[&3] - 0.25).abs() < 0.001);
@@ -4501,8 +4514,7 @@ mod tests {
         let adj = build_linear_graph();
         let result = flow_score(&adj, &[(1, 1.0)], 0.5, 0.3, 10);
 
-        let score_map: HashMap<NodeId, f32> =
-            result.iter().map(|s| (s.node_id, s.score)).collect();
+        let score_map: HashMap<NodeId, f32> = result.iter().map(|s| (s.node_id, s.score)).collect();
         // Node 3 score would be 0.25 < 0.3, so it shouldn't propagate
         assert!(score_map.contains_key(&1));
         assert!(score_map.contains_key(&2));
@@ -4601,9 +4613,13 @@ mod tests {
         let meta1 = make_meta(1, 2, 0);
         adj.add_edge(1, 2, 0, meta1).unwrap();
         let meta2 = EdgeMeta {
-            source: 1, target: 3, label: 1,
+            source: 1,
+            target: 3,
+            label: 1,
             temporal: BiTemporal::new_current(1000),
-            provenance: None, weight: 1.0, token_cost: 0,
+            provenance: None,
+            weight: 1.0,
+            token_cost: 0,
         };
         adj.add_edge(1, 3, 1, meta2).unwrap();
 
@@ -4614,8 +4630,15 @@ mod tests {
             ..EdgeFilter::none()
         };
         let result = bfs(
-            &adj, &[1], 1, 100, &filter, &NodeFilter::none(), Direction::Outgoing,
-            None, None,
+            &adj,
+            &[1],
+            1,
+            100,
+            &filter,
+            &NodeFilter::none(),
+            Direction::Outgoing,
+            None,
+            None,
         );
         assert_eq!(result.visited_nodes.len(), 2);
         assert!(result.visited_nodes.contains(&2));
@@ -4641,22 +4664,30 @@ mod tests {
 
         // Edge 1->2: always valid
         let meta1 = EdgeMeta {
-            source: 1, target: 2, label: 0,
+            source: 1,
+            target: 2,
+            label: 0,
             temporal: BiTemporal::new_current(100),
-            provenance: None, weight: 1.0, token_cost: 0,
+            provenance: None,
+            weight: 1.0,
+            token_cost: 0,
         };
         adj.add_edge(1, 2, 0, meta1).unwrap();
 
         // Edge 2->3: valid [200, 300)
         let meta2 = EdgeMeta {
-            source: 2, target: 3, label: 0,
+            source: 2,
+            target: 3,
+            label: 0,
             temporal: BiTemporal {
                 valid_from: 200,
                 valid_until: 300,
                 tx_from: 200,
                 tx_until: BiTemporal::OPEN,
             },
-            provenance: None, weight: 1.0, token_cost: 0,
+            provenance: None,
+            weight: 1.0,
+            token_cost: 0,
         };
         adj.add_edge(2, 3, 0, meta2).unwrap();
 
@@ -4667,8 +4698,15 @@ mod tests {
             ..NodeFilter::none()
         };
         let result = bfs(
-            &adj, &[1], 3, 100, &EdgeFilter::none(), &nf, Direction::Outgoing,
-            None, None,
+            &adj,
+            &[1],
+            3,
+            100,
+            &EdgeFilter::none(),
+            &nf,
+            Direction::Outgoing,
+            None,
+            None,
         );
         assert!(result.visited_nodes.contains(&2));
         assert!(result.visited_nodes.contains(&3));
@@ -4680,8 +4718,15 @@ mod tests {
             ..NodeFilter::none()
         };
         let result2 = bfs(
-            &adj, &[1], 3, 100, &EdgeFilter::none(), &nf2, Direction::Outgoing,
-            None, None,
+            &adj,
+            &[1],
+            3,
+            100,
+            &EdgeFilter::none(),
+            &nf2,
+            Direction::Outgoing,
+            None,
+            None,
         );
         // Node 2 should be filtered out because none of its edges are valid at t=50
         assert!(!result2.visited_nodes.contains(&2));
@@ -4703,17 +4748,25 @@ mod tests {
 
         // Edge 1->2: created very recently (now - 100ms)
         let meta1 = EdgeMeta {
-            source: 1, target: 2, label: 0,
+            source: 1,
+            target: 2,
+            label: 0,
             temporal: BiTemporal::new_current(now_ms - 100),
-            provenance: None, weight: 1.0, token_cost: 0,
+            provenance: None,
+            weight: 1.0,
+            token_cost: 0,
         };
         adj.add_edge(1, 2, 0, meta1).unwrap();
 
         // Edge 1->3: created long ago (now - 10_000_000ms = ~2.7 hours ago)
         let meta2 = EdgeMeta {
-            source: 1, target: 3, label: 0,
+            source: 1,
+            target: 3,
+            label: 0,
             temporal: BiTemporal::new_current(now_ms - 10_000_000),
-            provenance: None, weight: 1.0, token_cost: 0,
+            provenance: None,
+            weight: 1.0,
+            token_cost: 0,
         };
         adj.add_edge(1, 3, 0, meta2).unwrap();
 
@@ -4723,8 +4776,15 @@ mod tests {
             ..EdgeFilter::none()
         };
         let result = bfs(
-            &adj, &[1], 1, 100, &filter, &NodeFilter::none(), Direction::Outgoing,
-            None, None,
+            &adj,
+            &[1],
+            1,
+            100,
+            &filter,
+            &NodeFilter::none(),
+            Direction::Outgoing,
+            None,
+            None,
         );
         assert_eq!(result.visited_nodes.len(), 2); // seed + node 2
         assert!(result.visited_nodes.contains(&2));
@@ -4740,22 +4800,34 @@ mod tests {
         adj.add_node(3);
 
         let meta1 = EdgeMeta {
-            source: 1, target: 2, label: 0,
+            source: 1,
+            target: 2,
+            label: 0,
             temporal: BiTemporal {
-                valid_from: 100, valid_until: 500,
-                tx_from: 100, tx_until: BiTemporal::OPEN,
+                valid_from: 100,
+                valid_until: 500,
+                tx_from: 100,
+                tx_until: BiTemporal::OPEN,
             },
-            provenance: None, weight: 1.0, token_cost: 0,
+            provenance: None,
+            weight: 1.0,
+            token_cost: 0,
         };
         adj.add_edge(1, 2, 0, meta1).unwrap();
 
         let meta2 = EdgeMeta {
-            source: 1, target: 3, label: 0,
+            source: 1,
+            target: 3,
+            label: 0,
             temporal: BiTemporal {
-                valid_from: 600, valid_until: 900,
-                tx_from: 600, tx_until: BiTemporal::OPEN,
+                valid_from: 600,
+                valid_until: 900,
+                tx_from: 600,
+                tx_until: BiTemporal::OPEN,
             },
-            provenance: None, weight: 1.0, token_cost: 0,
+            provenance: None,
+            weight: 1.0,
+            token_cost: 0,
         };
         adj.add_edge(1, 3, 0, meta2).unwrap();
 
@@ -4765,8 +4837,15 @@ mod tests {
             ..EdgeFilter::none()
         };
         let result = bfs(
-            &adj, &[1], 1, 100, &filter, &NodeFilter::none(), Direction::Outgoing,
-            None, None,
+            &adj,
+            &[1],
+            1,
+            100,
+            &filter,
+            &NodeFilter::none(),
+            Direction::Outgoing,
+            None,
+            None,
         );
         assert_eq!(result.visited_nodes.len(), 2); // seed + node 2
         assert!(result.visited_nodes.contains(&2));
@@ -4778,8 +4857,15 @@ mod tests {
             ..EdgeFilter::none()
         };
         let result2 = bfs(
-            &adj, &[1], 1, 100, &filter2, &NodeFilter::none(), Direction::Outgoing,
-            None, None,
+            &adj,
+            &[1],
+            1,
+            100,
+            &filter2,
+            &NodeFilter::none(),
+            Direction::Outgoing,
+            None,
+            None,
         );
         assert_eq!(result2.visited_nodes.len(), 3); // seed + nodes 2 and 3
 
@@ -4789,8 +4875,15 @@ mod tests {
             ..EdgeFilter::none()
         };
         let result3 = bfs(
-            &adj, &[1], 1, 100, &filter3, &NodeFilter::none(), Direction::Outgoing,
-            None, None,
+            &adj,
+            &[1],
+            1,
+            100,
+            &filter3,
+            &NodeFilter::none(),
+            Direction::Outgoing,
+            None,
+            None,
         );
         assert_eq!(result3.visited_nodes.len(), 1); // only seed
     }
@@ -5038,8 +5131,15 @@ mod tests {
         };
 
         let result = bfs(
-            &adj, &[1], 1, 100, &EdgeFilter::none(), &nf, Direction::Outgoing,
-            Some(&label_lookup), None,
+            &adj,
+            &[1],
+            1,
+            100,
+            &EdgeFilter::none(),
+            &nf,
+            Direction::Outgoing,
+            Some(&label_lookup),
+            None,
         );
         assert!(result.visited_nodes.contains(&1)); // seed always included
         assert!(result.visited_nodes.contains(&2)); // label 0: passes
@@ -5061,9 +5161,7 @@ mod tests {
         adj.add_edge(1, 3, 0, meta2).unwrap();
 
         // Property check: only node 2 has "status"
-        let prop_check = |nid: NodeId, prop: &str| -> bool {
-            nid == 2 && prop == "status"
-        };
+        let prop_check = |nid: NodeId, prop: &str| -> bool { nid == 2 && prop == "status" };
 
         let nf = NodeFilter {
             has_property: Some(vec!["status".to_string()]),
@@ -5071,8 +5169,15 @@ mod tests {
         };
 
         let result = bfs(
-            &adj, &[1], 1, 100, &EdgeFilter::none(), &nf, Direction::Outgoing,
-            None, Some(&prop_check),
+            &adj,
+            &[1],
+            1,
+            100,
+            &EdgeFilter::none(),
+            &nf,
+            Direction::Outgoing,
+            None,
+            Some(&prop_check),
         );
         assert!(result.visited_nodes.contains(&1)); // seed always included
         assert!(result.visited_nodes.contains(&2)); // has "status": passes
@@ -5104,12 +5209,18 @@ mod tests {
         assert!((result[0].score - 1.0).abs() < 0.001);
 
         // Tied nodes (score=0.5) should be sorted by node_id ascending
-        let tied: Vec<&ScoredNode> = result.iter().filter(|s| (s.score - 0.5).abs() < 0.001).collect();
+        let tied: Vec<&ScoredNode> = result
+            .iter()
+            .filter(|s| (s.score - 0.5).abs() < 0.001)
+            .collect();
         assert_eq!(tied.len(), 4);
         for i in 1..tied.len() {
-            assert!(tied[i - 1].node_id < tied[i].node_id,
+            assert!(
+                tied[i - 1].node_id < tied[i].node_id,
                 "Tied nodes should be sorted by node_id ascending: {} < {}",
-                tied[i - 1].node_id, tied[i].node_id);
+                tied[i - 1].node_id,
+                tied[i].node_id
+            );
         }
     }
 
@@ -5145,7 +5256,17 @@ mod tests {
     #[test]
     fn test_bfs_empty_graph_no_seeds() {
         let adj = AdjacencyStore::new();
-        let result = bfs(&adj, &[], 3, 100, &EdgeFilter::none(), &NodeFilter::none(), Direction::Outgoing, None, None);
+        let result = bfs(
+            &adj,
+            &[],
+            3,
+            100,
+            &EdgeFilter::none(),
+            &NodeFilter::none(),
+            Direction::Outgoing,
+            None,
+            None,
+        );
         assert!(result.visited_nodes.is_empty());
         assert!(result.visited_edges.is_empty());
     }
@@ -5153,7 +5274,17 @@ mod tests {
     #[test]
     fn test_bfs_seed_not_in_graph() {
         let adj = AdjacencyStore::new();
-        let result = bfs(&adj, &[999], 3, 100, &EdgeFilter::none(), &NodeFilter::none(), Direction::Outgoing, None, None);
+        let result = bfs(
+            &adj,
+            &[999],
+            3,
+            100,
+            &EdgeFilter::none(),
+            &NodeFilter::none(),
+            Direction::Outgoing,
+            None,
+            None,
+        );
         // Seed is pushed into visited even if not in graph, but no expansion
         assert_eq!(result.visited_nodes.len(), 1);
         assert_eq!(result.visited_nodes[0], 999);
@@ -5172,7 +5303,17 @@ mod tests {
         adj.add_node(4);
         adj.add_edge(3, 4, 0, make_meta(3, 4, 0)).unwrap();
 
-        let result = bfs(&adj, &[1], 5, 100, &EdgeFilter::none(), &NodeFilter::none(), Direction::Outgoing, None, None);
+        let result = bfs(
+            &adj,
+            &[1],
+            5,
+            100,
+            &EdgeFilter::none(),
+            &NodeFilter::none(),
+            Direction::Outgoing,
+            None,
+            None,
+        );
         assert_eq!(result.visited_nodes.len(), 2);
         assert!(result.visited_nodes.contains(&1));
         assert!(result.visited_nodes.contains(&2));
@@ -5190,7 +5331,17 @@ mod tests {
         adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
         adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
 
-        let result = bfs(&adj, &[1], 10, 100, &EdgeFilter::none(), &NodeFilter::none(), Direction::Outgoing, None, None);
+        let result = bfs(
+            &adj,
+            &[1],
+            10,
+            100,
+            &EdgeFilter::none(),
+            &NodeFilter::none(),
+            Direction::Outgoing,
+            None,
+            None,
+        );
         // Should visit each node exactly once (seen set prevents revisits)
         assert_eq!(result.visited_nodes.len(), 3);
     }
@@ -5198,7 +5349,17 @@ mod tests {
     #[test]
     fn test_bfs_max_depth_zero() {
         let adj = build_linear_graph();
-        let result = bfs(&adj, &[1], 0, 100, &EdgeFilter::none(), &NodeFilter::none(), Direction::Outgoing, None, None);
+        let result = bfs(
+            &adj,
+            &[1],
+            0,
+            100,
+            &EdgeFilter::none(),
+            &NodeFilter::none(),
+            Direction::Outgoing,
+            None,
+            None,
+        );
         // max_depth=0: seeds only, no expansion
         assert_eq!(result.visited_nodes.len(), 1);
         assert_eq!(result.visited_nodes[0], 1);
@@ -5207,7 +5368,17 @@ mod tests {
     #[test]
     fn test_bfs_max_depth_255() {
         let adj = build_linear_graph(); // 4 nodes
-        let result = bfs(&adj, &[1], 255, 100, &EdgeFilter::none(), &NodeFilter::none(), Direction::Outgoing, None, None);
+        let result = bfs(
+            &adj,
+            &[1],
+            255,
+            100,
+            &EdgeFilter::none(),
+            &NodeFilter::none(),
+            Direction::Outgoing,
+            None,
+            None,
+        );
         // Should traverse entire graph without overflow
         assert_eq!(result.visited_nodes.len(), 4);
     }
@@ -5215,7 +5386,17 @@ mod tests {
     #[test]
     fn test_bfs_max_nodes_limit() {
         let adj = build_star_graph(); // 5 nodes: 1->2, 1->3, 1->4, 1->5
-        let result = bfs(&adj, &[1], 5, 2, &EdgeFilter::none(), &NodeFilter::none(), Direction::Outgoing, None, None);
+        let result = bfs(
+            &adj,
+            &[1],
+            5,
+            2,
+            &EdgeFilter::none(),
+            &NodeFilter::none(),
+            Direction::Outgoing,
+            None,
+            None,
+        );
         // max_nodes=2: should stop after 2 nodes
         assert_eq!(result.visited_nodes.len(), 2);
     }
@@ -5351,23 +5532,35 @@ mod tests {
         adj.add_node(3);
 
         let meta_12 = EdgeMeta {
-            source: 1, target: 2, label: 0,
+            source: 1,
+            target: 2,
+            label: 0,
             temporal: BiTemporal::new_current(1000),
-            provenance: None, weight: 0.1, token_cost: 0,
+            provenance: None,
+            weight: 0.1,
+            token_cost: 0,
         };
         adj.add_edge(1, 2, 0, meta_12).unwrap();
 
         let meta_23 = EdgeMeta {
-            source: 2, target: 3, label: 0,
+            source: 2,
+            target: 3,
+            label: 0,
             temporal: BiTemporal::new_current(1000),
-            provenance: None, weight: 0.1, token_cost: 0,
+            provenance: None,
+            weight: 0.1,
+            token_cost: 0,
         };
         adj.add_edge(2, 3, 0, meta_23).unwrap();
 
         let meta_13 = EdgeMeta {
-            source: 1, target: 3, label: 0,
+            source: 1,
+            target: 3,
+            label: 0,
             temporal: BiTemporal::new_current(1000),
-            provenance: None, weight: 1.0, token_cost: 0,
+            provenance: None,
+            weight: 1.0,
+            token_cost: 0,
         };
         adj.add_edge(1, 3, 0, meta_13).unwrap();
 
@@ -5489,7 +5682,9 @@ mod tests {
         // Clique 2: 4-5, 4-6, 5-6
         // Bridge: 3-4
         let mut adj = AdjacencyStore::new();
-        for i in 1..=6 { adj.add_node(i); }
+        for i in 1..=6 {
+            adj.add_node(i);
+        }
         // Clique 1
         adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
         adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
@@ -5560,7 +5755,9 @@ mod tests {
         // Clique 2: 4-5, 4-6, 5-6
         // Bridge: 3-4
         let mut adj = AdjacencyStore::new();
-        for i in 1..=6 { adj.add_node(i); }
+        for i in 1..=6 {
+            adj.add_node(i);
+        }
         adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
         adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
         adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
@@ -5620,9 +5817,13 @@ mod tests {
         adj.add_node(1);
         adj.add_node(2);
         let meta = EdgeMeta {
-            source: 1, target: 2, label: 0,
+            source: 1,
+            target: 2,
+            label: 0,
             temporal: BiTemporal::new_current(1000),
-            provenance: None, weight: 0.0, token_cost: 0,
+            provenance: None,
+            weight: 0.0,
+            token_cost: 0,
         };
         adj.add_edge(1, 2, 0, meta).unwrap();
         // Zero weight → cost = f64::MAX, so path exists but is very expensive
@@ -5680,8 +5881,7 @@ mod tests {
         let result = flow_score(&adj, &[(1, 1.0)], 0.85, 0.01, 10);
         // Must terminate and produce scores for all 3 nodes
         assert_eq!(result.len(), 3);
-        let score_map: HashMap<NodeId, f32> =
-            result.iter().map(|s| (s.node_id, s.score)).collect();
+        let score_map: HashMap<NodeId, f32> = result.iter().map(|s| (s.node_id, s.score)).collect();
         // Seed has highest score
         assert_eq!(score_map[&1], 1.0);
         // Scores decrease along the cycle
@@ -5704,8 +5904,7 @@ mod tests {
         adj.add_edge(3, 4, 0, make_meta(3, 4, 0)).unwrap();
 
         let result = flow_score(&adj, &[(1, 1.0)], 0.8, 0.01, 5);
-        let score_map: HashMap<NodeId, f32> =
-            result.iter().map(|s| (s.node_id, s.score)).collect();
+        let score_map: HashMap<NodeId, f32> = result.iter().map(|s| (s.node_id, s.score)).collect();
         // Node 4: best path gives 1.0 * 0.8 * 0.8 = 0.64
         assert!((score_map[&4] - 0.64).abs() < 0.001);
         // Node 2 and 3 should have equal scores (symmetric)
@@ -5724,7 +5923,11 @@ mod tests {
         let non_seed: Vec<&ScoredNode> = result.iter().filter(|s| s.node_id != 1).collect();
         for s in &non_seed {
             // NaN comparisons: NaN > existing returns false, so no propagation
-            assert!(!s.score.is_nan(), "NaN should not propagate to node {}", s.node_id);
+            assert!(
+                !s.score.is_nan(),
+                "NaN should not propagate to node {}",
+                s.node_id
+            );
         }
     }
 
@@ -5732,15 +5935,16 @@ mod tests {
     fn test_flow_score_multiple_seeds_different_scores() {
         // Seeds at both ends of a chain: 1(1.0) -> 2 -> 3 <- 5(0.5) <- 4
         let mut adj = AdjacencyStore::new();
-        for i in 1..=5 { adj.add_node(i); }
+        for i in 1..=5 {
+            adj.add_node(i);
+        }
         adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
         adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
         adj.add_edge(4, 5, 0, make_meta(4, 5, 0)).unwrap();
         adj.add_edge(5, 3, 0, make_meta(5, 3, 0)).unwrap();
 
         let result = flow_score(&adj, &[(1, 1.0), (4, 0.5)], 0.8, 0.01, 5);
-        let score_map: HashMap<NodeId, f32> =
-            result.iter().map(|s| (s.node_id, s.score)).collect();
+        let score_map: HashMap<NodeId, f32> = result.iter().map(|s| (s.node_id, s.score)).collect();
         // Node 3 reachable from both seeds:
         //   via 1 -> 2 -> 3: 1.0 * 0.8 * 0.8 = 0.64
         //   via 4 -> 5 -> 3: 0.5 * 0.8 * 0.8 = 0.32
@@ -5785,7 +5989,9 @@ mod tests {
     fn test_betweenness_linear_graph() {
         // 1 -- 2 -- 3 -- 4 (undirected via both directions)
         let mut adj = AdjacencyStore::new();
-        for i in 1..=4 { adj.add_node(i); }
+        for i in 1..=4 {
+            adj.add_node(i);
+        }
         for i in 1..=3 {
             adj.add_edge(i, i + 1, 0, make_meta(i, i + 1, 0)).unwrap();
             adj.add_edge(i + 1, i, 0, make_meta(i + 1, i, 0)).unwrap();
@@ -5806,7 +6012,9 @@ mod tests {
     fn test_betweenness_star_graph() {
         // Center node 1 connects to 2,3,4,5 (undirected)
         let mut adj = AdjacencyStore::new();
-        for i in 1..=5 { adj.add_node(i); }
+        for i in 1..=5 {
+            adj.add_node(i);
+        }
         for i in 2..=5 {
             adj.add_edge(1, i, 0, make_meta(1, i, 0)).unwrap();
             adj.add_edge(i, 1, 0, make_meta(i, 1, 0)).unwrap();
@@ -5857,7 +6065,9 @@ mod tests {
     fn test_closeness_linear_graph() {
         // 1 -- 2 -- 3 (undirected)
         let mut adj = AdjacencyStore::new();
-        for i in 1..=3 { adj.add_node(i); }
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
         adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
         adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
         adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
@@ -5888,7 +6098,9 @@ mod tests {
     fn test_closeness_complete_triangle() {
         // 1--2, 2--3, 1--3 (complete, undirected)
         let mut adj = AdjacencyStore::new();
-        for i in 1..=3 { adj.add_node(i); }
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
         adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
         adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
         adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
@@ -5928,7 +6140,9 @@ mod tests {
     fn test_triangles_single_triangle() {
         // Triangle: 1-2-3 (undirected)
         let mut adj = AdjacencyStore::new();
-        for i in 1..=3 { adj.add_node(i); }
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
         adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
         adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
         adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
@@ -5939,7 +6153,10 @@ mod tests {
         let result = triangle_count(&adj, &EdgeFilter::none());
         assert_eq!(result.total_triangles, 1);
         let node_map: HashMap<NodeId, (u32, f64)> = result
-            .per_node.iter().map(|&(n, t, c)| (n, (t, c))).collect();
+            .per_node
+            .iter()
+            .map(|&(n, t, c)| (n, (t, c)))
+            .collect();
         // Each node participates in 1 triangle
         assert_eq!(node_map[&1].0, 1);
         assert_eq!(node_map[&2].0, 1);
@@ -5952,7 +6169,9 @@ mod tests {
     fn test_triangles_no_triangle() {
         // Star: 1-2, 1-3, 1-4 (no triangles since spokes not connected)
         let mut adj = AdjacencyStore::new();
-        for i in 1..=4 { adj.add_node(i); }
+        for i in 1..=4 {
+            adj.add_node(i);
+        }
         for i in 2..=4 {
             adj.add_edge(1, i, 0, make_meta(1, i, 0)).unwrap();
             adj.add_edge(i, 1, 0, make_meta(i, 1, 0)).unwrap();
@@ -5961,7 +6180,10 @@ mod tests {
         let result = triangle_count(&adj, &EdgeFilter::none());
         assert_eq!(result.total_triangles, 0);
         let node_map: HashMap<NodeId, (u32, f64)> = result
-            .per_node.iter().map(|&(n, t, c)| (n, (t, c))).collect();
+            .per_node
+            .iter()
+            .map(|&(n, t, c)| (n, (t, c)))
+            .collect();
         // Center has 3 neighbors but 0 triangles → cc = 0
         assert_eq!(node_map[&1].0, 0);
         assert_eq!(node_map[&1].1, 0.0);
@@ -5980,7 +6202,9 @@ mod tests {
     fn test_triangles_two_triangles_shared_edge() {
         // 1-2-3 triangle + 2-3-4 triangle (share edge 2-3)
         let mut adj = AdjacencyStore::new();
-        for i in 1..=4 { adj.add_node(i); }
+        for i in 1..=4 {
+            adj.add_node(i);
+        }
         // Triangle 1-2-3
         adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
         adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
@@ -5997,7 +6221,10 @@ mod tests {
         let result = triangle_count(&adj, &EdgeFilter::none());
         assert_eq!(result.total_triangles, 2);
         let node_map: HashMap<NodeId, (u32, f64)> = result
-            .per_node.iter().map(|&(n, t, c)| (n, (t, c))).collect();
+            .per_node
+            .iter()
+            .map(|&(n, t, c)| (n, (t, c)))
+            .collect();
         // Nodes 2 and 3 participate in both triangles
         assert_eq!(node_map[&2].0, 2);
         assert_eq!(node_map[&3].0, 2);
@@ -6028,7 +6255,9 @@ mod tests {
     fn test_scc_simple_cycle() {
         // 1 -> 2 -> 3 -> 1
         let mut adj = AdjacencyStore::new();
-        for i in 1..=3 { adj.add_node(i); }
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
         adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
         adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
         adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
@@ -6057,7 +6286,9 @@ mod tests {
         // SCC 2: 3 -> 4 -> 3
         // Bridge: 2 -> 3 (not creating a larger SCC)
         let mut adj = AdjacencyStore::new();
-        for i in 1..=4 { adj.add_node(i); }
+        for i in 1..=4 {
+            adj.add_node(i);
+        }
         adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
         adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
         adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
@@ -6118,7 +6349,9 @@ mod tests {
     fn test_topo_sort_diamond() {
         // 1 -> 2, 1 -> 3, 2 -> 4, 3 -> 4
         let mut adj = AdjacencyStore::new();
-        for i in 1..=4 { adj.add_node(i); }
+        for i in 1..=4 {
+            adj.add_node(i);
+        }
         adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
         adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
         adj.add_edge(2, 4, 0, make_meta(2, 4, 0)).unwrap();
@@ -6136,7 +6369,9 @@ mod tests {
     fn test_topo_sort_cycle_error() {
         // 1 -> 2 -> 3 -> 1
         let mut adj = AdjacencyStore::new();
-        for i in 1..=3 { adj.add_node(i); }
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
         adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
         adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
         adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
@@ -6182,7 +6417,8 @@ mod tests {
         assert_eq!(result.len(), 5);
 
         // Find center node (1) and its score
-        let center_score = result.iter()
+        let center_score = result
+            .iter()
             .find(|&&(nid, _)| nid == 1)
             .map(|&(_, score)| score)
             .expect("center node should be in results");
@@ -6190,17 +6426,24 @@ mod tests {
         // All spoke nodes should have lower betweenness than center
         for &(nid, score) in &result {
             if nid != 1 {
-                assert!(score < center_score,
+                assert!(
+                    score < center_score,
                     "spoke node {} (score={}) should have lower betweenness than center (score={})",
-                    nid, score, center_score);
+                    nid,
+                    score,
+                    center_score
+                );
             }
         }
 
         // Spoke nodes are leaves — they lie on no shortest paths between other pairs
         for &(nid, score) in &result {
             if nid != 1 {
-                assert_eq!(score, 0.0,
-                    "spoke node {} should have betweenness 0, got {}", nid, score);
+                assert_eq!(
+                    score, 0.0,
+                    "spoke node {} should have betweenness 0, got {}",
+                    nid, score
+                );
             }
         }
     }
@@ -6225,7 +6468,9 @@ mod tests {
     fn test_leiden_two_cliques() {
         // Two cliques connected by a bridge
         let mut adj = AdjacencyStore::new();
-        for i in 1..=6 { adj.add_node(i); }
+        for i in 1..=6 {
+            adj.add_node(i);
+        }
         // Clique 1: 1-2-3
         adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
         adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
@@ -6343,7 +6588,9 @@ mod tests {
     fn test_node2vec_deterministic() {
         // Two runs with same seed should produce identical walks
         let mut adj = AdjacencyStore::new();
-        for i in 1..=3 { adj.add_node(i); }
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
         adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
         adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
         adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
@@ -6408,21 +6655,33 @@ mod tests {
         adj.add_node(3);
 
         let meta_12 = EdgeMeta {
-            source: 1, target: 2, label: 0,
+            source: 1,
+            target: 2,
+            label: 0,
             temporal: BiTemporal::new_current(1000),
-            provenance: None, weight: 0.1, token_cost: 0,
+            provenance: None,
+            weight: 0.1,
+            token_cost: 0,
         };
         adj.add_edge(1, 2, 0, meta_12).unwrap();
         let meta_23 = EdgeMeta {
-            source: 2, target: 3, label: 0,
+            source: 2,
+            target: 3,
+            label: 0,
             temporal: BiTemporal::new_current(1000),
-            provenance: None, weight: 0.1, token_cost: 0,
+            provenance: None,
+            weight: 0.1,
+            token_cost: 0,
         };
         adj.add_edge(2, 3, 0, meta_23).unwrap();
         let meta_13 = EdgeMeta {
-            source: 1, target: 3, label: 0,
+            source: 1,
+            target: 3,
+            label: 0,
             temporal: BiTemporal::new_current(1000),
-            provenance: None, weight: 1.0, token_cost: 0,
+            provenance: None,
+            weight: 1.0,
+            token_cost: 0,
         };
         adj.add_edge(1, 3, 0, meta_13).unwrap();
 
@@ -6438,7 +6697,9 @@ mod tests {
     fn test_k_shortest_basic() {
         // Diamond: 1->2->4, 1->3->4
         let mut adj = AdjacencyStore::new();
-        for i in 1..=4 { adj.add_node(i); }
+        for i in 1..=4 {
+            adj.add_node(i);
+        }
         adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
         adj.add_edge(2, 4, 0, make_meta(2, 4, 0)).unwrap();
         adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
@@ -6495,7 +6756,9 @@ mod tests {
     fn test_degree_centrality_star() {
         // Star: center 1 connects to 2,3,4,5 (undirected via both directions)
         let mut adj = AdjacencyStore::new();
-        for i in 1..=5 { adj.add_node(i); }
+        for i in 1..=5 {
+            adj.add_node(i);
+        }
         for i in 2..=5 {
             adj.add_edge(1, i, 0, make_meta(1, i, 0)).unwrap();
             adj.add_edge(i, 1, 0, make_meta(i, 1, 0)).unwrap();
@@ -6544,7 +6807,9 @@ mod tests {
         // Undirected star: center should have highest eigenvector centrality
         // (need reverse edges so spokes see center and center sees spokes)
         let mut adj = AdjacencyStore::new();
-        for i in 1..=5 { adj.add_node(i); }
+        for i in 1..=5 {
+            adj.add_node(i);
+        }
         for i in 2..=5 {
             adj.add_edge(1, i, 0, make_meta(1, i, 0)).unwrap();
             adj.add_edge(i, 1, 0, make_meta(i, 1, 0)).unwrap();
@@ -6557,10 +6822,26 @@ mod tests {
         let result = eigenvector_centrality(&adj, 100, 1e-8);
         let ec: HashMap<NodeId, f64> = result.into_iter().collect();
         // Center node should have the highest score (most connected)
-        assert!(ec[&1] >= ec[&4], "center ec={} should be >= spoke4 ec={}", ec[&1], ec[&4]);
-        assert!(ec[&1] >= ec[&5], "center ec={} should be >= spoke5 ec={}", ec[&1], ec[&5]);
+        assert!(
+            ec[&1] >= ec[&4],
+            "center ec={} should be >= spoke4 ec={}",
+            ec[&1],
+            ec[&4]
+        );
+        assert!(
+            ec[&1] >= ec[&5],
+            "center ec={} should be >= spoke5 ec={}",
+            ec[&1],
+            ec[&5]
+        );
         // All scores should be non-negative
-        for &(_, score) in &[(1, ec[&1]), (2, ec[&2]), (3, ec[&3]), (4, ec[&4]), (5, ec[&5])] {
+        for &(_, score) in &[
+            (1, ec[&1]),
+            (2, ec[&2]),
+            (3, ec[&3]),
+            (4, ec[&4]),
+            (5, ec[&5]),
+        ] {
             assert!(score >= 0.0);
         }
     }
@@ -6586,7 +6867,9 @@ mod tests {
     fn test_eigenvector_complete_triangle() {
         // Complete triangle: all nodes should have equal scores
         let mut adj = AdjacencyStore::new();
-        for i in 1..=3 { adj.add_node(i); }
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
         adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
         adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
         adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
@@ -6606,7 +6889,9 @@ mod tests {
     fn test_hits_star_graph() {
         // Star: 1->2, 1->3, 1->4
         let mut adj = AdjacencyStore::new();
-        for i in 1..=4 { adj.add_node(i); }
+        for i in 1..=4 {
+            adj.add_node(i);
+        }
         adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
         adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
         adj.add_edge(1, 4, 0, make_meta(1, 4, 0)).unwrap();
@@ -6650,7 +6935,9 @@ mod tests {
     fn test_hits_bidirectional() {
         // Complete graph: all nodes should have similar auth and hub scores
         let mut adj = AdjacencyStore::new();
-        for i in 1..=3 { adj.add_node(i); }
+        for i in 1..=3 {
+            adj.add_node(i);
+        }
         adj.add_edge(1, 2, 0, make_meta(1, 2, 0)).unwrap();
         adj.add_edge(2, 1, 0, make_meta(2, 1, 0)).unwrap();
         adj.add_edge(2, 3, 0, make_meta(2, 3, 0)).unwrap();
@@ -6729,7 +7016,10 @@ mod tests {
                 break;
             }
         }
-        assert!(any_different, "different seeds should produce different embeddings");
+        assert!(
+            any_different,
+            "different seeds should produce different embeddings"
+        );
     }
 
     #[test]
@@ -6852,10 +7142,7 @@ mod tests {
         adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
 
         let sim = jaccard_similarity(&adj, 1, 2);
-        assert!(
-            (sim - 1.0 / 3.0).abs() < 1e-10,
-            "expected 1/3, got {sim}"
-        );
+        assert!((sim - 1.0 / 3.0).abs() < 1e-10, "expected 1/3, got {sim}");
     }
 
     #[test]
@@ -6993,10 +7280,7 @@ mod tests {
         let results = all_pairs_similarity(&adj, SimilarityMetric::Jaccard, 10);
         assert_eq!(results.len(), 3);
         for (_, _, sim) in &results {
-            assert!(
-                (sim - 1.0 / 3.0).abs() < 1e-10,
-                "expected 1/3, got {sim}"
-            );
+            assert!((sim - 1.0 / 3.0).abs() < 1e-10, "expected 1/3, got {sim}");
         }
     }
 
@@ -7205,8 +7489,7 @@ mod tests {
         adj.add_edge(1, 3, 0, make_meta(1, 3, 0)).unwrap();
         adj.add_edge(3, 1, 0, make_meta(3, 1, 0)).unwrap();
 
-        let predictions =
-            predict_links(&adj, LinkPredictionMetric::PreferentialAttachment, 5);
+        let predictions = predict_links(&adj, LinkPredictionMetric::PreferentialAttachment, 5);
         assert!(predictions.is_empty());
     }
 
@@ -7306,15 +7589,23 @@ mod tests {
             adj.add_node(i);
         }
         let meta1 = EdgeMeta {
-            source: 1, target: 2, label: 0,
+            source: 1,
+            target: 2,
+            label: 0,
             temporal: BiTemporal::new_current(1000),
-            provenance: None, weight: 3.0, token_cost: 0,
+            provenance: None,
+            weight: 3.0,
+            token_cost: 0,
         };
         adj.add_edge(1, 2, 0, meta1).unwrap();
         let meta2 = EdgeMeta {
-            source: 2, target: 3, label: 0,
+            source: 2,
+            target: 3,
+            label: 0,
             temporal: BiTemporal::new_current(1000),
-            provenance: None, weight: 2.0, token_cost: 0,
+            provenance: None,
+            weight: 2.0,
+            token_cost: 0,
         };
         adj.add_edge(2, 3, 0, meta2).unwrap();
 
@@ -7351,9 +7642,13 @@ mod tests {
         let edges = [(1, 2, 3.0), (1, 3, 2.0), (2, 4, 3.0), (3, 4, 2.0)];
         for (s, t, w) in edges {
             let meta = EdgeMeta {
-                source: s, target: t, label: 0,
+                source: s,
+                target: t,
+                label: 0,
                 temporal: BiTemporal::new_current(1000),
-                provenance: None, weight: w, token_cost: 0,
+                provenance: None,
+                weight: w,
+                token_cost: 0,
             };
             adj.add_edge(s, t, 0, meta).unwrap();
         }
@@ -7402,39 +7697,63 @@ mod tests {
             adj.add_node(i);
         }
         let meta1 = EdgeMeta {
-            source: 1, target: 2, label: 0,
+            source: 1,
+            target: 2,
+            label: 0,
             temporal: BiTemporal::new_current(1000),
-            provenance: None, weight: 1.0, token_cost: 0,
+            provenance: None,
+            weight: 1.0,
+            token_cost: 0,
         };
         adj.add_edge(1, 2, 0, meta1).unwrap();
         let meta1r = EdgeMeta {
-            source: 2, target: 1, label: 0,
+            source: 2,
+            target: 1,
+            label: 0,
             temporal: BiTemporal::new_current(1000),
-            provenance: None, weight: 1.0, token_cost: 0,
+            provenance: None,
+            weight: 1.0,
+            token_cost: 0,
         };
         adj.add_edge(2, 1, 0, meta1r).unwrap();
         let meta2 = EdgeMeta {
-            source: 2, target: 3, label: 0,
+            source: 2,
+            target: 3,
+            label: 0,
             temporal: BiTemporal::new_current(1000),
-            provenance: None, weight: 2.0, token_cost: 0,
+            provenance: None,
+            weight: 2.0,
+            token_cost: 0,
         };
         adj.add_edge(2, 3, 0, meta2).unwrap();
         let meta2r = EdgeMeta {
-            source: 3, target: 2, label: 0,
+            source: 3,
+            target: 2,
+            label: 0,
             temporal: BiTemporal::new_current(1000),
-            provenance: None, weight: 2.0, token_cost: 0,
+            provenance: None,
+            weight: 2.0,
+            token_cost: 0,
         };
         adj.add_edge(3, 2, 0, meta2r).unwrap();
         let meta3 = EdgeMeta {
-            source: 1, target: 3, label: 0,
+            source: 1,
+            target: 3,
+            label: 0,
             temporal: BiTemporal::new_current(1000),
-            provenance: None, weight: 3.0, token_cost: 0,
+            provenance: None,
+            weight: 3.0,
+            token_cost: 0,
         };
         adj.add_edge(1, 3, 0, meta3).unwrap();
         let meta3r = EdgeMeta {
-            source: 3, target: 1, label: 0,
+            source: 3,
+            target: 1,
+            label: 0,
             temporal: BiTemporal::new_current(1000),
-            provenance: None, weight: 3.0, token_cost: 0,
+            provenance: None,
+            weight: 3.0,
+            token_cost: 0,
         };
         adj.add_edge(3, 1, 0, meta3r).unwrap();
 
@@ -7772,8 +8091,10 @@ mod tests {
         // 2-hop sampling: fan-out [10, 10] should reach nodes 4 and 5
         let result2 = neighbor_sample(&adj, &[1], &[10, 10], 42);
         assert_eq!(result2.num_seeds, 1);
-        assert!(result2.node_ids.contains(&4) || result2.node_ids.contains(&5),
-            "2-hop should reach at least one of nodes 4 or 5");
+        assert!(
+            result2.node_ids.contains(&4) || result2.node_ids.contains(&5),
+            "2-hop should reach at least one of nodes 4 or 5"
+        );
     }
 
     #[test]

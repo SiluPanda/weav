@@ -156,5 +156,4 @@ mod tests {
         // 10000 bytes, CharDiv4: ceil(10000/4) = 2500
         assert_eq!(counter.count(&text), 2500);
     }
-
 }

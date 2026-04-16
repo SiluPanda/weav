@@ -3,6 +3,7 @@
 #[cfg(feature = "llm-providers")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use weav_core::types::ResolutionMode;
 
 // ─── Input types ─────────────────────────────────────────────────────────────
 
@@ -149,6 +150,7 @@ pub struct ExtractionStats {
     pub total_chunks: usize,
     pub total_entities: usize,
     pub entities_merged: usize,
+    pub entities_resolved: usize,
     pub total_relationships: usize,
     pub relationships_merged: usize,
     pub llm_calls: usize,
@@ -177,6 +179,10 @@ pub struct IngestOptions {
     pub chunk_overlap: Option<usize>,
     pub entity_types: Option<Vec<String>>,
     pub custom_extraction_prompt: Option<String>,
+    pub resolution_mode: Option<ResolutionMode>,
+    pub link_existing_entities: Option<bool>,
+    pub resolution_candidate_limit: Option<usize>,
+    pub custom_resolution_prompt: Option<String>,
 }
 
 #[cfg(test)]
@@ -185,11 +191,26 @@ mod tests {
 
     #[test]
     fn test_document_format_from_str() {
-        assert_eq!(DocumentFormat::from_str_lossy("text"), Some(DocumentFormat::PlainText));
-        assert_eq!(DocumentFormat::from_str_lossy("PDF"), Some(DocumentFormat::Pdf));
-        assert_eq!(DocumentFormat::from_str_lossy("docx"), Some(DocumentFormat::Docx));
-        assert_eq!(DocumentFormat::from_str_lossy("CSV"), Some(DocumentFormat::Csv));
-        assert_eq!(DocumentFormat::from_str_lossy("txt"), Some(DocumentFormat::PlainText));
+        assert_eq!(
+            DocumentFormat::from_str_lossy("text"),
+            Some(DocumentFormat::PlainText)
+        );
+        assert_eq!(
+            DocumentFormat::from_str_lossy("PDF"),
+            Some(DocumentFormat::Pdf)
+        );
+        assert_eq!(
+            DocumentFormat::from_str_lossy("docx"),
+            Some(DocumentFormat::Docx)
+        );
+        assert_eq!(
+            DocumentFormat::from_str_lossy("CSV"),
+            Some(DocumentFormat::Csv)
+        );
+        assert_eq!(
+            DocumentFormat::from_str_lossy("txt"),
+            Some(DocumentFormat::PlainText)
+        );
         assert_eq!(DocumentFormat::from_str_lossy("unknown"), None);
     }
 
@@ -247,6 +268,10 @@ mod tests {
         assert!(opts.document_id.is_none());
         assert!(opts.format.is_none());
         assert!(opts.entity_types.is_none());
+        assert!(opts.resolution_mode.is_none());
+        assert!(opts.link_existing_entities.is_none());
+        assert!(opts.resolution_candidate_limit.is_none());
+        assert!(opts.custom_resolution_prompt.is_none());
     }
 
     #[test]
@@ -255,6 +280,7 @@ mod tests {
         assert_eq!(stats.total_chunks, 0);
         assert_eq!(stats.total_entities, 0);
         assert_eq!(stats.entities_merged, 0);
+        assert_eq!(stats.entities_resolved, 0);
     }
 
     #[test]

@@ -18,6 +18,7 @@ service WeavService {
   rpc BulkAddNodes(BulkAddNodesRequest) returns (BulkAddNodesResponse);
   rpc BulkAddEdges(BulkAddEdgesRequest) returns (BulkAddEdgesResponse);
   rpc ContextQueryStream(ContextQueryRequest) returns (stream ContextChunkProto);
+  rpc SubscribeEvents(SubscribeEventsRequest) returns (stream GraphEventProto);
   rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
   rpc Info(InfoRequest) returns (InfoResponse);
 }
@@ -29,11 +30,13 @@ message PingResponse {
 
 message CreateGraphRequest {
   string name = 1;
+  ScopeRefProto scope = 2;
 }
 message CreateGraphResponse {}
 
 message DropGraphRequest {
   string name = 1;
+  ScopeRefProto scope = 2;
 }
 message DropGraphResponse {}
 
@@ -44,6 +47,7 @@ message ListGraphsResponse {
 
 message GraphInfoRequest {
   string name = 1;
+  ScopeRefProto scope = 2;
 }
 message GraphInfoResponse {
   string name = 1;
@@ -62,6 +66,7 @@ message AddNodeRequest {
   repeated Property properties = 3;
   repeated float embedding = 4;
   string entity_key = 5;
+  ScopeRefProto scope = 6;
 }
 message AddNodeResponse {
   uint64 node_id = 1;
@@ -70,6 +75,7 @@ message AddNodeResponse {
 message GetNodeRequest {
   string graph = 1;
   uint64 node_id = 2;
+  ScopeRefProto scope = 3;
 }
 message GetNodeResponse {
   uint64 node_id = 1;
@@ -82,12 +88,14 @@ message UpdateNodeRequest {
   uint64 node_id = 2;
   repeated Property properties = 3;
   repeated float embedding = 4;
+  ScopeRefProto scope = 5;
 }
 message UpdateNodeResponse {}
 
 message DeleteNodeRequest {
   string graph = 1;
   uint64 node_id = 2;
+  ScopeRefProto scope = 3;
 }
 message DeleteNodeResponse {}
 
@@ -97,6 +105,7 @@ message AddEdgeRequest {
   uint64 target = 3;
   string label = 4;
   float weight = 5;
+  ScopeRefProto scope = 6;
 }
 message AddEdgeResponse {
   uint64 edge_id = 1;
@@ -105,6 +114,7 @@ message AddEdgeResponse {
 message InvalidateEdgeRequest {
   string graph = 1;
   uint64 edge_id = 2;
+  ScopeRefProto scope = 3;
 }
 message InvalidateEdgeResponse {}
 
@@ -116,6 +126,32 @@ message ContextQueryRequest {
   uint32 budget = 5;
   uint32 max_depth = 6;
   bool include_provenance = 7;
+  RetrievalMode retrieval_mode = 8;
+  RerankConfigProto rerank = 9;
+  ScopeRefProto scope = 10;
+}
+
+enum RetrievalMode {
+  RETRIEVAL_MODE_UNSPECIFIED = 0;
+  RETRIEVAL_MODE_LOCAL = 1;
+  RETRIEVAL_MODE_GLOBAL = 2;
+  RETRIEVAL_MODE_HYBRID = 3;
+  RETRIEVAL_MODE_DRIFT = 4;
+}
+
+message RerankConfigProto {
+  optional bool enabled = 1;
+  string provider = 2;
+  string model = 3;
+  optional uint32 candidate_limit = 4;
+  optional float score_weight = 5;
+}
+
+message ScopeRefProto {
+  string workspace_id = 1;
+  string user_id = 2;
+  string agent_id = 3;
+  string session_id = 4;
 }
 
 message ContextChunkProto {
@@ -146,6 +182,7 @@ message BulkNodeItem {
 message BulkAddNodesRequest {
   string graph = 1;
   repeated BulkNodeItem nodes = 2;
+  ScopeRefProto scope = 3;
 }
 message BulkAddNodesResponse {
   repeated uint64 ids = 1;
@@ -161,9 +198,24 @@ message BulkEdgeItem {
 message BulkAddEdgesRequest {
   string graph = 1;
   repeated BulkEdgeItem edges = 2;
+  ScopeRefProto scope = 3;
 }
 message BulkAddEdgesResponse {
   repeated uint64 ids = 1;
+}
+
+message SubscribeEventsRequest {
+  string graph = 1;
+  uint64 since_sequence = 2;
+  uint32 replay_limit = 3;
+}
+
+message GraphEventProto {
+  uint64 sequence = 1;
+  string graph = 2;
+  uint64 timestamp_ms = 3;
+  string kind = 4;
+  string payload_json = 5;
 }
 
 message SnapshotRequest {}

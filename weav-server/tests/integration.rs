@@ -24,9 +24,7 @@ fn add_node(engine: &Engine, graph: &str, label: &str, name: &str, key: Option<&
             r#"NODE ADD TO "{graph}" LABEL "{label}" PROPERTIES {{"name": "{name}"}} KEY "{k}""#
         )
     } else {
-        format!(
-            r#"NODE ADD TO "{graph}" LABEL "{label}" PROPERTIES {{"name": "{name}"}}"#
-        )
+        format!(r#"NODE ADD TO "{graph}" LABEL "{label}" PROPERTIES {{"name": "{name}"}}"#)
     };
     let cmd = parse_command(&cmd_str).unwrap();
     match engine.execute_command(cmd, None).unwrap() {
@@ -36,14 +34,41 @@ fn add_node(engine: &Engine, graph: &str, label: &str, name: &str, key: Option<&
 }
 
 fn add_edge(engine: &Engine, graph: &str, src: u64, tgt: u64, label: &str, weight: f32) -> u64 {
-    let cmd_str = format!(
-        r#"EDGE ADD TO "{graph}" FROM {src} TO {tgt} LABEL "{label}" WEIGHT {weight}"#
-    );
+    let cmd_str =
+        format!(r#"EDGE ADD TO "{graph}" FROM {src} TO {tgt} LABEL "{label}" WEIGHT {weight}"#);
     let cmd = parse_command(&cmd_str).unwrap();
     match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Integer(id) => id,
         other => panic!("expected Integer from EDGE ADD, got: {:?}", other),
     }
+}
+
+#[test]
+fn test_cdc_replay_events_are_chronological_and_resume_from_sequence() {
+    let engine = make_engine();
+    create_graph(&engine, "cdc-replay");
+
+    add_node(&engine, "cdc-replay", "person", "Alice", Some("alice"));
+    add_node(&engine, "cdc-replay", "person", "Bob", Some("bob"));
+
+    let replayed = engine.replay_events(Some("cdc-replay"), 0, 10);
+    assert_eq!(replayed.len(), 3);
+    assert!(
+        replayed
+            .windows(2)
+            .all(|window| window[0].sequence < window[1].sequence)
+    );
+    assert!(matches!(
+        replayed[0].kind,
+        weav_core::events::EventKind::GraphCreated { .. }
+    ));
+
+    let resumed = engine.replay_events(Some("cdc-replay"), replayed[1].sequence, 10);
+    assert_eq!(resumed.len(), 1);
+    assert!(matches!(
+        resumed[0].kind,
+        weav_core::events::EventKind::NodeCreated { .. }
+    ));
 }
 
 // ---- Test 1: Full Graph Lifecycle ----
@@ -66,9 +91,27 @@ fn test_full_graph_lifecycle() {
     }
 
     // Add nodes with properties
-    let n1 = add_node(&engine, "lifecycle-graph", "company", "Apple Inc", Some("apple"));
-    let n2 = add_node(&engine, "lifecycle-graph", "person", "Tim Cook", Some("tim-cook"));
-    let n3 = add_node(&engine, "lifecycle-graph", "product", "iPhone", Some("iphone"));
+    let n1 = add_node(
+        &engine,
+        "lifecycle-graph",
+        "company",
+        "Apple Inc",
+        Some("apple"),
+    );
+    let n2 = add_node(
+        &engine,
+        "lifecycle-graph",
+        "person",
+        "Tim Cook",
+        Some("tim-cook"),
+    );
+    let n3 = add_node(
+        &engine,
+        "lifecycle-graph",
+        "product",
+        "iPhone",
+        Some("iphone"),
+    );
 
     assert!(n1 >= 1);
     assert_ne!(n1, n2);
@@ -110,8 +153,14 @@ fn test_full_graph_lifecycle() {
     .unwrap();
     match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Context(result) => {
-            assert!(result.nodes_considered > 0, "Should consider at least the seed node");
-            assert!(result.nodes_included > 0, "Should include at least the seed node");
+            assert!(
+                result.nodes_considered > 0,
+                "Should consider at least the seed node"
+            );
+            assert!(
+                result.nodes_included > 0,
+                "Should include at least the seed node"
+            );
             // The seed node (Apple Inc) should be in the results
             let has_apple = result.chunks.iter().any(|c| c.node_id == n1);
             assert!(has_apple, "Apple node should be in the context results");
@@ -127,7 +176,10 @@ fn test_full_graph_lifecycle() {
     match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
             assert_eq!(info.node_count, 2, "Should have 2 nodes after deletion");
-            assert_eq!(info.edge_count, 1, "Deleting n2 should remove the employs edge");
+            assert_eq!(
+                info.edge_count, 1,
+                "Deleting n2 should remove the employs edge"
+            );
         }
         other => panic!("expected GraphInfo, got: {:?}", other),
     }
@@ -156,7 +208,13 @@ fn test_temporal_workflow() {
 
     let n1 = add_node(&engine, "temporal-graph", "person", "Alice", Some("alice"));
     let n2 = add_node(&engine, "temporal-graph", "person", "Bob", Some("bob"));
-    let n3 = add_node(&engine, "temporal-graph", "person", "Charlie", Some("charlie"));
+    let n3 = add_node(
+        &engine,
+        "temporal-graph",
+        "person",
+        "Charlie",
+        Some("charlie"),
+    );
 
     let e1 = add_edge(&engine, "temporal-graph", n1, n2, "knows", 0.9);
     let _e2 = add_edge(&engine, "temporal-graph", n1, n3, "knows", 0.8);
@@ -203,10 +261,7 @@ fn test_dedup_through_engine() {
     let n2 = add_node(&engine, "dedup-graph", "person", "Bob", Some("bob-key"));
 
     // Look up by entity key
-    let cmd = parse_command(
-        "NODE GET \"dedup-graph\" WHERE entity_key = \"alice-key\"",
-    )
-    .unwrap();
+    let cmd = parse_command("NODE GET \"dedup-graph\" WHERE entity_key = \"alice-key\"").unwrap();
     match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::NodeInfo(info) => {
             assert_eq!(info.node_id, n1);
@@ -215,10 +270,7 @@ fn test_dedup_through_engine() {
         other => panic!("expected NodeInfo, got: {:?}", other),
     }
 
-    let cmd = parse_command(
-        "NODE GET \"dedup-graph\" WHERE entity_key = \"bob-key\"",
-    )
-    .unwrap();
+    let cmd = parse_command("NODE GET \"dedup-graph\" WHERE entity_key = \"bob-key\"").unwrap();
     match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::NodeInfo(info) => {
             assert_eq!(info.node_id, n2);
@@ -227,10 +279,7 @@ fn test_dedup_through_engine() {
     }
 
     // Look up a non-existent key should error
-    let cmd = parse_command(
-        "NODE GET \"dedup-graph\" WHERE entity_key = \"nonexistent\"",
-    )
-    .unwrap();
+    let cmd = parse_command("NODE GET \"dedup-graph\" WHERE entity_key = \"nonexistent\"").unwrap();
     assert!(
         engine.execute_command(cmd, None).is_err(),
         "Looking up non-existent entity_key should return an error"
@@ -249,7 +298,10 @@ fn test_budget_enforcement_e2e() {
     // Add multiple nodes with varying content lengths
     let mut node_ids = Vec::new();
     for i in 0..20 {
-        let description = format!("This is a fairly long description for node number {}. It contains enough text to consume a meaningful number of tokens in the budget calculation.", i);
+        let description = format!(
+            "This is a fairly long description for node number {}. It contains enough text to consume a meaningful number of tokens in the budget calculation.",
+            i
+        );
         let cmd_str = format!(
             r#"NODE ADD TO "budget-graph" LABEL "doc" PROPERTIES {{"name": "doc_{}", "content": "{}"}} KEY "doc-{}""#,
             i, description, i
@@ -412,14 +464,23 @@ fn test_conflict_resolution() {
     create_graph(&engine, "conflict-graph");
 
     // Add a node with entity_key "dup-key"
-    let n1 = add_node(&engine, "conflict-graph", "person", "Alice", Some("dup-key"));
+    let n1 = add_node(
+        &engine,
+        "conflict-graph",
+        "person",
+        "Alice",
+        Some("dup-key"),
+    );
 
     // Add a second node with the SAME entity_key but different properties.
     // Entity-key dedup returns existing node_id and merges properties.
     let n2 = add_node(&engine, "conflict-graph", "person", "Bob", Some("dup-key"));
 
     // Dedup should return the same node_id.
-    assert_eq!(n1, n2, "Same entity_key should return the same node_id (dedup)");
+    assert_eq!(
+        n1, n2,
+        "Same entity_key should return the same node_id (dedup)"
+    );
 
     // Graph should show 1 node (deduped).
     let cmd = parse_command("GRAPH INFO \"conflict-graph\"").unwrap();
@@ -478,7 +539,8 @@ fn test_bulk_operations() {
     for i in 0..99 {
         edge_entries.push(format!(
             r#"{{"source": {}, "target": {}, "label": "next", "weight": 0.5}}"#,
-            node_ids[i], node_ids[i + 1]
+            node_ids[i],
+            node_ids[i + 1]
         ));
     }
     let edges_json = format!("[{}]", edge_entries.join(", "));
@@ -565,10 +627,7 @@ fn test_protocol_parity() {
     }
 
     // NODE GET by entity_key should return the same node.
-    let cmd = parse_command(
-        "NODE GET \"parity-graph\" WHERE entity_key = \"test-key\"",
-    )
-    .unwrap();
+    let cmd = parse_command("NODE GET \"parity-graph\" WHERE entity_key = \"test-key\"").unwrap();
     match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::NodeInfo(info) => {
             assert_eq!(info.node_id, node_id, "Key lookup should match ID lookup");
@@ -729,7 +788,9 @@ fn test_concurrent_writes() {
 
     // Wait for all threads.
     for handle in handles {
-        handle.join().expect("Thread panicked during concurrent writes");
+        handle
+            .join()
+            .expect("Thread panicked during concurrent writes");
     }
 
     // Verify total node count = 8 * 50 = 400.
@@ -797,7 +858,10 @@ fn test_edge_delete_and_get() {
     // EDGE DELETE the edge.
     let cmd = parse_command(&format!("EDGE DELETE \"edge-ops-graph\" {e1}")).unwrap();
     let resp = engine.execute_command(cmd, None).unwrap();
-    assert!(matches!(resp, CommandResponse::Ok), "EDGE DELETE should return Ok");
+    assert!(
+        matches!(resp, CommandResponse::Ok),
+        "EDGE DELETE should return Ok"
+    );
 
     // EDGE GET after deletion should fail.
     let cmd = parse_command(&format!("EDGE GET \"edge-ops-graph\" {e1}")).unwrap();
@@ -826,7 +890,10 @@ fn test_config_set_and_get() {
     // CONFIG SET a key-value pair.
     let cmd = parse_command("CONFIG SET \"my.key\" \"my.value\"").unwrap();
     let resp = engine.execute_command(cmd, None).unwrap();
-    assert!(matches!(resp, CommandResponse::Ok), "CONFIG SET should return Ok");
+    assert!(
+        matches!(resp, CommandResponse::Ok),
+        "CONFIG SET should return Ok"
+    );
 
     // CONFIG GET should return the value.
     let cmd = parse_command("CONFIG GET \"my.key\"").unwrap();
@@ -851,7 +918,10 @@ fn test_config_set_and_get() {
     let cmd = parse_command("CONFIG GET \"my.key\"").unwrap();
     match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Text(val) => {
-            assert_eq!(val, "updated.value", "CONFIG GET should return the updated value");
+            assert_eq!(
+                val, "updated.value",
+                "CONFIG GET should return the updated value"
+            );
         }
         other => panic!("expected Text, got: {:?}", other),
     }
@@ -931,11 +1001,8 @@ fn test_concurrent_reads() {
 
                 // Read a specific node
                 let node_id = (t % 50) + 1;
-                let cmd = parse_command(&format!(
-                    "NODE GET \"concurrent-graph\" {}",
-                    node_id
-                ))
-                .unwrap();
+                let cmd =
+                    parse_command(&format!("NODE GET \"concurrent-graph\" {}", node_id)).unwrap();
                 let resp = engine_clone.execute_command(cmd, None).unwrap();
                 match resp {
                     CommandResponse::NodeInfo(info) => {
@@ -999,10 +1066,7 @@ fn test_error_propagation() {
     );
 
     // 7. Edge add with missing nodes
-    let cmd = parse_command(
-        r#"EDGE ADD TO "error-graph" FROM 1 TO 2 LABEL "link""#,
-    )
-    .unwrap();
+    let cmd = parse_command(r#"EDGE ADD TO "error-graph" FROM 1 TO 2 LABEL "link""#).unwrap();
     assert!(
         engine.execute_command(cmd, None).is_err(),
         "EDGE ADD with non-existent nodes should error"
@@ -1023,10 +1087,7 @@ fn test_error_propagation() {
     );
 
     // 10. Context query on non-existent graph
-    let cmd = parse_command(
-        r#"CONTEXT "test" FROM "nonexistent" SEEDS NODES ["x"]"#,
-    )
-    .unwrap();
+    let cmd = parse_command(r#"CONTEXT "test" FROM "nonexistent" SEEDS NODES ["x"]"#).unwrap();
     assert!(
         engine.execute_command(cmd, None).is_err(),
         "CONTEXT on non-existent graph should error"
@@ -1049,10 +1110,22 @@ fn test_context_query_multi_seed() {
     create_graph(&engine, "multi-seed-graph");
 
     // Create a small knowledge graph
-    let alice = add_node(&engine, "multi-seed-graph", "person", "Alice", Some("alice"));
+    let alice = add_node(
+        &engine,
+        "multi-seed-graph",
+        "person",
+        "Alice",
+        Some("alice"),
+    );
     let bob = add_node(&engine, "multi-seed-graph", "person", "Bob", Some("bob"));
     let rust = add_node(&engine, "multi-seed-graph", "topic", "Rust", Some("rust"));
-    let python = add_node(&engine, "multi-seed-graph", "topic", "Python", Some("python"));
+    let python = add_node(
+        &engine,
+        "multi-seed-graph",
+        "topic",
+        "Python",
+        Some("python"),
+    );
 
     add_edge(&engine, "multi-seed-graph", alice, rust, "uses", 0.9);
     add_edge(&engine, "multi-seed-graph", bob, python, "uses", 0.8);
@@ -1091,7 +1164,10 @@ fn test_stats_and_info() {
     let cmd = parse_command("INFO").unwrap();
     match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::Text(text) => {
-            assert!(text.contains("weav-server"), "INFO should contain server name");
+            assert!(
+                text.contains("weav-server"),
+                "INFO should contain server name"
+            );
         }
         other => panic!("expected Text, got: {:?}", other),
     }
@@ -1108,13 +1184,7 @@ fn test_stats_and_info() {
     // Create a graph with nodes and check per-graph stats
     create_graph(&engine, "stats-graph");
     for i in 0..5 {
-        add_node(
-            &engine,
-            "stats-graph",
-            "entity",
-            &format!("E{}", i),
-            None,
-        );
+        add_node(&engine, "stats-graph", "entity", &format!("E{}", i), None);
     }
 
     let cmd = parse_command("STATS \"stats-graph\"").unwrap();
@@ -1198,10 +1268,8 @@ fn test_node_update_e2e() {
     }
 
     // Update a non-existent node should fail
-    let cmd = parse_command(
-        r#"NODE UPDATE "update-graph" 99999 PROPERTIES {"name": "Ghost"}"#,
-    )
-    .unwrap();
+    let cmd =
+        parse_command(r#"NODE UPDATE "update-graph" 99999 PROPERTIES {"name": "Ghost"}"#).unwrap();
     assert!(
         engine.execute_command(cmd, None).is_err(),
         "Updating a non-existent node should return an error"
@@ -1353,11 +1421,8 @@ fn test_concurrent_read_write_interleaving() {
 
                 // Read: NODE GET (one of the initial nodes)
                 let node_id = (t % 10) + 1;
-                let cmd = parse_command(&format!(
-                    "NODE GET \"rw-interleave-graph\" {}",
-                    node_id
-                ))
-                .unwrap();
+                let cmd = parse_command(&format!("NODE GET \"rw-interleave-graph\" {}", node_id))
+                    .unwrap();
                 let resp = engine_clone.execute_command(cmd, None).unwrap();
                 match resp {
                     CommandResponse::NodeInfo(info) => {
@@ -1484,7 +1549,13 @@ fn test_edge_operations_e2e() {
 
     let n1 = add_node(&engine, "edge-e2e-graph", "person", "Alice", Some("alice"));
     let n2 = add_node(&engine, "edge-e2e-graph", "person", "Bob", Some("bob"));
-    let n3 = add_node(&engine, "edge-e2e-graph", "person", "Charlie", Some("charlie"));
+    let n3 = add_node(
+        &engine,
+        "edge-e2e-graph",
+        "person",
+        "Charlie",
+        Some("charlie"),
+    );
 
     // Add multiple edges
     let e1 = add_edge(&engine, "edge-e2e-graph", n1, n2, "knows", 0.9);
@@ -1565,7 +1636,10 @@ fn test_edge_operations_e2e() {
     let cmd = parse_command("GRAPH INFO \"edge-e2e-graph\"").unwrap();
     match engine.execute_command(cmd, None).unwrap() {
         CommandResponse::GraphInfo(info) => {
-            assert_eq!(info.edge_count, 2, "Edge count should be 2 after one deletion");
+            assert_eq!(
+                info.edge_count, 2,
+                "Edge count should be 2 after one deletion"
+            );
         }
         other => panic!("expected GraphInfo, got: {:?}", other),
     }
@@ -1595,9 +1669,27 @@ fn test_temporal_filtering_context() {
     let engine = make_engine();
     create_graph(&engine, "temporal-ctx-graph");
 
-    let n1 = add_node(&engine, "temporal-ctx-graph", "event", "Event1", Some("ev1"));
-    let n2 = add_node(&engine, "temporal-ctx-graph", "event", "Event2", Some("ev2"));
-    let n3 = add_node(&engine, "temporal-ctx-graph", "event", "Event3", Some("ev3"));
+    let n1 = add_node(
+        &engine,
+        "temporal-ctx-graph",
+        "event",
+        "Event1",
+        Some("ev1"),
+    );
+    let n2 = add_node(
+        &engine,
+        "temporal-ctx-graph",
+        "event",
+        "Event2",
+        Some("ev2"),
+    );
+    let n3 = add_node(
+        &engine,
+        "temporal-ctx-graph",
+        "event",
+        "Event3",
+        Some("ev3"),
+    );
 
     add_edge(&engine, "temporal-ctx-graph", n1, n2, "precedes", 0.9);
     add_edge(&engine, "temporal-ctx-graph", n2, n3, "precedes", 0.8);
@@ -1715,10 +1807,7 @@ fn test_integration_bulk_insert_empty_arrays() {
     let engine = make_engine();
     create_graph(&engine, "bulk-empty-graph");
 
-    let cmd = parse_command(
-        r#"BULK NODES TO "bulk-empty-graph" DATA []"#,
-    )
-    .unwrap();
+    let cmd = parse_command(r#"BULK NODES TO "bulk-empty-graph" DATA []"#).unwrap();
     let resp = engine.execute_command(cmd, None).unwrap();
     match resp {
         CommandResponse::IntegerList(ids) => {
@@ -1746,7 +1835,13 @@ fn test_integration_context_no_seeds_found() {
     create_graph(&engine, "ctx-noseed-graph");
 
     // Add a node so the graph is not empty, but use a different key.
-    add_node(&engine, "ctx-noseed-graph", "person", "Alice", Some("alice"));
+    add_node(
+        &engine,
+        "ctx-noseed-graph",
+        "person",
+        "Alice",
+        Some("alice"),
+    );
 
     // Query with a non-existent entity key.
     let cmd = parse_command(
@@ -1807,7 +1902,10 @@ fn test_integration_edge_invalidate_then_query() {
     )
     .unwrap();
     let resp = engine.execute_command(cmd, None);
-    assert!(resp.is_ok(), "Context query after edge invalidation should not error")
+    assert!(
+        resp.is_ok(),
+        "Context query after edge invalidation should not error"
+    )
 }
 
 // ---- Test 28: Graph drop cleans everything ----
@@ -1820,7 +1918,13 @@ fn test_integration_graph_drop_cleans_everything() {
     create_graph(&engine, "drop-clean-graph");
 
     // Add a few nodes and edges.
-    let n1 = add_node(&engine, "drop-clean-graph", "person", "Alice", Some("alice"));
+    let n1 = add_node(
+        &engine,
+        "drop-clean-graph",
+        "person",
+        "Alice",
+        Some("alice"),
+    );
     let n2 = add_node(&engine, "drop-clean-graph", "person", "Bob", Some("bob"));
     let n3 = add_node(&engine, "drop-clean-graph", "company", "Acme", Some("acme"));
     add_edge(&engine, "drop-clean-graph", n1, n2, "knows", 0.8);

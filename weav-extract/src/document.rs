@@ -17,11 +17,9 @@ pub fn extract_text(doc: &InputDocument) -> WeavResult<String> {
 fn extract_plain_text(content: &DocumentContent) -> WeavResult<String> {
     match content {
         DocumentContent::Text(s) => Ok(s.clone()),
-        DocumentContent::Binary(bytes) => {
-            String::from_utf8(bytes.clone()).map_err(|e| {
-                WeavError::DocumentParseError(format!("invalid UTF-8 in plain text: {e}"))
-            })
-        }
+        DocumentContent::Binary(bytes) => String::from_utf8(bytes.clone()).map_err(|e| {
+            WeavError::DocumentParseError(format!("invalid UTF-8 in plain text: {e}"))
+        }),
     }
 }
 
@@ -37,19 +35,14 @@ fn extract_pdf_text(content: &DocumentContent) -> WeavResult<String> {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp_dir = std::env::temp_dir();
     let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp_path = tmp_dir.join(format!(
-        "weav_pdf_{}_{}.pdf",
-        std::process::id(),
-        seq,
-    ));
+    let tmp_path = tmp_dir.join(format!("weav_pdf_{}_{}.pdf", std::process::id(), seq,));
     std::fs::write(&tmp_path, bytes).map_err(|e| {
         WeavError::DocumentParseError(format!("failed to write temp PDF file: {e}"))
     })?;
 
     let result = (|| -> WeavResult<String> {
-        let mut doc = pdf_oxide::PdfDocument::open(&tmp_path).map_err(|e| {
-            WeavError::DocumentParseError(format!("failed to parse PDF: {e}"))
-        })?;
+        let mut doc = pdf_oxide::PdfDocument::open(&tmp_path)
+            .map_err(|e| WeavError::DocumentParseError(format!("failed to parse PDF: {e}")))?;
 
         let page_count = doc.page_count().map_err(|e| {
             WeavError::DocumentParseError(format!("failed to get PDF page count: {e}"))
@@ -96,20 +89,16 @@ fn extract_docx_text(content: &DocumentContent) -> WeavResult<String> {
     };
 
     let cursor = std::io::Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(cursor).map_err(|e| {
-        WeavError::DocumentParseError(format!("failed to open DOCX as ZIP: {e}"))
-    })?;
+    let mut archive = zip::ZipArchive::new(cursor)
+        .map_err(|e| WeavError::DocumentParseError(format!("failed to open DOCX as ZIP: {e}")))?;
 
     let mut xml_content = String::new();
     {
         let mut file = archive.by_name("word/document.xml").map_err(|e| {
-            WeavError::DocumentParseError(format!(
-                "DOCX missing word/document.xml: {e}"
-            ))
+            WeavError::DocumentParseError(format!("DOCX missing word/document.xml: {e}"))
         })?;
-        std::io::Read::read_to_string(&mut file, &mut xml_content).map_err(|e| {
-            WeavError::DocumentParseError(format!("failed to read DOCX XML: {e}"))
-        })?;
+        std::io::Read::read_to_string(&mut file, &mut xml_content)
+            .map_err(|e| WeavError::DocumentParseError(format!("failed to read DOCX XML: {e}")))?;
     }
 
     // Extract text content from XML: collect text between <w:t> tags.
@@ -196,9 +185,8 @@ fn extract_text_from_docx_xml(xml: &str) -> String {
 fn extract_csv_text(content: &DocumentContent) -> WeavResult<String> {
     let data = match content {
         DocumentContent::Text(s) => s.clone(),
-        DocumentContent::Binary(b) => String::from_utf8(b.clone()).map_err(|e| {
-            WeavError::DocumentParseError(format!("invalid UTF-8 in CSV: {e}"))
-        })?,
+        DocumentContent::Binary(b) => String::from_utf8(b.clone())
+            .map_err(|e| WeavError::DocumentParseError(format!("invalid UTF-8 in CSV: {e}")))?,
     };
 
     let mut reader = csv::ReaderBuilder::new()
@@ -213,9 +201,7 @@ fn extract_csv_text(content: &DocumentContent) -> WeavResult<String> {
         .collect();
 
     if headers.is_empty() {
-        return Err(WeavError::DocumentParseError(
-            "CSV has no headers".into(),
-        ));
+        return Err(WeavError::DocumentParseError("CSV has no headers".into()));
     }
 
     let mut sentences = Vec::new();

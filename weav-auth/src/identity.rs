@@ -212,7 +212,11 @@ mod tests {
         assert!(identity.permissions.has_category(CommandCategory::Read));
         assert!(identity.permissions.has_category(CommandCategory::Write));
         assert!(identity.permissions.has_category(CommandCategory::Admin));
-        assert!(identity.permissions.has_category(CommandCategory::Connection));
+        assert!(
+            identity
+                .permissions
+                .has_category(CommandCategory::Connection)
+        );
     }
 
     #[test]
@@ -326,7 +330,10 @@ mod tests {
     fn test_graph_permission_from_str() {
         assert_eq!(GraphPermission::parse("read"), GraphPermission::Read);
         assert_eq!(GraphPermission::parse("r"), GraphPermission::Read);
-        assert_eq!(GraphPermission::parse("readwrite"), GraphPermission::ReadWrite);
+        assert_eq!(
+            GraphPermission::parse("readwrite"),
+            GraphPermission::ReadWrite
+        );
         assert_eq!(GraphPermission::parse("rw"), GraphPermission::ReadWrite);
         assert_eq!(GraphPermission::parse("write"), GraphPermission::ReadWrite);
         assert_eq!(GraphPermission::parse("admin"), GraphPermission::Admin);
@@ -378,6 +385,20 @@ mod tests {
         assert!(!perms.can_admin_graph("app:users"));
         assert!(perms.can_read_graph("shared"));
         assert!(!perms.can_write_graph("shared"));
+    }
+
+    #[test]
+    fn test_user_permissions_graph_acl_scoped_graphs() {
+        let perms = UserPermissions {
+            allowed_categories: CommandCategorySet::all(),
+            graph_acl: vec![GraphAcl {
+                pattern: "ws:acme:*".into(),
+                permission: GraphPermission::ReadWrite,
+            }],
+        };
+        assert!(perms.can_read_graph("ws:acme:user:u_123"));
+        assert!(perms.can_write_graph("ws:acme:user:u_123:agent:a_support"));
+        assert!(!perms.can_read_graph("ws:other:user:u_123"));
     }
 
     #[test]

@@ -145,10 +145,7 @@ mod tests {
         }
 
         // Verify specific messages for the previously untested variants
-        assert_eq!(
-            WeavError::EdgeNotFound(99).to_string(),
-            "edge 99 not found"
-        );
+        assert_eq!(WeavError::EdgeNotFound(99).to_string(), "edge 99 not found");
         assert_eq!(
             WeavError::DuplicateNode("alice".into()).to_string(),
             "duplicate node: entity with key 'alice' already exists"

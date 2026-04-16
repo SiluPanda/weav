@@ -3,17 +3,21 @@
 use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
 use weav_proto::command::{
-    context_result_to_resp3, error_to_resp3, node_id_to_resp3, ok_resp3,
-    resp3_to_command_string, string_list_to_resp3,
+    context_result_to_resp3, error_to_resp3, node_id_to_resp3, ok_resp3, resp3_to_command_string,
+    string_list_to_resp3,
 };
 use weav_proto::resp3::{Resp3Codec, Resp3Value};
 use weav_query::parser::parse_command;
 
 use crate::engine::{CommandResponse, Engine};
+
+#[cfg(feature = "tls")]
+use tokio_rustls::{TlsAcceptor, server::TlsStream};
 
 /// Convert a `CommandResponse` to a `Resp3Value` for sending back over the wire.
 fn command_response_to_resp3(resp: CommandResponse) -> Resp3Value {
@@ -21,9 +25,11 @@ fn command_response_to_resp3(resp: CommandResponse) -> Resp3Value {
         CommandResponse::Ok => ok_resp3(),
         CommandResponse::Pong => Resp3Value::SimpleString("PONG".to_string()),
         CommandResponse::Integer(n) => node_id_to_resp3(n),
-        CommandResponse::IntegerList(ids) => {
-            Resp3Value::Array(ids.into_iter().map(|id| Resp3Value::Number(id as i64)).collect())
-        }
+        CommandResponse::IntegerList(ids) => Resp3Value::Array(
+            ids.into_iter()
+                .map(|id| Resp3Value::Number(id as i64))
+                .collect(),
+        ),
         CommandResponse::Text(s) => Resp3Value::BlobString(s.into_bytes()),
         CommandResponse::StringList(items) => string_list_to_resp3(items),
         CommandResponse::Context(result) => context_result_to_resp3(&result),
@@ -116,6 +122,14 @@ fn command_response_to_resp3(resp: CommandResponse) -> Resp3Value {
                 Resp3Value::Number(info.entities_merged as i64),
             ),
             (
+                Resp3Value::SimpleString("entities_resolved".to_string()),
+                Resp3Value::Number(info.entities_resolved as i64),
+            ),
+            (
+                Resp3Value::SimpleString("entities_linked_existing".to_string()),
+                Resp3Value::Number(info.entities_linked_existing as i64),
+            ),
+            (
                 Resp3Value::SimpleString("relationships_created".to_string()),
                 Resp3Value::Number(info.relationships_created as i64),
             ),
@@ -129,15 +143,170 @@ fn command_response_to_resp3(resp: CommandResponse) -> Resp3Value {
     }
 }
 
-/// Run the RESP3 TCP server, accepting connections and processing commands.
-pub async fn run_resp3_server(engine: Arc<Engine>, addr: &str) {
-    let listener = match TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::error!("Failed to bind RESP3 server on {}: {}", addr, e);
-            return;
+async fn handle_resp3_connection<S>(engine: Arc<Engine>, peer: std::net::SocketAddr, stream: S)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    tracing::debug!("RESP3 connection from {}", peer);
+    let mut framed = Framed::new(stream, Resp3Codec::new());
+
+    // Per-connection identity (None until AUTH succeeds).
+    let mut identity: Option<weav_auth::identity::SessionIdentity> = None;
+
+    while let Some(frame_result) = framed.next().await {
+        let frame = match frame_result {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::debug!("RESP3 decode error from {}: {}", peer, e);
+                break;
+            }
+        };
+
+        // Convert RESP3 frame to command string.
+        let cmd_str = match resp3_to_command_string(&frame) {
+            Ok(s) => s,
+            Err(e) => {
+                let resp = error_to_resp3(&e);
+                if framed.send(resp).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        // Parse the command.
+        let cmd = match parse_command(&cmd_str) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                if framed.send(error_to_resp3(&e)).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        // Handle AUTH specially: authenticate and store the identity.
+        if let weav_query::parser::Command::Auth {
+            ref username,
+            ref password,
+        } = cmd
+            && engine.is_auth_enabled()
+        {
+            let auth_result = match username {
+                Some(u) => engine.authenticate(u, password),
+                None => engine.authenticate_default(password),
+            };
+            let response = match auth_result {
+                Ok(id) => {
+                    let resp_text = format!("OK (user: {})", id.username);
+                    identity = Some(id);
+                    command_response_to_resp3(CommandResponse::Text(resp_text))
+                }
+                Err(e) => error_to_resp3(&e),
+            };
+            if framed.send(response).await.is_err() {
+                break;
+            }
+            continue;
         }
-    };
+
+        // Execute command with current identity.
+        let response = match engine.execute_command(cmd, identity.as_ref()) {
+            Ok(resp) => command_response_to_resp3(resp),
+            Err(e) => error_to_resp3(&e),
+        };
+
+        if framed.send(response).await.is_err() {
+            break;
+        }
+    }
+
+    tracing::debug!("RESP3 connection closed from {}", peer);
+}
+
+async fn upgrade_resp3_stream(
+    peer: std::net::SocketAddr,
+    stream: TcpStream,
+    #[cfg(feature = "tls")] tls_acceptor: Option<TlsAcceptor>,
+) -> Option<impl AsyncRead + AsyncWrite + Unpin + Send + 'static> {
+    #[cfg(feature = "tls")]
+    if let Some(acceptor) = tls_acceptor {
+        match acceptor.accept(stream).await {
+            Ok(tls_stream) => return Some(EitherStream::Tls(tls_stream)),
+            Err(err) => {
+                tracing::warn!("RESP3 TLS handshake failed from {}: {}", peer, err);
+                return None;
+            }
+        }
+    }
+
+    Some(EitherStream::Tcp(stream))
+}
+
+#[allow(clippy::large_enum_variant)]
+enum EitherStream {
+    Tcp(TcpStream),
+    #[cfg(feature = "tls")]
+    Tls(TlsStream<TcpStream>),
+}
+
+impl AsyncRead for EitherStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            EitherStream::Tcp(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+            #[cfg(feature = "tls")]
+            EitherStream::Tls(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for EitherStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match &mut *self {
+            EitherStream::Tcp(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+            #[cfg(feature = "tls")]
+            EitherStream::Tls(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            EitherStream::Tcp(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+            #[cfg(feature = "tls")]
+            EitherStream::Tls(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match &mut *self {
+            EitherStream::Tcp(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+            #[cfg(feature = "tls")]
+            EitherStream::Tls(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Run the RESP3 TCP server, accepting connections and processing commands.
+pub async fn run_resp3_server(
+    engine: Arc<Engine>,
+    addr: &str,
+    #[cfg(feature = "tls")] tls_acceptor: Option<TlsAcceptor>,
+) -> std::io::Result<()> {
+    let listener = TcpListener::bind(addr).await?;
 
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -149,6 +318,8 @@ pub async fn run_resp3_server(engine: Arc<Engine>, addr: &str) {
         };
 
         let engine = engine.clone();
+        #[cfg(feature = "tls")]
+        let tls_acceptor = tls_acceptor.clone();
         tokio::spawn(async move {
             // Enforce connection limit
             if let Err(e) = engine.try_acquire_connection() {
@@ -156,81 +327,26 @@ pub async fn run_resp3_server(engine: Arc<Engine>, addr: &str) {
                 return;
             }
 
-            tracing::debug!("RESP3 connection from {}", peer);
-            let mut framed = Framed::new(stream, Resp3Codec::new());
-
-            // Per-connection identity (None until AUTH succeeds).
-            let mut identity: Option<weav_auth::identity::SessionIdentity> = None;
-
-            while let Some(frame_result) = framed.next().await {
-                let frame = match frame_result {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::debug!("RESP3 decode error from {}: {}", peer, e);
-                        break;
-                    }
-                };
-
-                // Convert RESP3 frame to command string.
-                let cmd_str = match resp3_to_command_string(&frame) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let resp = error_to_resp3(&e);
-                        if framed.send(resp).await.is_err() {
-                            break;
-                        }
-                        continue;
-                    }
-                };
-
-                // Parse the command.
-                let cmd = match parse_command(&cmd_str) {
-                    Ok(cmd) => cmd,
-                    Err(e) => {
-                        if framed.send(error_to_resp3(&e)).await.is_err() {
-                            break;
-                        }
-                        continue;
-                    }
-                };
-
-                // Handle AUTH specially: authenticate and store the identity.
-                if let weav_query::parser::Command::Auth { ref username, ref password } = cmd
-                    && engine.is_auth_enabled()
-                {
-                    let auth_result = match username {
-                        Some(u) => engine.authenticate(u, password),
-                        None => engine.authenticate_default(password),
-                    };
-                    let response = match auth_result {
-                        Ok(id) => {
-                            let resp_text = format!("OK (user: {})", id.username);
-                            identity = Some(id);
-                            command_response_to_resp3(CommandResponse::Text(resp_text))
-                        }
-                        Err(e) => error_to_resp3(&e),
-                    };
-                    if framed.send(response).await.is_err() {
-                        break;
-                    }
-                    continue;
-                }
-
-                // Execute command with current identity.
-                let response = match engine.execute_command(cmd, identity.as_ref()) {
-                    Ok(resp) => command_response_to_resp3(resp),
-                    Err(e) => error_to_resp3(&e),
-                };
-
-                if framed.send(response).await.is_err() {
-                    break;
-                }
+            if let Some(io) = upgrade_resp3_stream(
+                peer,
+                stream,
+                #[cfg(feature = "tls")]
+                tls_acceptor,
+            )
+            .await
+            {
+                handle_resp3_connection(engine.clone(), peer, io).await;
+            } else {
+                engine.release_connection();
+                return;
             }
 
             engine.release_connection();
-            tracing::debug!("RESP3 connection closed from {}", peer);
         });
     }
+
+    #[allow(unreachable_code)]
+    Ok(())
 }
 
 #[cfg(test)]
@@ -268,10 +384,8 @@ mod tests {
 
     #[test]
     fn test_command_response_to_resp3_string_list() {
-        let resp = command_response_to_resp3(CommandResponse::StringList(vec![
-            "a".into(),
-            "b".into(),
-        ]));
+        let resp =
+            command_response_to_resp3(CommandResponse::StringList(vec!["a".into(), "b".into()]));
         match resp {
             Resp3Value::Array(items) => {
                 assert_eq!(items.len(), 2);
