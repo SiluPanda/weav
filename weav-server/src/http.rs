@@ -3431,7 +3431,8 @@ async fn infer_schema(
     // Collect node type info
     let all_nodes = gs.adjacency.all_node_ids();
     type PropertyStats = (String, u64, u64, std::collections::HashSet<String>);
-    type LabelProps = std::collections::HashMap<String, std::collections::HashMap<String, PropertyStats>>;
+    type LabelProps =
+        std::collections::HashMap<String, std::collections::HashMap<String, PropertyStats>>;
     let mut label_props: LabelProps = std::collections::HashMap::new();
     let mut label_counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
 

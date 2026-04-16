@@ -3918,9 +3918,7 @@ impl Engine {
                         &["_created_at", "_tx_from", "_ttl_expires_at", "_group_id"];
                     let filtered: std::collections::HashMap<&str, &Value> = all_props
                         .into_iter()
-                        .filter(|(k, _)| {
-                            !k.starts_with('_') || PRESERVED_INTERNAL.contains(k)
-                        })
+                        .filter(|(k, _)| !k.starts_with('_') || PRESERVED_INTERNAL.contains(k))
                         .collect();
                     serde_json::to_string(&filtered).unwrap_or_default()
                 };
