@@ -3,7 +3,7 @@
 
 # ─── Builder Stage ────────────────────────────────────────────────────────────
 
-FROM rust:1.85-slim-bookworm AS builder
+FROM rust:stable-slim-bookworm AS builder
 
 WORKDIR /build
 
@@ -51,7 +51,7 @@ RUN cargo build --release -p weav-server --features weav-server/full && \
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
+    ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
